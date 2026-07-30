@@ -26,7 +26,8 @@ jobs:
         with:
           enable-cache: true
       - name: Install
-        run: uv sync --locked
+        # bench/ imports oxrdflib, so `ty` needs the bench group to resolve it.
+        run: uv sync --locked --group bench
       - name: Ruff format
         run: uv run ruff format --check
       - name: Ruff lint

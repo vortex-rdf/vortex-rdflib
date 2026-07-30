@@ -8,9 +8,11 @@ cd "$(git rev-parse --show-toplevel)"
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$1"; }
 
-# `--locked` fails if uv.lock is out of date, exactly like CI.
-info "uv sync --locked"
-uv sync --locked
+# `--locked` fails if uv.lock is out of date, exactly like CI. The bench group
+# comes along so `ty` can resolve bench/'s optional imports (and so a push does
+# not silently uninstall the benchmark contenders).
+info "uv sync --locked --group bench"
+uv sync --locked --group bench
 
 # --- lint job ---
 info "uv run ruff format --check"
