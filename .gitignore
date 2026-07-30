@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Local RDF datasets and generated Vortex files used for manual testing
+*.vortex
+/test/
+
+.claude
