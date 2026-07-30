@@ -101,6 +101,14 @@ def main() -> int:
             parser.error(f"unknown adapter slug(s): {', '.join(sorted(unknown))}")
         adapters = [a for a in ADAPTERS if a.slug in wanted]
 
+    # Fail fast with the fix, not per-worker skips: a plain `uv sync` prunes
+    # the bench group, silently uninstalling the contenders.
+    if any(a.slug.startswith("oxrdflib") for a in adapters):
+        try:
+            import oxrdflib  # noqa: F401
+        except ImportError:
+            parser.error("oxrdflib is not installed — run `uv sync --group bench` first")
+
     cfg = config_from_env()
     m = moduli(cfg)
     queries = build_queries(cfg, m)
