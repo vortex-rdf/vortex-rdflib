@@ -37,6 +37,8 @@ dependencies = [
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.16", "ty>=0.0.60"]
+# Comparative benchmark contenders (bench/): oxrdflib pulls pyoxigraph.
+bench = ["oxrdflib>=0.4"]
 
 [project.urls]
 Homepage = "https://github.com/vortex-rdf/vortex-rdflib"

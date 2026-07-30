@@ -96,6 +96,28 @@ to raise the budget (recommended for large stores).
 | `VORTEX_RDF_DISABLE_PUSHDOWN=1` | Keep rdflib's default BGP evaluator |
 | `VORTEX_RDF_TRACE_TRIPLES=1` | Print every `triples()` pattern (debugging) |
 
+## Benchmarks
+
+A comparative benchmark — `VortexStore` vs rdflib's in-memory `Memory` store
+vs [oxrdflib](https://github.com/oxigraph/oxrdflib) (Oxigraph) — runs on every
+push to `main` and publishes a dashboard to GitHub Pages:
+<https://vortex-rdf.github.io/vortex-rdflib/>.
+
+It executes a synthetic representative SPARQL set (lookups/scans, star and
+chain joins, FILTER/DISTINCT/ORDER BY/GROUP BY) and records per-store peak
+RSS; each store's full lifecycle runs in its own process. SPARQL evaluation
+is rdflib's engine for every store, with two labeled reference rows: Vortex
+with the BGP pushdown, and Oxigraph's native SPARQL engine.
+
+Run it locally (defaults to the full 250k-triple CI scale; scale down with
+`BENCH_TRIPLES`):
+
+```bash
+uv sync --group bench
+BENCH_TRIPLES=20000 uv run python -m bench.run_bench --out bench/results.json
+uv run python scripts/render_bench_dashboard.py bench/results.json public/index.html
+```
+
 ## Development
 
 The repo is managed with [uv](https://docs.astral.sh/uv/); `uv.lock` pins the

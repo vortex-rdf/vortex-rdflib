@@ -1,0 +1,60 @@
+name: Benchmark Dashboard
+
+on:
+  push:
+    branches:
+      - main
+    # Skip the ~15-minute comparative bench on doc-only pushes. Deliberately
+    # narrow: bench/ and scripts/ are dashboard inputs.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install (with bench contenders)
+        run: uv sync --locked --group bench
+
+      # Full scale: the code defaults (250k triples). One worker process per
+      # store; peak-RSS readings are per-store and uncontaminated.
+      - name: Run comparative benchmark
+        run: uv run python -m bench.run_bench --out bench/results.json
+
+      - name: Render dashboard
+        run: uv run python scripts/render_bench_dashboard.py bench/results.json public/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
