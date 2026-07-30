@@ -110,6 +110,55 @@ def test_pushdown_equals_default_evaluator(dict_vortex, sparql):
     assert with_pushdown == without_pushdown
 
 
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_probe_join_path_equals_default_evaluator(dict_vortex, monkeypatch, sparql):
+    """Same A/B matrix with the probe threshold forced to zero, so every
+    shared-variable join takes the per-binding probe path instead of the
+    hash join — both strategies must be observationally identical."""
+    import vortex_rdflib.pushdown as pd
+
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    graph = Graph(store=VortexStore(str(dict_vortex)))
+    register_sparql_pushdown()
+    with_probe = run(graph, sparql)
+    try:
+        unregister_sparql_pushdown()
+        without_pushdown = run(graph, sparql)
+    finally:
+        register_sparql_pushdown()
+    assert with_probe == without_pushdown
+
+
+def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
+    """A 1-row anchor joined against a 300-row predicate must take the probe
+    path under the real threshold, and still produce the right rows."""
+    import vortex_rdflib.pushdown as pd
+
+    nt = tmp_path / "skewed.nt"
+    nt.write_text(
+        '<http://ex.org/s0> <http://ex.org/rare> "anchor" .\n'
+        + "".join(
+            f"<http://ex.org/s{i}> <http://ex.org/big> <http://ex.org/o{i}> .\n" for i in range(300)
+        )
+    )
+    out = tmp_path / "skewed.vortex"
+    serialize_rdf(str(nt), str(out), layout="dictionary")
+
+    probes = []
+    original = pd._probe_join
+    monkeypatch.setattr(pd, "_probe_join", lambda *a: probes.append(1) or original(*a))
+    graph = Graph(store=VortexStore(str(out)))
+    register_sparql_pushdown()
+    rows = run(
+        graph,
+        """SELECT ?s ?o WHERE {
+            ?s <http://ex.org/rare> "anchor" .
+            ?s <http://ex.org/big> ?o }""",
+    )
+    assert rows == [(URIRef("http://ex.org/s0"), URIRef("http://ex.org/o0"))]
+    assert probes, "the skewed join did not take the probe path"
+
+
 def test_pushdown_is_actually_used(dict_vortex, monkeypatch):
     import vortex_rdflib.pushdown as pd
 
