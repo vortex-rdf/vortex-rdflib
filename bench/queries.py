@@ -24,6 +24,7 @@ those a lower iteration budget, mirroring FULL_SCAN_OPTS in the JS bench.
 """
 
 from dataclasses import dataclass
+from textwrap import dedent
 
 from .dataset import DatasetConfig, Moduli, object_nt, predicate_iri, subject_iri
 
@@ -37,6 +38,17 @@ class Query:
     sparql: str
     heavy: bool = False
     is_ask: bool = False
+
+
+def _sparql(text: str) -> str:
+    """Strip the Python source indentation off a query written inline.
+
+    Queries are laid out one triple pattern per line: whitespace is
+    insignificant to SPARQL, and the dashboard prints ``sparql`` verbatim in
+    its query-set section, so the text a reader sees is exactly the text the
+    stores were given.
+    """
+    return dedent(text).strip()
 
 
 def _chain_predicates(cfg: DatasetConfig, m: Moduli) -> tuple[int, int]:
@@ -108,49 +120,130 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
     pf = f"<{predicate_iri(filter_p)}>"
 
     return [
-        Query("ask-spo", "lookups", f"ASK {{ {s0} {p0} {o0} }}", is_ask=True),
-        Query("po-lookup", "lookups", f"SELECT ?s WHERE {{ ?s {p0} {o0} }}"),
-        Query("o-scan", "lookups", f"SELECT ?s ?p WHERE {{ ?s ?p {o_link} }}"),
-        Query("p-scan", "lookups", f"SELECT ?s ?o WHERE {{ ?s {p1} ?o }}"),
+        Query(
+            "ask-spo",
+            "lookups",
+            _sparql(f"""
+                ASK {{
+                  {s0} {p0} {o0}
+                }}
+            """),
+            is_ask=True,
+        ),
+        Query(
+            "po-lookup",
+            "lookups",
+            _sparql(f"""
+                SELECT ?s WHERE {{
+                  ?s {p0} {o0}
+                }}
+            """),
+        ),
+        Query(
+            "o-scan",
+            "lookups",
+            _sparql(f"""
+                SELECT ?s ?p WHERE {{
+                  ?s ?p {o_link}
+                }}
+            """),
+        ),
+        Query(
+            "p-scan",
+            "lookups",
+            _sparql(f"""
+                SELECT ?s ?o WHERE {{
+                  ?s {p1} ?o
+                }}
+            """),
+        ),
         Query(
             "star-2",
             "joins",
-            f"SELECT ?s ?o WHERE {{ ?s {p0} {o0} . ?s {star_p2} ?o }}",
+            _sparql(f"""
+                SELECT ?s ?o WHERE {{
+                  ?s {p0} {o0} .
+                  ?s {star_p2} ?o
+                }}
+            """),
         ),
         Query(
             "star-3",
             "joins",
-            f"SELECT ?s ?o ?o2 WHERE {{ ?s {p0} {o0} . ?s {star_p2} ?o . ?s {star_p3} ?o2 }}",
+            _sparql(f"""
+                SELECT ?s ?o ?o2 WHERE {{
+                  ?s {p0} {o0} .
+                  ?s {star_p2} ?o .
+                  ?s {star_p3} ?o2
+                }}
+            """),
         ),
         Query(
             "chain-2",
             "joins",
-            f"SELECT ?s ?o WHERE {{ ?s {chain_pa} ?m . ?m {chain_pb} ?o }}",
+            _sparql(f"""
+                SELECT ?s ?o WHERE {{
+                  ?s {chain_pa} ?m .
+                  ?m {chain_pb} ?o
+                }}
+            """),
             heavy=True,
         ),
         Query(
             "optional",
             "joins",
-            f"SELECT ?s ?o ?x WHERE {{ ?s {p0} {o0} . ?s {star_p2} ?o . "
-            f"OPTIONAL {{ ?s {star_p3} ?x }} }}",
+            _sparql(f"""
+                SELECT ?s ?o ?x WHERE {{
+                  ?s {p0} {o0} .
+                  ?s {star_p2} ?o
+                  OPTIONAL {{
+                    ?s {star_p3} ?x
+                  }}
+                }}
+            """),
         ),
         Query(
             "filter-range",
             "features",
-            f"{XSD_PREFIX}\nSELECT ?s ?v WHERE {{ ?s {pf} ?v . "
-            f"FILTER(datatype(?v) = xsd:integer && ?v < {int_cut}) }}",
+            _sparql(f"""
+                {XSD_PREFIX}
+                SELECT ?s ?v WHERE {{
+                  ?s {pf} ?v .
+                  FILTER(datatype(?v) = xsd:integer && ?v < {int_cut})
+                }}
+            """),
         ),
-        Query("distinct", "features", f"SELECT DISTINCT ?o WHERE {{ ?s {p1} ?o }}"),
+        Query(
+            "distinct",
+            "features",
+            _sparql(f"""
+                SELECT DISTINCT ?o WHERE {{
+                  ?s {p1} ?o
+                }}
+            """),
+        ),
         Query(
             "order-limit",
             "features",
-            f"{XSD_PREFIX}\nSELECT ?s ?v WHERE {{ ?s {pf} ?v . "
-            f"FILTER(datatype(?v) = xsd:integer) }} ORDER BY DESC(?v) LIMIT 10",
+            _sparql(f"""
+                {XSD_PREFIX}
+                SELECT ?s ?v WHERE {{
+                  ?s {pf} ?v .
+                  FILTER(datatype(?v) = xsd:integer)
+                }}
+                ORDER BY DESC(?v)
+                LIMIT 10
+            """),
         ),
         Query(
             "agg-count",
             "features",
-            "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p",
+            _sparql("""
+                SELECT ?p (COUNT(*) AS ?n) WHERE {
+                  ?s ?p ?o
+                }
+                GROUP BY ?p
+            """),
             heavy=True,
         ),
     ]
