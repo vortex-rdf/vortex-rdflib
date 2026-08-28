@@ -193,11 +193,15 @@ no API token is stored in the repository. To cut a release:
    `[Unreleased]` section (regenerated from Conventional Commits via
    [git-cliff](https://git-cliff.org/); refresh anytime with
    `scripts/update-changelog.sh`).
-3. Commit, then push a matching `v<version>` tag.
+3. Commit, then push a matching `vX.Y.Z` tag.
 
 The full CI matrix runs on the tagged commit and must pass before anything is
-built, and the workflow refuses to publish if the tag and `pyproject.toml`
-disagree.
+built; the workflow refuses to publish if the tag, `pyproject.toml` and
+`uv.lock` disagree on the version; and the wheel is smoke-tested against the
+test suite before upload. Running the workflow by hand (Actions → Release →
+Run workflow) is a dry run — build, validate, smoke-test, publish nothing —
+unless the "Publish to PyPI" toggle is on, which is how to retry a release
+whose publish step failed.
 
 ## License
 

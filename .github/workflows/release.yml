@@ -1,40 +1,87 @@
 name: Release
 
-# Publishes to PyPI when a `v*` tag is pushed. The package is pure Python:
-# one universal wheel plus the sdist.
+# Publishes vortex-rdflib to PyPI. A version tag push (v*.*.*) publishes;
+# workflow_dispatch runs the same pipeline by hand — a dry run by default
+# (build, validate and smoke-test, publish nothing), or a real publish with
+# the `pypi` toggle for re-publishing after a partial failure. PyPI rejects
+# re-uploading an existing version, so only a version that never landed can
+# be retried.
+#
+# PyPI uses GitHub OIDC trusted publishing — no long-lived token. The project
+# is configured once to trust this repo, this workflow file (release.yml) and
+# the "release" GitHub environment: project Settings -> Publishing (set up as
+# a pending publisher before the first release).
+
 on:
   push:
-    tags: ["v*"]
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      pypi:
+        description: "Publish to PyPI (off = dry run: build, validate and smoke-test only)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
-  # The full CI matrix must pass on the tagged commit before anything is
-  # built or published.
+  # The full CI suite runs against the exact ref being released; the publish
+  # job is gated on it, so dispatching from a commit whose CI never ran is
+  # still safe.
   ci:
     name: CI
     uses: ./.github/workflows/ci.yml
 
+  # The version is declared in pyproject.toml and pinned again in uv.lock.
+  # This job fails before anything is built when they disagree with the tag
+  # being pushed (or, on workflow_dispatch, with each other).
+  verify-versions:
+    name: Verify versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compare declared versions
+        run: |
+          set -euo pipefail
+
+          project_version="$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")"
+          lock_version="$(python3 -c "import tomllib; lock = tomllib.load(open('uv.lock', 'rb')); print(next(p['version'] for p in lock['package'] if p['name'] == 'vortex-rdflib'))")"
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            expected="${GITHUB_REF_NAME#v}"
+          else
+            expected="$project_version"
+          fi
+          echo "Expected version: $expected"
+
+          fail=0
+          check() {
+            if [ "$2" != "$expected" ]; then
+              echo "::error::$1 declares version '$2', expected '$expected'"
+              fail=1
+            else
+              echo "  $1: $2"
+            fi
+          }
+          check "pyproject.toml" "$project_version"
+          check "uv.lock" "$lock_version"
+          exit "$fail"
+
   build:
     name: Build distributions
+    needs: [ci, verify-versions]
     runs-on: ubuntu-latest
-    needs: ci
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
-      - name: Check tag matches project version
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          project="$(python3 -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
-          if [ "$tag" != "$project" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $project"
-            exit 1
-          fi
       - name: Build sdist and wheel
         run: |
           uv build
           uvx twine check dist/*
+      # The test suite runs against the built wheel in an isolated environment,
+      # not the source tree, so what gets published is what got tested.
       - name: Smoke-test the wheel
         run: >
           uv run --isolated --no-project
@@ -45,20 +92,25 @@ jobs:
           name: dist
           path: dist
 
+  # A tag push publishes; a dispatch publishes only with the toggle on. The
+  # inputs.* context is empty on push events (falsy toggle), so the gate ORs
+  # in the event check.
   publish:
     name: Publish to PyPI
-    runs-on: ubuntu-latest
     needs: build
+    if: ${{ github.event_name == 'push' || inputs.pypi }}
+    runs-on: ubuntu-latest
     environment:
       name: release
       url: https://pypi.org/p/vortex-rdflib
     permissions:
-      # Trusted Publishing: PyPI mints a short-lived token from this OIDC
-      # identity, so no API token needs to live in repository secrets.
       id-token: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
