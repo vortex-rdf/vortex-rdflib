@@ -203,21 +203,19 @@
 <main>
   <section id="overview" class="group">
     <p class="lede">
-      One run of <code>bench/run_bench.py</code> — <a href="https://github.com/vortex-rdf/vortex-rdflib">vortex-rdflib</a>'s
-      <code>VortexStore</code> compared against rdflib's in-memory <code>Memory</code> store and
-      <a href="https://github.com/oxigraph/oxrdflib">oxrdflib</a> (Oxigraph), executing a synthetic
-      representative SPARQL set: single-pattern lookups and scans, anchored star and unanchored
-      chain joins, and feature queries (FILTER, DISTINCT, ORDER BY + LIMIT, GROUP BY).
+      One run of <code>bench/run_bench.py</code>: <a href="https://github.com/vortex-rdf/vortex-rdflib">vortex-rdflib</a>'s
+      <code>VortexStore</code> against rdflib, <a href="https://github.com/oxigraph/oxrdflib">oxrdflib</a>
+      (Oxigraph), <a href="https://github.com/cottas-rdf/pycottas">pycottas-rdflib</a> (COTTAS) and
+      <a href="https://pypi.org/project/rdflib-hdt/">rdflib-hdt</a> (HDT), over a synthetic SPARQL
+      set: lookups and scans, star and chain joins, and FILTER / DISTINCT / ORDER BY / GROUP BY.
+      The Vortex rows are all Dictionary layout, crossed over <em>residency</em> and
+      <em>secondary index</em> (none, by-copy, by-reference).
     </p>
     <p class="lede">
-      SPARQL evaluation is <em>rdflib's engine for every store</em> — the store serving triple
-      patterns is the variable — with two deliberate exceptions kept as reference points:
-      Vortex rows marked <em>pushdown</em> hand whole BGPs to vortex-rdflib's code-space
-      evaluator, and the <em>native SPARQL</em> row delegates the query string to Oxigraph's own
-      engine. The dataset's distinct-term count scales with rows (each subject described by ~10
-      triples, a small closed predicate vocabulary, IRI + typed/plain/lang literal objects), so
-      term handling is actually exercised. Every query is non-empty by construction, and result
-      counts are cross-checked across stores.
+      rdflib's engine evaluates every store, so the store serving triple patterns is the only
+      variable. Each label records where a query's bytes come from:
+      <em>in-mem</em> stores live fully in memory, <em>file</em> stores perform file access reads per query.
+      Every query matches by construction, and row counts are cross-checked across stores.
     </p>
     <div class="kpi-row" id="kpi-row"></div>
     <p class="lede mono" id="matched-rows"></p>
@@ -230,10 +228,10 @@
       <h2>N-Triples to queryable store</h2>
     </div>
     <p class="group-desc">
-      Cold start: parse/build from the shared <span class="mono">.nt</span> file until the store
-      answers queries. Vortex rows include <span class="mono">serialize_rdf</span> (building the
-      <span class="mono">.vortex</span> file) plus store open; rdflib and oxrdflib rows are
-      <span class="mono">Graph.parse</span>. One sample — read magnitudes, not decimals.
+      Cold start: from the shared <span class="mono">.nt</span> file to a queryable store. Most
+      libraries build their own format first — <span class="mono">serialize_rdf</span> (vortex-rdflib),
+      <span class="mono">rdf2cottas</span>, <span class="mono">hdt convert</span> — then open it;
+      rdflib and oxrdflib parse directly. Median of repeated full rebuilds.
     </p>
     <div class="panel-grid" id="load-panels"></div>
   </section>
@@ -246,9 +244,7 @@
     <p class="group-desc">
       Median wall-clock time to execute <em>and fully consume</em> each query.
       <b>Green</b> marks the fastest store in each column; the grey multiplier is the slowdown
-      vs that column's best. Ruled-off rows change what is being measured: Vortex rows below
-      the first rule run on rdflib's default BGP evaluator (no pushdown — the A/B for its
-      effect), and the final row swaps in Oxigraph's native SPARQL engine.
+      vs that column's best.
     </p>
     <div class="panel-grid" id="query-panels"></div>
   </section>
@@ -259,11 +255,9 @@
       <h2>Peak memory (RSS)</h2>
     </div>
     <p class="group-desc">
-      Each store's full lifecycle — parse/build, every query, result materialization — runs in
-      its own process, so this is a clean per-store peak resident-set size: the kernel-tracked
-      high-water mark (<span class="mono">VmHWM</span>), not a point-in-time sample.
-      <em>Store footprint</em> is RSS after load minus the process baseline before it — what
-      holding the dataset costs. Lower is better; smallest first.
+      Each store's whole lifecycle runs in its own process — build, every query, result
+      materialization — so this is a clean per-store peak resident-set size: the kernel
+      high-water mark (<span class="mono">VmHWM</span>), not a sample. Lower is better.
     </p>
     <div class="panel-grid" id="memory-panels"></div>
   </section>
@@ -274,10 +268,9 @@
       <h2>The query set</h2>
     </div>
     <p class="group-desc">
-      Anchor terms and thresholds are derived from the dataset generator's modular arithmetic,
-      so every query matches at least one row by construction. <span class="mono">heavy</span>
-      queries touch the whole dataset (or a whole predicate's bindings joined against the
-      store) and run with a lower iteration budget.
+      Anchor terms and thresholds come from the dataset generator's modular arithmetic, so every
+      query matches at least one row. <span class="mono">heavy</span> queries touch the whole
+      dataset and run with a lower iteration budget.
     </p>
     <div id="queryset-host"></div>
   </section>
@@ -321,15 +314,13 @@ const byId = new Map(DATA.map(d => [d.id, d]));
 // Memory reshaped to the {median, median_ns} cell shape renderMatrixPanel
 // reads, so the memory panel reuses the same renderer for a different unit.
 const memPeak = new Map(MEMORY.map(m => [m.slug, cellMb(m.peakRssMb)]));
-const memStore = new Map(MEMORY.map(m => [m.slug, cellMb(m.storeMb)]));
 function cellMb(mb){ return mb == null ? null : { median: mb.toLocaleString() + " MB", median_ns: mb }; }
 
 const ADAPTERS = CONFIG.adapters || [];
 const QUERIES = CONFIG.queries || [];
-const ENGINE_LABEL = { "rdflib+pushdown": "rdflib + pushdown", "rdflib": "rdflib", "native": "native" };
-// Rule off the rows where what-is-measured changes: the pushdown A/B row and
+// Rule off the rows where what-is-measured changes: the other stores, then
 // the different-engine row.
-function rowBreak(slug){ return slug === "vortex_dict_nopush" || slug === "rdflib_memory" || slug === "oxrdflib_native"; }
+function rowBreak(slug){ return slug === "rdflib_memory"; }
 
 function get(map, id){ const r = map.get(id); if(!r) console.warn("missing bench id", id); return r; }
 
@@ -388,7 +379,7 @@ function renderMatrixPanel(container, cfg, map){
 
 function storeRows(idFor){
   return ADAPTERS.map(a => ({
-    labels: [a.label, ENGINE_LABEL[a.engine] ?? a.engine],
+    labels: [a.label],
     ids: idFor(a),
     break: rowBreak(a.slug),
   }));
@@ -397,8 +388,8 @@ function storeRows(idFor){
 // ---- load ----
 renderMatrixPanel(document.getElementById("load-panels"), {
   title: "Load (cold start)",
-  note: "Time from the shared N-Triples file to a queryable store, fastest first. Green = fastest; the multiplier is the slowdown vs it.",
-  rowHeaders: ["Store", "Engine"], columns: ["Load"], sortByColumn: 0,
+  note: "Median time from the shared N-Triples file to a queryable store, fastest first. Green = fastest.",
+  rowHeaders: ["Store"], columns: ["Load"], sortByColumn: 0,
   rows: storeRows(a => [`load::${a.slug}`]),
 }, byId);
 
@@ -406,11 +397,11 @@ renderMatrixPanel(document.getElementById("load-panels"), {
 const GROUP_META = {
   lookups: {
     tag: "Lookups & scans",
-    note: "Single-pattern shapes: a fully-bound ASK, a bound predicate+object lookup, a bound-object scan, and a full predicate scan (~n/32 rows materialized).",
+    note: "Single-pattern shapes: a fully-bound ASK, a bound predicate+object lookup, a bound-object scan, and a full predicate scan.",
   },
   joins: {
     tag: "Joins",
-    note: "Anchored 2- and 3-leg subject stars, an unanchored 2-hop chain (heavy: one whole predicate's bindings joined against the store), and the star with an OPTIONAL leg. Where the BGP strategy — one pushdown pass vs a triples() call per candidate binding — dominates.",
+    note: "Anchored 2- and 3-leg subject stars, an unanchored 2-hop chain (heavy: one whole predicate's bindings joined against the store), and the star with an OPTIONAL leg.",
   },
   features: {
     tag: "SPARQL features",
@@ -425,7 +416,7 @@ for (const [group, meta] of Object.entries(GROUP_META)){
     title: meta.tag,
     note: meta.note,
     wide: true,
-    rowHeaders: ["Store", "Engine"],
+    rowHeaders: ["Store"],
     columns: qs.map(q => q.name + (q.heavy ? " •" : "")),
     rows: storeRows(a => qs.map(q => `${q.name}::${a.slug}`)),
   }, byId);
@@ -436,39 +427,18 @@ const memHost = document.getElementById("memory-panels");
 renderMatrixPanel(memHost, {
   title: "Peak RSS — whole lifecycle",
   note: "Kernel high-water mark (VmHWM) of each store's own process: parse/build + all queries. Smallest first.",
-  rowHeaders: ["Store", "Engine"], columns: ["Peak RSS"], sortByColumn: 0,
+  rowHeaders: ["Store"], columns: ["Peak RSS"], sortByColumn: 0,
   rows: storeRows(a => [a.slug]),
 }, memPeak);
-renderMatrixPanel(memHost, {
-  title: "Store footprint after load",
-  note: "RSS after load minus the process baseline before it — what holding the dataset costs. The file-backed Vortex row leaves the quads in the file, which is the point.",
-  rowHeaders: ["Store", "Engine"], columns: ["Footprint"], sortByColumn: 0,
-  rows: storeRows(a => [a.slug]),
-}, memStore);
 
 // ---- KPIs ----
-function geomeanRatio(numSlug, denSlug){
-  const logs = [];
-  for (const q of QUERIES){
-    const a = byId.get(`${q.name}::${numSlug}`), b = byId.get(`${q.name}::${denSlug}`);
-    if (a && b && a.median_ns > 0 && b.median_ns > 0) logs.push(Math.log(a.median_ns / b.median_ns));
-  }
-  return logs.length ? Math.exp(logs.reduce((s,x) => s+x, 0) / logs.length) : null;
-}
 const tiles = [
-  { label:"Stores", value:String(ADAPTERS.length), sub:"vortex-rdflib · rdflib Memory · oxrdflib" },
+  { label:"Stores", value:String(ADAPTERS.length), sub:"vortex-rdflib · rdflib · oxrdflib · pycottas · hdt" },
   { label:"Queries", value:String(QUERIES.length), sub:"lookups · joins · features" },
   { label:"Triples", value:(CONFIG.triples||0).toLocaleString(), sub:"synthetic, deterministic" },
   { label:"Distinct terms", value:(CONFIG.cardinality?.terms||0).toLocaleString(),
     sub:`${(CONFIG.cardinality?.nSubj||0).toLocaleString()} subjects · ${CONFIG.cardinality?.nPred||0} predicates` },
-  { label:"Iterations", value:`${CONFIG.queryIters??"?"} / ${CONFIG.heavyIters??"?"}`, sub:"query / heavy" },
 ];
-const vsNoPush = geomeanRatio("vortex_dict_nopush", "vortex_dict_mem");
-if (vsNoPush) tiles.push({ label:"BGP pushdown effect", value:vsNoPush.toFixed(1)+"×",
-  sub:"geomean speedup vs same store without pushdown" });
-const vsMemory = geomeanRatio("rdflib_memory", "vortex_dict_mem");
-if (vsMemory) tiles.push({ label:"vs rdflib Memory", value:vsMemory.toFixed(1)+"×",
-  sub:"geomean speedup, Vortex dict · in-mem" });
 const host = document.getElementById("kpi-row");
 for (const t of tiles){
   const el = document.createElement("div");

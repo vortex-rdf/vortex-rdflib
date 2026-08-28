@@ -72,18 +72,39 @@ Set `VORTEX_RDF_DISABLE_CODE_PATH=1` to force the string path.
 each triple pattern is matched natively once and the join runs as hash joins
 over `u32` codes, decoding terms only for the final solutions. This replaces
 rdflib's default nested-loop evaluation (one `triples()` call per candidate
-binding) and is what makes joins fast — measured ~6x on an in-memory store
-and ~50x on a file-backed one, 3x faster than rdflib's own in-memory store.
+binding).
+
+The gain is concentrated where that nested loop degenerates: unanchored joins
+such as a two-hop chain (`?s ?pa ?m . ?m ?pb ?o`), where rdflib would
+re-enter the store once per intermediate binding. The other query shapes land
+close to the default evaluator — the single-pattern ones have no join to
+improve, and a star anchored on a ground term gives rdflib's nested loop the
+same one-row-then-probe access pattern the pushdown itself uses. Per-query
+figures are on the [benchmark
+dashboard](https://vortex-rdf.github.io/vortex-rdflib/).
+
 The hook only fires for VortexStore graphs with the code path available and
 falls back to the default evaluator otherwise (other stores, RDF-star
 patterns, non-BGP algebra). Set `VORTEX_RDF_DISABLE_PUSHDOWN=1` to keep the
-default evaluator.
+default evaluator; that switch is what the equivalence tests use as their
+oracle, and re-running the benchmark with it set measures the pushdown's own
+contribution.
 
 **File-backed vs in-memory.** The default open is lazy and file-backed.
 `VortexStore(path, in_memory=True)` (or env `VORTEX_RDF_IN_MEMORY=1`) loads
-the store into memory once: each `triples()` call then skips the per-call
-file-scan pipeline (~1 ms → ~0.15 ms per call), which is decisive for SPARQL
-joins evaluated by per-binding probing.
+the store into memory once, so queries skip the per-call file-read pipeline.
+That helps point lookups and joins, and does nothing for the scan-dominated
+queries, which are bound by rdflib's own result handling.
+
+**Secondary indexes.** `serialize_rdf(..., indexes=["secondary-by-copy"])`
+(or `"secondary-by-reference"`) writes index components into the `.vortex`
+file, for a modest increase in build time and file size. They pay off on
+file-backed stores answering single-pattern lookups, where they largely erase
+the file-backed penalty for object and predicate-object lookups. On an
+in-memory store they change nothing measurable, since the rows are resident
+already, and on multi-pattern joins the run-to-run spread is wider than any
+effect they have. Enable them for lookup-heavy file-backed workloads; measure
+before assuming they help elsewhere.
 
 For Dictionary-layout files, the term dictionary is held in memory when it
 fits the residency budget; pass `VortexStore(path, max_resident_bytes=...)`
@@ -101,24 +122,39 @@ fits the residency budget; pass `VortexStore(path, max_resident_bytes=...)`
 
 ## Benchmarks
 
-A comparative benchmark — `VortexStore` vs rdflib's in-memory `Memory` store
-vs [oxrdflib](https://github.com/oxigraph/oxrdflib) (Oxigraph) — runs on every
-push to `main` and publishes a dashboard to GitHub Pages:
-<https://vortex-rdf.github.io/vortex-rdflib/>.
+A comparative benchmark — `VortexStore` against rdflib's in-memory `Memory`
+store, [oxrdflib](https://github.com/oxigraph/oxrdflib) (Oxigraph),
+[pycottas](https://github.com/cottas-rdf/pycottas) (COTTAS) and
+[rdflib-hdt](https://pypi.org/project/rdflib-hdt/) (HDT) — runs on every
+push to `main` and publishes the current numbers to GitHub Pages:
+**<https://vortex-rdf.github.io/vortex-rdflib/>**. That dashboard is the
+reference for how these variants actually compare; timings vary with machine
+and dataset, so this README deliberately quotes none.
 
 It executes a synthetic representative SPARQL set (lookups/scans, star and
 chain joins, FILTER/DISTINCT/ORDER BY/GROUP BY) and records per-store peak
 RSS; each store's full lifecycle runs in its own process. SPARQL evaluation
-is rdflib's engine for every store, with two labeled reference rows: Vortex
-with the BGP pushdown, and Oxigraph's native SPARQL engine.
+is rdflib's engine for every store, so the store serving triple patterns is
+the only variable — a store's own SPARQL engine is out of scope, since it
+skips rdflib's parse and algebra and is not measuring the same work.
 
-Run it locally (defaults to the full 250k-triple CI scale; scale down with
-`BENCH_TRIPLES`):
+The Vortex rows are all Dictionary layout — the layout that enables the code
+path — crossed over the two axes that change how a store answers: residency
+(file-backed vs in-memory) and secondary index (none, by-copy, by-reference).
+
+`pycottas` and `rdflib-hdt` pin dependencies that cannot share the project
+environment — pycottas an exact `pyoxigraph`, rdflib-hdt an exact `rdflib` —
+so `run_bench` builds each a throwaway virtualenv and runs that worker with
+its interpreter. rdflib-hdt reads HDT but cannot write it, so the HDT file is
+built by the Rust crate's CLI, which the refresh script installs on demand.
+
+Run it locally with `scripts/refresh.sh` — it syncs the contenders, ensures
+the HDT builder, measures, and re-renders the dashboard:
 
 ```bash
-uv sync --group bench
-BENCH_TRIPLES=20000 uv run python -m bench.run_bench --out bench/results.json
-uv run python scripts/render_bench_dashboard.py bench/results.json public/index.html
+scripts/refresh.sh                      # every stage, at the 250k CI scale
+BENCH_TRIPLES=20000 scripts/refresh.sh  # scale down
+scripts/refresh.sh --only render        # template-only edits: no re-measurement
 ```
 
 ## Development
