@@ -232,6 +232,10 @@
       libraries build their own format first — <span class="mono">serialize_rdf</span> (vortex-rdflib),
       <span class="mono">rdf2cottas</span>, <span class="mono">hdt convert</span> — then open it;
       rdflib and oxrdflib parse directly. Median of repeated full rebuilds.
+      <strong>rdflib-hdt is read-only</strong>: it cannot write HDT, so its file is built by the
+      Rust <a href="https://crates.io/crates/hdt">hdt</a> crate's CLI and only opened by the
+      library measured here — that row's build is another implementation's work, unlike every
+      other row.
     </p>
     <div class="panel-grid" id="load-panels"></div>
   </section>
