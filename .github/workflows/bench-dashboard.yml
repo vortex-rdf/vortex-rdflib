@@ -35,6 +35,14 @@ jobs:
       - name: Install (with bench contenders)
         run: uv sync --locked --group bench
 
+      # rdflib-hdt reads HDT but cannot write it, so its build step shells out
+      # to the Rust crate's CLI. The contenders whose pins conflict with the
+      # project environment (pycottas, rdflib-hdt) get isolated venvs that
+      # run_bench builds itself; rdflib-hdt compiles hdt-cpp from source there,
+      # which needs the C++ toolchain ubuntu-latest already ships.
+      - name: Install the HDT builder
+        run: cargo install hdt --features cli --locked
+
       # Full scale: the code defaults (250k triples). One worker process per
       # store; peak-RSS readings are per-store and uncontaminated.
       - name: Run comparative benchmark

@@ -8,7 +8,8 @@ query.
 
 Scale knobs (env): ``BENCH_TRIPLES`` (default 250,000), ``BENCH_PREDICATES``,
 ``BENCH_SUBJ_RATIO``, ``BENCH_OBJ_RATIO``, ``BENCH_LITERAL_FRAC``,
-``BENCH_QUERY_ITERS``, ``BENCH_HEAVY_ITERS``, ``BENCH_QUERY_BUDGET_S``.
+``BENCH_QUERY_ITERS``, ``BENCH_HEAVY_ITERS``, ``BENCH_LOAD_ITERS``,
+``BENCH_QUERY_BUDGET_S``.
 A quick local run: ``BENCH_TRIPLES=20000 uv run python -m bench.run_bench``.
 """
 
@@ -19,8 +20,9 @@ import subprocess
 import sys
 import tempfile
 from datetime import UTC, datetime
-from importlib import metadata
+from importlib import metadata, util
 from pathlib import Path
+from shutil import which
 
 from .adapters import ADAPTERS, Adapter
 from .dataset import config_from_env, moduli, write_ntriples
@@ -30,10 +32,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKER_TIMEOUT_S = int(os.environ.get("BENCH_WORKER_TIMEOUT_S", 3600))
 
 
-def run_worker(adapter: Adapter, nt_path: Path, work_dir: Path) -> dict | None:
+def run_worker(adapter: Adapter, nt_path: Path, work_dir: Path, python: str) -> dict | None:
     out_file = work_dir / f"worker-{adapter.slug}.json"
     cmd = [
-        sys.executable,
+        python,
         "-m",
         "bench.worker",
         adapter.slug,
@@ -53,6 +55,31 @@ def run_worker(adapter: Adapter, nt_path: Path, work_dir: Path) -> dict | None:
         return None
     with open(out_file, encoding="utf-8") as f:
         return json.load(f)
+
+
+def ensure_venv(adapter: Adapter, work_dir: Path) -> str:
+    """Create the isolated environment `adapter` runs in; return its python.
+
+    The worker still runs `python -m bench.worker` from the repo root, so the
+    venv only needs rdflib and the contender itself — never vortex-rdflib,
+    which these adapters do not import.
+
+    `CXXFLAGS` carries the include hdt-cpp 1.3.3 omits: its sources use
+    `uint64_t` without including <cstdint>, which GCC 13+ rejects. Harmless
+    for contenders that ship wheels.
+    """
+    venv_dir = work_dir / f"venv-{adapter.slug}"
+    python = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    env = {**os.environ, "CXXFLAGS": "-include cstdint " + os.environ.get("CXXFLAGS", "")}
+    print(f"[{adapter.slug}] building isolated env: {' '.join(adapter.venv_packages)}")
+    subprocess.run(["uv", "venv", str(venv_dir)], check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["uv", "pip", "install", "--python", str(python), *adapter.venv_packages],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    return str(python)
 
 
 def cpu_model() -> str:
@@ -103,11 +130,19 @@ def main() -> int:
 
     # Fail fast with the fix, not per-worker skips: a plain `uv sync` prunes
     # the bench group, silently uninstalling the contenders.
-    if any(a.slug.startswith("oxrdflib") for a in adapters):
-        try:
-            import oxrdflib  # noqa: F401
-        except ImportError:
-            parser.error("oxrdflib is not installed — run `uv sync --group bench` first")
+    missing = sorted(
+        {a.requires for a in adapters if a.requires and not util.find_spec(a.requires)}
+    )
+    if missing:
+        parser.error(f"not installed: {', '.join(missing)} — run `uv sync --group bench` first")
+    no_cli = sorted(
+        {a.requires_cli for a in adapters if a.requires_cli and not which(a.requires_cli)}
+    )
+    if no_cli:
+        parser.error(
+            f"command(s) not on PATH: {', '.join(no_cli)} — the HDT builder comes from "
+            "`cargo install hdt --features cli`"
+        )
 
     cfg = config_from_env()
     m = moduli(cfg)
@@ -125,7 +160,21 @@ def main() -> int:
 
     for adapter in adapters:
         print(f"\n=== {adapter.label} ({adapter.slug}, engine: {adapter.engine}) ===")
-        out = run_worker(adapter, nt_path, work_dir)
+        try:
+            python = ensure_venv(adapter, work_dir) if adapter.venv_packages else sys.executable
+        except subprocess.CalledProcessError as error:
+            detail = (error.stderr or b"").decode(errors="replace").strip().splitlines()
+            print(f"[{adapter.slug}] isolated env failed to build — skipping; others still run")
+            failures.append(
+                {
+                    "slug": adapter.slug,
+                    "label": adapter.label,
+                    "phase": "venv",
+                    "error": detail[-1] if detail else "uv failed",
+                }
+            )
+            continue
+        out = run_worker(adapter, nt_path, work_dir, python)
         if out is None:
             failures.append(
                 {

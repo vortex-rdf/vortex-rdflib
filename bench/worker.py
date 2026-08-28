@@ -11,7 +11,8 @@ each query (results are always iterated to exhaustion — lazy result setup
 must not masquerade as query speed). Normal queries get one warmup run, then
 up to ``BENCH_QUERY_ITERS`` samples capped by a ``BENCH_QUERY_BUDGET_S`` time
 budget; ``heavy`` queries (full-scan class) get ``BENCH_HEAVY_ITERS`` fixed
-samples and no warmup.
+samples and no warmup. The load is sampled ``BENCH_LOAD_ITERS`` times, each a
+full rebuild of the store's own file from the shared ``.nt``.
 """
 
 import gc
@@ -29,6 +30,7 @@ QUERY_ITERS = int(os.environ.get("BENCH_QUERY_ITERS", 10))
 QUERY_MIN_ITERS = 3
 QUERY_BUDGET_NS = float(os.environ.get("BENCH_QUERY_BUDGET_S", 2.0)) * 1e9
 HEAVY_ITERS = int(os.environ.get("BENCH_HEAVY_ITERS", 3))
+LOAD_ITERS = int(os.environ.get("BENCH_LOAD_ITERS", 3))
 
 
 def _status_mb(key: str) -> int | None:
@@ -111,17 +113,37 @@ def main() -> int:
     matched: dict[str, int] = {}
     failures: list[dict] = []
 
+    # Build the store LOAD_ITERS times, keeping the last for the queries.
+    # Every sample is a full build from the same `.nt`: the factories rewrite
+    # their own file rather than reusing one.
+    #
+    # The footprint is read off the FIRST build, against the baseline taken
+    # before it. A later build is no good for that: freeing a store returns
+    # its pages to the allocator, not the OS, so the next build reuses them
+    # and the delta collapses to near zero. Each later build still releases
+    # its predecessor first, so only one store is ever live and the peak-RSS
+    # figure stays a single store's lifecycle.
     gc.collect()
     baseline_mb = rss_mb()
-
-    t0 = perf_counter_ns()
-    graph = adapter.make(nt_path, work_dir)
-    load_ns = float(perf_counter_ns() - t0)
-    rows.append(make_row("load", slug, [load_ns]))
-
-    gc.collect()
-    loaded_mb = rss_mb()
-    print(f"[{slug}] loaded in {fmt_ns(load_ns)} — RSS {baseline_mb} -> {loaded_mb} MB", flush=True)
+    loaded_mb = None
+    load_samples: list[float] = []
+    graph = None
+    for iteration in range(LOAD_ITERS):
+        if graph is not None:
+            graph = None
+            gc.collect()
+        t0 = perf_counter_ns()
+        graph = adapter.make(nt_path, work_dir)
+        load_samples.append(float(perf_counter_ns() - t0))
+        if iteration == 0:
+            gc.collect()
+            loaded_mb = rss_mb()
+    rows.append(make_row("load", slug, load_samples))
+    print(
+        f"[{slug}] loaded in {rows[-1]['median']} ({len(load_samples)} samples)"
+        f" — RSS {baseline_mb} -> {loaded_mb} MB",
+        flush=True,
+    )
 
     for query in queries:
         try:

@@ -1,4 +1,4 @@
-"""Comparative SPARQL benchmark: VortexStore vs rdflib Memory vs oxrdflib.
+"""Comparative SPARQL benchmark: VortexStore vs rdflib vs oxrdflib.
 
 Not part of the published package — run from the repo root:
 
