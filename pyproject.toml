@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "vortex-rdflib"
-version = "0.1.0"
+version = "0.2.0"
 description = "rdflib Store implementation for Vortex-RDF, a columnar RDF store"
 readme = "README.md"
 license = "MIT"
@@ -31,7 +31,7 @@ classifiers = [
 dependencies = [
   # The native binding layer (PyO3 extension over vortex-rdf-core). This
   # package is the rdflib integration built on top of it.
-  "vortex-rdf>=0.5,<0.6",
+  "vortex-rdf>=0.10,<0.11",
   "rdflib>=7,<8",
 ]
 

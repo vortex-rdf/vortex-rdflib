@@ -60,10 +60,12 @@ from Python — it enables the code path and BGP pushdown described below.
 **Term codes instead of strings.** For Dictionary-layout stores, matched rows
 cross the native boundary as zero-copy `u32` term-code columns
 (`vortex_rdf.VortexRdfStore.match_codes`); `VortexStore.triples()` decodes
-each distinct code to an rdflib term once and caches it for the store's
-lifetime. Other layouts fall back to a de-duplicated N-Triples term table
-(`match_compact`). Set `VORTEX_RDF_DISABLE_CODE_PATH=1` to force the string
-path.
+each distinct code to an rdflib term once — all of a match's new codes in a
+single GIL-released `TermDict.decode_many` call — and caches it for the
+store's lifetime. Fully-ground patterns (existence checks) are answered by
+`count_quads` without materializing any term. Other layouts fall back to
+N-Triples string columns (`match_columns`), parsing each distinct term once.
+Set `VORTEX_RDF_DISABLE_CODE_PATH=1` to force the string path.
 
 **SPARQL BGP pushdown.** Constructing a `VortexStore` registers an rdflib
 `CUSTOM_EVALS` hook that evaluates whole basic graph patterns in one pass:
@@ -84,8 +86,9 @@ file-scan pipeline (~1 ms → ~0.15 ms per call), which is decisive for SPARQL
 joins evaluated by per-binding probing.
 
 For Dictionary-layout files, the term dictionary is held in memory when it
-fits the residency budget; pass `VortexStore(path, max_resident_terms=...)`
-to raise the budget (recommended for large stores).
+fits the residency budget; pass `VortexStore(path, max_resident_bytes=...)`
+(the dictionary's compressed size in bytes) to raise the budget
+(recommended for large stores).
 
 ## Environment variables
 

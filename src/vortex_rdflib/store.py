@@ -50,7 +50,7 @@ class VortexStore(Store):
         path: str | None = None,
         layout: str | None = None,
         backend: str = "native",
-        max_resident_terms: int | None = None,
+        max_resident_bytes: int | None = None,
         in_memory: bool | None = None,
         **kwargs,
     ):
@@ -63,7 +63,7 @@ class VortexStore(Store):
         self.path = str(Path(path)) if path is not None else None
         self.layout = _LAYOUT_ALIASES.get(layout, layout) if layout else None
         self.backend = backend
-        self.max_resident_terms = max_resident_terms
+        self.max_resident_bytes = max_resident_bytes
         # File-backed lazy open by default; in-memory drops the ~1 ms per-call
         # file-scan floor (decisive for rdflib joins) at the cost of loading
         # the store up front. Env override for benchmark sweeps.
@@ -102,7 +102,7 @@ class VortexStore(Store):
 
         self._native = VortexRdfStore(
             self.path,
-            max_resident_terms=self.max_resident_terms,
+            max_resident_bytes=self.max_resident_bytes,
             in_memory=self.in_memory,
         )
         # Record what the file actually is, whatever label the caller passed.
@@ -156,39 +156,68 @@ class VortexStore(Store):
 
         store = self._store()
 
+        # Fully-ground pattern: an existence check. Counting from the row
+        # selection materializes no term at all; multiplicity (the triple in
+        # several graphs) is preserved by yielding once per matching quad.
+        if s_n3 is not None and p_n3 is not None and o_n3 is not None:
+            for _ in range(store.count_quads(s_n3, p_n3, o_n3)):
+                yield (s, p, o), None
+            return
+
         if self._dict is not None:
             cols = store.match_codes(s_n3, p_n3, o_n3)
             if cols is not None:
-                # Zero-copy u32 views over the Rust column buffers; decode
-                # each distinct code to an rdflib term once, cached for the
-                # store's lifetime (codes are stable in a read-only store).
+                # Zero-copy u32 views over the Rust column buffers; every
+                # distinct code not yet in the store-lifetime cache is decoded
+                # in one GIL-released decode_many call (codes are stable in a
+                # read-only store).
                 s_codes = memoryview(cols[0]).cast("I").tolist()
                 p_codes = memoryview(cols[1]).cast("I").tolist()
                 o_codes = memoryview(cols[2]).cast("I").tolist()
-                decode = self._decode_term
+                self._prime_decode_cache(s_codes, p_codes, o_codes)
+                cached = self._decode_cache
                 # strict: the three columns come from one native match and
                 # must be equally long; truncation would hide a native bug.
                 for row in zip(s_codes, p_codes, o_codes, strict=True):
-                    yield (decode(row[0]), decode(row[1]), decode(row[2])), None
+                    yield (cached[row[0]], cached[row[1]], cached[row[2]]), None
                 return
 
-        lexical_terms, indexed_rows = store.match_compact(s_n3, p_n3, o_n3)
-        parsed_terms = [self._from_n3_safe(value) for value in lexical_terms]
-        term_count = len(parsed_terms)
-        for s_idx, p_idx, o_idx in indexed_rows:
-            if s_idx >= term_count or p_idx >= term_count or o_idx >= term_count:
-                raise ValueError(
-                    "Compact native result has an invalid term index: "
-                    f"{(s_idx, p_idx, o_idx)!r}, terms={term_count}"
-                )
-            yield (
-                (
-                    parsed_terms[s_idx],
-                    parsed_terms[p_idx],
-                    parsed_terms[o_idx],
-                ),
-                None,
-            )
+        # String fallback (non-dictionary layouts, non-resident dictionary):
+        # match_columns shares one Python string object across repeats of a
+        # term, so memoizing the parse by string turns per-row term
+        # construction into per-distinct-term construction.
+        subjects, predicates, objects, _graphs = store.match_columns(s_n3, p_n3, o_n3)
+        parse = self._from_n3_safe
+        memo: dict[str, Node] = {}
+        for s_raw, p_raw, o_raw in zip(subjects, predicates, objects, strict=True):
+            row = []
+            for raw in (s_raw, p_raw, o_raw):
+                node = memo.get(raw)
+                if node is None:
+                    node = memo[raw] = parse(raw)
+                row.append(node)
+            yield (row[0], row[1], row[2]), None
+
+    def _prime_decode_cache(self, *code_columns) -> None:
+        """Decode every code not yet in the cache in one native call.
+
+        ``decode_many`` releases the GIL for the whole batch and returns one
+        shared string per distinct code, so the per-term cost collapses from
+        one FFI round trip each to one bulk call per match.
+        """
+        if self._dict is None:
+            raise ValueError("store has no resident term dictionary (code path inactive)")
+        cache = self._decode_cache
+        distinct: set[int] = set()
+        for column in code_columns:
+            distinct.update(column)
+        missing = list(distinct.difference(cache))
+        if not missing:
+            return
+        for code, raw in zip(missing, self._dict.decode_many(missing), strict=True):
+            if raw is None:
+                raise ValueError(f"term code {code} is not in the store dictionary")
+            cache[code] = self._from_n3_safe(raw)
 
     def _decode_term(self, code: int) -> Node:
         node = self._decode_cache.get(code)

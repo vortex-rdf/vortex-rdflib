@@ -136,8 +136,7 @@ def _match_pattern(ctx, store, s, p, o):
     cols = store._store().match_codes(*n3)
     if cols is None:
         raise NotImplementedError
-    nrows = len(memoryview(cols[0]).cast("I"))
-    return {"n3": n3, "cols": cols, "nrows": nrows, "varpos": varpos}
+    return {"n3": n3, "cols": cols, "nrows": len(cols[0]), "varpos": varpos}
 
 
 def _materialize(pat):
@@ -177,27 +176,30 @@ def _probe_join(store, schema, rows, pat):
     it is what lets an anchored star beat rdflib's own nested loop instead
     of losing to it.
     """
-    match = store._store().match_codes
-    decode = store._dict.decode
+    native = store._store()
+    match = native.match_codes
+    count = native.count_quads
     bound = [(schema.index(v), pos) for v, pos in pat["varpos"].items() if v in schema]
     free = {v: pos for v, pos in pat["varpos"].items() if v not in schema}
     eq_checks = [(pos[0], later) for pos in free.values() for later in pos[1:]]
     out_positions = [pos[0] for pos in free.values()]
     needed = sorted({idx for pos in free.values() for idx in pos})
+
+    # One GIL-released batch decode covers every code the probes will bind.
+    distinct = {row[row_idx] for row in rows for row_idx, _ in bound}
+    codes = list(distinct)
     n3_cache: dict[int, str] = {}
+    for code, term in zip(codes, store._dict.decode_many(codes), strict=True):
+        if term is None:
+            raise ValueError(f"term code {code} is not in the store dictionary")
+        n3_cache[code] = term
 
     out = []
     for row in rows:
         n3 = list(pat["n3"])
         satisfiable = True
         for row_idx, positions in bound:
-            code = row[row_idx]
-            term = n3_cache.get(code)
-            if term is None:
-                term = decode(code)
-                if term is None:
-                    raise ValueError(f"term code {code} is not in the store dictionary")
-                n3_cache[code] = term
+            term = n3_cache[row[row_idx]]
             for idx in positions:
                 # The dictionary stores canonical N-Triples forms: a literal
                 # ('"') cannot occupy subject or predicate position, and only
@@ -209,13 +211,15 @@ def _probe_join(store, schema, rows, pat):
         if not satisfiable:
             continue
 
+        if not free:
+            # Existence probe: count from the row selection, materialize
+            # no columns.
+            if count(*n3):
+                out.append(row)
+            continue
         cols = match(*n3)
         if cols is None:
             raise NotImplementedError
-        if not free:
-            if len(memoryview(cols[0]).cast("I")):
-                out.append(row)
-            continue
         views = {idx: memoryview(cols[idx]).cast("I").tolist() for idx in needed}
         for i in range(len(views[needed[0]])):
             if all(views[a][i] == views[b][i] for a, b in eq_checks):
@@ -247,9 +251,13 @@ def _join(schema_a, rows_a, schema_b, rows_b):
 
 
 def _yield_solutions(ctx, store, schema, rows):
-    decode = store._decode_term
+    # One batch decode for every distinct code across the final solutions;
+    # intermediate join results never decode at all.
+    if rows and schema:
+        store._prime_decode_cache(*zip(*rows, strict=True))
+    cached = store._decode_cache
     for row in rows:
         c = ctx.push()
         for term, code in zip(schema, row, strict=True):
-            c[term] = decode(code)
+            c[term] = cached[code]
         yield c.solution()
