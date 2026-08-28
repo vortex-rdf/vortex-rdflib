@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "vortex-rdflib"
-version = "0.2.0"
+version = "0.1.0"
 description = "rdflib Store implementation for Vortex-RDF, a columnar RDF store"
 readme = "README.md"
 license = "MIT"
