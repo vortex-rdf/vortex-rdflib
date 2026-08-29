@@ -36,6 +36,10 @@ _:b0 <http://ex.org/knows> <http://ex.org/alice> .
 <http://ex.org/gina> <http://ex.org/age> "7"^^<http://www.w3.org/2001/XMLSchema#byte> .
 <http://ex.org/gina> <http://ex.org/score> "NaN"^^<http://www.w3.org/2001/XMLSchema#double> .
 <http://ex.org/gina> <http://ex.org/name> "Bob"@EN .
+<http://ex.org/hank> <http://ex.org/knows> <http://ex.org/alice> .
+<http://ex.org/hank> <http://ex.org/knows> <http://ex.org/carol> .
+<http://ex.org/carol> <http://ex.org/knows> <http://ex.org/dave> .
+<http://ex.org/dave> <http://ex.org/knows> <http://ex.org/hank> .
 """ + (
     "<http://ex.org/dave> <http://ex.org/born> "
     '"2020-01-01T00:00:00"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n'
@@ -258,6 +262,97 @@ QUERIES = [
         ?x <http://ex.org/age> ?a } GROUP BY ?x""",
     """SELECT (COUNT(?a) AS ?n) WHERE {
         ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }""",
+    # --- OPTIONAL: hash and probe paths, hoisted inner FILTER, nesting, chains, fan-out
+    """SELECT ?x ?n ?a WHERE {
+        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }""",
+    """SELECT ?x ?a WHERE {
+        ?x <http://ex.org/knows> ?y OPTIONAL { ?y <http://ex.org/age> ?a } }""",
+    """SELECT ?x ?n ?a WHERE {
+        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a FILTER(?a > 10) } }""",
+    """SELECT ?x ?n ?a WHERE {
+        ?x <http://ex.org/name> ?n
+        OPTIONAL { ?x <http://ex.org/age> ?a FILTER(?a > 10 && lang(?n) = "en") } }""",
+    """SELECT ?x ?n ?a WHERE {
+        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a FILTER(1 = 2) } }""",
+    """SELECT ?x ?y ?z WHERE {
+        ?x <http://ex.org/knows> ?y
+        OPTIONAL { ?y <http://ex.org/knows> ?z OPTIONAL { ?z <http://ex.org/age> ?a } } }""",
+    """SELECT ?x ?a ?s WHERE {
+        ?x <http://ex.org/name> ?n
+        OPTIONAL { ?x <http://ex.org/age> ?a }
+        OPTIONAL { ?x <http://ex.org/score> ?s } }""",
+    """SELECT ?x ?y ?n WHERE {
+        ?x <http://ex.org/knows> ?y OPTIONAL { ?y <http://ex.org/name> ?n } }""",
+    """SELECT ?x ?o WHERE {
+        ?x <http://ex.org/age> ?a OPTIONAL { <http://ex.org/alice> <http://ex.org/name> ?o } }""",
+    """SELECT ?x ?n WHERE {
+        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/nothing> ?a } }""",
+    """SELECT ?x ?a WHERE {
+        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } FILTER(bound(?a)) }""",
+    """SELECT ?x ?a WHERE {
+        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } FILTER(?a > 10) }""",
+    """SELECT ?x WHERE {
+        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a }
+        FILTER(?a > 10 || !bound(?a)) }""",
+    # an OPTIONAL variable joined again later: a nullable key, left to rdflib
+    """SELECT ?x ?y ?n WHERE {
+        ?x <http://ex.org/name> ?m OPTIONAL { ?x <http://ex.org/knows> ?y }
+        ?y <http://ex.org/name> ?n }""",
+    # OPTIONAL over a joined block, and inside a lazy join (a context-bound outer variable)
+    """SELECT ?x ?n ?a WHERE {
+        ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?n
+        OPTIONAL { ?y <http://ex.org/age> ?a } }""",
+    """SELECT ?x ?a ?s WHERE {
+        VALUES ?x { <http://ex.org/bob> <http://ex.org/erin> }
+        ?x <http://ex.org/age> ?a OPTIONAL { ?x <http://ex.org/score> ?s } }""",
+    """SELECT ?x ?a WHERE {
+        VALUES ?a { 42 7 }
+        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }""",
+    """ASK { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a }
+        FILTER(!bound(?a)) }""",
+    # --- group joins: nested groups, three groups (non-lazy), cross product, a filtered group
+    """SELECT ?x ?n ?a WHERE {
+        { ?x <http://ex.org/name> ?n } { ?x <http://ex.org/age> ?a } }""",
+    """SELECT ?x ?n ?a ?s WHERE {
+        { ?x <http://ex.org/name> ?n } { ?x <http://ex.org/age> ?a }
+        { ?x <http://ex.org/score> ?s } }""",
+    """SELECT ?n ?m WHERE {
+        { <http://ex.org/alice> <http://ex.org/name> ?n }
+        { <http://ex.org/bob> <http://ex.org/name> ?m } }""",
+    """SELECT ?x ?n ?a WHERE {
+        { ?x <http://ex.org/name> ?n FILTER(lang(?n) = "en") } { ?x <http://ex.org/age> ?a } }""",
+    """SELECT ?x ?n ?a WHERE {
+        { ?x <http://ex.org/name> ?n } { ?x <http://ex.org/age> ?a FILTER(?a > 10) } }""",
+    """SELECT ?x ?y WHERE {
+        { ?x <http://ex.org/knows> ?y } { ?y <http://ex.org/knows> ?x } }""",
+    # a filter in the second group that could see the first group's binding: left to rdflib
+    """SELECT ?x ?n ?a WHERE {
+        { ?x <http://ex.org/name> ?n }
+        { ?x <http://ex.org/age> ?a FILTER(str(?n) != "") } }""",
+    # --- MINUS: shared variables, none, empty right side, nested, under a filter
+    """SELECT ?x ?n WHERE {
+        ?x <http://ex.org/name> ?n MINUS { ?x <http://ex.org/age> ?a } }""",
+    """SELECT ?x ?n WHERE {
+        ?x <http://ex.org/name> ?n MINUS { ?y <http://ex.org/age> ?a } }""",
+    """SELECT ?x ?n WHERE {
+        ?x <http://ex.org/name> ?n MINUS { ?x <http://ex.org/nothing> ?a } }""",
+    """SELECT ?x ?y WHERE {
+        ?x <http://ex.org/knows> ?y MINUS { ?x <http://ex.org/knows> <http://ex.org/carol> } }""",
+    """SELECT ?x ?y WHERE {
+        ?x <http://ex.org/knows> ?y
+        MINUS { ?y <http://ex.org/name> ?n FILTER(lang(?n) = "en") } }""",
+    """SELECT ?x WHERE {
+        ?x <http://ex.org/name> ?n MINUS { ?x <http://ex.org/age> ?a } FILTER(isIRI(?x)) }""",
+    """SELECT ?x ?n WHERE {
+        VALUES ?x { <http://ex.org/bob> <http://ex.org/alice> }
+        ?x <http://ex.org/name> ?n MINUS { ?y <http://ex.org/nothing> ?z } }""",
+    """SELECT ?x ?n WHERE {
+        VALUES ?x { <http://ex.org/bob> <http://ex.org/alice> }
+        ?x <http://ex.org/name> ?n MINUS { ?y <http://ex.org/age> ?z } }""",
+    """SELECT (COUNT(*) AS ?n) WHERE {
+        ?x <http://ex.org/name> ?m MINUS { ?x <http://ex.org/age> ?a } }""",
+    """SELECT DISTINCT ?x WHERE {
+        ?x <http://ex.org/knows> ?y OPTIONAL { ?y <http://ex.org/age> ?a } }""",
 ]
 
 
@@ -602,3 +697,68 @@ def test_distinct_decodes_only_the_survivors(tmp_path):
     rows = run(graph, "SELECT DISTINCT ?p WHERE { ?s ?p ?o }")
     assert len(rows) == 7
     assert len(store._decode_cache) == 7
+
+
+def test_left_join_probe_and_hash_paths_are_ours(graph, monkeypatch):
+    """An OPTIONAL is solved inside the hook — the inner pattern probed per
+    outer row under a low threshold, hash-joined under a high one — never by
+    rdflib re-entering the BGP hook once per outer solution."""
+    left_joins, probes, bgps = [], [], []
+    original_left = pd._solve_left_join
+    original_probe = pd._probe_join
+    original_bgp = pd._solve_bgp
+    monkeypatch.setattr(
+        pd, "_solve_left_join", lambda *a: left_joins.append(1) or original_left(*a)
+    )
+    monkeypatch.setattr(
+        pd, "_probe_join", lambda *a, **k: probes.append(1) or original_probe(*a, **k)
+    )
+    monkeypatch.setattr(pd, "_solve_bgp", lambda *a: bgps.append(1) or original_bgp(*a))
+    register_sparql_pushdown()
+    sparql = (
+        "SELECT ?x ?a WHERE { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }"
+    )
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    assert len(run(graph, sparql)) == 8
+    assert left_joins and probes and len(bgps) == 1
+    left_joins.clear(), probes.clear(), bgps.clear()
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 10**9)
+    assert len(run(graph, sparql)) == 8
+    assert left_joins and not probes and len(bgps) == 1
+
+
+def test_minus_is_an_anti_join_in_code_space(graph, monkeypatch):
+    calls = []
+    original = pd._solve_minus
+    monkeypatch.setattr(pd, "_solve_minus", lambda *a: calls.append(1) or original(*a))
+    register_sparql_pushdown()
+    rows = run(
+        graph, "SELECT ?x WHERE { ?x <http://ex.org/name> ?n MINUS { ?x <http://ex.org/age> ?a } }"
+    )
+    subjects = {row[0] for row in rows}
+    assert len(rows) == 3  # alice, carol and the blank node have a name but no age
+    assert {URIRef("http://ex.org/alice"), URIRef("http://ex.org/carol")} <= subjects
+    assert calls
+
+
+def test_cheated_scope_falls_back_to_rdflib(graph, monkeypatch):
+    """An OPTIONAL whose inner pattern uses a variable bound outside its own
+    left side is re-checked by rdflib with that binding dropped; that shape
+    is handed back, and still answered correctly."""
+    left_joins = []
+    original = pd._solve_left_join
+
+    def spy(*args):
+        try:
+            return original(*args)
+        except NotImplementedError:
+            left_joins.append("fallback")
+            raise
+
+    monkeypatch.setattr(pd, "_solve_left_join", spy)
+    sparql = """SELECT ?x ?a ?y WHERE {
+        { VALUES ?a { 42 } }
+        { ?x <http://ex.org/name> ?n OPTIONAL { ?y <http://ex.org/age> ?a } } }"""
+    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    assert with_pushdown == without_pushdown
+    assert "fallback" in left_joins

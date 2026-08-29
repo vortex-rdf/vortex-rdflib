@@ -718,7 +718,6 @@ def analyze_filter(node, block_vars, ctx) -> FilterPlan:
     when the filter sits directly inside an EXISTS body
     (``no_isolated_scope``).
     """
-    block_set = set(block_vars)
     outer = dict(ctx.bindings.items())
     init = ctx.initBindings or {}
     if getattr(node, "no_isolated_scope", False):
@@ -726,8 +725,17 @@ def analyze_filter(node, block_vars, ctx) -> FilterPlan:
     else:
         allowed = set(node._vars or ()) | set(init)
         visible = {v: term for v, term in outer.items() if v in allowed}
+    return analyze_expr(node.expr, block_vars, ctx, visible)
+
+
+def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
+    """Route the conjuncts of a boolean expression over ``block_vars``;
+    ``visible`` maps the context-bound variables the expression may see to
+    their terms, every other non-block variable is unbound."""
+    block_set = set(block_vars)
     plan = FilterPlan([], {}, [])
-    for expr in _flatten_and(node.expr, []):
+    for conjunct_expr in _flatten_and(expr, []):
+        expr = conjunct_expr
         if _is_impure(expr):
             raise NotImplementedError
         referenced = expr_vars(expr)

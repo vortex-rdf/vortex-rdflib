@@ -16,13 +16,18 @@ What runs in code space:
   tuples, or re-probes the store per binding when the running relation is
   far smaller than the next pattern's match (``_probe_join``), and
   intermediate results never decode a term;
-- a ``Filter`` over a pattern is split into conjuncts (:mod:`.filters`):
+- a ``Filter`` over a block is split into conjuncts (:mod:`.filters`):
   those over one variable are evaluated once per distinct code of the
   variable and applied to the pattern scans *before* the join, the others
   once per distinct code tuple after it — a whitelist of expression shapes
   runs as predicates over the stored spellings, anything else (and every
   value outside the fast path's exact domain) is answered by rdflib's own
   evaluator, per distinct value instead of per row;
+- group joins (``Join``), ``OPTIONAL`` (``LeftJoin``) and ``MINUS`` over
+  blocks run as hash joins, left joins and anti-joins over code tuples, with
+  the OPTIONAL's inner pattern re-probed per outer row when the outer
+  relation is small — instead of rdflib re-entering the store once per
+  outer solution;
 - ``Project``, ``Distinct`` and ``Slice`` (LIMIT/OFFSET) heads are applied
   to the code-space relation, and an ``AskQuery`` over one pattern is
   answered from the row selection alone, so only the projected variables of
@@ -76,6 +81,9 @@ _VAR_LIKE = (Variable, BNode)
 _HANDLER_NAMES = {
     "BGP": "_eval_block_node",
     "Filter": "_eval_block_node",
+    "Join": "_eval_block_node",
+    "LeftJoin": "_eval_block_node",
+    "Minus": "_eval_block_node",
     "Project": "_eval_head",
     "Slice": "_eval_head",
     "Distinct": "_eval_head",
@@ -85,7 +93,7 @@ _HANDLER_NAMES = {
 _ALL_OPS = frozenset(_HANDLER_NAMES)
 _ENABLED_OPS = _ALL_OPS
 # Nodes a "block" is made of: a subtree solved into one code-space relation.
-_BLOCK_NODES = frozenset({"BGP", "Filter"})
+_BLOCK_NODES = frozenset({"BGP", "Filter", "Join", "LeftJoin", "Minus"})
 
 # Solutions decode in chunks that grow geometrically: the first chunk keeps a
 # LIMIT (or any consumer that stops early) from decoding more than a few
@@ -208,20 +216,52 @@ def _check_block(node) -> None:
     if name == "Filter":
         _check_block(node.p)
         return
+    if name in ("Join", "LeftJoin", "Minus"):
+        _check_block(node.p1)
+        _check_block(node.p2)
+        return
     raise NotImplementedError
+
+
+def _node_vars(node, out: list | None = None) -> list:
+    """Every variable-like term a block mentions, in first-seen order
+    (static: what rdflib's ``_vars`` is made of)."""
+    if out is None:
+        out = []
+    name = node.name
+    if name == "BGP":
+        for triple in node.triples:
+            for term in triple:
+                if isinstance(term, _VAR_LIKE) and term not in out:
+                    out.append(term)
+    elif name == "Filter":
+        _node_vars(node.p, out)
+    else:
+        _node_vars(node.p1, out)
+        _node_vars(node.p2, out)
+    return out
 
 
 def _block_vars(ctx, node) -> list:
     """The variables a block binds: its variable-like terms the context has
     not bound, in first-seen order (static, no matching)."""
-    if node.name == "Filter":
-        return _block_vars(ctx, node.p)
-    out: list = []
-    for triple in node.triples:
-        for term in triple:
-            if isinstance(term, _VAR_LIKE) and term not in out and ctx[term] is None:
-                out.append(term)
-    return out
+    return [term for term in _node_vars(node) if ctx[term] is None]
+
+
+def _block_nullable(node) -> frozenset:
+    """The variables a block may leave unbound: those an OPTIONAL side
+    introduces."""
+    name = node.name
+    if name == "BGP":
+        return frozenset()
+    if name == "Filter":
+        return _block_nullable(node.p)
+    if name == "Minus":
+        return _block_nullable(node.p1)
+    nullable = _block_nullable(node.p1) | _block_nullable(node.p2)
+    if name == "LeftJoin":
+        nullable |= frozenset(_node_vars(node.p2)) - frozenset(_node_vars(node.p1))
+    return nullable
 
 
 def _eval_head(ctx, store, part):
@@ -522,34 +562,240 @@ def _block_nonempty(ctx, store, block) -> bool:
     return next(_code_rows(rel), None) is not None
 
 
-def _solve_block(ctx, store, node) -> Relation:
-    if node.name == "BGP":
-        return _solve_bgp(ctx, store, node.triples)
-    if node.name == "Filter":
-        return _solve_filter(ctx, store, node)
+def _solve_block(ctx, store, node, env=frozenset(), var_preds=None) -> Relation:
+    """Solve a block into a relation.
+
+    ``env`` is the set of variables an enclosing lazy join or OPTIONAL binds
+    row by row in rdflib's evaluation — here the sides are solved
+    independently and joined, which is only exact while nothing inside
+    depends on those values (a FILTER that could see them falls back).
+    ``var_preds`` are single-variable filter conjuncts pushed down to the
+    pattern scans binding the variable.
+    """
+    name = node.name
+    if name == "BGP":
+        return _solve_bgp(ctx, store, node.triples, var_preds)
+    if name == "Filter":
+        return _solve_filter(ctx, store, node, env, var_preds)
+    if name == "Join":
+        return _solve_join(ctx, store, node, env, var_preds)
+    if name == "LeftJoin":
+        return _solve_left_join(ctx, store, node, env, var_preds)
+    if name == "Minus":
+        return _solve_minus(ctx, store, node, env, var_preds)
     raise NotImplementedError
 
 
-def _solve_filter(ctx, store, node) -> Relation:
+def _solve_filter(ctx, store, node, env, var_preds) -> Relation:
     """A ``Filter`` over a block: constant conjuncts decide the whole block
-    before anything is matched, single-variable conjuncts restrict the
-    pattern scans, the rest filters the joined rows."""
+    before anything is matched, single-variable conjuncts over variables the
+    block always binds restrict the pattern scans, the rest filters the
+    solved rows."""
     inner = node.p
-    if inner.name != "BGP":
-        raise NotImplementedError
     block_vars = _block_vars(ctx, inner)
     plan = filters.analyze_filter(node, block_vars, ctx)
+    if env:
+        _reject_env_references(node, plan, env, ctx)
     for conjunct in plan.constant:
         if not filters.evaluate_constant(conjunct):
             return Relation.from_rows(tuple(block_vars), [])
-    rel = _solve_bgp(ctx, store, inner.triples, plan.per_var or None)
-    if plan.tuples:
+    nullable = _block_nullable(inner)
+    pushed = dict(var_preds or {})
+    residual = list(plan.tuples)
+    for var, conjuncts in plan.per_var.items():
+        if var in nullable:
+            residual.extend(conjuncts)
+        else:
+            pushed[var] = pushed.get(var, []) + conjuncts
+    rel = _solve_block(ctx, store, inner, env, pushed or None)
+    if residual:
         preds = tuple(
             filters.tuple_predicate(store, conjunct, [rel.schema.index(v) for v in conjunct.vars])
-            for conjunct in plan.tuples
+            for conjunct in residual
         )
         rel = _filter_relation(rel, preds)
     return rel
+
+
+def _reject_env_references(node, plan, env, ctx) -> None:
+    """A conjunct referencing a variable an enclosing join binds row by row,
+    where rdflib would let the filter see that binding, cannot be evaluated
+    on an independently solved block."""
+    everything = getattr(node, "no_isolated_scope", False)
+    allowed = set(node._vars or ()) | set(ctx.initBindings or ())
+    conjuncts = plan.constant + plan.tuples + [c for cs in plan.per_var.values() for c in cs]
+    for conjunct in conjuncts:
+        for var in filters.expr_vars(conjunct.expr):
+            if var in env and var not in conjunct.vars and var not in conjunct.consts:
+                if everything or var in allowed:
+                    raise NotImplementedError
+
+
+def _rows_of(rel: Relation) -> list:
+    """The relation's rows, materialized."""
+    if rel.rows is not None:
+        return rel.rows
+    return list(_code_rows(rel))
+
+
+def _shared_key_ok(left: Relation, right: Relation, shared) -> None:
+    # A join key that may be unbound needs rdflib's compatibility semantics
+    # (unbound matches anything); a hash join cannot give them.
+    if any(v in left.nullable or v in right.nullable for v in shared):
+        raise NotImplementedError
+
+
+def _solve_join(ctx, store, node, env, var_preds) -> Relation:
+    """A group join: both sides solved, then a hash join on the shared
+    variables (a probe of the right pattern when the left side is small).
+    rdflib deduplicates the right side of a non-lazy join."""
+    lazy = bool(node.lazy)
+    left = _solve_block(ctx, store, node.p1, env, var_preds)
+    left_rows = _rows_of(left)
+    if not left_rows:
+        schema = left.schema + tuple(v for v in _block_vars(ctx, node.p2) if v not in left.schema)
+        return Relation(schema, None, [], 0, left.nullable | _block_nullable(node.p2))
+    right_env = env | frozenset(_node_vars(node.p1)) if lazy else env
+    p2 = node.p2
+    if lazy and p2.name == "BGP" and len(p2.triples) == 1:
+        pat = _match_pattern(ctx, store, *p2.triples[0])
+        if var_preds:
+            _restrict_pattern(store, pat, var_preds)
+        shares = any(v in left.schema for v in pat["varpos"])
+        if shares and len(left_rows) * _PROBE_FANOUT < pat["nrows"]:
+            _shared_key_ok(
+                left, Relation((), None, [], 0), [v for v in pat["varpos"] if v in left.schema]
+            )
+            schema, rows = _probe_join(store, left.schema, left_rows, pat)
+            return Relation(schema, None, rows, len(rows), left.nullable)
+        right = _rel_from_pattern(pat)
+    else:
+        right = _solve_block(ctx, store, p2, right_env, var_preds)
+    right_rows = _rows_of(right)
+    if not lazy:
+        right_rows = list(dict.fromkeys(right_rows))
+    shared = [v for v in right.schema if v in left.schema]
+    _shared_key_ok(left, right, shared)
+    schema, rows = _join(left.schema, left_rows, right.schema, right_rows)
+    return Relation(schema, None, rows, len(rows), left.nullable | right.nullable)
+
+
+def _solve_left_join(ctx, store, node, env, var_preds) -> Relation:
+    """An OPTIONAL: every left row, extended by the matching right rows that
+    pass the hoisted inner FILTER, or padded with unbound variables."""
+    p1, p2, expr = node.p1, node.p2, node.expr
+    vars1, vars2 = _node_vars(p1), _node_vars(p2)
+    condition = expr if getattr(expr, "name", None) != "TrueFilter" else None
+    # rdflib re-evaluates an unmatched OPTIONAL with only p1's variables bound
+    # (its "cheated scope" check); that differs from the first pass only when
+    # a variable bound outside — by the context or by an enclosing join —
+    # reaches p2 or the condition, so those shapes are left to rdflib.
+    outer = dict(ctx.bindings.items())
+    cheated = (env | frozenset(outer)) - frozenset(ctx.initBindings or ())
+    p1_vars = p1._vars
+    if p1_vars is not None and cheated:
+        p1_vars = frozenset(p1_vars)
+        if (frozenset(vars2) - p1_vars) & cheated:
+            raise NotImplementedError
+        if condition is not None and frozenset(filters.expr_vars(condition)) & p1_vars & cheated:
+            raise NotImplementedError
+
+    left = _solve_block(ctx, store, p1, env, var_preds)
+    left_rows = _rows_of(left)
+    extra = tuple(v for v in _block_vars(ctx, p2) if v not in left.schema)
+    nullable = left.nullable | _block_nullable(p2) | frozenset(extra)
+    if not left_rows:
+        return Relation(left.schema + extra, None, [], 0, nullable)
+
+    def condition_preds(schema):
+        if condition is None:
+            return ()
+        init = set(ctx.initBindings or ())
+        visible = {v: term for v, term in outer.items() if v in init}
+        plan = filters.analyze_expr(condition, list(schema), ctx, visible)
+        for conjunct in plan.constant:
+            if not filters.evaluate_constant(conjunct):
+                return None  # no pair can pass: every left row is unmatched
+        conjuncts = plan.tuples + [c for cs in plan.per_var.values() for c in cs]
+        return tuple(
+            filters.tuple_predicate(store, c, [schema.index(v) for v in c.vars]) for c in conjuncts
+        )
+
+    if p2.name == "BGP" and len(p2.triples) == 1:
+        pat = _match_pattern(ctx, store, *p2.triples[0])
+        shares = any(v in left.schema for v in pat["varpos"])
+        if shares and len(left_rows) * _PROBE_FANOUT < pat["nrows"]:
+            _shared_key_ok(
+                left, Relation((), None, [], 0), [v for v in pat["varpos"] if v in left.schema]
+            )
+            schema = left.schema + tuple(v for v in pat["varpos"] if v not in left.schema)
+            preds = condition_preds(schema)
+            if preds is None:
+                rows = [row + (None,) * len(extra) for row in left_rows]
+                return Relation(left.schema + extra, None, rows, len(rows), nullable)
+            schema, rows = _probe_join(
+                store, left.schema, left_rows, pat, keep_unmatched=True, row_preds=preds
+            )
+            return Relation(schema, None, rows, len(rows), nullable)
+        right = _rel_from_pattern(pat)
+    else:
+        right = _solve_block(ctx, store, p2, env | frozenset(vars1))
+    shared = [v for v in right.schema if v in left.schema]
+    _shared_key_ok(left, right, shared)
+    schema = left.schema + tuple(v for v in right.schema if v not in left.schema)
+    preds = condition_preds(schema)
+    if preds is None:
+        rows = [row + (None,) * (len(schema) - len(left.schema)) for row in left_rows]
+        return Relation(schema, None, rows, len(rows), nullable)
+    rows = _left_join_rows(left.schema, left_rows, right.schema, _rows_of(right), preds)
+    return Relation(schema, None, rows, len(rows), nullable)
+
+
+def _left_join_rows(schema_a, rows_a, schema_b, rows_b, preds) -> list:
+    """Hash left join: each left row extended by every compatible right row
+    that passes ``preds`` (over the combined row), or padded with None."""
+    shared = [v for v in schema_b if v in schema_a]
+    keep_b = [i for i, v in enumerate(schema_b) if v not in schema_a]
+    ia = [schema_a.index(v) for v in shared]
+    ib = [schema_b.index(v) for v in shared]
+    table: dict = {}
+    for rb in rows_b:
+        table.setdefault(tuple(rb[i] for i in ib), []).append(tuple(rb[i] for i in keep_b))
+    pad = (None,) * len(keep_b)
+    out = []
+    for ra in rows_a:
+        matched = False
+        for tail in table.get(tuple(ra[i] for i in ia), ()):
+            row = ra + tail
+            if all(pred(row) for pred in preds):
+                out.append(row)
+                matched = True
+        if not matched:
+            out.append(ra + pad)
+    return out
+
+
+def _solve_minus(ctx, store, node, env, var_preds) -> Relation:
+    """MINUS: an anti-join on the shared variables. Without shared block
+    variables rdflib's compatibility test turns on the context's own
+    bindings, which every row of both sides carries: nothing is removed at
+    top level, everything is when the right side is non-empty otherwise."""
+    left = _solve_block(ctx, store, node.p1, env, var_preds)
+    left_rows = _rows_of(left)
+    if not left_rows:
+        return left
+    right = _solve_block(ctx, store, node.p2, env)
+    shared = [v for v in right.schema if v in left.schema]
+    if not shared:
+        if dict(ctx.bindings.items()) and next(_code_rows(right), None) is not None:
+            return Relation(left.schema, None, [], 0, left.nullable)
+        return Relation(left.schema, None, left_rows, len(left_rows), left.nullable)
+    _shared_key_ok(left, right, shared)
+    ia = [left.schema.index(v) for v in shared]
+    ib = [right.schema.index(v) for v in shared]
+    keys = {tuple(rb[i] for i in ib) for rb in _code_rows(right)}
+    rows = [ra for ra in left_rows if tuple(ra[i] for i in ia) not in keys]
+    return Relation(left.schema, None, rows, len(rows), left.nullable)
 
 
 def _filter_relation(rel: Relation, preds) -> Relation:
@@ -744,7 +990,7 @@ def _join_patterns(store, patterns) -> Relation:
     return Relation.from_rows(schema, rows)
 
 
-def _probe_join(store, schema, rows, pat):
+def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
     """Join the relation against a pattern by re-matching it per binding.
 
     The adaptive half of the join strategy: when the running relation is far
@@ -754,7 +1000,9 @@ def _probe_join(store, schema, rows, pat):
     re-matching natively keeps the work proportional to the small side —
     it is what lets an anchored star beat rdflib's own nested loop instead
     of losing to it. A ``keep`` restriction on the pattern's free variables
-    is applied to the probed rows.
+    is applied to the probed rows, as are ``row_preds`` over the extended
+    row; with ``keep_unmatched`` a row without a continuation is kept,
+    padded with None (a left join).
     """
     native = store._store()
     match = native.match_codes
@@ -776,6 +1024,7 @@ def _probe_join(store, schema, rows, pat):
             raise ValueError(f"term code {code} is not in the store dictionary")
         n3_cache[code] = term
 
+    pad = (None,) * len(free)
     out = []
     for row in rows:
         n3 = list(pat["n3"])
@@ -790,24 +1039,30 @@ def _probe_join(store, schema, rows, pat):
                 if (idx == 0 and term[0] == '"') or (idx == 1 and term[0] != "<"):
                     satisfiable = False
                 n3[idx] = term
+        matched = False
         if not satisfiable:
-            continue
-
-        if not free:
+            pass
+        elif not free:
             # Existence probe: count from the row selection, materialize
             # no columns.
-            if count(*n3):
+            if count(*n3) and all(pred(row) for pred in row_preds):
                 out.append(row)
-            continue
-        cols = match(*n3)
-        if cols is None:
-            raise NotImplementedError
-        views = {idx: memoryview(cols[idx]).cast("I").tolist() for idx in needed}
-        for i in range(len(views[needed[0]])):
-            if all(views[a][i] == views[b][i] for a, b in eq_checks) and all(
-                views[p][i] in allowed for p, allowed in members
-            ):
-                out.append(row + tuple(views[idx][i] for idx in out_positions))
+                matched = True
+        else:
+            cols = match(*n3)
+            if cols is None:
+                raise NotImplementedError
+            views = {idx: memoryview(cols[idx]).cast("I").tolist() for idx in needed}
+            for i in range(len(views[needed[0]])):
+                if all(views[a][i] == views[b][i] for a, b in eq_checks) and all(
+                    views[p][i] in allowed for p, allowed in members
+                ):
+                    extended = row + tuple(views[idx][i] for idx in out_positions)
+                    if all(pred(extended) for pred in row_preds):
+                        out.append(extended)
+                        matched = True
+        if keep_unmatched and not matched:
+            out.append(row + pad)
     return schema + tuple(free.keys()), out
 
 
