@@ -208,6 +208,56 @@ QUERIES = [
         ?x <http://ex.org/age> ?a FILTER(?x = <http://ex.org/bob>) }""",
     "ASK { ?x <http://ex.org/age> ?a FILTER(?a > 100) }",
     "ASK { ?x <http://ex.org/age> ?a FILTER(?a > 10) }",
+    # --- DISTINCT (code-level, then term-level: "042" and "42" are one integer)
+    "SELECT DISTINCT ?p WHERE { ?s ?p ?o }",
+    "SELECT DISTINCT ?s ?o WHERE { ?s <http://ex.org/knows> ?o }",
+    "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a }",
+    "SELECT DISTINCT ?n WHERE { ?x <http://ex.org/name> ?n }",
+    "SELECT DISTINCT ?o WHERE { ?s ?p ?o } LIMIT 3",
+    "SELECT DISTINCT ?o WHERE { ?s ?p ?o } OFFSET 5 LIMIT 4",
+    """SELECT DISTINCT ?x WHERE {
+        ?x <http://ex.org/name> ?n . ?x <http://ex.org/age> ?a }""",
+    "SELECT DISTINCT ?x ?zzz WHERE { ?x <http://ex.org/name> ?n }",
+    "SELECT DISTINCT * WHERE { ?s ?p ?o }",
+    "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a > 0) }",
+    "SELECT REDUCED ?p WHERE { ?s ?p ?o }",
+    "SELECT DISTINCT ?p WHERE { ?s ?p ?o } ORDER BY ?p LIMIT 2",
+    # --- COUNT: no grouping (count_quads fast path), bound/unbound/distinct targets
+    "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }",
+    "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://ex.org/nothing> ?o }",
+    "SELECT (COUNT(?o) AS ?n) WHERE { ?s <http://ex.org/name> ?o }",
+    "SELECT (COUNT(?zzz) AS ?n) WHERE { ?s <http://ex.org/name> ?o }",
+    "SELECT (COUNT(DISTINCT ?a) AS ?n) WHERE { ?x <http://ex.org/age> ?a }",
+    "SELECT (COUNT(DISTINCT ?n) AS ?c) WHERE { ?x <http://ex.org/name> ?n }",
+    "SELECT (COUNT(DISTINCT *) AS ?n) WHERE { ?x <http://ex.org/name> ?n }",
+    "SELECT (COUNT(*) AS ?n) (COUNT(?o) AS ?m) WHERE { ?s ?p ?o }",
+    "SELECT (COUNT(*) AS ?n) WHERE { ?x <http://ex.org/likes> ?x }",
+    "SELECT (COUNT(*) AS ?n) WHERE { ?x <http://ex.org/age> ?a FILTER(?a > 0) }",
+    """SELECT (COUNT(*) AS ?n) WHERE {
+        ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?m }""",
+    # --- GROUP BY: columns, several keys, an absent key, HAVING, joins, empty input
+    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p",
+    "SELECT ?s (COUNT(?o) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?s",
+    "SELECT ?p ?s (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p ?s",
+    "SELECT ?a (COUNT(*) AS ?n) WHERE { ?x <http://ex.org/age> ?a } GROUP BY ?a",
+    "SELECT ?n (COUNT(*) AS ?c) WHERE { ?x <http://ex.org/name> ?n } GROUP BY ?n",
+    "SELECT ?zzz (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?zzz",
+    "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p",
+    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p HAVING (COUNT(*) > 3)",
+    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o FILTER(isIRI(?o)) } GROUP BY ?p",
+    """SELECT ?x (COUNT(*) AS ?n) WHERE {
+        ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?m } GROUP BY ?x""",
+    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p <http://ex.org/nothing> } GROUP BY ?p",
+    "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p",
+    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p ORDER BY ?p LIMIT 2",
+    # --- aggregates left to rdflib: SUM, a bare variable without GROUP BY, non-block inputs
+    "SELECT (SUM(?v) AS ?n) WHERE { ?x <http://ex.org/score> ?v }",
+    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o }",
+    """SELECT ?x (COUNT(*) AS ?n) WHERE {
+        VALUES ?x { <http://ex.org/bob> <http://ex.org/dave> }
+        ?x <http://ex.org/age> ?a } GROUP BY ?x""",
+    """SELECT (COUNT(?a) AS ?n) WHERE {
+        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }""",
 ]
 
 
@@ -504,3 +554,51 @@ def test_init_bindings_are_visible_to_filters(graph):
     finally:
         register_sparql_pushdown()
     assert with_pushdown == without_pushdown == [(Literal(42),)]
+
+
+def test_distinct_and_count_are_answered_in_code_space(graph, monkeypatch):
+    distincts, aggregates = [], []
+    original_distinct = pd._eval_distinct
+    original_aggregate = pd._eval_aggregate
+    monkeypatch.setattr(
+        pd, "_eval_distinct", lambda *a: distincts.append(1) or original_distinct(*a)
+    )
+    monkeypatch.setattr(
+        pd, "_eval_aggregate", lambda *a: aggregates.append(1) or original_aggregate(*a)
+    )
+    register_sparql_pushdown()
+    rows = run(graph, "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a }")
+    assert len(rows) == 4  # "042" and "42" are the same integer
+    rows = run(graph, "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p")
+    assert (URIRef("http://ex.org/name"), Literal(8)) in rows
+    assert distincts and aggregates
+
+
+def test_count_over_one_pattern_counts_instead_of_matching(graph):
+    register_sparql_pushdown()
+    native = _CountingNative(graph.store._store())
+    graph.store._native = native
+    rows = run(graph, "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://ex.org/name> ?o }")
+    assert rows == [(Literal(8),)]
+    rows = run(graph, "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://ex.org/nothing> ?o }")
+    assert rows == [(Literal(0),)]
+    assert (native.counts, native.matches) == (2, 0)
+
+
+def test_distinct_decodes_only_the_survivors(tmp_path):
+    """``SELECT DISTINCT ?p`` over 700 rows with 7 predicates decodes 7 codes."""
+    nt = tmp_path / "wide.nt"
+    nt.write_text(
+        "".join(
+            f"<http://ex.org/s{i}> <http://ex.org/p{i % 7}> <http://ex.org/o{i}> .\n"
+            for i in range(700)
+        )
+    )
+    out = tmp_path / "wide.vortex"
+    serialize_rdf(str(nt), str(out), layout="dictionary")
+    store = VortexStore(str(out), in_memory=True)
+    graph = Graph(store=store)
+    register_sparql_pushdown()
+    rows = run(graph, "SELECT DISTINCT ?p WHERE { ?s ?p ?o }")
+    assert len(rows) == 7
+    assert len(store._decode_cache) == 7

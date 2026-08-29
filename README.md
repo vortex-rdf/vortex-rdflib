@@ -80,9 +80,12 @@ string comparisons, `datatype`, `lang`, `langMatches`, `isIRI`/`isLiteral`/
 spellings, and anything else, or any value outside that fast path's exact
 domain, is answered by rdflib's own expression evaluator — with
 single-variable conditions applied to the pattern scans before the join. The
-projection, `LIMIT`/`OFFSET` and `ASK` above a pattern are answered on the
-same code-space result, and solutions are decoded lazily in chunks, so a
-`LIMIT 10` decodes a few dozen codes and an ASK none.
+projection, `DISTINCT`, `LIMIT`/`OFFSET`, `ASK` and `COUNT` aggregates
+(`COUNT(*)`, `COUNT(?v)`, `COUNT(DISTINCT ?v)`, with or without `GROUP BY`)
+above a pattern are answered on the same code-space result, and solutions are
+decoded lazily in chunks — a `LIMIT 10` decodes a few dozen codes, an ASK or a
+`COUNT(*)` over one pattern none at all, a `DISTINCT ?p` over the whole store
+only its distinct predicates.
 
 The gain is concentrated where that nested loop degenerates: unanchored joins
 such as a two-hop chain (`?s ?pa ?m . ?m ?pb ?o`), where rdflib would

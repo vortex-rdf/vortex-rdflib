@@ -23,11 +23,16 @@ What runs in code space:
   runs as predicates over the stored spellings, anything else (and every
   value outside the fast path's exact domain) is answered by rdflib's own
   evaluator, per distinct value instead of per row;
-- ``Project`` and ``Slice`` (LIMIT/OFFSET) heads are applied to the
-  code-space relation, and an ``AskQuery`` over one pattern is answered from
-  the row selection alone, so only the projected variables of the rows that
-  are actually consumed are ever decoded — a ``LIMIT 10`` decodes a few
-  dozen codes, an ASK none;
+- ``Project``, ``Distinct`` and ``Slice`` (LIMIT/OFFSET) heads are applied
+  to the code-space relation, and an ``AskQuery`` over one pattern is
+  answered from the row selection alone, so only the projected variables of
+  the rows that are actually consumed are ever decoded — a ``LIMIT 10``
+  decodes a few dozen codes, an ASK none, a ``DISTINCT ?p`` over the whole
+  store only its distinct predicates;
+- ``COUNT`` aggregates (``COUNT(*)``, ``COUNT(?v)``, ``COUNT(DISTINCT ?v)``,
+  with or without ``GROUP BY`` variables) are computed over the code
+  columns, decoding only the group keys — and a ``COUNT(*)`` over one
+  pattern is answered by ``count_quads`` without matching a row;
 - solutions are decoded lazily in growing chunks, each distinct code once
   through the store's decode cache, and built directly as
   ``FrozenBindings``, the row shape every rdflib operator above expects.
@@ -49,9 +54,11 @@ value through rdflib's evaluator, for bisecting and A/B measurements.
 """
 
 import os
+from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from itertools import islice
+from typing import Any
 
 from rdflib.plugins.sparql import CUSTOM_EVALS
 from rdflib.plugins.sparql.sparql import FrozenBindings
@@ -71,6 +78,8 @@ _HANDLER_NAMES = {
     "Filter": "_eval_block_node",
     "Project": "_eval_head",
     "Slice": "_eval_head",
+    "Distinct": "_eval_head",
+    "AggregateJoin": "_eval_aggregate",
     "AskQuery": "_eval_ask",
 }
 _ALL_OPS = frozenset(_HANDLER_NAMES)
@@ -161,30 +170,34 @@ class Relation:
 @dataclass(slots=True)
 class _Head:
     block: object
-    pv: tuple | None
+    pv: tuple
     start: int
     stop: int | None
+    distinct: bool
 
 
 def _plan_head(part) -> _Head:
-    """Recognize a ``Slice? -> Project -> block`` head, eagerly.
+    """Recognize a ``Slice? -> Distinct? -> Project -> block`` head, eagerly.
 
     Anything else is rdflib's: its evaluator runs the node and re-enters the
     hook for the nodes below.
     """
-    node, start, stop = part, 0, None
+    node, start, stop, distinct = part, 0, None, False
     if node.name == "Slice":
         start = int(node.start or 0)
         # The key is absent without LIMIT; CompValue then answers None.
         length = node.length
         stop = None if length is None else start + int(length)
         node = node.p
+    if node.name == "Distinct":
+        distinct = True
+        node = node.p
     if node.name != "Project":
         raise NotImplementedError
     pv = node.PV
     pv = (pv,) if isinstance(pv, Variable) else tuple(pv)
     _check_block(node.p)
-    return _Head(node.p, pv, start, stop)
+    return _Head(node.p, pv, start, stop, distinct)
 
 
 def _check_block(node) -> None:
@@ -214,7 +227,274 @@ def _block_vars(ctx, node) -> list:
 def _eval_head(ctx, store, part):
     head = _plan_head(part)
     rel = _solve_block(ctx, store, head.block)
+    if head.distinct:
+        return _eval_distinct(ctx, store, rel, head)
     return _yield_solutions(ctx, store, rel, head.pv, head.start, head.stop)
+
+
+def _eval_distinct(ctx, store, rel: Relation, head: _Head):
+    """DISTINCT over the projected variables, without decoding the
+    duplicates: code-distinct tuples first, then a term-level pass over the
+    survivors (rdflib compares decoded terms, and two spellings of a typed
+    literal can be one term), then LIMIT/OFFSET."""
+    keys = tuple(v for v in head.pv if v in rel.schema)
+    idx = [rel.schema.index(v) for v in keys]
+    rows = _term_distinct(store, _code_distinct(rel, idx), rel.foreign)
+    return _yield_rows(ctx, store, keys, rows, rel.foreign, head.pv, head.start, head.stop)
+
+
+def _code_distinct(rel: Relation, idx: list) -> Iterator[tuple]:
+    """The relation's rows projected to ``idx``, one per distinct code
+    tuple, in first-seen order."""
+    if rel.cols is not None and not rel.preds:
+        if len(idx) == 1:
+            return ((code,) for code in dict.fromkeys(rel.cols[idx[0]]))
+        columns = [rel.cols[i].tolist() for i in idx]
+        return iter(dict.fromkeys(zip(*columns, strict=True)))
+
+    def rows():
+        seen: set = set()
+        for row in _code_rows(rel):
+            key = tuple(row[i] for i in idx)
+            if key not in seen:
+                seen.add(key)
+                yield key
+
+    return rows()
+
+
+def _term_distinct(store, tuples: Iterator[tuple], foreign: dict) -> Iterator[tuple]:
+    """Drop the code tuples whose decoded terms equal an earlier tuple's."""
+    seen: set = set()
+    size = _CHUNK_START
+    while True:
+        chunk = list(islice(tuples, size))
+        if not chunk:
+            return
+        keys = _equivalence_keys(
+            store, {c for row in chunk for c in row if c is not None and c >= 0}
+        )
+        for row in chunk:
+            key = tuple(None if c is None else (keys[c] if c >= 0 else foreign[c]) for c in row)
+            if key not in seen:
+                seen.add(key)
+                yield row
+        size = min(size * 4, _CHUNK_MAX)
+
+
+def _equivalence_keys(store, codes) -> dict:
+    """Keys equal iff rdflib finds the decoded terms equal.
+
+    IRIs, blank nodes and untyped literals are one term per spelling, so the
+    code itself is the key; a typed literal's lexical form may be normalized
+    by rdflib (``"042"^^xsd:integer`` is ``42``), so it is keyed by the
+    decoded term. Only typed literals are decoded here.
+    """
+    literal_lo, iri_lo, _ = store._term_kind_bounds()
+    keys: dict = {}
+    literals = []
+    for code in codes:
+        if literal_lo <= code < iri_lo:
+            literals.append(code)
+        else:
+            keys[code] = code
+    if literals:
+        cache = store._decode_cache
+        for code, spelling in zip(literals, store._dict.decode_many(literals), strict=True):
+            if spelling is None:
+                raise ValueError(f"term code {code} is not in the store dictionary")
+            if spelling.endswith(">"):
+                term = cache.get(code)
+                if term is None:
+                    term = cache[code] = store._from_n3_safe(spelling)
+                keys[code] = term
+            else:
+                keys[code] = code
+    return keys
+
+
+def _eval_aggregate(ctx, store, part):
+    """``AggregateJoin`` over a ``Group`` of a block, for COUNT aggregates.
+
+    Counts are taken over the code columns; only the group keys are decoded.
+    Groups whose decoded keys are equal terms are merged, as rdflib groups by
+    decoded term. ``Aggregate_Sample`` of a GROUP BY variable is the key
+    itself (that is how rdflib carries the group variable into the row);
+    every other aggregate is rdflib's.
+    """
+    group = part.p
+    if getattr(group, "name", None) != "Group":
+        raise NotImplementedError
+    block = group.p
+    _check_block(block)
+    group_vars = None if group.expr is None else list(group.expr)
+    if group_vars is not None and not all(isinstance(v, Variable) for v in group_vars):
+        raise NotImplementedError
+    counts, samples = [], []
+    for agg in part.A:
+        if agg.name == "Aggregate_Count":
+            target = agg.vars
+            if target != "*" and not isinstance(target, _VAR_LIKE):
+                raise NotImplementedError
+            counts.append((agg.res, target, bool(agg.distinct)))
+        elif agg.name == "Aggregate_Sample":
+            if group_vars is None or agg.vars not in group_vars:
+                raise NotImplementedError
+            samples.append((agg.res, agg.vars))
+        else:
+            raise NotImplementedError
+
+    # One pattern, no grouping, plain counts: the row selection's size.
+    if group_vars is None and block.name == "BGP" and len(block.triples) == 1:
+        pat = _pattern_terms(ctx, store, *block.triples[0])
+        if all(len(pos) == 1 for pos in pat["varpos"].values()) and all(
+            not distinct and (target == "*" or target in pat["varpos"] or ctx[target] is not None)
+            for _, target, distinct in counts
+        ):
+            n = 0 if pat["unsatisfiable"] else store._store().count_quads(*pat["n3"])
+            return iter([FrozenBindings(ctx, {res: Literal(n) for res, _, _ in counts})])
+
+    rel = _solve_block(ctx, store, block)
+    return _aggregate_rows(ctx, store, rel, group_vars or [], counts, samples, group.expr is None)
+
+
+@dataclass(slots=True)
+class _CountSpec:
+    """One COUNT aggregate over the block: ``rows`` (``COUNT(*)``), a
+    column (``COUNT(?v)`` for a block variable), ``const`` (a variable the
+    context bound, present in every row) or ``none`` (bound nowhere)."""
+
+    res: Any
+    kind: str
+    col: int = -1
+    distinct: bool = False
+
+
+@dataclass(slots=True)
+class _Group:
+    rows: int
+    counts: list  # per spec: bound values seen (non-distinct column counts)
+    sets: list  # per spec: the codes (or rows) seen, for distinct counts
+
+
+def _aggregate_rows(ctx, store, rel: Relation, group_vars, counts, samples, implicit_group):
+    schema = rel.schema
+    col = {v: i for i, v in enumerate(schema)}
+    # A group key part is a column; a context-bound variable does not split
+    # groups and an unbound one contributes a None key part (as rdflib's).
+    key_cols = [col[v] for v in group_vars if v in col]
+    specs = []
+    for res, target, distinct in counts:
+        if target == "*":
+            specs.append(_CountSpec(res, "rows", distinct=distinct))
+        elif target in col:
+            specs.append(_CountSpec(res, "col", col[target], distinct))
+        elif ctx[target] is not None:
+            specs.append(_CountSpec(res, "const", distinct=distinct))
+        else:
+            specs.append(_CountSpec(res, "none"))
+    nspecs = len(specs)
+
+    def new_group(rows=0):
+        return _Group(rows, [0] * nspecs, [set() for _ in specs])
+
+    groups: dict[tuple, _Group] = {}
+    plain = all(spec.kind in ("rows", "const") and not spec.distinct for spec in specs)
+    if rel.cols is not None and not rel.preds and len(key_cols) <= 1 and plain:
+        # COUNT(*) [GROUP BY ?v] over one pattern: count the codes directly.
+        if key_cols:
+            for code, n in Counter(rel.cols[key_cols[0]]).items():
+                groups[(code,)] = new_group(n)
+        elif rel.nrows:
+            groups[()] = new_group(rel.nrows)
+    else:
+        for row in _code_rows(rel):
+            key = tuple(row[i] for i in key_cols)
+            group = groups.get(key)
+            if group is None:
+                group = groups[key] = new_group()
+            group.rows += 1
+            for j, spec in enumerate(specs):
+                if spec.kind == "col":
+                    code = row[spec.col]
+                    if code is not None:
+                        if spec.distinct:
+                            group.sets[j].add(code)
+                        else:
+                            group.counts[j] += 1
+                elif spec.distinct:  # rows, const
+                    group.sets[j].add(row if spec.kind == "rows" else ())
+
+    if not groups:
+        if implicit_group:
+            return iter([FrozenBindings(ctx, {res: Literal(0) for res, _, _ in counts})])
+        return iter([FrozenBindings(ctx)])
+
+    # Merge groups whose decoded keys are equal terms; distinct counts likewise
+    # count equal terms once.
+    codes = {c for key in groups for c in key if c is not None}
+    for group in groups.values():
+        for j, spec in enumerate(specs):
+            if spec.distinct and spec.kind == "col":
+                codes.update(group.sets[j])
+            elif spec.distinct and spec.kind == "rows":
+                codes.update(c for row in group.sets[j] for c in row if c is not None)
+    equivalence = _equivalence_keys(store, {c for c in codes if c >= 0})
+    foreign = rel.foreign
+
+    def term_key(code):
+        return None if code is None else (equivalence[code] if code >= 0 else foreign[code])
+
+    merged: dict[tuple, tuple[tuple, _Group]] = {}
+    for key, group in groups.items():
+        tkey = tuple(term_key(c) for c in key)
+        first = merged.get(tkey)
+        if first is None:
+            merged[tkey] = (key, group)
+            continue
+        base = first[1]
+        base.rows += group.rows
+        for j in range(nspecs):
+            base.counts[j] += group.counts[j]
+            base.sets[j] |= group.sets[j]
+
+    key_index = {v: i for i, v in enumerate(v for v in group_vars if v in col)}
+    store._prime_decode_cache(
+        [c for key, _ in merged.values() for c in key if c is not None and c >= 0]
+    )
+    cached = store._decode_cache
+
+    def solutions():
+        for key, group in merged.values():
+            row: dict = {}
+            for j, spec in enumerate(specs):
+                if spec.kind == "rows":
+                    if spec.distinct:
+                        n = len({tuple(term_key(c) for c in r) for r in group.sets[j]})
+                    else:
+                        n = group.rows
+                elif spec.kind == "col":
+                    n = (
+                        len({term_key(c) for c in group.sets[j]})
+                        if spec.distinct
+                        else group.counts[j]
+                    )
+                elif spec.kind == "const":
+                    n = 1 if spec.distinct else group.rows
+                else:
+                    n = 0
+                row[spec.res] = Literal(n)
+            for res, var in samples:
+                if var in key_index:
+                    code = key[key_index[var]]
+                    row[res] = (
+                        None if code is None else (cached[code] if code >= 0 else foreign[code])
+                    )
+                else:
+                    row[res] = ctx[var]
+            yield FrozenBindings(ctx, row)
+
+    return solutions()
 
 
 def _eval_block_node(ctx, store, part):
@@ -582,7 +862,12 @@ def _yield_solutions(ctx, store, rel: Relation, project=None, start=0, stop=None
     rdflib's BGP rows contain); with it only the projected variables, the
     way ``Project`` would have narrowed them.
     """
-    schema = rel.schema
+    return _yield_rows(ctx, store, rel.schema, _code_rows(rel), rel.foreign, project, start, stop)
+
+
+def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, start, stop):
+    """Decode code rows over ``schema`` into solutions (see
+    ``_yield_solutions``); ``start``/``stop`` slice the rows first."""
     outer = dict(ctx.bindings.items())
     if project is None:
         keys, idx, base = schema, list(range(len(schema))), outer
@@ -590,9 +875,8 @@ def _yield_solutions(ctx, store, rel: Relation, project=None, start=0, stop=None
         keys = tuple(v for v in project if v in schema)
         idx = [schema.index(v) for v in keys]
         base = {v: outer[v] for v in project if v not in schema and v in outer}
-    rows = islice(_code_rows(rel), start, stop)
+    rows = islice(rows, start, stop)
     cached = store._decode_cache
-    foreign = rel.foreign
     size = _CHUNK_START
     while True:
         chunk = list(islice(rows, size))
