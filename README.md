@@ -73,9 +73,16 @@ Set `VORTEX_RDF_DISABLE_CODE_PATH=1` to force the string path.
 each triple pattern is matched natively once and the join runs as hash joins
 over `u32` codes, decoding terms only for the final solutions. This replaces
 rdflib's default nested-loop evaluation (one `triples()` call per candidate
-binding). The projection, `LIMIT`/`OFFSET` and `ASK` above a pattern are
-answered on the same code-space result, and solutions are decoded lazily in
-chunks, so a `LIMIT 10` decodes a few dozen codes and an ASK none.
+binding). A `FILTER` over a pattern is evaluated once per distinct value
+instead of once per row — a whitelist of expression shapes (numeric and
+string comparisons, `datatype`, `lang`, `langMatches`, `isIRI`/`isLiteral`/
+`isBlank`, `regex`, `strstarts`, ...) runs as predicates over the stored term
+spellings, and anything else, or any value outside that fast path's exact
+domain, is answered by rdflib's own expression evaluator — with
+single-variable conditions applied to the pattern scans before the join. The
+projection, `LIMIT`/`OFFSET` and `ASK` above a pattern are answered on the
+same code-space result, and solutions are decoded lazily in chunks, so a
+`LIMIT 10` decodes a few dozen codes and an ASK none.
 
 The gain is concentrated where that nested loop degenerates: unanchored joins
 such as a two-hop chain (`?s ?pa ?m . ?m ?pb ?o`), where rdflib would
@@ -124,6 +131,7 @@ fits the residency budget; pass `VortexStore(path, max_resident_bytes=...)`
 | `VORTEX_RDF_DISABLE_CODE_PATH=1` | Force the N-Triples string path instead of `u32` codes |
 | `VORTEX_RDF_DISABLE_PUSHDOWN=1` | Keep rdflib's default evaluator for every operator |
 | `VORTEX_RDF_PUSHDOWN_OPS=<list>` | Only push down the listed algebra nodes (`bgp` = basic graph patterns only) |
+| `VORTEX_RDF_FILTER_FAST=0` | Evaluate every FILTER value through rdflib's expression evaluator (still once per distinct value) |
 | `VORTEX_RDF_TRACE_TRIPLES=1` | Print every `triples()` pattern (debugging) |
 
 ## Benchmarks

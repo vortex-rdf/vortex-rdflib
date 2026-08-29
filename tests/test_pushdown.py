@@ -8,7 +8,7 @@ from rdflib.plugins.sparql.sparql import QueryContext
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from vortex_rdflib import VortexStore, register_sparql_pushdown, unregister_sparql_pushdown
+from vortex_rdflib import VortexStore, filters, register_sparql_pushdown, unregister_sparql_pushdown
 
 FIXTURE_NT = """\
 <http://ex.org/alice> <http://ex.org/name> "Alice" .
@@ -21,7 +21,25 @@ FIXTURE_NT = """\
 <http://ex.org/carol> <http://ex.org/likes> <http://ex.org/carol> .
 _:b0 <http://ex.org/name> "Anon" .
 _:b0 <http://ex.org/knows> <http://ex.org/alice> .
-"""
+<http://ex.org/dave> <http://ex.org/age> "042"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://ex.org/dave> <http://ex.org/name> "Bob"@en-US .
+<http://ex.org/dave> <http://ex.org/flag> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<http://ex.org/dave> <http://ex.org/knows> <http://ex.org/bob> .
+<http://ex.org/erin> <http://ex.org/age> "abc"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://ex.org/erin> <http://ex.org/score> "1.5"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex.org/erin> <http://ex.org/code> "x"^^<http://ex.org/dt> .
+<http://ex.org/erin> <http://ex.org/name> "q\\"uote" .
+<http://ex.org/frank> <http://ex.org/age> "-3"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://ex.org/frank> <http://ex.org/score> "1e2"^^<http://www.w3.org/2001/XMLSchema#double> .
+<http://ex.org/frank> <http://ex.org/name> "" .
+<http://ex.org/frank> <http://ex.org/flag> "false"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<http://ex.org/gina> <http://ex.org/age> "7"^^<http://www.w3.org/2001/XMLSchema#byte> .
+<http://ex.org/gina> <http://ex.org/score> "NaN"^^<http://www.w3.org/2001/XMLSchema#double> .
+<http://ex.org/gina> <http://ex.org/name> "Bob"@EN .
+""" + (
+    "<http://ex.org/dave> <http://ex.org/born> "
+    '"2020-01-01T00:00:00"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n'
+)
 
 QUERIES = [
     # single patterns
@@ -102,6 +120,94 @@ QUERIES = [
     "ASK { ?a <http://ex.org/knows> ?b . ?b <http://ex.org/age> ?n }",
     "ASK { ?a <http://ex.org/knows> ?b . ?b <http://ex.org/nothing> ?n }",
     "ASK {}",
+    # --- FILTER: numeric comparisons (integer, decimal, double, NaN, ill-typed, byte)
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a < 10) }",
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a >= 42) }",
+    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(42 = ?a) }",
+    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(?a != 42) }",
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a > -5 && ?a < 50) }",
+    "SELECT ?x ?v WHERE { ?x <http://ex.org/score> ?v FILTER(?v > 1) }",
+    "SELECT ?x ?v WHERE { ?x <http://ex.org/score> ?v FILTER(?v < 100) }",
+    """PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?x WHERE { ?x <http://ex.org/age> ?a
+        FILTER(datatype(?a) = xsd:integer && ?a < 100) }""",
+    """PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(datatype(?a) != xsd:integer) }""",
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a IN (42, 7)) }",
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a NOT IN (42)) }",
+    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(sameTerm(?a, 42)) }",
+    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(isNumeric(?a)) }",
+    "SELECT ?x WHERE { ?x <http://ex.org/score> ?v FILTER(?v + 1 > 2) }",
+    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(coalesce(?zzz, ?a) = 42) }",
+    'SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(str(?a) = "42") }',
+    'SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(?a = "42") }',
+    # --- FILTER: strings, language tags, regex
+    """SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n
+        FILTER(langMatches(lang(?n), "EN")) }""",
+    """SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n
+        FILTER(langMatches(lang(?n), "en-US")) }""",
+    'SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n FILTER(lang(?n) = "") }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(?n = "Bob"@en) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(?n = "Carol") }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(str(?n) = "Bob") }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(strstarts(?n, "A")) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(strstarts(?n, "B"@en)) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(contains(?n, "o")) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(strends(str(?n), "e")) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(regex(?n, "^a", "i")) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(regex(str(?n), "\\"")) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(?n != "") }',
+    "SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(?n) }",
+    # --- FILTER: term kinds, IRIs, bound
+    "SELECT ?s ?o WHERE { ?s ?p ?o FILTER(isIRI(?o)) }",
+    "SELECT ?s ?o WHERE { ?s ?p ?o FILTER(isBlank(?s)) }",
+    "SELECT ?s ?o WHERE { ?s ?p ?o FILTER(isLiteral(?o) && !isBlank(?s)) }",
+    "SELECT ?s ?o WHERE { ?s ?p ?o FILTER(isIRI(?o) || isBlank(?o)) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(bound(?o)) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(!bound(?zzz)) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(bound(?zzz)) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(?o = <http://ex.org/carol>) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(?o != <http://ex.org/carol>) }",
+    'SELECT ?s WHERE { ?s ?p ?o FILTER(?o IN (<http://ex.org/carol>, "Carol")) }',
+    # --- FILTER: constants, several variables, joins, other datatypes
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(1 = 2) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(1 < 2) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(?s != ?o) }",
+    "SELECT ?s ?o WHERE { ?s ?p ?o FILTER(sameTerm(?s, ?o)) }",
+    """SELECT ?a ?b WHERE { ?x <http://ex.org/age> ?a . ?y <http://ex.org/age> ?b
+        FILTER(?a < ?b) }""",
+    """SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n . ?x <http://ex.org/age> ?a
+        FILTER(?a > 10) }""",
+    """SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n . ?x <http://ex.org/age> ?a
+        FILTER(?a > 10 && lang(?n) = "en") }""",
+    """SELECT ?x WHERE { ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?n
+        FILTER(regex(?n, "^C")) }""",
+    'SELECT ?x WHERE { ?x <http://ex.org/code> ?c FILTER(?c = "x"^^<http://ex.org/dt>) }',
+    "SELECT ?x WHERE { ?x <http://ex.org/code> ?c FILTER(?c < 5) }",
+    "SELECT ?x WHERE { ?x <http://ex.org/flag> ?f FILTER(?f) }",
+    "SELECT ?x WHERE { ?x <http://ex.org/flag> ?f FILTER(?f = true) }",
+    """PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?x WHERE { ?x <http://ex.org/born> ?d
+        FILTER(?d < "2021-01-01T00:00:00"^^xsd:dateTime) }""",
+    """PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?x WHERE { ?x <http://ex.org/born> ?d
+        FILTER(?d = "2020-01-01T00:00:00"^^xsd:dateTime) }""",
+    # --- FILTER: EXISTS (generic route), OPTIONAL-bound var, two FILTERs, RAND (fallback)
+    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
+        FILTER NOT EXISTS { ?x <http://ex.org/age> ?a } }""",
+    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
+        FILTER EXISTS { ?x <http://ex.org/knows> <http://ex.org/carol> } }""",
+    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
+        OPTIONAL { ?x <http://ex.org/age> ?a } FILTER(!bound(?a)) }""",
+    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(?a > 0) FILTER(?a < 50) }",
+    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(rand() < 2) }",
+    # --- FILTER under VALUES: the filter sees a context-bound variable
+    """SELECT ?x ?a WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/dave> }
+        ?x <http://ex.org/age> ?a FILTER(?a > 10) }""",
+    """SELECT ?x ?a WHERE { VALUES ?x { <http://ex.org/bob> }
+        ?x <http://ex.org/age> ?a FILTER(?x = <http://ex.org/bob>) }""",
+    "ASK { ?x <http://ex.org/age> ?a FILTER(?a > 100) }",
+    "ASK { ?x <http://ex.org/age> ?a FILTER(?a > 10) }",
 ]
 
 
@@ -122,13 +228,19 @@ def graph(dict_vortex, request):
     return Graph(store=VortexStore(str(dict_vortex), in_memory=request.param))
 
 
+def _row_key(row):
+    # rdflib's term ordering is not total (NaN literals), so sort on the
+    # N-Triples spellings, which is.
+    return tuple("" if term is None else term.n3() for term in row)
+
+
 def run(graph, sparql):
     """A query's answer in a comparable form: the ASK boolean, or the
     solution rows as a sorted multiset."""
     result = graph.query(sparql)
     if result.type == "ASK":
         return result.askAnswer
-    return sorted(tuple(row) for row in result)
+    return sorted((tuple(row) for row in result), key=_row_key)
 
 
 def both_ways(graph, sparql):
@@ -168,6 +280,15 @@ def test_bgp_only_mode_equals_default_evaluator(graph, monkeypatch, sparql):
     assert bgp_only == without_pushdown
 
 
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_generic_filter_route_equals_default_evaluator(graph, monkeypatch, sparql):
+    """``VORTEX_RDF_FILTER_FAST=0``: every FILTER value goes through rdflib's
+    own expression evaluator, once per distinct value."""
+    monkeypatch.setattr(filters, "_FAST_ENABLED", False)
+    generic, without_pushdown = both_ways(graph, sparql)
+    assert generic == without_pushdown
+
+
 def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
     """A 1-row anchor joined against a 300-row predicate must take the probe
     path under the real threshold, and still produce the right rows."""
@@ -202,7 +323,7 @@ def test_pushdown_is_actually_used(graph, monkeypatch):
     monkeypatch.setattr(pd, "_solve_bgp", lambda *a: calls.append(1) or original(*a))
     register_sparql_pushdown()
     rows = run(graph, "SELECT ?s ?o WHERE { ?s <http://ex.org/name> ?o }")
-    assert len(rows) == 4
+    assert len(rows) == 8
     assert calls, "pushdown hook was not invoked"
 
 
@@ -218,7 +339,7 @@ def test_head_intercepts_the_whole_slice_project_chain(graph, monkeypatch):
     assert heads == ["Slice"]
     heads.clear()
     rows = run(graph, "SELECT ?o WHERE { ?s <http://ex.org/name> ?o }")
-    assert len(rows) == 4
+    assert len(rows) == 8
     assert heads == ["Project"]
 
 
@@ -230,7 +351,7 @@ def test_solutions_are_built_without_context_push(graph, monkeypatch):
     monkeypatch.setattr(QueryContext, "push", lambda self: pushes.append(1) or original(self))
     register_sparql_pushdown()
     rows = run(graph, "SELECT ?s ?o WHERE { ?s <http://ex.org/name> ?o }")
-    assert len(rows) == 4
+    assert len(rows) == 8
     assert not pushes
 
 
@@ -333,3 +454,53 @@ def test_string_fallback_when_code_path_disabled(dict_vortex, monkeypatch):
             ?x <http://ex.org/name> ?n }""",
     )
     assert {row[0] for row in rows} == {Literal("Bob", lang="en"), Literal("Carol")}
+
+
+def test_filter_is_pushed_into_the_pattern_scan(graph, monkeypatch):
+    """A single-variable conjunct restricts the pattern before any row is
+    built, on the fast route: rdflib's evaluator is never consulted."""
+    restrictions = []
+    original = pd._restrict_pattern
+    monkeypatch.setattr(pd, "_restrict_pattern", lambda *a: restrictions.append(1) or original(*a))
+    generic_calls = []
+    original_generic = filters.Conjunct.generic
+    monkeypatch.setattr(
+        filters.Conjunct,
+        "generic",
+        lambda self, b: generic_calls.append(1) or original_generic(self, b),
+    )
+    register_sparql_pushdown()
+    rows = run(graph, "SELECT ?x ?v WHERE { ?x <http://ex.org/score> ?v FILTER(?v > 1) }")
+    assert {row[0] for row in rows} == {URIRef("http://ex.org/erin"), URIRef("http://ex.org/frank")}
+    assert restrictions and not generic_calls
+
+
+def test_values_outside_the_fast_domain_take_the_generic_route(graph, monkeypatch):
+    """``str(?a)`` of a numeric literal is rdflib's normalized lexical form:
+    the fast route defers those values, one call per distinct value."""
+    generic_calls = []
+    original_generic = filters.Conjunct.generic
+    monkeypatch.setattr(
+        filters.Conjunct,
+        "generic",
+        lambda self, b: generic_calls.append(b) or original_generic(self, b),
+    )
+    register_sparql_pushdown()
+    rows = run(graph, 'SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(str(?a) = "42") }')
+    assert {row[0] for row in rows} == {URIRef("http://ex.org/bob"), URIRef("http://ex.org/dave")}
+    assert len(generic_calls) == 5  # one per distinct age code, never per row
+
+
+def test_init_bindings_are_visible_to_filters(graph):
+    sparql = "SELECT ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?x = ?who && ?a > 0) }"
+    init = {"who": URIRef("http://ex.org/bob")}
+    register_sparql_pushdown()
+    with_pushdown = sorted((tuple(r) for r in graph.query(sparql, initBindings=init)), key=_row_key)
+    try:
+        unregister_sparql_pushdown()
+        without_pushdown = sorted(
+            (tuple(r) for r in graph.query(sparql, initBindings=init)), key=_row_key
+        )
+    finally:
+        register_sparql_pushdown()
+    assert with_pushdown == without_pushdown == [(Literal(42),)]
