@@ -17,8 +17,9 @@ Three groups, mirroring how the dashboard panels are organized:
 - ``joins``    — anchored star-2/star-3, an unanchored 2-hop chain, and an
   OPTIONAL: where the BGP evaluation strategy (vortex-rdflib's whole-BGP
   pushdown vs rdflib's per-binding nested loop) dominates.
-- ``features`` — FILTER on a typed range, DISTINCT, ORDER BY + LIMIT, and a
-  full-scan GROUP BY aggregate: rdflib operators layered over the BGP.
+- ``features`` — FILTER on a typed range, a term-kind FILTER (``isIRI``),
+  DISTINCT, ORDER BY + LIMIT, and a full-scan GROUP BY aggregate: rdflib
+  operators layered over the BGP.
 
 ``heavy`` marks queries whose single execution touches the whole dataset (or
 a whole predicate's bindings joined against the store); the harness gives
@@ -232,6 +233,16 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                 SELECT ?s ?v WHERE {{
                   ?s {pf} ?v .
                   FILTER(datatype(?v) = xsd:integer && ?v < {int_cut})
+                }}
+            """),
+        ),
+        Query(
+            "filter-class",
+            "features",
+            _sparql(f"""
+                SELECT ?s ?o WHERE {{
+                  ?s {p1} ?o
+                  FILTER(isIRI(?o))
                 }}
             """),
         ),
