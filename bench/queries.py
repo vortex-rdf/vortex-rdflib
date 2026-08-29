@@ -23,8 +23,9 @@ Three groups, mirroring how the dashboard panels are organized:
   nested loop) dominates.
 - ``features`` — FILTER on a typed range, a term-kind FILTER (``isIRI``),
   DISTINCT over a predicate scan and over the whole store, ORDER BY + LIMIT,
-  and full-scan aggregates (a GROUP BY count, a COUNT(*), a COUNT DISTINCT
-  per group): rdflib operators layered over the BGP.
+  a full ORDER BY of a predicate scan, and full-scan aggregates (a GROUP BY
+  count, a COUNT(*), a COUNT DISTINCT per group): rdflib operators layered
+  over the BGP.
 
 ``heavy`` marks queries whose single execution touches the whole dataset (or
 a whole predicate's bindings joined against the store); the harness gives
@@ -374,6 +375,16 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                 }}
                 ORDER BY DESC(?v)
                 LIMIT 10
+            """),
+        ),
+        Query(
+            "order-var",
+            "features",
+            _sparql(f"""
+                SELECT ?s ?o WHERE {{
+                  ?s {p1} ?o
+                }}
+                ORDER BY ?o
             """),
         ),
         Query(
