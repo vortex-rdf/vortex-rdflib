@@ -28,12 +28,15 @@ What runs in code space:
   and semi-joins over code tuples, with the inner pattern re-probed per
   outer row when the outer relation is small — instead of rdflib
   re-entering the store once per outer solution;
-- ``Project``, ``Distinct`` and ``Slice`` (LIMIT/OFFSET) heads are applied
-  to the code-space relation, and an ``AskQuery`` over one pattern is
-  answered from the row selection alone, so only the projected variables of
-  the rows that are actually consumed are ever decoded — a ``LIMIT 10``
-  decodes a few dozen codes, an ASK none, a ``DISTINCT ?p`` over the whole
-  store only its distinct predicates;
+- ``Project``, ``Distinct``, ``OrderBy`` (on variables) and ``Slice``
+  (LIMIT/OFFSET) heads are applied to the code-space relation, and an
+  ``AskQuery`` over one pattern is answered from the row selection alone, so
+  only the projected variables of the rows that are actually consumed are
+  ever decoded — a ``LIMIT 10`` decodes a few dozen codes, an ASK none, a
+  ``DISTINCT ?p`` over the whole store only its distinct predicates; an
+  ORDER BY ranks each distinct code once (blank nodes and IRIs by code
+  order, literals through rdflib's own comparator) and sorts the code rows,
+  a top-k when a LIMIT follows;
 - ``COUNT`` aggregates (``COUNT(*)``, ``COUNT(?v)``, ``COUNT(DISTINCT ?v)``,
   with or without ``GROUP BY`` variables) are computed over the code
   columns, decoding only the group keys — and a ``COUNT(*)`` over one
@@ -58,6 +61,7 @@ graph patterns only) and ``VORTEX_RDF_FILTER_FAST=0`` routes every FILTER
 value through rdflib's evaluator, for bisecting and A/B measurements.
 """
 
+import heapq
 import os
 from collections import Counter
 from collections.abc import Callable, Iterator
@@ -66,6 +70,7 @@ from itertools import islice
 from typing import Any
 
 from rdflib.plugins.sparql import CUSTOM_EVALS
+from rdflib.plugins.sparql.evalutils import _val
 from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
 
@@ -87,6 +92,7 @@ _HANDLER_NAMES = {
     "Project": "_eval_head",
     "Slice": "_eval_head",
     "Distinct": "_eval_head",
+    "OrderBy": "_eval_head",
     "AggregateJoin": "_eval_aggregate",
     "AskQuery": "_eval_ask",
 }
@@ -178,19 +184,21 @@ class Relation:
 @dataclass(slots=True)
 class _Head:
     block: object
-    pv: tuple
+    pv: tuple | None
     start: int
     stop: int | None
     distinct: bool
+    order: list  # (variable, descending) per ORDER BY condition
 
 
 def _plan_head(part) -> _Head:
-    """Recognize a ``Slice? -> Distinct? -> Project -> block`` head, eagerly.
+    """Recognize a ``Slice? -> Distinct? -> Project -> OrderBy? -> block``
+    head (or a bare ``OrderBy -> block``), eagerly.
 
     Anything else is rdflib's: its evaluator runs the node and re-enters the
     hook for the nodes below.
     """
-    node, start, stop, distinct = part, 0, None, False
+    node, start, stop, distinct, order = part, 0, None, False, []
     if node.name == "Slice":
         start = int(node.start or 0)
         # The key is absent without LIMIT; CompValue then answers None.
@@ -200,12 +208,23 @@ def _plan_head(part) -> _Head:
     if node.name == "Distinct":
         distinct = True
         node = node.p
-    if node.name != "Project":
+    pv = None
+    if node.name == "Project":
+        pv = node.PV
+        pv = (pv,) if isinstance(pv, Variable) else tuple(pv)
+        node = node.p
+    elif distinct or start or stop is not None:
         raise NotImplementedError
-    pv = node.PV
-    pv = (pv,) if isinstance(pv, Variable) else tuple(pv)
-    _check_block(node.p)
-    return _Head(node.p, pv, start, stop, distinct)
+    if node.name == "OrderBy":
+        for condition in node.expr:
+            if not isinstance(condition.expr, Variable):
+                raise NotImplementedError
+            order.append((condition.expr, condition.order == "DESC"))
+        node = node.p
+    if pv is None and not order:
+        raise NotImplementedError
+    _check_block(node)
+    return _Head(node, pv, start, stop, distinct, order)
 
 
 def _check_block(node) -> None:
@@ -267,9 +286,80 @@ def _block_nullable(node) -> frozenset:
 def _eval_head(ctx, store, part):
     head = _plan_head(part)
     rel = _solve_block(ctx, store, head.block)
+    if head.order:
+        # DISTINCT narrows the rows after the sort, so only a plain LIMIT
+        # can stop the sort at the top k.
+        rows = _order_rows(ctx, store, rel, head.order, None if head.distinct else head.stop)
+        rel = Relation(rel.schema, None, rows, len(rows), rel.nullable, rel.foreign)
     if head.distinct:
         return _eval_distinct(ctx, store, rel, head)
     return _yield_solutions(ctx, store, rel, head.pv, head.start, head.stop)
+
+
+def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
+    """The relation's rows in ORDER BY order.
+
+    Each sort variable's distinct codes are ranked once (``_rank_codes``);
+    a row's key is the tuple of its ranks, negated for DESC, so one stable
+    sort reproduces rdflib's chain of stable sorts, and a following LIMIT
+    keeps only the top ``stop`` rows. A variable the block does not bind
+    ties every row, as it does for rdflib.
+    """
+    rows = _rows_of(rel)
+    keys = []
+    for var, descending in order:
+        if var not in rel.schema:
+            continue
+        index = rel.schema.index(var)
+        ranks = _rank_codes(store, rel.foreign, {row[index] for row in rows})
+        keys.append((index, ranks, -1 if descending else 1))
+    if not keys:
+        return rows
+
+    def sort_key(row):
+        return tuple(sign * ranks[row[i]] for i, ranks, sign in keys)
+
+    if stop is not None and stop < len(rows):
+        return heapq.nsmallest(stop, rows, key=sort_key)
+    return sorted(rows, key=sort_key)
+
+
+def _rank_codes(store, foreign: dict, codes) -> dict:
+    """Ranks reproducing rdflib's ORDER BY comparison (``_val``): unbound
+    first, then blank nodes, IRIs and literals. Blank nodes and IRIs order
+    as their spellings, so their codes already are their ranks; literals are
+    decoded and sorted with rdflib's own comparator, adjacent terms that
+    compare equal sharing a rank so the stable sort keeps their input
+    order."""
+    ranks = {None: -1}
+    literal_lo, iri_lo, blank_lo = store._term_kind_bounds()
+    blanks, iris, others = [], [], []
+    by_kind = all(code is None or code >= 0 for code in codes)
+    for code in codes:
+        if code is None:
+            continue
+        if by_kind and code >= blank_lo:
+            blanks.append(code)
+        elif by_kind and code >= iri_lo:
+            iris.append(code)
+        else:
+            others.append(code)
+    rank = 0
+    for code in sorted(blanks) + sorted(iris):
+        ranks[code] = rank
+        rank += 1
+    if others:
+        store._prime_decode_cache([code for code in others if code >= 0])
+        cached = store._decode_cache
+        terms = [(_val(cached[c] if c >= 0 else foreign[c]), c) for c in others]
+        terms.sort(key=lambda item: item[0])
+        previous = None
+        for key, code in terms:
+            if previous is not None and previous < key:
+                rank += 1
+            ranks[code] = rank
+            previous = key
+    return ranks
 
 
 def _eval_distinct(ctx, store, rel: Relation, head: _Head):
@@ -277,10 +367,11 @@ def _eval_distinct(ctx, store, rel: Relation, head: _Head):
     duplicates: code-distinct tuples first, then a term-level pass over the
     survivors (rdflib compares decoded terms, and two spellings of a typed
     literal can be one term), then LIMIT/OFFSET."""
-    keys = tuple(v for v in head.pv if v in rel.schema)
+    pv = head.pv or ()
+    keys = tuple(v for v in pv if v in rel.schema)
     idx = [rel.schema.index(v) for v in keys]
     rows = _term_distinct(store, _code_distinct(rel, idx), rel.foreign)
-    return _yield_rows(ctx, store, keys, rows, rel.foreign, head.pv, head.start, head.stop)
+    return _yield_rows(ctx, store, keys, rows, rel.foreign, pv, head.start, head.stop)
 
 
 def _code_distinct(rel: Relation, idx: list) -> Iterator[tuple]:

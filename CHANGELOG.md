@@ -30,7 +30,7 @@ First standalone release. The rdflib integration previously lived in the
   with single-variable conditions applied to the pattern scans before the
   join; `OPTIONAL`, `MINUS`, `FILTER (NOT) EXISTS` and nested groups run as
   hash left joins, anti-joins, semi-joins and joins over code tuples; the
-  projection, `DISTINCT`,
+  projection, `DISTINCT`, `ORDER BY` on variables,
   `LIMIT`/`OFFSET`, `ASK` and `COUNT` aggregates (with or without
   `GROUP BY`) above a block are answered on the same code-space result, and
   solutions are decoded lazily in chunks, only for the rows and variables
@@ -40,6 +40,6 @@ First standalone release. The rdflib integration previously lived in the
   `VORTEX_RDF_FILTER_FAST=0`.
 - Benchmark: a "pushdown off" row and nine operator-shaped queries
   (`ask-var`, `limit-scan`, `filter-class`, `distinct-p`, `count-all`,
-  `count-distinct`, `optional-wide`, `not-exists`, `minus`) on the
-  dashboard.
+  `count-distinct`, `optional-wide`, `not-exists`, `minus`, `order-var`)
+  on the dashboard.
 - `py.typed` marker.

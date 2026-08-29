@@ -387,6 +387,50 @@ QUERIES = [
     "ASK { ?x <http://ex.org/name> ?n FILTER NOT EXISTS { ?x <http://ex.org/age> ?a } }",
     """SELECT (COUNT(*) AS ?c) WHERE { ?x <http://ex.org/name> ?n
         FILTER NOT EXISTS { ?x <http://ex.org/age> ?a } }""",
+    # --- ORDER BY (as multisets here; ORDER_QUERIES below compares the sequences)
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a",
+    "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY DESC(?n)",
+    "SELECT ?s ?p ?o WHERE { ?s ?p ?o FILTER(?o = ?o) } ORDER BY ?o",
+    "SELECT ?x ?s WHERE { ?x <http://ex.org/score> ?s FILTER(?s = ?s) } ORDER BY ?s",
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a LIMIT 2",
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY DESC(?a) OFFSET 1 LIMIT 2",
+    "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a",
+    "SELECT DISTINCT ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY ?n LIMIT 3",
+    """SELECT ?x ?a WHERE { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }
+        ORDER BY ?a""",
+    "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY str(?n)",
+    "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY ?zzz ?n",
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a > 0) } ORDER BY DESC(?a)",
+    "SELECT * WHERE { ?s ?p ?o } ORDER BY ?p ?s LIMIT 5",
+    """SELECT ?x ?a WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/gina> }
+        ?x <http://ex.org/age> ?a } ORDER BY ?a""",
+]
+
+#: ORDER BY queries whose order is total (every tie broken by a unique variable),
+#: compared as sequences: the pushdown must sort exactly as rdflib does. The
+#: NaN score is kept out of sorted columns (`?o = ?o`): rdflib's comparator
+#: raises decimal.InvalidOperation on a NaN double against a decimal.
+ORDER_QUERIES = [
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a ?x",
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY DESC(?a) ?x",
+    "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY ?n ?x",
+    "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY DESC(?n) DESC(?x)",
+    "SELECT ?s ?p ?o WHERE { ?s ?p ?o FILTER(?o = ?o) } ORDER BY ?o ?s ?p",
+    "SELECT ?s ?p ?o WHERE { ?s ?p ?o FILTER(?o = ?o) } ORDER BY DESC(?s) ?p ?o",
+    "SELECT ?s ?p ?o WHERE { ?s ?p ?o FILTER(?o = ?o) } ORDER BY ?p DESC(?o) ?s",
+    """SELECT ?x ?a WHERE { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }
+        ORDER BY ?a ?x""",
+    """SELECT ?x ?a WHERE { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }
+        ORDER BY DESC(?a) ?x""",
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a ?x LIMIT 2",
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a ?x OFFSET 1 LIMIT 3",
+    "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a",
+    "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY DESC(?a) LIMIT 2",
+    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a > 0) } ORDER BY DESC(?a) ?x",
+    "SELECT ?x ?s WHERE { ?x <http://ex.org/score> ?s FILTER(?s = ?s) } ORDER BY ?s ?x",
+    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p ORDER BY ?p",
+    "SELECT ?x ?y WHERE { ?x <http://ex.org/knows> ?y } ORDER BY ?y ?x",
+    "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY ?zzz ?n ?x",
 ]
 
 
@@ -422,13 +466,18 @@ def run(graph, sparql):
     return sorted((tuple(row) for row in result), key=_row_key)
 
 
-def both_ways(graph, sparql):
+def run_ordered(graph, sparql):
+    """The solution rows in the order the query produced them."""
+    return [tuple(row) for row in graph.query(sparql)]
+
+
+def both_ways(graph, sparql, runner=run):
     """The answer with the pushdown and under rdflib's default evaluator."""
     register_sparql_pushdown()
-    with_pushdown = run(graph, sparql)
+    with_pushdown = runner(graph, sparql)
     try:
         unregister_sparql_pushdown()
-        without_pushdown = run(graph, sparql)
+        without_pushdown = runner(graph, sparql)
     finally:
         register_sparql_pushdown()
     return with_pushdown, without_pushdown
@@ -437,6 +486,12 @@ def both_ways(graph, sparql):
 @pytest.mark.parametrize("sparql", QUERIES)
 def test_pushdown_equals_default_evaluator(graph, sparql):
     with_pushdown, without_pushdown = both_ways(graph, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", ORDER_QUERIES)
+def test_order_by_sequence_equals_default_evaluator(graph, sparql):
+    with_pushdown, without_pushdown = both_ways(graph, sparql, run_ordered)
     assert with_pushdown == without_pushdown
 
 
@@ -828,3 +883,21 @@ def test_exists_is_a_semi_join_in_code_space(graph, monkeypatch):
             FILTER EXISTS { ?x <http://ex.org/score> ?s FILTER(?s > ?a) } }""",
     )
     assert rows == [(URIRef("http://ex.org/frank"),)] and generic_calls
+
+
+def test_order_by_is_a_rank_sort_in_code_space(graph, monkeypatch):
+    ordered = []
+    original = pd._order_rows
+    monkeypatch.setattr(pd, "_order_rows", lambda *a: ordered.append(a[4]) or original(*a))
+    register_sparql_pushdown()
+    rows = run_ordered(
+        graph, "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a ?x LIMIT 2"
+    )
+    assert [row[1].toPython() for row in rows] == [-3, 7]  # the 7 is an xsd:byte
+    assert ordered == [2]  # the LIMIT bounds the sort to the top 2
+    ordered.clear()
+    rows = run_ordered(
+        graph, "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a LIMIT 2"
+    )
+    assert [row[0].toPython() for row in rows] == [-3, 7]
+    assert ordered == [None]  # DISTINCT narrows after the sort: no top-k

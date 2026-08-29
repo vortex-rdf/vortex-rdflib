@@ -84,9 +84,11 @@ single-variable conditions applied to the pattern scans before the join.
 run as hash left joins, anti-joins, semi-joins and joins over the same code
 tuples (an inner pattern is re-probed per outer row when the outer side is
 small), instead of rdflib re-entering the store once per outer solution. The
-projection, `DISTINCT`, `LIMIT`/`OFFSET`, `ASK` and `COUNT` aggregates
-(`COUNT(*)`, `COUNT(?v)`, `COUNT(DISTINCT ?v)`, with or without `GROUP BY`)
-above a pattern are answered on the same code-space result, and solutions are
+projection, `DISTINCT`, `ORDER BY` on variables, `LIMIT`/`OFFSET`, `ASK` and
+`COUNT` aggregates (`COUNT(*)`, `COUNT(?v)`, `COUNT(DISTINCT ?v)`, with or
+without `GROUP BY`) above a pattern are answered on the same code-space
+result (an ORDER BY ranks each distinct value once, a following LIMIT keeps
+only the top rows), and solutions are
 decoded lazily in chunks — a `LIMIT 10` decodes a few dozen codes, an ASK or a
 `COUNT(*)` over one pattern none at all, a `DISTINCT ?p` over the whole store
 only its distinct predicates.
