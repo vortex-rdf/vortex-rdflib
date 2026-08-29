@@ -1,13 +1,10 @@
-name: CodSpeed Benchmarks
+name: CodSpeed
 
-# Instrumented benchmarks for the vortex variants, uploaded to CodSpeed so
+# Instrumented benchmarks (bench/test_codspeed.py), uploaded to CodSpeed so
 # every commit carries deterministic instruction counts. The comparative
-# wall-clock benchmark (bench/run_bench.py) is a different job entirely —
-# it feeds the Pages dashboard from bench-dashboard.yml and is never
-# uploaded here.
-#
-# Requires a CodSpeed project connected to this repository; the runner
-# authenticates over OIDC, so there is no token to store.
+# wall-clock benchmark (bench/run_bench.py) is a different job entirely: it
+# feeds the Pages dashboard from bench-dashboard.yml and is never uploaded
+# here.
 
 on:
   push:
@@ -19,40 +16,49 @@ on:
       - '**.md'
       - 'LICENSE'
       - '.gitignore'
+  # Required to get a performance report on every pull request.
   pull_request:
     paths-ignore:
       - '**.md'
       - 'LICENSE'
       - '.gitignore'
+  # Lets CodSpeed trigger a backtest run to seed the baseline.
   workflow_dispatch:
 
 permissions:
-  contents: read # required for actions/checkout
-  id-token: write # required for OIDC authentication with CodSpeed
+  contents: read
+  # OpenID Connect authentication with CodSpeed — no token to store.
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   benchmarks:
-    name: Run Python benchmarks
+    name: Run benchmarks
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          # Pinned: instruction counts are only comparable across commits
+          # when the interpreter is the same, so the runner image's default
+          # Python must not get to decide it.
+          python-version: "3.13"
 
-      # No Rust toolchain: this package is pure Python and the native layer
-      # arrives as a prebuilt vortex-rdf wheel. `uv sync --locked` installs
-      # the dev group, which carries pytest-codspeed; the bench group's
-      # third-party contenders are deliberately not needed here.
+      # No Rust toolchain: the native layer arrives as a prebuilt vortex-rdf
+      # wheel. The default groups are enough — pytest-codspeed lives in
+      # `dev`, and the suite never touches the `bench` group's contenders.
       - name: Install
         run: uv sync --locked
 
       # simulation = instruction counting under Valgrind, the same mode the
-      # vortex-rdf suites use, so the Python rows are read alongside them.
-      - name: Run the benchmarks
+      # vortex-rdf suites use, so these rows are read alongside them.
+      - name: Run benchmarks
         uses: CodSpeedHQ/action@v5
         with:
           mode: simulation

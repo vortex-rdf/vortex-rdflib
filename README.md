@@ -1,6 +1,7 @@
 # vortex-rdflib
 
 [![CI](https://github.com/vortex-rdf/vortex-rdflib/actions/workflows/ci.yml/badge.svg)](https://github.com/vortex-rdf/vortex-rdflib/actions/workflows/ci.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/vortex-rdf/vortex-rdflib?utm_source=badge)
 [![PyPI](https://img.shields.io/pypi/v/vortex-rdflib.svg)](https://pypi.org/project/vortex-rdflib/)
 [![Python versions](https://img.shields.io/pypi/pyversions/vortex-rdflib.svg)](https://pypi.org/project/vortex-rdflib/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -162,22 +163,33 @@ scripts/refresh.sh --only render        # template-only edits: no re-measurement
 The dashboard answers "how does this compare?"; it cannot answer "did this
 commit make things slower?", because wall-clock numbers from a shared CI
 runner move on their own. `bench/test_codspeed.py` covers that: the **same**
-dataset generator and the **same** twelve queries, run against the six vortex
-variants only, under `pytest --codspeed` in instrumentation mode so every
-task gets a deterministic instruction count. It runs on every push and PR
-(`.github/workflows/codspeed.yml`) and needs no third-party contenders.
+dataset generator and the **same** twelve queries, measured per commit under
+CodSpeed's CPU simulation so every task gets a deterministic instruction
+count. Every pull request gets a report at
+<https://app.codspeed.io/vortex-rdf/vortex-rdflib>, so a change that costs
+instructions is visible before it lands.
 
-Other libraries are deliberately absent: their instruction counts move when
-*they* release, which is not a signal this repo can act on.
+Only the vortex variants are measured: another library's instruction count
+moves when *it* releases, which is not a signal this repo can act on. And
+since instruction counts are deterministic, the suite does not run the full
+configurations × queries cross product; the whole query set runs on the
+primary configuration (Dictionary layout, in-memory, BGP pushdown on) and
+each other axis is isolated on the queries where it can move the number —
+the BGP-pushdown A/B on the join queries, file-backed opens and secondary
+indexes on the lookups they target, the `Store.triples()` service per pattern
+selectivity, the u32 code path against the N-Triples string fallback, and
+each residency's open cost.
+
+The suite is not part of `uv run pytest` (which runs `tests/` only); run it
+explicitly. 32,768 triples by default — small enough for Valgrind, and the
+size the vortex-rdf Rust and JS suites share, so a shared-core regression
+lands in every tab at comparable magnitude — override with
+`CODSPEED_BENCH_TRIPLES`:
 
 ```bash
-uv run pytest bench/test_codspeed.py --codspeed   # walltime mode locally
+uv run pytest bench/test_codspeed.py --codspeed   # wall-clock, no instrumentation
 CODSPEED_BENCH_TRIPLES=5000 uv run pytest bench/test_codspeed.py --codspeed
 ```
-
-The default scale is 32,768 triples — small enough for Valgrind, and the size
-the vortex-rdf Rust and JS suites share, so a shared-core regression lands in
-every tab at comparable magnitude.
 
 ## Development
 
