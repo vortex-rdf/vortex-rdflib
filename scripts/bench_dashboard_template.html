@@ -410,7 +410,7 @@ const GROUP_META = {
   },
   joins: {
     tag: "Joins",
-    note: "Anchored 2- and 3-leg subject stars, an unanchored 2-hop chain (heavy: one whole predicate's bindings joined against the store), and the star with an OPTIONAL leg.",
+    note: "Anchored 2- and 3-leg subject stars, an unanchored 2-hop chain (heavy: one whole predicate's bindings joined against the store), the star with an OPTIONAL leg, a wide OPTIONAL (a whole predicate scan as the outer side), and a MINUS over the filtered range (heavy: rdflib's MINUS is quadratic).",
   },
   features: {
     tag: "SPARQL features",

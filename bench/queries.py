@@ -14,9 +14,12 @@ Three groups, mirroring how the dashboard panels are organized:
   predicate scan): what a store's raw ``triples()`` service costs; plus an
   ASK over a variable pattern and a ``LIMIT 10`` over the whole store, the
   two heads a store can answer without decoding a term.
-- ``joins``    — anchored star-2/star-3, an unanchored 2-hop chain, and an
-  OPTIONAL: where the BGP evaluation strategy (vortex-rdflib's whole-BGP
-  pushdown vs rdflib's per-binding nested loop) dominates.
+- ``joins``    — anchored star-2/star-3, an unanchored 2-hop chain, an
+  anchored OPTIONAL, a wide OPTIONAL (a whole predicate scan as the outer
+  side) and a MINUS of the filtered range against an object-kind filtered
+  scan (heavy: rdflib's own MINUS is quadratic): where the join
+  strategy (vortex-rdflib's code-space joins vs rdflib's per-binding
+  nested loop) dominates.
 - ``features`` — FILTER on a typed range, a term-kind FILTER (``isIRI``),
   DISTINCT over a predicate scan and over the whole store, ORDER BY + LIMIT,
   and full-scan aggregates (a GROUP BY count, a COUNT(*), a COUNT DISTINCT
@@ -77,6 +80,51 @@ def _chain_predicates(cfg: DatasetConfig, m: Moduli) -> tuple[int, int]:
     return 0, max(counts, key=lambda p: counts[p])
 
 
+def _partner_predicate(cfg: DatasetConfig, m: Moduli, subjects: set[int], exclude: int) -> int:
+    """A predicate carried by roughly half of ``subjects`` — so a join of
+    those subjects' rows against it has matched *and* unmatched rows by
+    construction (OPTIONAL pads, MINUS and NOT EXISTS remove).
+
+    Subject ``j`` carries predicates ``(j + k * n_subj) mod n_pred`` for the
+    rows ``j + k * n_subj < n``; the walk counts them per predicate and picks
+    the one (other than ``exclude``) closest to half, strictly between none
+    and all.
+    """
+    counts: dict[int, int] = {}
+    for j in subjects:
+        for i in range(j, cfg.n, m.n_subj):
+            p = i % m.n_pred
+            counts[p] = counts.get(p, 0) + 1
+    total = len(subjects)
+    candidates = [p for p, c in counts.items() if p != exclude and 0 < c < total]
+    if not candidates:
+        raise ValueError("no predicate splits the subjects — dataset too small or ratios off")
+    return min(candidates, key=lambda p: abs(counts[p] - total / 2))
+
+
+def _object_split_predicate(cfg: DatasetConfig, m: Moduli, subjects: set[int], exclude: int) -> int:
+    """A predicate every one of ``subjects`` carries whose objects are IRIs for
+    some of them and literals for the others — so ``MINUS { ?s <q> ?x
+    FILTER(isIRI(?x)) }`` removes a proper subset by construction.
+
+    The filter-range subjects all come from the first block of rows
+    (``k = 0``), so they share one residue class modulo ``n_pred`` and
+    carry the same predicates; a predicate cannot split them, an object
+    kind can (the object index runs with the row index).
+    """
+    literal_cut = round(cfg.literal_frac * 10)
+    per_pred: dict[int, list[bool]] = {}
+    for j in subjects:
+        for i in range(j, cfg.n, m.n_subj):
+            per_pred.setdefault(i % m.n_pred, []).append((i % m.n_obj) % 10 >= literal_cut)
+    total = len(subjects)
+    for p in sorted(per_pred):
+        kinds = per_pred[p]
+        if p != exclude and len(kinds) == total and 0 < sum(kinds) < total:
+            return p
+    raise ValueError("no predicate splits the subjects by object kind — dataset too small")
+
+
 def _filter_predicate(cfg: DatasetConfig, m: Moduli) -> tuple[int, int]:
     """Pick the predicate for the numeric FILTER/ORDER BY queries, plus a
     threshold selecting roughly an eighth of its integer bindings.
@@ -122,6 +170,22 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
 
     filter_p, int_cut = _filter_predicate(cfg, m)
     pf = f"<{predicate_iri(filter_p)}>"
+
+    # Subjects of the p1 scan, and of the filter-range rows: the outer sides
+    # of the OPTIONAL and MINUS shapes, paired with a predicate half of them carry.
+    p1_subjects = {i % m.n_subj for i in range(1, cfg.n, m.n_pred)}
+    q_opt = f"<{predicate_iri(_partner_predicate(cfg, m, p1_subjects, exclude=1))}>"
+    filter_subjects = {
+        i % m.n_subj
+        for i in range(cfg.n)
+        if i % m.n_pred == filter_p
+        and (i % m.n_obj) % 10 < literal_cut
+        and (i % m.n_obj) % 3 == 0
+        and (i % m.n_obj) < int_cut
+    }
+    q_minus = (
+        f"<{predicate_iri(_object_split_predicate(cfg, m, filter_subjects, exclude=filter_p))}>"
+    )
 
     return [
         Query(
@@ -225,6 +289,36 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                   }}
                 }}
             """),
+        ),
+        Query(
+            "optional-wide",
+            "joins",
+            _sparql(f"""
+                SELECT ?s ?o ?x WHERE {{
+                  ?s {p1} ?o
+                  OPTIONAL {{
+                    ?s {q_opt} ?x
+                  }}
+                }}
+            """),
+        ),
+        Query(
+            "minus",
+            "joins",
+            _sparql(f"""
+                {XSD_PREFIX}
+                SELECT ?s ?v WHERE {{
+                  {{
+                    ?s {pf} ?v .
+                    FILTER(datatype(?v) = xsd:integer && ?v < {int_cut})
+                  }}
+                  MINUS {{
+                    ?s {q_minus} ?x
+                    FILTER(isIRI(?x))
+                  }}
+                }}
+            """),
+            heavy=True,
         ),
         Query(
             "filter-range",
