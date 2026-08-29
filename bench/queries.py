@@ -18,8 +18,9 @@ Three groups, mirroring how the dashboard panels are organized:
   OPTIONAL: where the BGP evaluation strategy (vortex-rdflib's whole-BGP
   pushdown vs rdflib's per-binding nested loop) dominates.
 - ``features`` — FILTER on a typed range, a term-kind FILTER (``isIRI``),
-  DISTINCT, ORDER BY + LIMIT, and a full-scan GROUP BY aggregate: rdflib
-  operators layered over the BGP.
+  DISTINCT over a predicate scan and over the whole store, ORDER BY + LIMIT,
+  and full-scan aggregates (a GROUP BY count, a COUNT(*), a COUNT DISTINCT
+  per group): rdflib operators layered over the BGP.
 
 ``heavy`` marks queries whose single execution touches the whole dataset (or
 a whole predicate's bindings joined against the store); the harness gives
@@ -273,6 +274,37 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
             "features",
             _sparql("""
                 SELECT ?p (COUNT(*) AS ?n) WHERE {
+                  ?s ?p ?o
+                }
+                GROUP BY ?p
+            """),
+            heavy=True,
+        ),
+        Query(
+            "distinct-p",
+            "features",
+            _sparql("""
+                SELECT DISTINCT ?p WHERE {
+                  ?s ?p ?o
+                }
+            """),
+            heavy=True,
+        ),
+        Query(
+            "count-all",
+            "features",
+            _sparql("""
+                SELECT (COUNT(*) AS ?n) WHERE {
+                  ?s ?p ?o
+                }
+            """),
+            heavy=True,
+        ),
+        Query(
+            "count-distinct",
+            "features",
+            _sparql("""
+                SELECT ?p (COUNT(DISTINCT ?o) AS ?n) WHERE {
                   ?s ?p ?o
                 }
                 GROUP BY ?p
