@@ -1,6 +1,7 @@
 # vortex-rdflib
 
 [![CI](https://github.com/vortex-rdf/vortex-rdflib/actions/workflows/ci.yml/badge.svg)](https://github.com/vortex-rdf/vortex-rdflib/actions/workflows/ci.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/vortex-rdf/vortex-rdflib?utm_source=badge)
 [![PyPI](https://img.shields.io/pypi/v/vortex-rdflib.svg)](https://pypi.org/project/vortex-rdflib/)
 [![Python versions](https://img.shields.io/pypi/pyversions/vortex-rdflib.svg)](https://pypi.org/project/vortex-rdflib/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -116,6 +117,24 @@ Run it locally (defaults to the full 250k-triple CI scale; scale down with
 uv sync --group bench
 BENCH_TRIPLES=20000 uv run python -m bench.run_bench --out bench/results.json
 uv run python scripts/render_bench_dashboard.py bench/results.json public/index.html
+```
+
+### Regression tracking (CodSpeed)
+
+`benchmarks/` is a second, complementary suite: same dataset generator and
+same SPARQL set, but measured per-commit under CodSpeed's CPU simulation
+instead of compared against other stores. Every pull request gets a report at
+<https://app.codspeed.io/vortex-rdf/vortex-rdflib>, so a change that costs
+instructions is visible before it lands. It covers `triples()` across pattern
+selectivities, the full query set, the BGP-pushdown A/B, the code path versus
+the N-Triples string fallback, and file-backed versus in-memory opens.
+
+The suite is not part of `uv run pytest` (which runs `tests/` only); run it
+explicitly — 20k triples by default, override with `CODSPEED_BENCH_TRIPLES`:
+
+```bash
+uv run pytest benchmarks --codspeed          # wall-clock, no instrumentation
+codspeed run --mode simulation -- uv run pytest benchmarks --codspeed
 ```
 
 ## Development
