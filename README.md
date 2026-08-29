@@ -54,7 +54,7 @@ serialize_rdf("data.nt", "data.vortex", layout="dictionary")
 
 `layout` accepts `"default"`, `"typed-object"` and `"dictionary"`; opening
 auto-detects the layout. The `"dictionary"` layout is the fastest to query
-from Python — it enables the code path and BGP pushdown described below.
+from Python — it enables the code path and SPARQL pushdown described below.
 
 ## How it stays fast
 
@@ -68,12 +68,14 @@ store's lifetime. Fully-ground patterns (existence checks) are answered by
 N-Triples string columns (`match_columns`), parsing each distinct term once.
 Set `VORTEX_RDF_DISABLE_CODE_PATH=1` to force the string path.
 
-**SPARQL BGP pushdown.** Constructing a `VortexStore` registers an rdflib
+**SPARQL pushdown.** Constructing a `VortexStore` registers an rdflib
 `CUSTOM_EVALS` hook that evaluates whole basic graph patterns in one pass:
 each triple pattern is matched natively once and the join runs as hash joins
 over `u32` codes, decoding terms only for the final solutions. This replaces
 rdflib's default nested-loop evaluation (one `triples()` call per candidate
-binding).
+binding). The projection, `LIMIT`/`OFFSET` and `ASK` above a pattern are
+answered on the same code-space result, and solutions are decoded lazily in
+chunks, so a `LIMIT 10` decodes a few dozen codes and an ASK none.
 
 The gain is concentrated where that nested loop degenerates: unanchored joins
 such as a two-hop chain (`?s ?pa ?m . ?m ?pb ?o`), where rdflib would
@@ -85,11 +87,13 @@ figures are on the [benchmark
 dashboard](https://vortex-rdf.github.io/vortex-rdflib/).
 
 The hook only fires for VortexStore graphs with the code path available and
-falls back to the default evaluator otherwise (other stores, RDF-star
-patterns, non-BGP algebra). Set `VORTEX_RDF_DISABLE_PUSHDOWN=1` to keep the
-default evaluator; that switch is what the equivalence tests use as their
-oracle, and re-running the benchmark with it set measures the pushdown's own
-contribution.
+falls back node by node otherwise: an unsupported construct (another store,
+RDF-star patterns, algebra the hook does not handle) is evaluated by rdflib,
+which re-enters the hook for the supported subtrees below it. Set
+`VORTEX_RDF_DISABLE_PUSHDOWN=1` to keep the default evaluator for everything;
+that switch is what the equivalence tests use as their oracle, and the
+dashboard's "pushdown off" row runs with it so the pushdown's own
+contribution is visible.
 
 **File-backed vs in-memory.** The default open is lazy and file-backed.
 `VortexStore(path, in_memory=True)` (or env `VORTEX_RDF_IN_MEMORY=1`) loads
@@ -118,7 +122,8 @@ fits the residency budget; pass `VortexStore(path, max_resident_bytes=...)`
 | --- | --- |
 | `VORTEX_RDF_IN_MEMORY=1` | Load stores into memory instead of file-backed lazy open |
 | `VORTEX_RDF_DISABLE_CODE_PATH=1` | Force the N-Triples string path instead of `u32` codes |
-| `VORTEX_RDF_DISABLE_PUSHDOWN=1` | Keep rdflib's default BGP evaluator |
+| `VORTEX_RDF_DISABLE_PUSHDOWN=1` | Keep rdflib's default evaluator for every operator |
+| `VORTEX_RDF_PUSHDOWN_OPS=<list>` | Only push down the listed algebra nodes (`bgp` = basic graph patterns only) |
 | `VORTEX_RDF_TRACE_TRIPLES=1` | Print every `triples()` pattern (debugging) |
 
 ## Benchmarks
@@ -163,7 +168,7 @@ scripts/refresh.sh --only render        # template-only edits: no re-measurement
 The dashboard answers "how does this compare?"; it cannot answer "did this
 commit make things slower?", because wall-clock numbers from a shared CI
 runner move on their own. `bench/test_codspeed.py` covers that: the **same**
-dataset generator and the **same** twelve queries, measured per commit under
+dataset generator and the **same** query set, measured per commit under
 CodSpeed's CPU simulation so every task gets a deterministic instruction
 count. Every pull request gets a report at
 <https://app.codspeed.io/vortex-rdf/vortex-rdflib>, so a change that costs

@@ -23,8 +23,12 @@ First standalone release. The rdflib integration previously lived in the
 - Dictionary-layout code path: matched rows arrive as zero-copy `u32`
   term-code columns and each distinct code is decoded to an rdflib term once,
   with a string-table fallback for other layouts.
-- SPARQL BGP pushdown: whole basic graph patterns are evaluated in one pass
-  as hash joins over `u32` term codes, with terms decoded only for final
-  solutions. Registered automatically; disable with
-  `VORTEX_RDF_DISABLE_PUSHDOWN=1`.
+- SPARQL pushdown: whole basic graph patterns are evaluated in one pass as
+  hash joins over `u32` term codes; the projection, `LIMIT`/`OFFSET` and
+  `ASK` above a pattern are answered on the same code-space result, and
+  solutions are decoded lazily in chunks, only for the rows and variables
+  actually consumed. Registered automatically; disable with
+  `VORTEX_RDF_DISABLE_PUSHDOWN=1`, narrow with `VORTEX_RDF_PUSHDOWN_OPS`.
+- Benchmark: a "pushdown off" row and two head-shaped queries (`ask-var`,
+  `limit-scan`) on the dashboard.
 - `py.typed` marker.
