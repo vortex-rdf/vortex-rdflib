@@ -16,8 +16,9 @@ Three groups, mirroring how the dashboard panels are organized:
   two heads a store can answer without decoding a term.
 - ``joins``    — anchored star-2/star-3, an unanchored 2-hop chain, an
   anchored OPTIONAL, a wide OPTIONAL (a whole predicate scan as the outer
-  side) and a MINUS of the filtered range against an object-kind filtered
-  scan (heavy: rdflib's own MINUS is quadratic): where the join
+  side), a NOT EXISTS over the same scan, and a MINUS of the filtered range
+  against an object-kind filtered scan (heavy: rdflib's own MINUS is
+  quadratic): where the join
   strategy (vortex-rdflib's code-space joins vs rdflib's per-binding
   nested loop) dominates.
 - ``features`` — FILTER on a typed range, a term-kind FILTER (``isIRI``),
@@ -297,6 +298,18 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                 SELECT ?s ?o ?x WHERE {{
                   ?s {p1} ?o
                   OPTIONAL {{
+                    ?s {q_opt} ?x
+                  }}
+                }}
+            """),
+        ),
+        Query(
+            "not-exists",
+            "joins",
+            _sparql(f"""
+                SELECT ?s ?o WHERE {{
+                  ?s {p1} ?o
+                  FILTER NOT EXISTS {{
                     ?s {q_opt} ?x
                   }}
                 }}
