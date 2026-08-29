@@ -249,6 +249,11 @@
       Median wall-clock time to execute <em>and fully consume</em> each query.
       <b>Green</b> marks the fastest store in each column; the grey multiplier is the slowdown
       vs that column's best.
+      <b>rdflib-hdt</b>'s own <span class="mono">optimize_sparql()</span> fast path is switched
+      off: it answers two of these joins wrongly — <span class="mono">chain-2</span> with 26 rows
+      and <span class="mono">optional</span> with 152, against the 18 and 1 that rdflib and
+      rdflib-hdt itself return without it. That row therefore runs on rdflib's engine, as every
+      other row does.
     </p>
     <div class="panel-grid" id="query-panels"></div>
   </section>
@@ -401,7 +406,7 @@ renderMatrixPanel(document.getElementById("load-panels"), {
 const GROUP_META = {
   lookups: {
     tag: "Lookups & scans",
-    note: "Single-pattern shapes: a fully-bound ASK, a bound predicate+object lookup, a bound-object scan, and a full predicate scan.",
+    note: "Single-pattern shapes: a fully-bound ASK, a bound predicate+object lookup, a bound-object scan, a full predicate scan, an ASK over a variable pattern, and a LIMIT 10 over the whole store.",
   },
   joins: {
     tag: "Joins",

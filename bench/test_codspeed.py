@@ -1,7 +1,7 @@
 """CodSpeed benchmark suite — vortex variants only.
 
 The instrumented counterpart of ``run_bench.py``. Both drive the *same*
-dataset generator (``bench.dataset``) and the *same* twelve SPARQL queries
+dataset generator (``bench.dataset``) and the *same* SPARQL query set
 (``bench.queries``) that the dashboard reports, so a task here and a column
 there ask the store the same question. What differs is the axis of comparison
 and how the answer is measured:

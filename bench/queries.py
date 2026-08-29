@@ -11,7 +11,9 @@ of them, not a benchmarking detail.
 Three groups, mirroring how the dashboard panels are organized:
 
 - ``lookups``  — single-pattern selectivity shapes (ASK, bound PO, bound O,
-  predicate scan): what a store's raw ``triples()`` service costs.
+  predicate scan): what a store's raw ``triples()`` service costs; plus an
+  ASK over a variable pattern and a ``LIMIT 10`` over the whole store, the
+  two heads a store can answer without decoding a term.
 - ``joins``    — anchored star-2/star-3, an unanchored 2-hop chain, and an
   OPTIONAL: where the BGP evaluation strategy (vortex-rdflib's whole-BGP
   pushdown vs rdflib's per-binding nested loop) dominates.
@@ -155,6 +157,26 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                 SELECT ?s ?o WHERE {{
                   ?s {p1} ?o
                 }}
+            """),
+        ),
+        Query(
+            "ask-var",
+            "lookups",
+            _sparql(f"""
+                ASK {{
+                  ?s {p1} ?o
+                }}
+            """),
+            is_ask=True,
+        ),
+        Query(
+            "limit-scan",
+            "lookups",
+            _sparql("""
+                SELECT * WHERE {
+                  ?s ?p ?o
+                }
+                LIMIT 10
             """),
         ),
         Query(

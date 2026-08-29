@@ -15,10 +15,11 @@ serving triple patterns is the only variable. A store's own evaluator is
 deliberately out of scope — it skips rdflib's parse and algebra entirely,
 which dominates the cheap queries, so its rows would not be comparable with
 the rest and would capture the "fastest" marker on most columns.
-For vortex adapters with a resident dictionary, rdflib's engine hands whole
-BGPs to this package's code-space pushdown. To measure the pushdown's own
-contribution, re-run with ``VORTEX_RDF_DISABLE_PUSHDOWN=1`` in the
-environment and compare against the same adapter's rows.
+For vortex adapters with a resident dictionary, rdflib's engine hands the
+algebra nodes this package understands to its code-space pushdown. The
+``pushdown off`` row runs the primary configuration with
+``VORTEX_RDF_DISABLE_PUSHDOWN=1``, so the pushdown's own contribution is the
+difference between two rows of the same store.
 
 The Vortex rows are all Dictionary layout — the layout that enables the term
 code path and so the only one worth tuning — crossed over the two axes that
@@ -155,6 +156,13 @@ ADAPTERS: list[Adapter] = [
         "vortex-rdflib (dict · in-mem · by-reference)",
         "rdflib",
         _make_vortex("ref", in_memory=True, indexes=BY_REFERENCE),
+    ),
+    Adapter(
+        "vortex_dict_mem_nopushdown",
+        "vortex-rdflib (dict · in-mem · pushdown off)",
+        "rdflib",
+        _make_vortex("noidx", in_memory=True),
+        env={"VORTEX_RDF_DISABLE_PUSHDOWN": "1"},
     ),
     Adapter(
         "vortex_dict_file",
