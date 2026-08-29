@@ -1,0 +1,59 @@
+name: CodSpeed Benchmarks
+
+# Instrumented benchmarks for the vortex variants, uploaded to CodSpeed so
+# every commit carries deterministic instruction counts. The comparative
+# wall-clock benchmark (bench/run_bench.py) is a different job entirely —
+# it feeds the Pages dashboard from bench-dashboard.yml and is never
+# uploaded here.
+#
+# Requires a CodSpeed project connected to this repository; the runner
+# authenticates over OIDC, so there is no token to store.
+
+on:
+  push:
+    branches:
+      - main
+    # Doc-only changes move no instruction counts; workflow_dispatch stays as
+    # the escape hatch since path filters never apply to it.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: read # required for actions/checkout
+  id-token: write # required for OIDC authentication with CodSpeed
+
+jobs:
+  benchmarks:
+    name: Run Python benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # No Rust toolchain: this package is pure Python and the native layer
+      # arrives as a prebuilt vortex-rdf wheel. `uv sync --locked` installs
+      # the dev group, which carries pytest-codspeed; the bench group's
+      # third-party contenders are deliberately not needed here.
+      - name: Install
+        run: uv sync --locked
+
+      # simulation = instruction counting under Valgrind, the same mode the
+      # vortex-rdf suites use, so the Python rows are read alongside them.
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation
+          run: uv run pytest bench/test_codspeed.py --codspeed

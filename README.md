@@ -157,6 +157,28 @@ BENCH_TRIPLES=20000 scripts/refresh.sh  # scale down
 scripts/refresh.sh --only render        # template-only edits: no re-measurement
 ```
 
+### Regression tracking (CodSpeed)
+
+The dashboard answers "how does this compare?"; it cannot answer "did this
+commit make things slower?", because wall-clock numbers from a shared CI
+runner move on their own. `bench/test_codspeed.py` covers that: the **same**
+dataset generator and the **same** twelve queries, run against the six vortex
+variants only, under `pytest --codspeed` in instrumentation mode so every
+task gets a deterministic instruction count. It runs on every push and PR
+(`.github/workflows/codspeed.yml`) and needs no third-party contenders.
+
+Other libraries are deliberately absent: their instruction counts move when
+*they* release, which is not a signal this repo can act on.
+
+```bash
+uv run pytest bench/test_codspeed.py --codspeed   # walltime mode locally
+CODSPEED_BENCH_TRIPLES=5000 uv run pytest bench/test_codspeed.py --codspeed
+```
+
+The default scale is 32,768 triples — small enough for Valgrind, and the size
+the vortex-rdf Rust and JS suites share, so a shared-core regression lands in
+every tab at comparable magnitude.
+
 ## Development
 
 The repo is managed with [uv](https://docs.astral.sh/uv/); `uv.lock` pins the

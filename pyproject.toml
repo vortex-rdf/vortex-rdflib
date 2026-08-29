@@ -36,7 +36,16 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.16", "ty>=0.0.60"]
+# pytest-codspeed instruments bench/test_codspeed.py. It sits in dev rather
+# than the bench group so `uv sync` alone can run the instrumented suite —
+# the bench group is for the comparative dashboard's third-party contenders,
+# which the CodSpeed run deliberately does not need.
+dev = [
+    "pytest>=8",
+    "pytest-codspeed>=4",
+    "ruff>=0.16",
+    "ty>=0.0.60",
+]
 # Comparative benchmark contenders (bench/): oxrdflib pulls pyoxigraph.
 bench = ["oxrdflib>=0.4"]
 
