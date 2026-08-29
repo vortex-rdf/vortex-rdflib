@@ -80,10 +80,10 @@ string comparisons, `datatype`, `lang`, `langMatches`, `isIRI`/`isLiteral`/
 spellings, and anything else, or any value outside that fast path's exact
 domain, is answered by rdflib's own expression evaluator — with
 single-variable conditions applied to the pattern scans before the join.
-`OPTIONAL`, `MINUS` and nested groups over patterns run as hash left joins,
-anti-joins and joins over the same code tuples (an OPTIONAL's inner pattern
-is re-probed per outer row when the outer side is small), instead of rdflib
-re-entering the store once per outer solution. The
+`OPTIONAL`, `MINUS`, `FILTER (NOT) EXISTS` and nested groups over patterns
+run as hash left joins, anti-joins, semi-joins and joins over the same code
+tuples (an inner pattern is re-probed per outer row when the outer side is
+small), instead of rdflib re-entering the store once per outer solution. The
 projection, `DISTINCT`, `LIMIT`/`OFFSET`, `ASK` and `COUNT` aggregates
 (`COUNT(*)`, `COUNT(?v)`, `COUNT(DISTINCT ?v)`, with or without `GROUP BY`)
 above a pattern are answered on the same code-space result, and solutions are

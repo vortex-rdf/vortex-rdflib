@@ -353,6 +353,40 @@ QUERIES = [
         ?x <http://ex.org/name> ?m MINUS { ?x <http://ex.org/age> ?a } }""",
     """SELECT DISTINCT ?x WHERE {
         ?x <http://ex.org/knows> ?y OPTIONAL { ?y <http://ex.org/age> ?a } }""",
+    # --- (NOT) EXISTS: semi/anti-joins on the shared variables, and the shapes left to rdflib
+    "SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER EXISTS { ?x <http://ex.org/age> ?a } }",
+    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
+        FILTER(!EXISTS { ?x <http://ex.org/age> ?a }) }""",
+    """SELECT ?x ?y WHERE { ?x <http://ex.org/knows> ?y
+        FILTER EXISTS { ?y <http://ex.org/knows> ?x } }""",
+    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
+        FILTER EXISTS { <http://ex.org/alice> <http://ex.org/knows> ?z } }""",
+    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
+        FILTER NOT EXISTS { ?z <http://ex.org/nothing> ?w } }""",
+    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
+        FILTER(EXISTS { ?x <http://ex.org/age> ?a } || lang(?n) = "en") }""",
+    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
+        FILTER EXISTS { ?x <http://ex.org/age> ?a FILTER(?a > 10) } }""",
+    """SELECT ?x WHERE { ?x <http://ex.org/age> ?a
+        FILTER EXISTS { ?x <http://ex.org/score> ?s FILTER(?s > ?a) } }""",
+    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a }
+        FILTER NOT EXISTS { ?y <http://ex.org/age> ?a } }""",
+    """SELECT ?x ?a WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/alice> }
+        ?x <http://ex.org/age> ?a FILTER EXISTS { ?x <http://ex.org/knows> ?y } }""",
+    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
+        FILTER EXISTS { ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?m } }""",
+    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
+        FILTER NOT EXISTS { ?x <http://ex.org/knows> ?y
+        OPTIONAL { ?y <http://ex.org/age> ?a } } }""",
+    "SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER EXISTS { ?x <http://ex.org/age> ?x } }",
+    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
+        FILTER(EXISTS { ?x <http://ex.org/age> ?a } && ?n != "") }""",
+    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
+        FILTER EXISTS { ?x <http://ex.org/knows> ?y
+        FILTER NOT EXISTS { ?y <http://ex.org/age> ?a } } }""",
+    "ASK { ?x <http://ex.org/name> ?n FILTER NOT EXISTS { ?x <http://ex.org/age> ?a } }",
+    """SELECT (COUNT(*) AS ?c) WHERE { ?x <http://ex.org/name> ?n
+        FILTER NOT EXISTS { ?x <http://ex.org/age> ?a } }""",
 ]
 
 
@@ -762,3 +796,35 @@ def test_cheated_scope_falls_back_to_rdflib(graph, monkeypatch):
     with_pushdown, without_pushdown = both_ways(graph, sparql)
     assert with_pushdown == without_pushdown
     assert "fallback" in left_joins
+
+
+def test_exists_is_a_semi_join_in_code_space(graph, monkeypatch):
+    """A (NOT) EXISTS conjunct is applied as a set membership on the shared
+    variables — probed per row for a small block, hash-joined otherwise —
+    without rdflib's evaluator running per row."""
+    applied, probes, generic_calls = [], [], []
+    original_apply = pd._apply_exists
+    original_probe = pd._probe_exists
+    original_generic = filters.Conjunct.generic
+    monkeypatch.setattr(pd, "_apply_exists", lambda *a: applied.append(1) or original_apply(*a))
+    monkeypatch.setattr(pd, "_probe_exists", lambda *a: probes.append(1) or original_probe(*a))
+    monkeypatch.setattr(
+        filters.Conjunct,
+        "generic",
+        lambda self, b: generic_calls.append(1) or original_generic(self, b),
+    )
+    register_sparql_pushdown()
+    sparql = """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
+        FILTER NOT EXISTS { ?x <http://ex.org/age> ?a } }"""
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    assert len(run(graph, sparql)) == 3 and applied and probes and not generic_calls
+    applied.clear(), probes.clear()
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 10**9)
+    assert len(run(graph, sparql)) == 3 and applied and not probes and not generic_calls
+    # a body FILTER that sees the block's bindings: rdflib's evaluator, per distinct tuple
+    rows = run(
+        graph,
+        """SELECT ?x WHERE { ?x <http://ex.org/age> ?a
+            FILTER EXISTS { ?x <http://ex.org/score> ?s FILTER(?s > ?a) } }""",
+    )
+    assert rows == [(URIRef("http://ex.org/frank"),)] and generic_calls

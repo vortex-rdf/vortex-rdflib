@@ -650,17 +650,24 @@ def is_kind_only(expr) -> bool:
 
 def expr_vars(node, out: list | None = None) -> list:
     """The variable-like terms an expression references, in first-seen
-    order (walks the parse tree, including an EXISTS body)."""
+    order. An EXISTS body is walked in its translated form (the instance
+    attribute): rdflib pulls the body's FILTERs out of the parse tree it
+    keeps under the key, so only the translation still names their
+    variables."""
     if out is None:
         out = []
     if isinstance(node, _VAR_LIKE):
         if node not in out:
             out.append(node)
     elif isinstance(node, CompValue):
+        if node.name in ("Builtin_EXISTS", "Builtin_NOTEXISTS"):
+            body = getattr(node, "graph", None)
+            if isinstance(body, CompValue):
+                return expr_vars(body, out)
         for key in node.keys():
             if key != "_vars":
                 expr_vars(dict.__getitem__(node, key), out)
-    elif isinstance(node, list):
+    elif isinstance(node, (list, tuple)):
         for x in node:
             expr_vars(x, out)
     return out
@@ -703,10 +710,35 @@ class Conjunct:
 
 
 @dataclass(slots=True)
+class ExistsConjunct:
+    conjunct: Conjunct
+    negate: bool
+    body: Any  # the translated algebra of the EXISTS group
+
+
+@dataclass(slots=True)
 class FilterPlan:
     constant: list  # conjuncts referencing no block variable
     per_var: dict  # block variable -> conjuncts referencing only it
     tuples: list  # conjuncts referencing several block variables
+    exists: list  # ExistsConjunct: (NOT) EXISTS conjuncts, semi/anti-joins
+
+
+def exists_shape(expr):
+    """``(negate, body)`` when a conjunct is ``EXISTS {..}``, ``NOT EXISTS
+    {..}`` or either under one ``!``; ``None`` otherwise. ``body`` is the
+    translated group, which rdflib keeps as an instance attribute."""
+    negate = False
+    node = expr
+    if isinstance(node, CompValue) and node.name == "UnaryNot":
+        negate = True
+        node = node.expr
+    if isinstance(node, CompValue) and node.name in ("Builtin_EXISTS", "Builtin_NOTEXISTS"):
+        body = getattr(node, "graph", None)
+        if not isinstance(body, CompValue):
+            return None
+        return (negate != (node.name == "Builtin_NOTEXISTS"), body)
+    return None
 
 
 def analyze_filter(node, block_vars, ctx) -> FilterPlan:
@@ -733,7 +765,7 @@ def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
     ``visible`` maps the context-bound variables the expression may see to
     their terms, every other non-block variable is unbound."""
     block_set = set(block_vars)
-    plan = FilterPlan([], {}, [])
+    plan = FilterPlan([], {}, [], [])
     for conjunct_expr in _flatten_and(expr, []):
         expr = conjunct_expr
         if _is_impure(expr):
@@ -752,7 +784,10 @@ def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
         conjunct = Conjunct(
             expr, variables, fast, fast is not None and is_kind_only(expr), consts, ctx
         )
-        if not variables:
+        shape = exists_shape(expr)
+        if shape is not None:
+            plan.exists.append(ExistsConjunct(conjunct, *shape))
+        elif not variables:
             plan.constant.append(conjunct)
         elif len(variables) == 1:
             plan.per_var.setdefault(variables[0], []).append(conjunct)

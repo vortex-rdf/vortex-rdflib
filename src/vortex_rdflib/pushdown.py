@@ -23,11 +23,11 @@ What runs in code space:
   runs as predicates over the stored spellings, anything else (and every
   value outside the fast path's exact domain) is answered by rdflib's own
   evaluator, per distinct value instead of per row;
-- group joins (``Join``), ``OPTIONAL`` (``LeftJoin``) and ``MINUS`` over
-  blocks run as hash joins, left joins and anti-joins over code tuples, with
-  the OPTIONAL's inner pattern re-probed per outer row when the outer
-  relation is small — instead of rdflib re-entering the store once per
-  outer solution;
+- group joins (``Join``), ``OPTIONAL`` (``LeftJoin``), ``MINUS`` and
+  ``FILTER (NOT) EXISTS`` over blocks run as hash joins, left joins, anti-
+  and semi-joins over code tuples, with the inner pattern re-probed per
+  outer row when the outer relation is small — instead of rdflib
+  re-entering the store once per outer solution;
 - ``Project``, ``Distinct`` and ``Slice`` (LIMIT/OFFSET) heads are applied
   to the code-space relation, and an ``AskQuery`` over one pattern is
   answered from the row selection alone, so only the projected variables of
@@ -614,7 +614,102 @@ def _solve_filter(ctx, store, node, env, var_preds) -> Relation:
             for conjunct in residual
         )
         rel = _filter_relation(rel, preds)
+    for exists in plan.exists:
+        rel = _apply_exists(ctx, store, rel, exists)
     return rel
+
+
+def _apply_exists(ctx, store, rel: Relation, exists) -> Relation:
+    """``FILTER (NOT) EXISTS { body }`` as a semi- or anti-join on the
+    variables the body shares with the block: the body is solved once (or,
+    for a small block and a one-pattern body, probed per row with
+    ``count_quads``) instead of once per row. Shapes rdflib would evaluate
+    differently on an independently solved body — a nullable shared
+    variable, a body the solver cannot take, a body FILTER that sees the
+    block's bindings — take the generic route, rdflib's own evaluator per
+    distinct tuple."""
+    body, negate = _unwrap_empty_joins(exists.body), exists.negate
+    rows = _rows_of(rel)
+    if not rows:
+        return rel
+
+    def generic():
+        conjunct = exists.conjunct
+        positions = [rel.schema.index(v) for v in conjunct.vars]
+        return _filter_relation(rel, (filters.tuple_predicate(store, conjunct, positions),))
+
+    try:
+        _check_block(body)
+    except NotImplementedError:
+        return generic()
+    shared = [v for v in _block_vars(ctx, body) if v in rel.schema]
+    if any(v in rel.nullable for v in shared):
+        return generic()
+    env = frozenset(rel.schema)
+    try:
+        if not shared:
+            found = next(_code_rows(_solve_block(ctx, store, body, env)), None) is not None
+            if found != negate:
+                return rel
+            return Relation(rel.schema, None, [], 0, rel.nullable, rel.foreign)
+        if body.name == "BGP" and len(body.triples) == 1:
+            pat = _match_pattern(ctx, store, *body.triples[0])
+            repeated_free = any(
+                len(pos) > 1 for v, pos in pat["varpos"].items() if v not in rel.schema
+            )
+            if not repeated_free and len(rows) * _PROBE_FANOUT < pat["nrows"]:
+                flags = _probe_exists(store, rel.schema, rows, pat)
+                kept = [row for row, found in zip(rows, flags, strict=True) if found != negate]
+                return Relation(rel.schema, None, kept, len(kept), rel.nullable, rel.foreign)
+            inner = _rel_from_pattern(pat)
+        else:
+            inner = _solve_block(ctx, store, body, env)
+    except NotImplementedError:
+        return generic()
+    ia = [rel.schema.index(v) for v in shared]
+    ib = [inner.schema.index(v) for v in shared]
+    keys = {tuple(row[i] for i in ib) for row in _code_rows(inner)}
+    kept = [row for row in rows if (tuple(row[i] for i in ia) in keys) != negate]
+    return Relation(rel.schema, None, kept, len(kept), rel.nullable, rel.foreign)
+
+
+def _unwrap_empty_joins(node):
+    """rdflib never simplifies an EXISTS body, so a group translates to a
+    Join with an empty BGP on one side; look through those."""
+    while getattr(node, "name", None) == "Join":
+        p1, p2 = node.p1, node.p2
+        if getattr(p1, "name", None) == "BGP" and not p1.triples:
+            node = p2
+        elif getattr(p2, "name", None) == "BGP" and not p2.triples:
+            node = p1
+        else:
+            break
+    return node
+
+
+def _probe_exists(store, schema, rows, pat) -> list:
+    """Whether the pattern, with each row's codes substituted, matches at
+    least one quad — one ``count_quads`` per row, no row materialized."""
+    count = store._store().count_quads
+    bound = [(schema.index(v), pos) for v, pos in pat["varpos"].items() if v in schema]
+    codes = list({row[row_idx] for row in rows for row_idx, _ in bound})
+    n3_cache: dict[int, str] = {}
+    for code, term in zip(codes, store._dict.decode_many(codes), strict=True):
+        if term is None:
+            raise ValueError(f"term code {code} is not in the store dictionary")
+        n3_cache[code] = term
+    out = []
+    for row in rows:
+        n3 = list(pat["n3"])
+        satisfiable = True
+        for row_idx, positions in bound:
+            term = n3_cache[row[row_idx]]
+            for idx in positions:
+                if (idx == 0 and term[0] == '"') or (idx == 1 and term[0] != "<"):
+                    satisfiable = False
+                n3[idx] = term
+        out.append(satisfiable and count(*n3) > 0)
+    return out
 
 
 def _reject_env_references(node, plan, env, ctx) -> None:
