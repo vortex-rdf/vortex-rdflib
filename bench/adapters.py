@@ -6,6 +6,27 @@ the factory functions: the rdflib-Memory worker never imports vortex_rdflib
 (whose pushdown hook registers into rdflib's ``CUSTOM_EVALS``), and only the
 oxrdflib workers import pyoxigraph.
 
+Quads: the dataset is N-Quads, and every store whose format has named graphs
+loads it into an rdflib ``Dataset`` whose default graph is the **union** of
+its graphs — so the queries that name no graph see exactly the triples they
+saw before the dataset had graphs, and the ``graphs`` group can name one.
+Two contenders cannot serve named graphs *through rdflib*, for different
+reasons, and both load the flattened N-Triples instead (``quads=False``) —
+the same statements in one graph, by construction of the generator. They
+answer every query but the ``graphs`` group, which the worker skips for them
+and the dashboard leaves empty.
+
+- **HDT** has none to serve: the format is triples-only.
+- **COTTAS** does have them — ``rdf2cottas`` reads N-Quads and always writes
+  an ``(s, p, o, g)`` table, its SQL translator can filter on ``g``, and
+  ``COTTASStore.is_quad_table`` reports it — but ``COTTASStore`` (pycottas
+  1.1.0) does not expose any of that to rdflib: it never sets
+  ``context_aware``, its ``triples()`` ignores the ``context`` argument and
+  yields ``None`` for every row's graph, and it does not override
+  ``contexts()``. A ``Dataset`` over it is refused and a ``GRAPH`` query
+  raises. Feeding it the N-Quads would only cost it a column it cannot be
+  asked about, so it gets the same triples the other stores are asked.
+
 ``env`` entries are applied by the orchestrator to the worker's environment
 before Python starts, so process-wide switches like
 ``VORTEX_RDF_DISABLE_PUSHDOWN`` are in place before any import runs.
@@ -33,7 +54,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from rdflib import Graph
+from rdflib import Dataset, Graph
 
 
 @dataclass(frozen=True)
@@ -41,9 +62,14 @@ class Adapter:
     slug: str
     label: str
     engine: str  # "rdflib" | "native"
-    make: Callable[[str, str], Graph]  # (nt_path, work_dir) -> queryable Graph
+    # (nq_path, nt_path, work_dir) -> queryable Graph or Dataset. A quad
+    # adapter builds from the N-Quads; a triple-only one from the N-Triples.
+    make: Callable[[str, str, str], Graph]
     env: dict[str, str] = field(default_factory=dict)
     query_kwargs: dict = field(default_factory=dict)
+    # Whether the store's format has named graphs. False means the `graphs`
+    # query group is not asked of it (see the module docstring).
+    quads: bool = True
     # Import name of the third-party package this adapter needs from the
     # project environment, so the orchestrator can fail fast with the fix
     # instead of losing a worker.
@@ -59,7 +85,7 @@ class Adapter:
 
 def _make_vortex(
     tag: str, in_memory: bool, indexes: tuple[str, ...] = ()
-) -> Callable[[str, str], Graph]:
+) -> Callable[[str, str, str], Graph]:
     """A Dictionary-layout store built with `indexes`, opened per `in_memory`.
 
     `tag` names the built file, so adapters sharing an index configuration
@@ -67,31 +93,31 @@ def _make_vortex(
     deterministic, so the residency variants rewrite identical bytes.
     """
 
-    def make(nt_path: str, work_dir: str) -> Graph:
+    def make(nq_path: str, nt_path: str, work_dir: str) -> Graph:
         from vortex_rdf import serialize_rdf
 
-        from vortex_rdflib import VortexStore
+        from vortex_rdflib import VortexRdflibStore
 
         out = str(Path(work_dir) / f"data-dict-{tag}.vortex")
-        serialize_rdf(nt_path, out, layout="dictionary", indexes=list(indexes))
-        return Graph(store=VortexStore(out, in_memory=in_memory))
+        serialize_rdf(nq_path, out, format="nquads", layout="dictionary", indexes=list(indexes))
+        return Dataset(store=VortexRdflibStore(out, in_memory=in_memory), default_union=True)
 
     return make
 
 
-def _make_rdflib_memory(nt_path: str, work_dir: str) -> Graph:
-    g = Graph()
-    g.parse(nt_path, format="nt")
-    return g
+def _make_rdflib_memory(nq_path: str, nt_path: str, work_dir: str) -> Graph:
+    ds = Dataset(default_union=True)
+    ds.parse(nq_path, format="nquads")
+    return ds
 
 
-def _make_oxrdflib(nt_path: str, work_dir: str) -> Graph:
-    g = Graph(store="Oxigraph")
-    g.parse(nt_path, format="nt")
-    return g
+def _make_oxrdflib(nq_path: str, nt_path: str, work_dir: str) -> Graph:
+    ds = Dataset(store="Oxigraph", default_union=True)
+    ds.parse(nq_path, format="nquads")
+    return ds
 
 
-def _make_rdflib_hdt(nt_path: str, work_dir: str) -> Graph:
+def _make_rdflib_hdt(nq_path: str, nt_path: str, work_dir: str) -> Graph:
     """An HDT file built from the shared N-Triples, served through its store.
 
     `rdflib-hdt` reads HDT but cannot write it, and hdt-cpp's `rdf2hdt` is not
@@ -121,7 +147,7 @@ def _make_rdflib_hdt(nt_path: str, work_dir: str) -> Graph:
     return Graph(store=HDTStore(str(out)))
 
 
-def _make_pycottas(nt_path: str, work_dir: str) -> Graph:
+def _make_pycottas(nq_path: str, nt_path: str, work_dir: str) -> Graph:
     """A COTTAS file built from the shared N-Triples, served through its store.
 
     `rdf2cottas` is the build step the load row measures, mirroring
@@ -197,6 +223,7 @@ ADAPTERS: list[Adapter] = [
         "rdflib",
         _make_pycottas,
         venv_packages=("rdflib>=7,<8", "pycottas>=1.1"),
+        quads=False,
     ),
     Adapter(
         "rdflib_hdt",
@@ -205,6 +232,7 @@ ADAPTERS: list[Adapter] = [
         _make_rdflib_hdt,
         venv_packages=("rdflib-hdt>=3.2",),
         requires_cli="hdt",
+        quads=False,
     ),
 ]
 

@@ -3,12 +3,17 @@ evaluator — every query shape is run both ways and compared exactly, on a
 file-backed and on an in-memory store."""
 
 import pytest
-from rdflib import Graph, Literal, URIRef
+from rdflib import Dataset, Graph, Literal, URIRef
 from rdflib.plugins.sparql.sparql import QueryContext
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from vortex_rdflib import VortexStore, filters, register_sparql_pushdown, unregister_sparql_pushdown
+from vortex_rdflib import (
+    VortexRdflibStore,
+    filters,
+    register_sparql_pushdown,
+    unregister_sparql_pushdown,
+)
 
 FIXTURE_NT = """\
 <http://ex.org/alice> <http://ex.org/name> "Alice" .
@@ -50,6 +55,37 @@ _:b0 <http://ex.org/knows> <http://ex.org/alice> .
     "<http://ex.org/dave> <http://ex.org/born> "
     '"2020-01-01T00:00:00"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n'
 )
+
+#: Graph names the quad fixture spreads the same statements over; the empty
+#: one is the default graph, which `GRAPH ?g` must never bind. `_:g4` is a
+#: blank-node graph name — legal in N-Quads, and the case a bare `Graph`'s own
+#: blank-node label has to be told apart from.
+FIXTURE_GRAPHS = (
+    "",
+    "<http://ex.org/g/1>",
+    "<http://ex.org/g/2>",
+    "<http://ex.org/g/3>",
+    "_:g4",
+)
+
+
+def _as_quads(ntriples: str) -> str:
+    """The triple fixture as N-Quads: every statement round-robin into one of
+    ``FIXTURE_GRAPHS``, then the first few repeated into the last graph — so
+    the union view holds some triples more than once, joins have to span
+    graphs, and each graph is a proper subset of the whole."""
+
+    def quad(line: str, graph: str) -> str:
+        statement = line.rstrip().removesuffix(".").rstrip()
+        return f"{statement} {graph} ." if graph else f"{statement} ."
+
+    lines = [line for line in ntriples.splitlines() if line]
+    quads = [quad(line, FIXTURE_GRAPHS[i % len(FIXTURE_GRAPHS)]) for i, line in enumerate(lines)]
+    quads += [quad(line, FIXTURE_GRAPHS[-1]) for line in lines[:4]]
+    return "\n".join(quads) + "\n"
+
+
+FIXTURE_NQ = _as_quads(FIXTURE_NT)
 
 QUERIES = [
     # single patterns
@@ -483,6 +519,109 @@ ORDER_QUERIES += [
         ORDER BY ?x ?y""",
 ]
 
+#: Shapes that name a graph. rdflib evaluates the `Graph` node itself — a
+#: bound name scopes the block below, an unbound one fans out over the
+#: store's graphs — so what is under test here is that every pushed-down
+#: block sees exactly the graph rdflib made active, and no other.
+GRAPH_QUERIES = [
+    # a bound graph, an absent one, and the default graph a `GRAPH` never names
+    "SELECT ?s ?o WHERE { GRAPH <http://ex.org/g/1> { ?s <http://ex.org/name> ?o } }",
+    "SELECT * WHERE { GRAPH <http://ex.org/g/1> { ?s ?p ?o } }",
+    "SELECT * WHERE { GRAPH <http://ex.org/absent> { ?s ?p ?o } }",
+    "ASK { GRAPH <http://ex.org/g/2> { ?s <http://ex.org/name> ?o } }",
+    "ASK { GRAPH <http://ex.org/absent> { ?s ?p ?o } }",
+    'ASK { GRAPH <http://ex.org/g/1> { <http://ex.org/alice> <http://ex.org/name> "Alice" } }',
+    # a graph variable: one interception per graph, the default graph excluded
+    "SELECT ?g ?s ?o WHERE { GRAPH ?g { ?s <http://ex.org/name> ?o } }",
+    "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }",
+    "SELECT ?g (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g",
+    "SELECT (COUNT(*) AS ?n) WHERE { GRAPH <http://ex.org/g/2> { ?s ?p ?o } }",
+    "SELECT ?g ?s WHERE { GRAPH ?g { ?s <http://ex.org/name> ?o } } ORDER BY ?g ?s LIMIT 5",
+    # joins, OPTIONAL, MINUS and FILTER inside one graph
+    """SELECT ?s ?n ?k WHERE { GRAPH ?g {
+        ?s <http://ex.org/name> ?n . ?s <http://ex.org/knows> ?k } }""",
+    """SELECT ?s ?n ?a WHERE { GRAPH <http://ex.org/g/3> {
+        ?s <http://ex.org/name> ?n OPTIONAL { ?s <http://ex.org/age> ?a } } }""",
+    """SELECT ?s WHERE { GRAPH <http://ex.org/g/3> {
+        ?s <http://ex.org/name> ?n MINUS { ?s <http://ex.org/knows> ?k } } }""",
+    """SELECT ?s ?n WHERE { GRAPH ?g {
+        ?s <http://ex.org/name> ?n FILTER(isIRI(?s)) } }""",
+    """SELECT ?s ?a WHERE { GRAPH <http://ex.org/g/1> {
+        ?s <http://ex.org/age> ?a
+        FILTER(datatype(?a) = <http://www.w3.org/2001/XMLSchema#integer>) } }""",
+    """SELECT ?s ?n WHERE { GRAPH <http://ex.org/g/3> {
+        VALUES ?s { <http://ex.org/alice> <http://ex.org/bob> } ?s <http://ex.org/name> ?n } }""",
+    # a block spanning the union default graph and a named one
+    """SELECT ?s ?n ?k WHERE {
+        ?s <http://ex.org/name> ?n .
+        GRAPH <http://ex.org/g/1> { ?s <http://ex.org/knows> ?k } }""",
+    """SELECT ?s ?n WHERE {
+        ?s <http://ex.org/name> ?n
+        FILTER NOT EXISTS { GRAPH <http://ex.org/g/1> { ?s <http://ex.org/knows> ?k } } }""",
+    # two graphs joined through the same variable
+    """SELECT ?s ?n ?k WHERE {
+        GRAPH <http://ex.org/g/1> { ?s <http://ex.org/name> ?n }
+        GRAPH <http://ex.org/g/2> { ?s <http://ex.org/knows> ?k } }""",
+    # --- the graph as a column: shapes where ?g is an ordinary variable ---
+    # a join inside one graph variable: both patterns must land in the *same*
+    # graph, which is the join on ?g
+    """SELECT ?g ?s ?n ?k WHERE { GRAPH ?g {
+        ?s <http://ex.org/name> ?n . ?s <http://ex.org/knows> ?k } }""",
+    # two graph variables, joined on the subject
+    """SELECT ?g ?h ?s WHERE {
+        GRAPH ?g { ?s <http://ex.org/name> ?n }
+        GRAPH ?h { ?s <http://ex.org/knows> ?k } }""",
+    # the union default graph joined to a graph variable
+    """SELECT ?g ?s ?k WHERE {
+        ?s <http://ex.org/name> ?n .
+        GRAPH ?g { ?s <http://ex.org/knows> ?k } }""",
+    # OPTIONAL and MINUS under a graph variable
+    """SELECT ?g ?s ?n ?a WHERE { GRAPH ?g {
+        ?s <http://ex.org/name> ?n OPTIONAL { ?s <http://ex.org/age> ?a } } }""",
+    """SELECT ?g ?s ?n WHERE { GRAPH ?g {
+        ?s <http://ex.org/name> ?n MINUS { ?s <http://ex.org/knows> ?k } } }""",
+    # an OPTIONAL whose *whole* right side is a graph: ?g may be unbound
+    """SELECT ?s ?g ?k WHERE {
+        ?s <http://ex.org/name> ?n
+        OPTIONAL { GRAPH ?g { ?s <http://ex.org/knows> ?k } } }""",
+    # FILTER on the graph variable itself
+    "SELECT ?g ?s WHERE { GRAPH ?g { ?s ?p ?o } FILTER(isIRI(?g)) }",
+    "SELECT ?g ?s WHERE { GRAPH ?g { ?s ?p ?o } FILTER(?g = <http://ex.org/g/2>) }",
+    "SELECT ?g ?s WHERE { GRAPH ?g { ?s ?p ?o } FILTER(isBLANK(?g)) }",
+    # the graph name repeated in another position of the same pattern
+    "SELECT ?g ?p ?o WHERE { GRAPH ?g { ?g ?p ?o } }",
+    # VALUES over graph names, including one the file does not hold
+    """SELECT ?g ?s WHERE {
+        VALUES ?g { <http://ex.org/g/1> <http://ex.org/absent> }
+        GRAPH ?g { ?s <http://ex.org/name> ?o } }""",
+    # heads over the graph column
+    "SELECT ?g ?s WHERE { GRAPH ?g { ?s ?p ?o } } ORDER BY ?g ?s LIMIT 7",
+    "SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }",
+    "SELECT ?g (COUNT(DISTINCT ?s) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g",
+    "ASK { GRAPH ?g { ?s <http://ex.org/knows> ?o } }",
+    # nested GRAPH: the inner one wins
+    """SELECT ?g ?h ?s WHERE {
+        GRAPH ?g { GRAPH <http://ex.org/g/2> { ?s <http://ex.org/name> ?n } }
+        GRAPH ?h { ?s <http://ex.org/knows> ?k } }""",
+    # (NOT) EXISTS under a graph variable — the body would be answered in the
+    # union, so the block goes back to rdflib rather than being pushed down
+    """SELECT ?g ?s WHERE { GRAPH ?g {
+        ?s <http://ex.org/name> ?n
+        FILTER EXISTS { ?s <http://ex.org/knows> ?k } } }""",
+    """SELECT ?g ?s WHERE { GRAPH ?g {
+        ?s <http://ex.org/name> ?n
+        FILTER NOT EXISTS { ?s <http://ex.org/knows> ?k } } }""",
+    # an EXISTS body that names a graph of its own
+    """SELECT ?s WHERE {
+        ?s <http://ex.org/name> ?n
+        FILTER EXISTS { GRAPH ?g { ?s <http://ex.org/knows> ?k } } }""",
+    # a FILTER EXISTS hoisted into an OPTIONAL's condition
+    """SELECT ?s ?n ?k WHERE {
+        ?s <http://ex.org/name> ?n
+        OPTIONAL { ?s <http://ex.org/knows> ?k
+                   FILTER EXISTS { ?s <http://ex.org/age> ?a } } }""",
+]
+
 
 @pytest.fixture(scope="module")
 def dict_vortex(tmp_path_factory):
@@ -498,7 +637,27 @@ def dict_vortex(tmp_path_factory):
 def graph(dict_vortex, request):
     """The fixture store, file-backed and loaded into memory: the native
     match path differs between the two, the pushdown must not."""
-    return Graph(store=VortexStore(str(dict_vortex), in_memory=request.param))
+    return Graph(store=VortexRdflibStore(str(dict_vortex), in_memory=request.param))
+
+
+@pytest.fixture(scope="module")
+def dict_vortex_quads(tmp_path_factory):
+    d = tmp_path_factory.mktemp("pushdown-quads")
+    nq = d / "fixture.nq"
+    nq.write_text(FIXTURE_NQ, encoding="utf-8")
+    out = d / "fixture.vortex"
+    serialize_rdf(str(nq), str(out), layout="dictionary", format="nquads")
+    return out
+
+
+@pytest.fixture(params=[False, True], ids=["file", "mem"])
+def dataset(dict_vortex_quads, request):
+    """The same statements spread over named graphs, as a Dataset whose
+    default graph is the union of every graph — so the query set above asks
+    the same questions with the graph column in play."""
+    return Dataset(
+        store=VortexRdflibStore(str(dict_vortex_quads), in_memory=request.param), default_union=True
+    )
 
 
 def _row_key(row):
@@ -537,6 +696,118 @@ def both_ways(graph, sparql, runner=run):
 def test_pushdown_equals_default_evaluator(graph, sparql):
     with_pushdown, without_pushdown = both_ways(graph, sparql)
     assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_pushdown_equals_default_evaluator_over_quads(dataset, sparql):
+    """The same shapes over the union default graph of a quad store: the
+    pushdown must scope every native match to the graph rdflib would have
+    asked, duplicates across graphs included."""
+    with_pushdown, without_pushdown = both_ways(dataset, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
+def test_graph_pattern_equals_default_evaluator(dataset, sparql):
+    """`GRAPH` shapes: a named graph, a graph variable rdflib fans out over
+    the store's graphs, and blocks that span the two."""
+    with_pushdown, without_pushdown = both_ways(dataset, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
+def test_graph_pattern_probe_path_equals_default_evaluator(dataset, monkeypatch, sparql):
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    with_probe, without_pushdown = both_ways(dataset, sparql)
+    assert with_probe == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
+def test_graph_pattern_bgp_only_equals_default_evaluator(dataset, monkeypatch, sparql):
+    """With only BGPs intercepted, rdflib evaluates the `Graph` node itself
+    and walks the store's graphs — so each block is pushed down under a
+    *constant* scope instead of binding the graph from the column. Both
+    routes must answer identically."""
+    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
+    bgp_only, without_pushdown = both_ways(dataset, sparql)
+    assert bgp_only == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
+def test_graph_pattern_generic_filter_equals_default_evaluator(dataset, monkeypatch, sparql):
+    monkeypatch.setattr(filters, "_FAST_ENABLED", False)
+    generic, without_pushdown = both_ways(dataset, sparql)
+    assert generic == without_pushdown
+
+
+def test_solutions_do_not_share_a_context_under_a_pushed_graph(dataset, monkeypatch):
+    """rdflib's ``evalGraph`` writes ``solution.ctx.graph`` back to the graph
+    it replaced as it yields. Here it evaluates the ``GRAPH`` and the
+    ``OPTIONAL`` itself over rows this module produced, so one context shared
+    across those rows would carry that write forward and send the OPTIONAL's
+    right side to the union instead of the row's graph."""
+    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
+    active = []
+    original = pd._active_scope
+    monkeypatch.setattr(
+        pd, "_active_scope", lambda ctx, store: active.append(ctx.graph) or original(ctx, store)
+    )
+    register_sparql_pushdown()
+    rows = run(
+        dataset,
+        """SELECT ?g ?s ?n ?a WHERE { GRAPH ?g {
+            ?s <http://ex.org/name> ?n OPTIONAL { ?s <http://ex.org/age> ?a } } }""",
+    )
+    assert rows
+    assert active, "the hook was never reached"
+    # Every match belongs to the graph rdflib pushed, never to the dataset it
+    # was pushed over.
+    assert all(graph is not dataset for graph in active)
+
+
+def test_graph_variable_is_bound_from_the_column(dataset):
+    """`GRAPH ?g` is one match with the graph as a schema variable, not one
+    match per graph: the store's five graphs cost a single `match_codes`."""
+    matches = []
+    inner = dataset.store._store()
+
+    class _Counting:
+        def match_codes(self, *args, **kwargs):
+            matches.append(args)
+            return inner.match_codes(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+    dataset.store._native = _Counting()
+    register_sparql_pushdown()
+    try:
+        rows = run(dataset, "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }")
+    finally:
+        dataset.store._native = inner
+    # Four named graphs, the default graph excluded, from one wildcard match.
+    assert len(rows) == 4
+    assert len(matches) == 1
+    assert matches[0][3] is None
+
+
+def test_graph_scope_reaches_the_native_match(dataset, monkeypatch):
+    """The graph is the pattern's fourth position, not a filter over the
+    union: an absent graph matches nothing and never materializes a row."""
+    patterns = []
+    original = pd._pattern_terms
+
+    def spy(*args):
+        pattern = original(*args)
+        patterns.append(pattern["n3"][3])
+        return pattern
+
+    monkeypatch.setattr(pd, "_pattern_terms", spy)
+    register_sparql_pushdown()
+    assert run(dataset, "SELECT * WHERE { GRAPH <http://ex.org/g/1> { ?s ?p ?o } }")
+    assert run(dataset, "SELECT * WHERE { GRAPH <http://ex.org/absent> { ?s ?p ?o } }") == []
+    assert run(dataset, "SELECT * WHERE { ?s ?p ?o }")
+    assert patterns == ["<http://ex.org/g/1>", "<http://ex.org/absent>", None]
 
 
 @pytest.mark.parametrize("sparql", ORDER_QUERIES)
@@ -590,7 +861,7 @@ def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
     probes = []
     original = pd._probe_join
     monkeypatch.setattr(pd, "_probe_join", lambda *a: probes.append(1) or original(*a))
-    graph = Graph(store=VortexStore(str(out)))
+    graph = Graph(store=VortexRdflibStore(str(out)))
     register_sparql_pushdown()
     rows = run(
         graph,
@@ -653,7 +924,7 @@ def test_limit_decodes_only_the_first_chunk(tmp_path):
     )
     out = tmp_path / "wide.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
-    store = VortexStore(str(out), in_memory=True)
+    store = VortexRdflibStore(str(out), in_memory=True)
     graph = Graph(store=store)
     register_sparql_pushdown()
     rows = run(graph, "SELECT * WHERE { ?s ?p ?o } LIMIT 10")
@@ -681,10 +952,23 @@ class _CountingNative:
         return getattr(self._inner, name)
 
 
-def test_ask_over_one_pattern_counts_instead_of_matching(graph):
-    register_sparql_pushdown()
+def _counting_native(graph) -> _CountingNative:
+    """Install the counter, with the store's own bookkeeping already done.
+
+    Resolving the graph's identifier costs one `count_quads` (a bare `Graph`
+    is blank-node labelled, and only the store can say whether that names a
+    graph of the file) — once per store, cached. Warming it here keeps the
+    assertions below about what a *query* costs.
+    """
+    graph.store._graph_n3(graph)
     native = _CountingNative(graph.store._store())
     graph.store._native = native
+    return native
+
+
+def test_ask_over_one_pattern_counts_instead_of_matching(graph):
+    register_sparql_pushdown()
+    native = _counting_native(graph)
     assert run(graph, "ASK { ?s <http://ex.org/knows> ?o }") is True
     assert run(graph, "ASK { ?s <http://ex.org/nothing> ?o }") is False
     assert (native.counts, native.matches) == (2, 0)
@@ -712,14 +996,14 @@ def test_native_none_falls_back_at_call_time(graph):
 def test_pushdown_ops_env_switch(dict_vortex, monkeypatch):
     monkeypatch.setattr(pd, "_ENABLED_OPS", pd._ALL_OPS)
     monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "bgp")
-    VortexStore(str(dict_vortex))
+    VortexRdflibStore(str(dict_vortex))
     assert pd._ENABLED_OPS == {"BGP"}
     monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "BGP, Project")
-    VortexStore(str(dict_vortex))
+    VortexRdflibStore(str(dict_vortex))
     assert pd._ENABLED_OPS == {"BGP", "Project"}
     monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "Bogus")
     with pytest.raises(ValueError, match="Bogus"):
-        VortexStore(str(dict_vortex))
+        VortexRdflibStore(str(dict_vortex))
 
 
 def test_non_vortex_graphs_unaffected(dict_vortex):
@@ -732,7 +1016,7 @@ def test_non_vortex_graphs_unaffected(dict_vortex):
 
 def test_string_fallback_when_code_path_disabled(dict_vortex, monkeypatch):
     monkeypatch.setenv("VORTEX_RDF_DISABLE_CODE_PATH", "1")
-    graph = Graph(store=VortexStore(str(dict_vortex)))
+    graph = Graph(store=VortexRdflibStore(str(dict_vortex)))
     rows = run(
         graph,
         """SELECT ?n WHERE {
@@ -812,8 +1096,7 @@ def test_distinct_and_count_are_answered_in_code_space(graph, monkeypatch):
 
 def test_count_over_one_pattern_counts_instead_of_matching(graph):
     register_sparql_pushdown()
-    native = _CountingNative(graph.store._store())
-    graph.store._native = native
+    native = _counting_native(graph)
     rows = run(graph, "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://ex.org/name> ?o }")
     assert rows == [(Literal(8),)]
     rows = run(graph, "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://ex.org/nothing> ?o }")
@@ -833,7 +1116,7 @@ def test_distinct_decodes_only_the_survivors(tmp_path):
     )
     out = tmp_path / "wide.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
-    store = VortexStore(str(out), in_memory=True)
+    store = VortexRdflibStore(str(out), in_memory=True)
     graph = Graph(store=store)
     register_sparql_pushdown()
     rows = run(graph, "SELECT DISTINCT ?p WHERE { ?s ?p ?o }")

@@ -9,6 +9,21 @@ FIXTURE_NT = """\
 _:b0 <http://xmlns.com/foaf/0.1/name> "Anon" .
 """
 
+# The same five statements as quads: two named graphs and the default graph,
+# with Alice's name in *both* named graphs — so the union view holds a triple
+# twice, which is what a quad store's union is.
+FIXTURE_NQ = """\
+<http://ex.org/alice> <http://xmlns.com/foaf/0.1/name> "Alice" <http://ex.org/g/1> .
+<http://ex.org/alice> <http://xmlns.com/foaf/0.1/name> "Alice" <http://ex.org/g/2> .
+<http://ex.org/alice> <http://xmlns.com/foaf/0.1/knows> <http://ex.org/bob> <http://ex.org/g/1> .
+<http://ex.org/bob> <http://xmlns.com/foaf/0.1/name> "Bob"@en <http://ex.org/g/2> .
+<http://ex.org/bob> <http://ex.org/age> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
+_:b0 <http://xmlns.com/foaf/0.1/name> "Anon" .
+"""
+
+GRAPH_1 = "http://ex.org/g/1"
+GRAPH_2 = "http://ex.org/g/2"
+
 LAYOUTS = ["default", "typed-object", "dictionary"]
 
 
@@ -20,6 +35,13 @@ def fixture_nt_path(tmp_path_factory):
 
 
 @pytest.fixture(scope="session")
+def fixture_nq_path(tmp_path_factory):
+    path = tmp_path_factory.mktemp("rdf") / "fixture.nq"
+    path.write_text(FIXTURE_NQ, encoding="utf-8")
+    return path
+
+
+@pytest.fixture(scope="session")
 def vortex_files(fixture_nt_path, tmp_path_factory):
     """One serialized `.vortex` file per layout, keyed by layout name."""
     out_dir = tmp_path_factory.mktemp("vortex")
@@ -27,5 +49,17 @@ def vortex_files(fixture_nt_path, tmp_path_factory):
     for layout in LAYOUTS:
         out = out_dir / f"fixture-{layout}.vortex"
         serialize_rdf(str(fixture_nt_path), str(out), layout=layout)
+        files[layout] = out
+    return files
+
+
+@pytest.fixture(scope="session")
+def vortex_quad_files(fixture_nq_path, tmp_path_factory):
+    """The quad fixture, one `.vortex` file per layout."""
+    out_dir = tmp_path_factory.mktemp("vortex-quads")
+    files = {}
+    for layout in LAYOUTS:
+        out = out_dir / f"fixture-quads-{layout}.vortex"
+        serialize_rdf(str(fixture_nq_path), str(out), layout=layout, format="nquads")
         files[layout] = out
     return files

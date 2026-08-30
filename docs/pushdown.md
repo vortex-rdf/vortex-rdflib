@@ -1,7 +1,7 @@
 # SPARQL pushdown
 
-`vortex-rdflib` answers SPARQL with rdflib's engine, but a `VortexStore` does
-more than serve triple patterns: it hooks into rdflib's algebra evaluation
+`vortex-rdflib` answers SPARQL with rdflib's engine, but a `VortexRdflibStore` does
+more than serve quad patterns: it hooks into rdflib's algebra evaluation
 and answers the operators it understands in **code space** — over the `u32`
 term codes of a Dictionary-layout store — handing everything else back to
 rdflib node by node. This document explains, for each pushdown, the algebra
@@ -12,24 +12,24 @@ it is faster, and when it steps aside.
 5–7 runs of a *prepared* query (`rdflib.plugins.sparql.prepareQuery`; rdflib's
 parse and algebra translation, ≈1.2 ms per query on this machine, excluded),
 measured on 2026-08-30 on an Intel Core Ultra 7 155H with Python 3.13.7,
-vortex-rdf 0.10.0 and rdflib 7.6.0, over the benchmark generator's
-50,000-triple dataset (`bench/dataset.py`: 5,000 subjects, 33 predicates,
-27,034 distinct terms) in a Dictionary-layout store loaded in memory
-(`VortexStore(path, in_memory=True)`). "rdflib" is the same store under
+vortex-rdf 0.10.0 and rdflib 7.6.0, over a single-graph 50,000-statement
+dataset from the benchmark generator (`bench/dataset.py`: 5,000 subjects, 33
+predicates, 27,034 distinct terms) in a Dictionary-layout store loaded in memory
+(`VortexRdflibStore(path, in_memory=True)`). "rdflib" is the same store under
 rdflib's default evaluator (`VORTEX_RDF_DISABLE_PUSHDOWN=1`), which is what
 the dashboard's *pushdown off* row runs; the [benchmark
 dashboard](https://vortex-rdf.github.io/vortex-rdflib/) is the live
-reference, at 250,000 triples and across the other stores.
+reference, at 250,000 quads over 8 graphs and across the other stores.
 
 ## How the hook works
 
 rdflib evaluates a query as a tree of algebra operators (`Project`, `Filter`,
 `LeftJoin`, `BGP`, ...) and, for **every** node, offers it to the functions
 registered in `rdflib.plugins.sparql.CUSTOM_EVALS` before running its own
-evaluator. Constructing a `VortexStore` registers one such hook
+evaluator. Constructing a `VortexRdflibStore` registers one such hook
 (`pushdown.register_sparql_pushdown`). The hook looks at the node's name:
 
-- a node it handles, over a graph whose store is a `VortexStore` with the
+- a node it handles, over a graph whose store is a `VortexRdflibStore` with the
   code path available (Dictionary layout, resident term dictionary), is
   answered in code space;
 - anything else raises `NotImplementedError`, which rdflib takes as "not
@@ -70,11 +70,63 @@ rdflib's per-row `ctx.push()`/`solution()`), in chunks that grow from 64 to
 does not hold yet. A consumer that stops early — `LIMIT`, `ASK`, the first
 match of an `EXISTS` — never decodes what it does not consume.
 
+## Named graphs
+
+**Shape.** Not an algebra node of its own: every pattern below carries the
+graph the query is active in. `_pattern_terms` builds a **quad** pattern,
+whose fourth position is `VortexRdflibStore._graph_n3(ctx.graph)` — `None`
+(the wildcard over every graph) for a union default graph, `""` for the
+default graph of a `Dataset` without union, the graph's own name inside a
+`GRAPH` block. Every `match_codes` and `count_quads` in this document takes
+that position, so a pushed-down block reads exactly the rows rdflib's own
+evaluator would have asked `ctx.graph` for, and an absent graph selects
+nothing without materializing a row.
+
+**In code space.** A `Graph` node is a block node like any other: it does not
+match anything itself, it sets the scope of the block below it (`_solve_block`
+recurses into `node.p` with the new scope, so a nested `GRAPH` simply wins).
+A bound name becomes the constant above. An **unbound variable becomes a
+column**: the pattern is matched with the graph wildcard and `?g` takes
+position 3 in `varpos`, which makes it an ordinary variable of the relation —
+joined, filtered, grouped, ordered and decoded like any other, out of the
+fourth column the native match already returns. Two patterns under the same
+`GRAPH ?g` therefore join on `?g`, which is exactly the requirement that they
+come from the same graph.
+
+`GRAPH` ranges over the *named* graphs, so the default graph's rows are
+dropped from a variable-scoped match. There is no "any named graph" native
+pattern, so `_exclude_default_graph` restricts the wildcard match afterwards:
+the graph column's distinct codes minus the default graph's, as a `keep` set,
+which every row path already applies (and which then narrows the values a
+`FILTER` on `?g` is evaluated over, so the default graph's empty name — which
+is no RDF term — never reaches a predicate).
+
+**Why it is faster.** rdflib's `evalGraph` walks the dataset's graphs and
+evaluates the block once per graph, joining `{?g: <name>}` onto every
+solution in Python. One match replaces all of it. Over the dashboard's
+250,000 quads in 8 graphs: `SELECT DISTINCT ?g` over the whole store 2,678 ms
+-> 117 ms, a `COUNT(*)` per graph 1,593 ms -> 148 ms, a predicate scan under
+`GRAPH ?g` 87 ms -> 28 ms. A *bound* graph gains too, because the head above
+it is now intercepted at the same time as the block: a scan inside one named
+graph 13.3 ms -> 5.6 ms.
+
+**Steps aside.** `FILTER (NOT) EXISTS` under a graph *variable*: rdflib
+evaluates an EXISTS body against the active graph, and under a variable there
+is no single active graph — the row's graph is a column — so the block goes
+back to rdflib, which walks the graphs itself. A term bound to something that
+cannot name a graph (a literal) is rdflib's too. And when rdflib does evaluate
+a `Graph` node — in `bgp` mode, or above a block it declined — it writes
+`solution.ctx.graph` back as it yields, so the solutions of a block below it
+each carry their own context rather than sharing the caller's
+(`_pushed_graph`); otherwise that write would reach the rows still to come and
+send an OPTIONAL's right side to the wrong graph.
+
 ## Basic graph patterns
 
 **Shape.** `BGP(triples)`; the pattern's terms may be variables, blank nodes
 (query blank nodes are variables), IRIs and literals. Property paths and
-RDF-star quoted triples are rdflib's.
+RDF-star quoted triples are rdflib's. Every pattern is matched as a quad,
+scoped to the active graph (see above).
 
 **In code space.** Every triple pattern is matched natively once, up front —
 a match is near-constant cost (45–67 µs in memory, ≈1 ms file-backed,
@@ -359,7 +411,7 @@ described above.
 | `VORTEX_RDF_PUSHDOWN_OPS=<list>` | Intercept only the listed algebra nodes (`BGP,Filter,Project,...`); `bgp` is basic graph patterns only, the behaviour of the first releases. |
 | `VORTEX_RDF_FILTER_FAST=0` | Route every FILTER value through rdflib's evaluator (still once per distinct value). |
 
-The switches are read when a `VortexStore` is constructed. The default
+The switches are read when a `VortexRdflibStore` is constructed. The default
 evaluator is the oracle of the test suite: `tests/test_pushdown.py` runs
 every query shape (≈240) with the pushdown and without, on a file-backed
 and an in-memory store, in four modes — the shipped configuration, the
@@ -398,8 +450,8 @@ joins.
 ## What stays with rdflib
 
 - `UNION` (each branch is a block of its own and is ours), `BIND`/`Extend`,
-  `GRAPH`, sub-selects, `SERVICE`: rdflib evaluates the node and re-enters
-  the hook below it.
+  sub-selects, `SERVICE`: rdflib evaluates the node and re-enters the hook
+  below it.
 - Property paths and RDF-star patterns.
 - `REDUCED`, aggregates other than `COUNT`, `GROUP BY` and `ORDER BY` on
   expressions.

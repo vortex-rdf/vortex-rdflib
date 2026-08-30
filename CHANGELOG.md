@@ -18,8 +18,20 @@ First standalone release. The rdflib integration previously lived in the
 
 ### Added
 
-- `VortexStore`: a read-only rdflib `Store` over `.vortex` files, file-backed
-  and lazily opened by default, or loaded into memory with `in_memory=True`.
+- `VortexRdflibStore`: a read-only rdflib `Store` over `.vortex` files,
+  file-backed and lazily opened by default, or loaded into memory with
+  `in_memory=True`.
+- Named graphs: the store is context-aware, so a `.vortex` file's quads can be
+  read through an rdflib `Dataset` — `contexts()`, per-graph `len()` and
+  `triples()`, `quads()` carrying each row's graph — and `GRAPH` works in
+  SPARQL. A `Graph` with no identifier of its own stays the view over the
+  whole file, so the triple-oriented usage is unchanged.
+- `GRAPH` pushdown: a named graph is the fourth position of every native match
+  below it, and `GRAPH ?g` binds the graph from the match's fourth column, so
+  the graph is an ordinary variable of the code-space relation — one match
+  instead of rdflib's walk over the dataset's graphs. At 250k quads over 8
+  graphs: `DISTINCT ?g` 2,678 ms -> 117 ms, `COUNT(*)` per graph
+  1,593 ms -> 148 ms, a predicate scan under `GRAPH ?g` 87 ms -> 28 ms.
 - Dictionary-layout code path: matched rows arrive as zero-copy `u32`
   term-code columns and each distinct code is decoded to an rdflib term once,
   with a string-table fallback for other layouts.
@@ -43,4 +55,17 @@ First standalone release. The rdflib integration previously lived in the
   (`ask-var`, `limit-scan`, `filter-class`, `distinct-p`, `count-all`,
   `count-distinct`, `optional-wide`, `not-exists`, `minus`, `order-var`,
   `values-64`) on the dashboard.
+- Benchmark: the dataset is quads, partitioned by subject over eight graphs
+  (`BENCH_GRAPHS`), and the quad-capable stores are compared as rdflib
+  `Dataset`s over their union — so every existing query keeps its row counts —
+  with a `graphs` panel for the shapes that name one (`graph-scan`,
+  `graph-star`, `graph-chain`, `graph-var`, `graph-names`, `graph-count`).
+  HDT and COTTAS do not serve named graphs through rdflib, so they load the
+  flattened N-Triples of the same statements and are not asked that group.
 - `py.typed` marker.
+
+### Fixed
+
+- A `FILTER (NOT) EXISTS` in an `OPTIONAL`'s group was hoisted into the
+  `LeftJoin` condition and then dropped, so the optional side could bind where
+  it should have stayed unbound. That shape is now left to rdflib.

@@ -8,7 +8,7 @@ orchestrator cross-checks them across stores: every store answers the same
 query over the same data, so a count disagreement is a correctness bug in one
 of them, not a benchmarking detail.
 
-Three groups, mirroring how the dashboard panels are organized:
+Four groups, mirroring how the dashboard panels are organized:
 
 - ``lookups``  — single-pattern selectivity shapes (ASK, bound PO, bound O,
   predicate scan): what a store's raw ``triples()`` service costs; plus an
@@ -27,16 +27,36 @@ Three groups, mirroring how the dashboard panels are organized:
   a full ORDER BY of a predicate scan, and full-scan aggregates (a GROUP BY
   count, a COUNT(*), a COUNT DISTINCT per group): rdflib operators layered
   over the BGP.
+- ``graphs``   — the shapes that name a graph: a scan and a star inside one
+  named graph, a chain that starts in one and continues wherever the object
+  lives, and the three an unbound ``GRAPH ?g`` drives — a scan, the distinct
+  graph names, and a count per graph. Marked ``quads``: the contenders that
+  cannot serve named graphs through rdflib (HDT, COTTAS — see
+  ``bench.adapters``) do not run them, and the dashboard leaves those cells
+  empty rather than pretending.
+
+  Every other query is asked over the **union** of the graphs, which is the
+  triple set (``bench.dataset`` puts each statement in exactly one graph), so
+  its row count is what it was before the dataset had graphs at all.
 
 ``heavy`` marks queries whose single execution touches the whole dataset (or
 a whole predicate's bindings joined against the store); the harness gives
 those a lower iteration budget, mirroring FULL_SCAN_OPTS in the JS bench.
 """
 
+from collections import Counter
 from dataclasses import dataclass
 from textwrap import dedent
 
-from .dataset import DatasetConfig, Moduli, object_nt, predicate_iri, subject_iri
+from .dataset import (
+    DatasetConfig,
+    Moduli,
+    graph_iri,
+    graph_of_subject,
+    object_nt,
+    predicate_iri,
+    subject_iri,
+)
 
 XSD_PREFIX = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>"
 
@@ -48,6 +68,8 @@ class Query:
     sparql: str
     heavy: bool = False
     is_ask: bool = False
+    #: Names a graph, so only a store that serves named graphs can answer it.
+    quads: bool = False
 
 
 def _sparql(text: str) -> str:
@@ -128,6 +150,51 @@ def _object_split_predicate(cfg: DatasetConfig, m: Moduli, subjects: set[int], e
     raise ValueError("no predicate splits the subjects by object kind — dataset too small")
 
 
+def _busiest_named_graph(subjects, m: Moduli) -> int:
+    """The named graph holding the most of ``subjects``.
+
+    Never the default graph (index 0): no ``GRAPH`` clause can name it, so a
+    query scoped there would measure an empty result.
+    """
+    counts = Counter(graph_of_subject(j, m) for j in subjects)
+    counts.pop(0, None)
+    if not counts:
+        raise ValueError("no named graph holds any of these subjects — dataset too small")
+    return max(counts, key=lambda g: (counts[g], -g))
+
+
+def _chain_graph(cfg: DatasetConfig, m: Moduli, p_a: int, p_b: int) -> int:
+    """The named graph whose ``p_a`` rows have the most continuations through
+    ``p_b`` — the chain's first leg is scoped to it, so it must have some.
+
+    The same walk as ``_chain_predicates``, counted per graph of the first
+    leg's subject; the continuation is wherever the middle node's own graph
+    is, which is the point of the query.
+    """
+    literal_cut = round(cfg.literal_frac * 10)
+    counts: dict[int, int] = {}
+    for i in range(p_a, cfg.n, m.n_pred):  # rows carrying predicate index p_a
+        j = i % m.n_obj
+        if j % 10 < literal_cut or j >= m.n_subj:
+            continue  # object is a literal or a non-subject IRI: no hop
+        g = graph_of_subject(i % m.n_subj, m)
+        if g == 0:
+            continue  # the default graph is not nameable
+        for i2 in range(j, cfg.n, m.n_subj):  # rows with subject index j
+            if i2 % m.n_pred == p_b:
+                counts[g] = counts.get(g, 0) + 1
+    if not counts:
+        raise ValueError("no named graph starts a chain — dataset too small or ratios off")
+    return max(counts, key=lambda g: (counts[g], -g))
+
+
+def _carriers(cfg: DatasetConfig, m: Moduli, subjects: set[int], predicate: int) -> set[int]:
+    """The members of ``subjects`` that carry ``predicate``."""
+    return {
+        j for j in subjects if any(i % m.n_pred == predicate for i in range(j, cfg.n, m.n_subj))
+    }
+
+
 def _filter_predicate(cfg: DatasetConfig, m: Moduli) -> tuple[int, int]:
     """Pick the predicate for the numeric FILTER/ORDER BY queries, plus a
     threshold selecting roughly an eighth of its integer bindings.
@@ -177,7 +244,8 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
     # Subjects of the p1 scan, and of the filter-range rows: the outer sides
     # of the OPTIONAL and MINUS shapes, paired with a predicate half of them carry.
     p1_subjects = {i % m.n_subj for i in range(1, cfg.n, m.n_pred)}
-    q_opt = f"<{predicate_iri(_partner_predicate(cfg, m, p1_subjects, exclude=1))}>"
+    opt_p = _partner_predicate(cfg, m, p1_subjects, exclude=1)
+    q_opt = f"<{predicate_iri(opt_p)}>"
     filter_subjects = {
         i % m.n_subj
         for i in range(cfg.n)
@@ -190,6 +258,14 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
         f"<{predicate_iri(_object_split_predicate(cfg, m, filter_subjects, exclude=filter_p))}>"
     )
     values_64 = " ".join(f"<{subject_iri(j)}>" for j in sorted(p1_subjects)[:64])
+
+    # Graph constants. A subject's statements are never split across graphs,
+    # so a graph is chosen by the subjects a query needs: the one holding most
+    # of them, which makes every graph-scoped query non-empty by construction.
+    g_scan = f"<{graph_iri(_busiest_named_graph(p1_subjects, m))}>"
+    star_subjects = _carriers(cfg, m, p1_subjects, opt_p)
+    g_star = f"<{graph_iri(_busiest_named_graph(star_subjects, m))}>"
+    g_chain = f"<{graph_iri(_chain_graph(cfg, m, chain_a, chain_b))}>"
 
     return [
         Query(
@@ -440,5 +516,83 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                 GROUP BY ?p
             """),
             heavy=True,
+        ),
+        Query(
+            "graph-scan",
+            "graphs",
+            _sparql(f"""
+                SELECT ?s ?o WHERE {{
+                  GRAPH {g_scan} {{
+                    ?s {p1} ?o
+                  }}
+                }}
+            """),
+            quads=True,
+        ),
+        Query(
+            "graph-star",
+            "graphs",
+            _sparql(f"""
+                SELECT ?s ?o ?x WHERE {{
+                  GRAPH {g_star} {{
+                    ?s {p1} ?o .
+                    ?s {q_opt} ?x
+                  }}
+                }}
+            """),
+            quads=True,
+        ),
+        Query(
+            "graph-chain",
+            "graphs",
+            _sparql(f"""
+                SELECT ?s ?o WHERE {{
+                  GRAPH {g_chain} {{
+                    ?s {chain_pa} ?m
+                  }}
+                  ?m {chain_pb} ?o
+                }}
+            """),
+            heavy=True,
+            quads=True,
+        ),
+        Query(
+            "graph-var",
+            "graphs",
+            _sparql(f"""
+                SELECT ?g ?s ?o WHERE {{
+                  GRAPH ?g {{
+                    ?s {p1} ?o
+                  }}
+                }}
+            """),
+            quads=True,
+        ),
+        Query(
+            "graph-names",
+            "graphs",
+            _sparql("""
+                SELECT DISTINCT ?g WHERE {
+                  GRAPH ?g {
+                    ?s ?p ?o
+                  }
+                }
+            """),
+            heavy=True,
+            quads=True,
+        ),
+        Query(
+            "graph-count",
+            "graphs",
+            _sparql("""
+                SELECT ?g (COUNT(*) AS ?n) WHERE {
+                  GRAPH ?g {
+                    ?s ?p ?o
+                  }
+                }
+                GROUP BY ?g
+            """),
+            heavy=True,
+            quads=True,
         ),
     ]

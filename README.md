@@ -7,15 +7,9 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 An [rdflib](https://rdflib.readthedocs.io/) `Store` implementation for
-[Vortex-RDF](https://github.com/vortex-rdf/vortex-rdf), a modern,
-high-performance columnar RDF serialization format — so `.vortex` files can
-be queried with SPARQL.
+[Vortex-RDF](https://github.com/vortex-rdf/vortex-rdf), a columnar zero-copy RDF serialization format — so `.vortex` files can be queried with SPARQL.
 
-This package is pure Python. The native layer is the
-[vortex-rdf](https://pypi.org/project/vortex-rdf/) package (PyO3 bindings
-over the `vortex-rdf-core` Rust crate), pulled in as a dependency: stores are
-**opened lazily from `.vortex` files** and queried in place, without loading
-the dataset into memory.
+The native layer is the [vortex-rdf](https://pypi.org/project/vortex-rdf/) package (PyO3 bindings over the `vortex-rdf-core` Rust crate), pulled in as a dependency: stores are **opened lazily from `.vortex` files** by default, and queried in place without loading the dataset into memory. A `.vortex` file can also be fully loaded in memory if desired, with exactly the same data structure.
 
 ## Install
 
@@ -25,23 +19,59 @@ pip install vortex-rdflib
 
 Python 3.11+. The `vortex-rdf` dependency ships prebuilt wheels for Linux
 (x86_64, aarch64), macOS (x86_64, arm64) and Windows (x64); on other
-platforms it builds from source, which needs a Rust toolchain.
+platforms it builds from source.
 
 ## Usage
 
 ```python
 from rdflib import Graph
-from vortex_rdflib import VortexStore
+from vortex_rdflib import VortexRdflibStore
 
-graph = Graph(store=VortexStore("data.vortex"))
+graph = Graph(store=VortexRdflibStore("data.vortex"))
 for row in graph.query("""
-    SELECT ?s ?o WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?o } LIMIT 10
+    SELECT ?s ?o WHERE { 
+        ?s <http://xmlns.com/foaf/0.1/name> ?o 
+    } 
+    LIMIT 10
 """):
     print(row.s, row.o)
 ```
 
-SPARQL evaluation is rdflib's engine; the store serves triple patterns from
-the Vortex file. The store is read-only.
+SPARQL evaluation is rdflib's engine; the store serves quad patterns from
+the Vortex file. The store is read-only so far. Support for mutations is in the roadmap.
+
+### Named graphs
+
+A `.vortex` file holds quads, so the store is context-aware. A `Dataset` gives
+the named graphs, and `GRAPH` works in SPARQL:
+
+```python
+from rdflib import Dataset
+from vortex_rdflib import VortexRdflibStore
+
+# default_union=True makes the SPARQL default graph the union of every graph
+dataset = Dataset(store=VortexRdflibStore("data.vortex"), default_union=True)
+
+for graph in dataset.graphs():
+    print(graph.identifier, len(graph))
+
+for row in dataset.query("""
+    SELECT ?g (COUNT(*) AS ?n) WHERE {
+        GRAPH ?g { ?s ?p ?o }
+    }
+    GROUP BY ?g
+"""):
+    print(row.g, row.n)
+```
+
+A plain `Graph(store=VortexRdflibStore(path))` — as in the example above — is
+the view over the **whole file**, every graph included: rdflib names a graph
+constructed without an identifier with a blank node, which names nothing the
+file holds. It is a multiset view, so a triple in two graphs is yielded twice;
+the store streams the quads it holds rather than building the RDF merge, which
+would cost a set the size of the result. Give the graph an identifier
+(`Graph(store=store, identifier=URIRef(...))`) to see one named graph, and note
+the corollary: a *blank-node* graph name is reachable only through a `Dataset`.
 
 To produce a `.vortex` file from an RDF file, use the binding layer directly
 (or the [vortex-rdf CLI](https://github.com/vortex-rdf/vortex-rdf)):
@@ -49,39 +79,31 @@ To produce a `.vortex` file from an RDF file, use the binding layer directly
 ```python
 from vortex_rdf import serialize_rdf
 
-serialize_rdf("data.nt", "data.vortex", layout="dictionary")
+serialize_rdf("data.nq", "data.vortex", format="nquads", layout="dictionary")
 ```
 
-`layout` accepts `"default"`, `"typed-object"` and `"dictionary"`; opening
+`layout` accepts `"default"`, `"typed-object"` and `"dictionary"` (see a [description here](https://github.com/vortex-rdf/vortex-rdf/blob/main/docs/file-format.md#4-the-quad-table)); opening
 auto-detects the layout. The `"dictionary"` layout is the fastest to query
-from Python — it enables the code path and SPARQL pushdown described below.
+from Python — it enables the SPARQL pushdowns described below.
 
-## How it stays fast
+## How it works
 
 **Term codes instead of strings.** For Dictionary-layout stores, matched rows
 cross the native boundary as zero-copy `u32` term-code columns
 (`vortex_rdf.VortexRdfStore.match_codes`), and each distinct code is decoded
 to an rdflib term once — in one GIL-released `TermDict.decode_many` call per
 batch — and cached for the store's lifetime. Other layouts fall back to
-N-Triples string columns, parsing each distinct term once
-(`VORTEX_RDF_DISABLE_CODE_PATH=1` forces that path).
+N-Triples string columns, parsing each distinct term once.
 
-**SPARQL pushdown.** Constructing a `VortexStore` registers an rdflib
+**SPARQL pushdown.** Constructing a `VortexRdflibStore` registers an rdflib
 `CUSTOM_EVALS` hook that answers the algebra operators it understands over
-those codes instead of leaving them to rdflib's per-row evaluation: basic
-graph patterns (one native match per pattern, hash or probe joins over `u32`
-tuples), `FILTER`, `OPTIONAL`, `MINUS`, `FILTER (NOT) EXISTS`, nested groups
-and `VALUES`, and the projection, `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`,
-`ASK` and `COUNT` aggregates above them — decoding terms only for the
-solutions actually consumed. Anything else is evaluated by rdflib, which
-re-enters the hook for the supported subtrees below it, so the behaviour is
-that of rdflib's default evaluator, only faster. What each pushdown does, why
-it is faster, and when it steps aside is described in
-[docs/pushdown.md](docs/pushdown.md); the switches to disable or narrow it are
-in the table below.
+vortex term codes instead of leaving them to rdflib's per-row evaluation: basic
+graph patterns, `FILTER`, `OPTIONAL`, `MINUS`, `FILTER (NOT) EXISTS`, nested groups
+and `VALUES`, projection, `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`,
+`ASK` and `COUNT` aggregates above them. Anything else is evaluated by rdflib. A more detailed description is available in [docs/pushdown.md](docs/pushdown.md); the switches to disable or narrow it are in the table below.
 
 **File-backed vs in-memory.** The default open is lazy and file-backed.
-`VortexStore(path, in_memory=True)` (or env `VORTEX_RDF_IN_MEMORY=1`) loads
+`VortexRdflibStore(path, in_memory=True)` (or env `VORTEX_RDF_IN_MEMORY=1`) loads
 the store into memory once, so queries skip the per-call file-read pipeline.
 That helps point lookups and joins, and does nothing for the scan-dominated
 queries, which are bound by rdflib's own result handling.
@@ -97,7 +119,7 @@ effect they have. Enable them for lookup-heavy file-backed workloads; measure
 before assuming they help elsewhere.
 
 For Dictionary-layout files, the term dictionary is held in memory when it
-fits the residency budget; pass `VortexStore(path, max_resident_bytes=...)`
+fits the residency budget; pass `VortexRdflibStore(path, max_resident_bytes=...)`
 (the dictionary's compressed size in bytes) to raise the budget
 (recommended for large stores).
 
@@ -114,7 +136,7 @@ fits the residency budget; pass `VortexStore(path, max_resident_bytes=...)`
 
 ## Benchmarks
 
-A comparative benchmark — `VortexStore` against rdflib's in-memory `Memory`
+A comparative benchmark — `VortexRdflibStore` against rdflib's in-memory `Memory`
 store, [oxrdflib](https://github.com/oxigraph/oxrdflib) (Oxigraph),
 [pycottas](https://github.com/cottas-rdf/pycottas) (COTTAS) and
 [rdflib-hdt](https://pypi.org/project/rdflib-hdt/) (HDT) — runs on every
@@ -124,11 +146,20 @@ reference for how these variants actually compare; timings vary with machine
 and dataset, so this README deliberately quotes none.
 
 It executes a synthetic representative SPARQL set (lookups/scans, star and
-chain joins, FILTER/DISTINCT/ORDER BY/GROUP BY) and records per-store peak
-RSS; each store's full lifecycle runs in its own process. SPARQL evaluation
-is rdflib's engine for every store, so the store serving triple patterns is
-the only variable — a store's own SPARQL engine is out of scope, since it
-skips rdflib's parse and algebra and is not measuring the same work.
+chain joins, FILTER/DISTINCT/ORDER BY/GROUP BY, and the shapes that name a
+graph) and records per-store peak RSS; each store's full lifecycle runs in its
+own process. SPARQL evaluation is rdflib's engine for every store, so the
+store serving quad patterns is the only variable — a store's own SPARQL engine
+is out of scope, since it skips rdflib's parse and algebra and is not
+measuring the same work.
+
+The dataset is quads: every statement about a subject goes into one graph, so
+the union of the graphs is exactly the triple set, and each store loads it as
+an rdflib `Dataset` whose default graph is that union. HDT and COTTAS cannot
+serve named graphs through rdflib — HDT's format has none, and pycottas'
+`COTTASStore` does not expose the ones COTTAS files can hold — so those two
+rows load the flattened N-Triples, the same statements, and are not asked the
+`graphs` group, whose cells stay empty for them.
 
 The Vortex rows are all Dictionary layout — the layout that enables the code
 path — crossed over the two axes that change how a store answers: residency
