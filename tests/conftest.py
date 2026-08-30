@@ -15,7 +15,7 @@ LAYOUTS = ["default", "typed-object", "dictionary"]
 @pytest.fixture(scope="session")
 def fixture_nt_path(tmp_path_factory):
     path = tmp_path_factory.mktemp("rdf") / "fixture.nt"
-    path.write_text(FIXTURE_NT)
+    path.write_text(FIXTURE_NT, encoding="utf-8")
     return path
 
 

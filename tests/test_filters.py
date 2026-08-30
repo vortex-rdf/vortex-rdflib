@@ -305,7 +305,8 @@ def test_canonical_spelling_round_trips_every_dictionary_term(tmp_path):
         '<http://ex.org/a> <http://ex.org/p> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .\n'
         '<http://ex.org/a> <http://ex.org/p> "x"^^<http://ex.org/dt> .\n'
         "<http://ex.org/\u00fc> <http://ex.org/p> _:b0 .\n"
-        '_:b0 <http://ex.org/p> "" .\n'
+        '_:b0 <http://ex.org/p> "" .\n',
+        encoding="utf-8",
     )
     out = tmp_path / "spellings.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
@@ -334,7 +335,8 @@ def test_kind_bounds_partition_the_dictionary(tmp_path):
         '<http://ex.org/a> <http://ex.org/p> "lit" .\n'
         "<http://ex.org/a> <http://ex.org/p> <http://ex.org/b> .\n"
         "_:x <http://ex.org/p> _:y .\n"
-        '<http://ex.org/a> <http://ex.org/q> "z"@en .\n'
+        '<http://ex.org/a> <http://ex.org/q> "z"@en .\n',
+        encoding="utf-8",
     )
     out = tmp_path / "kinds.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")

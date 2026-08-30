@@ -488,7 +488,7 @@ ORDER_QUERIES += [
 def dict_vortex(tmp_path_factory):
     d = tmp_path_factory.mktemp("pushdown")
     nt = d / "fixture.nt"
-    nt.write_text(FIXTURE_NT)
+    nt.write_text(FIXTURE_NT, encoding="utf-8")
     out = d / "fixture.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
     return out
@@ -581,7 +581,8 @@ def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
         '<http://ex.org/s0> <http://ex.org/rare> "anchor" .\n'
         + "".join(
             f"<http://ex.org/s{i}> <http://ex.org/big> <http://ex.org/o{i}> .\n" for i in range(300)
-        )
+        ),
+        encoding="utf-8",
     )
     out = tmp_path / "skewed.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
@@ -647,7 +648,8 @@ def test_limit_decodes_only_the_first_chunk(tmp_path):
         "".join(
             f"<http://ex.org/s{i}> <http://ex.org/p{i % 7}> <http://ex.org/o{i}> .\n"
             for i in range(700)
-        )
+        ),
+        encoding="utf-8",
     )
     out = tmp_path / "wide.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
@@ -826,7 +828,8 @@ def test_distinct_decodes_only_the_survivors(tmp_path):
         "".join(
             f"<http://ex.org/s{i}> <http://ex.org/p{i % 7}> <http://ex.org/o{i}> .\n"
             for i in range(700)
-        )
+        ),
+        encoding="utf-8",
     )
     out = tmp_path / "wide.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
