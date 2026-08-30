@@ -1,0 +1,65 @@
+name: CodSpeed
+
+# Instrumented benchmarks (bench/test_codspeed.py), uploaded to CodSpeed so
+# every commit carries deterministic instruction counts. The comparative
+# wall-clock benchmark (bench/run_bench.py) is a different job entirely: it
+# feeds the Pages dashboard from bench-dashboard.yml and is never uploaded
+# here.
+
+on:
+  push:
+    branches:
+      - main
+    # Doc-only changes move no instruction counts; workflow_dispatch stays as
+    # the escape hatch since path filters never apply to it.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  # Required to get a performance report on every pull request.
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  # Lets CodSpeed trigger a backtest run to seed the baseline.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # OpenID Connect authentication with CodSpeed — no token to store.
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmarks:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          # Pinned: instruction counts are only comparable across commits
+          # when the interpreter is the same, so the runner image's default
+          # Python must not get to decide it.
+          python-version: "3.13"
+
+      # No Rust toolchain: the native layer arrives as a prebuilt vortex-rdf
+      # wheel. The default groups are enough — pytest-codspeed lives in
+      # `dev`, and the suite never touches the `bench` group's contenders.
+      - name: Install
+        run: uv sync --locked
+
+      # simulation = instruction counting under Valgrind, the same mode the
+      # vortex-rdf suites use, so these rows are read alongside them.
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation
+          run: uv run pytest bench/test_codspeed.py --codspeed

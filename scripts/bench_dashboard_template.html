@@ -1,0 +1,543 @@
+<title>vortex-rdflib · bench dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    color-scheme: light;
+    --page:        #f9f9f7;
+    --surface:     #fcfcfb;
+    --surface-2:   #f3f2ee;
+    --ink:         #0b0b0b;
+    --ink-2:       #52514e;
+    --ink-muted:   #898781;
+    --grid:        #e1e0d9;
+    --baseline:    #c3c2b7;
+    --border:      rgba(11,11,11,0.10);
+    --border-strong: rgba(11,11,11,0.18);
+    --accent:      #2a78d6;
+    --good:        #0ca30c;
+    --bad:         #c93030;
+    --focus:       #2a78d6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page:        #0d0d0d;
+      --surface:     #1a1a19;
+      --surface-2:   #232322;
+      --ink:         #ffffff;
+      --ink-2:       #c3c2b7;
+      --ink-muted:   #898781;
+      --grid:        #2c2c2a;
+      --baseline:    #383835;
+      --border:      rgba(255,255,255,0.10);
+      --border-strong: rgba(255,255,255,0.18);
+      --accent:      #3987e5;
+      --good:        #0ca30c;
+      --bad:         #e05252;
+      --focus:       #3987e5;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface:#1a1a19; --surface-2:#232322;
+    --ink:#ffffff; --ink-2:#c3c2b7; --ink-muted:#898781;
+    --grid:#2c2c2a; --baseline:#383835; --border:rgba(255,255,255,0.10);
+    --border-strong: rgba(255,255,255,0.18);
+    --accent:#3987e5; --good:#0ca30c; --bad:#e05252;
+    --focus:#3987e5;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --page: #f9f9f7; --surface:#fcfcfb; --surface-2:#f3f2ee;
+    --ink:#0b0b0b; --ink-2:#52514e; --ink-muted:#898781;
+    --grid:#e1e0d9; --baseline:#c3c2b7; --border:rgba(11,11,11,0.10);
+    --border-strong: rgba(11,11,11,0.18);
+    --accent:#2a78d6; --good:#0ca30c; --bad:#c93030;
+    --focus:#2a78d6;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 15px;
+    line-height: 1.5;
+  }
+  .mono {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  a { color: var(--accent); }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+  /* ---- shell ---- */
+  header.topbar {
+    position: sticky; top: 0; z-index: 20;
+    background: color-mix(in srgb, var(--surface) 92%, transparent);
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 24px;
+  }
+  .topbar-row { display:flex; align-items:baseline; justify-content:space-between; gap:16px; flex-wrap:wrap; max-width: 1280px; margin: 0 auto; }
+  .brand { display:flex; align-items:baseline; gap:10px; }
+  .brand .mark { font-weight:700; letter-spacing:0.02em; font-size:14px; text-transform:uppercase; }
+  .brand .sub { color:var(--ink-2); font-size:13px; }
+  nav.seclinks { display:flex; gap:18px; flex-wrap:wrap; }
+  nav.seclinks a {
+    text-decoration:none; color:var(--ink-2); font-size:12px; text-transform:uppercase;
+    letter-spacing:0.06em; font-weight:600; border-bottom:2px solid transparent; padding-bottom:2px;
+  }
+  nav.seclinks a:hover { color:var(--ink); border-color: var(--accent); }
+
+  main { max-width: 1280px; margin: 0 auto; padding: 28px 24px 80px; }
+
+  .lede { max-width: 78ch; color:var(--ink-2); font-size:14.5px; margin: 4px 0 20px; }
+  .lede code { font-family: ui-monospace, monospace; font-size:0.93em; background:var(--surface-2); padding:1px 5px; border-radius:3px; }
+
+  /* ---- KPI strip ---- */
+  .kpi-row {
+    display:grid; grid-template-columns:repeat(auto-fit, minmax(180px,1fr));
+    gap:1px; background:var(--border); border:1px solid var(--border);
+    border-radius:8px; overflow:hidden; margin-bottom:20px;
+  }
+  .kpi { background:var(--surface); padding:16px 18px; display:flex; flex-direction:column; gap:6px; }
+  .kpi .label { font-size:11px; text-transform:uppercase; letter-spacing:0.07em; color:var(--ink-muted); font-weight:600; }
+  .kpi .value { font-size:22px; font-weight:600; }
+  .kpi .sub { font-size:12px; color:var(--ink-2); }
+
+  /* ---- sections ---- */
+  section.group { margin-bottom: 52px; scroll-margin-top: 84px; }
+  .group-head { display:flex; align-items:center; gap:12px; margin-bottom:6px; }
+  .chan-tag {
+    font-size:11px; font-weight:700; letter-spacing:0.08em; padding:3px 8px;
+    border:1px solid var(--border-strong); border-radius:4px; color:var(--ink-2);
+  }
+  .group-head h2 { margin:0; font-size:20px; font-weight:650; text-wrap: balance; }
+  .group-desc { color:var(--ink-2); font-size:13.5px; max-width:80ch; margin: 0 0 18px; }
+
+  .panel-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(420px,1fr)); gap:16px; }
+  .panel.wide { grid-column: 1 / -1; }
+  .panel { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:16px 18px 18px; }
+  .panel h3 { margin:0 0 2px; font-size:14.5px; font-weight:650; }
+  .panel .note { color:var(--ink-2); font-size:12.5px; margin: 0 0 12px; max-width:70ch; }
+
+  .failures { border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); }
+  .failures h3 { color: var(--bad); }
+  .failures ul { margin:6px 0 0; padding-left:18px; font-size:12.5px; color:var(--ink-2); }
+
+  /* ---- matrix tables (store rows × query columns) ---- */
+  .matrix-table { width:100%; border-collapse:collapse; margin-top:10px; font-size:12.5px; }
+  .matrix-table th, .matrix-table td { padding:7px 10px; border-bottom:1px solid var(--border); text-align:right; white-space:nowrap; }
+  .matrix-table th { color:var(--ink-muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; }
+  .matrix-table th.rowh, .matrix-table td.rowh { text-align:left; }
+  .matrix-table td.rowh.sub { color:var(--ink-muted); }
+  .matrix-table td.num { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .matrix-table td.num .ratio { color:var(--ink-muted); font-size:10.5px; margin-left:5px; }
+  .matrix-table td.num.best { color:var(--good); font-weight:700; }
+  .matrix-table tbody tr.group-break td { border-top:1px solid var(--border-strong); }
+  .table-wrap { overflow-x:auto; border:1px solid var(--border); border-radius:8px; }
+
+  /* ---- query text ---- */
+  details.query { border:1px solid var(--border); border-radius:8px; background:var(--surface); margin-bottom:8px; }
+  details.query summary { cursor:pointer; padding:10px 14px; font-size:13px; }
+  details.query summary .qname { font-weight:650; font-family: ui-monospace, monospace; }
+  details.query summary .qmeta { color:var(--ink-muted); font-size:12px; margin-left:8px; }
+  details.query pre {
+    margin:0; padding:12px 14px; border-top:1px solid var(--border);
+    background:var(--surface-2); border-radius:0 0 8px 8px;
+    font-size:12px; line-height:1.55; overflow-x:auto;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  /* ---- data table ---- */
+  .table-toolbar { display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
+  .table-toolbar input {
+    background:var(--surface); border:1px solid var(--border-strong); border-radius:6px;
+    padding:7px 10px; font-size:13px; color:var(--ink); min-width:220px;
+    font-family: ui-monospace, monospace;
+  }
+  .table-toolbar input::placeholder { color:var(--ink-muted); }
+  .table-toolbar .count { font-size:12px; color:var(--ink-muted); }
+  table.data { width:100%; border-collapse:collapse; font-size:12.5px; background:var(--surface); min-width: 720px; }
+  table.data th, table.data td { padding:8px 12px; text-align:right; white-space:nowrap; }
+  table.data td:first-child, table.data th:first-child { text-align:left; }
+  table.data thead th {
+    position:sticky; top:0; background:var(--surface-2); cursor:pointer; user-select:none;
+    font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--ink-2);
+    border-bottom:1px solid var(--border-strong);
+  }
+  table.data thead th:hover { color:var(--ink); }
+  table.data thead th .arrow { opacity:0.5; margin-left:3px; }
+  table.data tbody tr:nth-child(odd) { background: color-mix(in srgb, var(--surface-2) 45%, transparent); }
+  table.data td.name { font-family: ui-monospace, monospace; text-align:left; }
+  table.data td.num { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+
+  footer.prov {
+    margin-top:36px; padding-top:16px; border-top:1px solid var(--border);
+    color:var(--ink-muted); font-size:11.5px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition:none !important; animation:none !important; }
+  }
+</style>
+
+<header class="topbar">
+  <div class="topbar-row">
+    <div class="brand">
+      <span class="mark mono">vortex-rdflib · bench</span>
+      <span class="sub">SPARQL over rdflib stores — comparative benchmark</span>
+    </div>
+    <nav class="seclinks">
+      <a href="#overview">Overview</a>
+      <a href="#load">Load</a>
+      <a href="#queries">Queries</a>
+      <a href="#memory">Memory</a>
+      <a href="#queryset">Query set</a>
+      <a href="#data">Raw data</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section id="overview" class="group">
+    <p class="lede">
+      One run of <code>bench/run_bench.py</code>: <a href="https://github.com/vortex-rdf/vortex-rdflib">vortex-rdflib</a>'s
+      <code>VortexStore</code> against rdflib, <a href="https://github.com/oxigraph/oxrdflib">oxrdflib</a>
+      (Oxigraph), <a href="https://github.com/cottas-rdf/pycottas">pycottas-rdflib</a> (COTTAS) and
+      <a href="https://pypi.org/project/rdflib-hdt/">rdflib-hdt</a> (HDT), over a synthetic SPARQL
+      set: lookups and scans, star and chain joins, and FILTER / DISTINCT / ORDER BY / GROUP BY.
+      The Vortex rows are all Dictionary layout, crossed over <em>residency</em> and
+      <em>secondary index</em> (none, by-copy, by-reference).
+    </p>
+    <p class="lede">
+      rdflib's engine evaluates every store, so the store serving triple patterns is the only
+      variable. Each label records where a query's bytes come from:
+      <em>in-mem</em> stores live fully in memory, <em>file</em> stores perform file access reads per query.
+      Every query matches by construction, and row counts are cross-checked across stores.
+    </p>
+    <div class="kpi-row" id="kpi-row"></div>
+    <p class="lede mono" id="matched-rows"></p>
+    <div id="failures-host"></div>
+  </section>
+
+  <section id="load" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">LOAD</span>
+      <h2>N-Triples to queryable store</h2>
+    </div>
+    <p class="group-desc">
+      Cold start: from the shared <span class="mono">.nt</span> file to a queryable store. Most
+      libraries build their own format first — <span class="mono">serialize_rdf</span> (vortex-rdflib),
+      <span class="mono">rdf2cottas</span>, <span class="mono">hdt convert</span> — then open it;
+      rdflib and oxrdflib parse directly. Median of repeated full rebuilds.
+      <strong>rdflib-hdt is read-only</strong>: it cannot write HDT, so its file is built by the
+      Rust <a href="https://crates.io/crates/hdt">hdt</a> crate's CLI and only opened by the
+      library measured here — that row's build is another implementation's work, unlike every
+      other row.
+    </p>
+    <div class="panel-grid" id="load-panels"></div>
+  </section>
+
+  <section id="queries" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">QUERY</span>
+      <h2>SPARQL execution, per query</h2>
+    </div>
+    <p class="group-desc">
+      Median wall-clock time to execute <em>and fully consume</em> each query.
+      <b>Green</b> marks the fastest store in each column; the grey multiplier is the slowdown
+      vs that column's best.
+      <b>rdflib-hdt</b>'s own <span class="mono">optimize_sparql()</span> fast path is switched
+      off: it answers two of these joins wrongly — <span class="mono">chain-2</span> with 26 rows
+      and <span class="mono">optional</span> with 152, against the 18 and 1 that rdflib and
+      rdflib-hdt itself return without it. That row therefore runs on rdflib's engine, as every
+      other row does.
+    </p>
+    <div class="panel-grid" id="query-panels"></div>
+  </section>
+
+  <section id="memory" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">MEMORY</span>
+      <h2>Peak memory (RSS)</h2>
+    </div>
+    <p class="group-desc">
+      Each store's whole lifecycle runs in its own process — build, every query, result
+      materialization — so this is a clean per-store peak resident-set size: the kernel
+      high-water mark (<span class="mono">VmHWM</span>), not a sample. Lower is better.
+    </p>
+    <div class="panel-grid" id="memory-panels"></div>
+  </section>
+
+  <section id="queryset" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">SET</span>
+      <h2>The query set</h2>
+    </div>
+    <p class="group-desc">
+      Anchor terms and thresholds come from the dataset generator's modular arithmetic, so every
+      query matches at least one row. <span class="mono">heavy</span> queries touch the whole
+      dataset and run with a lower iteration budget.
+    </p>
+    <div id="queryset-host"></div>
+  </section>
+
+  <section id="data" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">DATA</span>
+      <h2>Every measurement</h2>
+    </div>
+    <p class="group-desc">Every (query, store) measurement from this run. Click a column to sort.</p>
+    <div class="table-toolbar">
+      <input id="table-filter" type="text" placeholder="filter by name…" autocomplete="off" />
+      <span class="count" id="table-count"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="data" id="data-table">
+        <thead><tr>
+          <th data-key="id" tabindex="0" role="button" aria-label="Sort by benchmark name">Benchmark</th>
+          <th data-key="fastest_ns" tabindex="0" role="button" aria-label="Sort by fastest">Fastest</th>
+          <th data-key="slowest_ns" tabindex="0" role="button" aria-label="Sort by slowest">Slowest</th>
+          <th data-key="median_ns" tabindex="0" role="button" aria-label="Sort by median">Median</th>
+          <th data-key="mean_ns" tabindex="0" role="button" aria-label="Sort by mean">Mean</th>
+          <th data-key="samples" tabindex="0" role="button" aria-label="Sort by sample count">Samples</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="prov mono" id="provenance"></footer>
+</main>
+
+<script>
+const DATA = __BENCH_DATA__;
+const MEMORY = __MEMORY_DATA__;
+const CONFIG = __CONFIG_DATA__;
+const FAILURES = __FAILURES_DATA__;
+const PROVENANCE = __PROVENANCE__;
+
+const byId = new Map(DATA.map(d => [d.id, d]));
+// Memory reshaped to the {median, median_ns} cell shape renderMatrixPanel
+// reads, so the memory panel reuses the same renderer for a different unit.
+const memPeak = new Map(MEMORY.map(m => [m.slug, cellMb(m.peakRssMb)]));
+function cellMb(mb){ return mb == null ? null : { median: mb.toLocaleString() + " MB", median_ns: mb }; }
+
+const ADAPTERS = CONFIG.adapters || [];
+const QUERIES = CONFIG.queries || [];
+// Rule off the rows where what-is-measured changes: the other stores, then
+// the different-engine row.
+function rowBreak(slug){ return slug === "rdflib_memory"; }
+
+function get(map, id){ const r = map.get(id); if(!r) console.warn("missing bench id", id); return r; }
+
+/** One panel form: a matrix table of store rows × measurement columns. Cells
+ * print the median; the column-best cell is green and every other cell
+ * carries its multiplier vs that best. cfg: { title, note, wide, rowHeaders,
+ * columns, rows:[{labels, ids, break}], sortByColumn } */
+function renderMatrixPanel(container, cfg, map){
+  const rows = cfg.rows
+    .map(r => ({...r, recs: r.ids.map(id => id ? get(map, id) : null)}))
+    .filter(r => r.recs.some(Boolean));
+  if (!rows.length) return;
+
+  if (cfg.sortByColumn != null){
+    rows.sort((a,b) => (a.recs[cfg.sortByColumn]?.median_ns ?? Infinity)
+                     - (b.recs[cfg.sortByColumn]?.median_ns ?? Infinity));
+    rows.forEach(r => delete r.break);
+  }
+
+  const best = cfg.columns.map((_, i) => Math.min(
+    ...rows.map(r => r.recs[i]?.median_ns ?? Infinity)));
+
+  const panel = document.createElement("div");
+  panel.className = "panel" + (cfg.wide ? " wide" : "");
+  panel.innerHTML = `<h3>${cfg.title}</h3><p class="note">${cfg.note}</p>`;
+
+  const wrap = document.createElement("div");
+  wrap.className = "table-wrap";
+  const table = document.createElement("table");
+  table.className = "matrix-table";
+  table.innerHTML = "<thead><tr>" +
+    cfg.rowHeaders.map(h => `<th class="rowh">${h}</th>`).join("") +
+    cfg.columns.map(c => `<th>${c}</th>`).join("") + "</tr></thead>";
+  const tbody = document.createElement("tbody");
+
+  for (const r of rows){
+    const tr = document.createElement("tr");
+    if (r.break) tr.className = "group-break";
+    tr.innerHTML =
+      r.labels.map((l, i) => `<td class="rowh${i ? " sub" : ""}">${l}</td>`).join("") +
+      r.recs.map((rec, i) => {
+        if (!rec) return `<td class="num">—</td>`;
+        const isBest = rec.median_ns === best[i];
+        const mult = rec.median_ns / best[i];
+        const multStr = mult >= 100 ? Math.round(mult).toLocaleString() : mult.toFixed(1);
+        const ratio = isBest ? "" : `<span class="ratio">${multStr}×</span>`;
+        return `<td class="num${isBest ? " best" : ""}">${rec.median}${ratio}</td>`;
+      }).join("");
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+  panel.appendChild(wrap);
+  container.appendChild(panel);
+}
+
+function storeRows(idFor){
+  return ADAPTERS.map(a => ({
+    labels: [a.label],
+    ids: idFor(a),
+    break: rowBreak(a.slug),
+  }));
+}
+
+// ---- load ----
+renderMatrixPanel(document.getElementById("load-panels"), {
+  title: "Load (cold start)",
+  note: "Median time from the shared N-Triples file to a queryable store, fastest first. Green = fastest.",
+  rowHeaders: ["Store"], columns: ["Load"], sortByColumn: 0,
+  rows: storeRows(a => [`load::${a.slug}`]),
+}, byId);
+
+// ---- query panels, one per group ----
+const GROUP_META = {
+  lookups: {
+    tag: "Lookups & scans",
+    note: "Single-pattern shapes: a fully-bound ASK, a bound predicate+object lookup, a bound-object scan, a full predicate scan, an ASK over a variable pattern, and a LIMIT 10 over the whole store.",
+  },
+  joins: {
+    tag: "Joins",
+    note: "Anchored 2- and 3-leg subject stars, an unanchored 2-hop chain (heavy: one whole predicate's bindings joined against the store), the star with an OPTIONAL leg, a VALUES of 64 subjects joined to a predicate scan, a wide OPTIONAL (a whole predicate scan as the outer side), a NOT EXISTS over the same scan, and a MINUS over the filtered range (heavy: rdflib's MINUS is quadratic).",
+  },
+  features: {
+    tag: "SPARQL features",
+    note: "rdflib operators over the BGP: a typed-numeric FILTER range, an isIRI term-kind FILTER over a predicate scan, DISTINCT over a predicate scan, ORDER BY + LIMIT top-k, a full ORDER BY of a predicate scan, and the full-scan shapes (heavy): a GROUP BY count, DISTINCT predicates, COUNT(*), and a COUNT DISTINCT per predicate.",
+  },
+};
+const queryHost = document.getElementById("query-panels");
+for (const [group, meta] of Object.entries(GROUP_META)){
+  const qs = QUERIES.filter(q => q.group === group);
+  if (!qs.length) continue;
+  renderMatrixPanel(queryHost, {
+    title: meta.tag,
+    note: meta.note,
+    wide: true,
+    rowHeaders: ["Store"],
+    columns: qs.map(q => q.name + (q.heavy ? " •" : "")),
+    rows: storeRows(a => qs.map(q => `${q.name}::${a.slug}`)),
+  }, byId);
+}
+
+// ---- memory ----
+const memHost = document.getElementById("memory-panels");
+renderMatrixPanel(memHost, {
+  title: "Peak RSS — whole lifecycle",
+  note: "Kernel high-water mark (VmHWM) of each store's own process: parse/build + all queries. Smallest first.",
+  rowHeaders: ["Store"], columns: ["Peak RSS"], sortByColumn: 0,
+  rows: storeRows(a => [a.slug]),
+}, memPeak);
+
+// ---- KPIs ----
+const tiles = [
+  { label:"Stores", value:String(ADAPTERS.length), sub:"vortex-rdflib · rdflib · oxrdflib · pycottas · hdt" },
+  { label:"Queries", value:String(QUERIES.length), sub:"lookups · joins · features" },
+  { label:"Triples", value:(CONFIG.triples||0).toLocaleString(), sub:"synthetic, deterministic" },
+  { label:"Distinct terms", value:(CONFIG.cardinality?.terms||0).toLocaleString(),
+    sub:`${(CONFIG.cardinality?.nSubj||0).toLocaleString()} subjects · ${CONFIG.cardinality?.nPred||0} predicates` },
+];
+const host = document.getElementById("kpi-row");
+for (const t of tiles){
+  const el = document.createElement("div");
+  el.className = "kpi";
+  el.innerHTML = `<span class="label">${t.label}</span><span class="value mono">${t.value}</span><span class="sub mono">${t.sub}</span>`;
+  host.appendChild(el);
+}
+
+// ---- matched rows + failures ----
+const matched = Object.entries(CONFIG.matchedRows || {});
+if (matched.length){
+  document.getElementById("matched-rows").innerHTML =
+    "Result rows per query (cross-checked across stores): " +
+    matched.map(([q, n]) => `<strong>${q}</strong> ${Number(n).toLocaleString()}`).join(" · ");
+}
+if (FAILURES.length){
+  const panel = document.createElement("div");
+  panel.className = "panel failures";
+  panel.innerHTML = `<h3>Unmeasured phases</h3>
+    <p class="note">A missing cell below is a store that could not complete the work, not a benchmark nobody ran.</p>
+    <ul>${FAILURES.map(f => `<li><span class="mono">${f.label} / ${f.phase}</span> — ${f.error}</li>`).join("")}</ul>`;
+  document.getElementById("failures-host").appendChild(panel);
+}
+
+// ---- query set ----
+const qsHost = document.getElementById("queryset-host");
+for (const q of QUERIES){
+  const d = document.createElement("details");
+  d.className = "query";
+  const rowsN = CONFIG.matchedRows?.[q.name];
+  d.innerHTML = `<summary><span class="qname">${q.name}</span><span class="qmeta">${q.group}${q.heavy ? " · heavy" : ""}${rowsN != null ? ` · ${Number(rowsN).toLocaleString()} rows` : ""}</span></summary>
+    <pre>${q.sparql.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</pre>`;
+  qsHost.appendChild(d);
+}
+
+// ---- raw data table ----
+(function makeTable(){
+  const tbody = document.querySelector("#data-table tbody");
+  const countEl = document.getElementById("table-count");
+  const filterEl = document.getElementById("table-filter");
+  let sortKey = "median_ns", sortDir = 1, filterText = "";
+
+  function draw(){
+    const rows = DATA
+      .filter(d => d.id.toLowerCase().includes(filterText))
+      .sort((a,b) => {
+        const av = a[sortKey], bv = b[sortKey];
+        if (av == null && bv == null) return 0;
+        if (av == null) return 1;
+        if (bv == null) return -1;
+        if (typeof av === "string") return sortDir * av.localeCompare(bv);
+        return sortDir * (av - bv);
+      });
+    tbody.innerHTML = "";
+    for (const d of rows){
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td class="name">${d.id}</td>
+        <td class="num">${d.fastest||""}</td>
+        <td class="num">${d.slowest||""}</td>
+        <td class="num">${d.median||""}</td>
+        <td class="num">${d.mean||""}</td>
+        <td class="num">${d.samples||""}</td>`;
+      tbody.appendChild(tr);
+    }
+    countEl.textContent = rows.length + " / " + DATA.length + " rows";
+    document.querySelectorAll("#data-table th").forEach(th => {
+      th.querySelector(".arrow")?.remove();
+      if (th.dataset.key === sortKey){
+        const arrow = document.createElement("span");
+        arrow.className = "arrow";
+        arrow.textContent = sortDir === 1 ? "↑" : "↓";
+        th.appendChild(arrow);
+      }
+    });
+  }
+
+  document.querySelectorAll("#data-table th").forEach(th => {
+    const activate = () => {
+      const key = th.dataset.key;
+      if (key === sortKey) sortDir *= -1; else { sortKey = key; sortDir = 1; }
+      draw();
+    };
+    th.addEventListener("click", activate);
+    th.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); activate(); }
+    });
+  });
+  filterEl.addEventListener("input", () => { filterText = filterEl.value.trim().toLowerCase(); draw(); });
+  draw();
+})();
+
+document.getElementById("provenance").textContent = PROVENANCE;
+</script>
