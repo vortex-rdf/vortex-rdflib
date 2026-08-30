@@ -27,7 +27,9 @@ What runs in code space:
   ``FILTER (NOT) EXISTS`` over blocks run as hash joins, left joins, anti-
   and semi-joins over code tuples, with the inner pattern re-probed per
   outer row when the outer relation is small — instead of rdflib
-  re-entering the store once per outer solution;
+  re-entering the store once per outer solution; an inline ``VALUES`` table
+  is a code-space relation too (a constant the dictionary does not hold
+  gets a private negative code and joins nothing);
 - ``Project``, ``Distinct``, ``OrderBy`` (on variables) and ``Slice``
   (LIMIT/OFFSET) heads are applied to the code-space relation, and an
   ``AskQuery`` over one pattern is answered from the row selection alone, so
@@ -75,6 +77,7 @@ from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
 
 from . import filters
+from .terms import canonical_spelling
 
 _EVAL_KEY = "vortex_rdflib_bgp"
 
@@ -89,6 +92,7 @@ _HANDLER_NAMES = {
     "Join": "_eval_block_node",
     "LeftJoin": "_eval_block_node",
     "Minus": "_eval_block_node",
+    "ToMultiSet": "_eval_block_node",
     "Project": "_eval_head",
     "Slice": "_eval_head",
     "Distinct": "_eval_head",
@@ -99,7 +103,7 @@ _HANDLER_NAMES = {
 _ALL_OPS = frozenset(_HANDLER_NAMES)
 _ENABLED_OPS = _ALL_OPS
 # Nodes a "block" is made of: a subtree solved into one code-space relation.
-_BLOCK_NODES = frozenset({"BGP", "Filter", "Join", "LeftJoin", "Minus"})
+_BLOCK_NODES = frozenset({"BGP", "Filter", "Join", "LeftJoin", "Minus", "ToMultiSet"})
 
 # Solutions decode in chunks that grow geometrically: the first chunk keeps a
 # LIMIT (or any consumer that stops early) from decoding more than a few
@@ -239,6 +243,8 @@ def _check_block(node) -> None:
         _check_block(node.p1)
         _check_block(node.p2)
         return
+    if name == "ToMultiSet" and getattr(node.p, "name", None) == "values":
+        return
     raise NotImplementedError
 
 
@@ -255,6 +261,11 @@ def _node_vars(node, out: list | None = None) -> list:
                     out.append(term)
     elif name == "Filter":
         _node_vars(node.p, out)
+    elif name == "ToMultiSet":
+        for row in node.p.res:
+            for term in row:
+                if term not in out:
+                    out.append(term)
     else:
         _node_vars(node.p1, out)
         _node_vars(node.p2, out)
@@ -273,6 +284,11 @@ def _block_nullable(node) -> frozenset:
     name = node.name
     if name == "BGP":
         return frozenset()
+    if name == "ToMultiSet":
+        rows = node.p.res
+        return frozenset(
+            v for v in _node_vars(node) if any(row.get(v, "UNDEF") == "UNDEF" for row in rows)
+        )
     if name == "Filter":
         return _block_nullable(node.p)
     if name == "Minus":
@@ -674,7 +690,68 @@ def _solve_block(ctx, store, node, env=frozenset(), var_preds=None) -> Relation:
         return _solve_left_join(ctx, store, node, env, var_preds)
     if name == "Minus":
         return _solve_minus(ctx, store, node, env, var_preds)
+    if name == "ToMultiSet":
+        return _solve_values(ctx, store, node)
     raise NotImplementedError
+
+
+def _solve_values(ctx, store, node) -> Relation:
+    """An inline VALUES table as a relation: each constant looked up by its
+    canonical spelling (a term the dictionary does not hold gets a negative
+    code, so it joins nothing but is still yielded verbatim), UNDEF unbound.
+    A row that contradicts a context binding is dropped, as rdflib's
+    ``evalValues`` skips it on AlreadyBound."""
+    rows_in = node.p.res
+    variables = _node_vars(node)
+    schema = tuple(v for v in variables if ctx[v] is None)
+    bound = {v: ctx[v] for v in variables if ctx[v] is not None}
+    codes: dict = {}
+    rows = []
+    for row in rows_in:
+        if any(row.get(v, "UNDEF") != "UNDEF" and row[v] != term for v, term in bound.items()):
+            continue
+        out = []
+        for v in schema:
+            term = row.get(v, "UNDEF")
+            if term == "UNDEF":
+                out.append(None)
+                continue
+            code = codes.get(term)
+            if code is None:
+                code = codes[term] = _constant_code(store, term)
+            out.append(code)
+        rows.append(tuple(out))
+    nullable = frozenset(v for i, v in enumerate(schema) if any(row[i] is None for row in rows))
+    return Relation(schema, None, rows, len(rows), nullable, store._foreign)
+
+
+def _constant_code(store, term) -> int:
+    """The dictionary code of a query constant, or a private negative one.
+
+    ``encode`` is an exact lookup of the canonical spelling; if it misses but
+    the store does hold the term under a spelling the pattern parser accepts
+    (``count_quads`` is spelling-tolerant), the canonicalization disagreed
+    with the store's and the query is left to rdflib rather than guessed.
+    """
+    code = store._dict.encode(canonical_spelling(term))
+    if code is not None:
+        # rdflib would carry the query's own object into the solutions; when
+        # that object is not the decoded dictionary term (a query literal
+        # rdflib's parser left unnormalized, "042"^^xsd:integer), the two are
+        # observably different rows, so the query is left to rdflib.
+        if store._decode_term(code) != term:
+            raise NotImplementedError
+        return code
+    n3 = term.n3()
+    count = store._store().count_quads
+    positions = [(None, None, n3)]
+    if not isinstance(term, Literal):
+        positions.append((n3, None, None))
+        if isinstance(term, URIRef):
+            positions.append((None, n3, None))
+    if any(count(*pattern) for pattern in positions):
+        raise NotImplementedError
+    return store._foreign_code(term)
 
 
 def _solve_filter(ctx, store, node, env, var_preds) -> Relation:
@@ -783,12 +860,7 @@ def _probe_exists(store, schema, rows, pat) -> list:
     least one quad — one ``count_quads`` per row, no row materialized."""
     count = store._store().count_quads
     bound = [(schema.index(v), pos) for v, pos in pat["varpos"].items() if v in schema]
-    codes = list({row[row_idx] for row in rows for row_idx, _ in bound})
-    n3_cache: dict[int, str] = {}
-    for code, term in zip(codes, store._dict.decode_many(codes), strict=True):
-        if term is None:
-            raise ValueError(f"term code {code} is not in the store dictionary")
-        n3_cache[code] = term
+    n3_cache = _probe_spellings(store, rows, bound)
     out = []
     for row in rows:
         n3 = list(pat["n3"])
@@ -840,7 +912,7 @@ def _solve_join(ctx, store, node, env, var_preds) -> Relation:
     left_rows = _rows_of(left)
     if not left_rows:
         schema = left.schema + tuple(v for v in _block_vars(ctx, node.p2) if v not in left.schema)
-        return Relation(schema, None, [], 0, left.nullable | _block_nullable(node.p2))
+        return Relation(schema, None, [], 0, left.nullable | _block_nullable(node.p2), left.foreign)
     right_env = env | frozenset(_node_vars(node.p1)) if lazy else env
     p2 = node.p2
     if lazy and p2.name == "BGP" and len(p2.triples) == 1:
@@ -853,7 +925,7 @@ def _solve_join(ctx, store, node, env, var_preds) -> Relation:
                 left, Relation((), None, [], 0), [v for v in pat["varpos"] if v in left.schema]
             )
             schema, rows = _probe_join(store, left.schema, left_rows, pat)
-            return Relation(schema, None, rows, len(rows), left.nullable)
+            return Relation(schema, None, rows, len(rows), left.nullable, left.foreign)
         right = _rel_from_pattern(pat)
     else:
         right = _solve_block(ctx, store, p2, right_env, var_preds)
@@ -863,7 +935,8 @@ def _solve_join(ctx, store, node, env, var_preds) -> Relation:
     shared = [v for v in right.schema if v in left.schema]
     _shared_key_ok(left, right, shared)
     schema, rows = _join(left.schema, left_rows, right.schema, right_rows)
-    return Relation(schema, None, rows, len(rows), left.nullable | right.nullable)
+    foreign = left.foreign or right.foreign
+    return Relation(schema, None, rows, len(rows), left.nullable | right.nullable, foreign)
 
 
 def _solve_left_join(ctx, store, node, env, var_preds) -> Relation:
@@ -872,17 +945,21 @@ def _solve_left_join(ctx, store, node, env, var_preds) -> Relation:
     p1, p2, expr = node.p1, node.p2, node.expr
     vars1, vars2 = _node_vars(p1), _node_vars(p2)
     condition = expr if getattr(expr, "name", None) != "TrueFilter" else None
-    # rdflib re-evaluates an unmatched OPTIONAL with only p1's variables bound
-    # (its "cheated scope" check); that differs from the first pass only when
-    # a variable bound outside — by the context or by an enclosing join —
-    # reaches p2 or the condition, so those shapes are left to rdflib.
+    # rdflib re-evaluates an unmatched OPTIONAL with only p1's `_vars` bound
+    # (its "cheated scope" check). That differs from the first pass when a
+    # variable that pass drops — bound by the context, by an enclosing join,
+    # or by p1 outside its `_vars` (a VALUES table) — reaches p2, or when a
+    # variable it keeps was invisible to the condition before; those shapes
+    # are left to rdflib.
     outer = dict(ctx.bindings.items())
-    cheated = (env | frozenset(outer)) - frozenset(ctx.initBindings or ())
+    init = frozenset(ctx.initBindings or ())
     p1_vars = p1._vars
-    if p1_vars is not None and cheated:
+    if p1_vars is not None:
         p1_vars = frozenset(p1_vars)
-        if (frozenset(vars2) - p1_vars) & cheated:
+        dropped = (env | frozenset(outer) | frozenset(vars1)) - init - p1_vars
+        if dropped & frozenset(vars2):
             raise NotImplementedError
+        cheated = (env | frozenset(outer)) - init
         if condition is not None and frozenset(filters.expr_vars(condition)) & p1_vars & cheated:
             raise NotImplementedError
 
@@ -891,7 +968,7 @@ def _solve_left_join(ctx, store, node, env, var_preds) -> Relation:
     extra = tuple(v for v in _block_vars(ctx, p2) if v not in left.schema)
     nullable = left.nullable | _block_nullable(p2) | frozenset(extra)
     if not left_rows:
-        return Relation(left.schema + extra, None, [], 0, nullable)
+        return Relation(left.schema + extra, None, [], 0, nullable, left.foreign)
 
     def condition_preds(schema):
         if condition is None:
@@ -918,23 +995,24 @@ def _solve_left_join(ctx, store, node, env, var_preds) -> Relation:
             preds = condition_preds(schema)
             if preds is None:
                 rows = [row + (None,) * len(extra) for row in left_rows]
-                return Relation(left.schema + extra, None, rows, len(rows), nullable)
+                return Relation(left.schema + extra, None, rows, len(rows), nullable, left.foreign)
             schema, rows = _probe_join(
                 store, left.schema, left_rows, pat, keep_unmatched=True, row_preds=preds
             )
-            return Relation(schema, None, rows, len(rows), nullable)
+            return Relation(schema, None, rows, len(rows), nullable, left.foreign)
         right = _rel_from_pattern(pat)
     else:
         right = _solve_block(ctx, store, p2, env | frozenset(vars1))
     shared = [v for v in right.schema if v in left.schema]
     _shared_key_ok(left, right, shared)
     schema = left.schema + tuple(v for v in right.schema if v not in left.schema)
+    foreign = left.foreign or right.foreign
     preds = condition_preds(schema)
     if preds is None:
         rows = [row + (None,) * (len(schema) - len(left.schema)) for row in left_rows]
-        return Relation(schema, None, rows, len(rows), nullable)
+        return Relation(schema, None, rows, len(rows), nullable, foreign)
     rows = _left_join_rows(left.schema, left_rows, right.schema, _rows_of(right), preds)
-    return Relation(schema, None, rows, len(rows), nullable)
+    return Relation(schema, None, rows, len(rows), nullable, foreign)
 
 
 def _left_join_rows(schema_a, rows_a, schema_b, rows_b, preds) -> list:
@@ -974,14 +1052,14 @@ def _solve_minus(ctx, store, node, env, var_preds) -> Relation:
     shared = [v for v in right.schema if v in left.schema]
     if not shared:
         if dict(ctx.bindings.items()) and next(_code_rows(right), None) is not None:
-            return Relation(left.schema, None, [], 0, left.nullable)
-        return Relation(left.schema, None, left_rows, len(left_rows), left.nullable)
+            return Relation(left.schema, None, [], 0, left.nullable, left.foreign)
+        return Relation(left.schema, None, left_rows, len(left_rows), left.nullable, left.foreign)
     _shared_key_ok(left, right, shared)
     ia = [left.schema.index(v) for v in shared]
     ib = [right.schema.index(v) for v in shared]
     keys = {tuple(rb[i] for i in ib) for rb in _code_rows(right)}
     rows = [ra for ra in left_rows if tuple(ra[i] for i in ia) not in keys]
-    return Relation(left.schema, None, rows, len(rows), left.nullable)
+    return Relation(left.schema, None, rows, len(rows), left.nullable, left.foreign)
 
 
 def _filter_relation(rel: Relation, preds) -> Relation:
@@ -1202,13 +1280,7 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
     needed = sorted({idx for pos in free.values() for idx in pos})
 
     # One GIL-released batch decode covers every code the probes will bind.
-    distinct = {row[row_idx] for row in rows for row_idx, _ in bound}
-    codes = list(distinct)
-    n3_cache: dict[int, str] = {}
-    for code, term in zip(codes, store._dict.decode_many(codes), strict=True):
-        if term is None:
-            raise ValueError(f"term code {code} is not in the store dictionary")
-        n3_cache[code] = term
+    n3_cache = _probe_spellings(store, rows, bound)
 
     pad = (None,) * len(free)
     out = []
@@ -1250,6 +1322,20 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
         if keep_unmatched and not matched:
             out.append(row + pad)
     return schema + tuple(free.keys()), out
+
+
+def _probe_spellings(store, rows, bound) -> dict:
+    """The N-Triples spelling of every code the probes substitute: one
+    batch decode for dictionary codes, the term's own spelling for a
+    constant outside the dictionary (which then matches nothing)."""
+    distinct = {row[row_idx] for row in rows for row_idx, _ in bound}
+    codes = [code for code in distinct if code >= 0]
+    n3_cache: dict[int, str] = {code: store._foreign[code].n3() for code in distinct if code < 0}
+    for code, term in zip(codes, store._dict.decode_many(codes), strict=True):
+        if term is None:
+            raise ValueError(f"term code {code} is not in the store dictionary")
+        n3_cache[code] = term
+    return n3_cache
 
 
 def _join(schema_a, rows_a, schema_b, rows_b):

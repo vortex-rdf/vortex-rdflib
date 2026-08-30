@@ -279,6 +279,47 @@ def test_parse_spelling_round_trips_escapes():
     assert parse_spelling("_:b0") == TermView(BLANK, "b0")
 
 
+def test_canonical_spelling_round_trips_every_dictionary_term(tmp_path):
+    """For every code of a store with escapes, tags and non-ASCII terms:
+    encode(canonical_spelling(decoded term)) is the code again."""
+    from vortex_rdf import serialize_rdf
+
+    from vortex_rdflib import VortexStore
+    from vortex_rdflib.terms import canonical_spelling
+
+    nt = tmp_path / "spellings.nt"
+    nt.write_text(
+        '<http://ex.org/a> <http://ex.org/p> "tab\\there" .\n'
+        '<http://ex.org/a> <http://ex.org/p> "line\\nbreak\\r" .\n'
+        '<http://ex.org/a> <http://ex.org/p> "quote\\"q\\\\bs" .\n'
+        '<http://ex.org/a> <http://ex.org/p> "\\u0001\\u001Fcontrols\\u007F" .\n'
+        '<http://ex.org/a> <http://ex.org/p> "\u00fcn\u00efc\u00f6d\u00e9 \U0001f600" .\n'
+        '<http://ex.org/a> <http://ex.org/p> "x"@EN-us .\n'
+        '<http://ex.org/a> <http://ex.org/p> "x"^^<http://www.w3.org/2001/XMLSchema#string> .\n'
+        '<http://ex.org/a> <http://ex.org/p> "042"^^<http://www.w3.org/2001/XMLSchema#integer> .\n'
+        '<http://ex.org/a> <http://ex.org/p> "1.50"^^<http://www.w3.org/2001/XMLSchema#decimal> .\n'
+        '<http://ex.org/a> <http://ex.org/p> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .\n'
+        '<http://ex.org/a> <http://ex.org/p> "x"^^<http://ex.org/dt> .\n'
+        "<http://ex.org/\u00fc> <http://ex.org/p> _:b0 .\n"
+        '_:b0 <http://ex.org/p> "" .\n'
+    )
+    out = tmp_path / "spellings.vortex"
+    serialize_rdf(str(nt), str(out), layout="dictionary")
+    store = VortexStore(str(out))
+    term_dict = store._dict
+    assert term_dict is not None
+    for code in range(len(term_dict)):
+        spelling = term_dict.decode(code)
+        assert spelling is not None
+        if spelling == "":
+            continue  # the default graph name is no RDF term
+        term = store._from_n3_safe(spelling)
+        if str(term) != parse_spelling(spelling).lex:
+            continue  # rdflib normalized the lexical form ("042" -> "42"): no round trip
+        assert canonical_spelling(term) == spelling, (code, spelling, term)
+        assert term_dict.encode(canonical_spelling(term)) == code
+
+
 def test_kind_bounds_partition_the_dictionary(tmp_path):
     from vortex_rdf import serialize_rdf
 

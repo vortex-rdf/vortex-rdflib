@@ -37,6 +37,12 @@ _:b0 <http://ex.org/knows> <http://ex.org/alice> .
 <http://ex.org/gina> <http://ex.org/score> "NaN"^^<http://www.w3.org/2001/XMLSchema#double> .
 <http://ex.org/gina> <http://ex.org/name> "Bob"@EN .
 <http://ex.org/hank> <http://ex.org/knows> <http://ex.org/alice> .
+<http://ex.org/hank> <http://ex.org/note> "tab\\there" .
+<http://ex.org/hank> <http://ex.org/note> "line\\nbreak" .
+<http://ex.org/hank> <http://ex.org/note> "back\\\\slash" .
+<http://ex.org/hank> <http://ex.org/note> "\\u0001control" .
+<http://ex.org/hank> <http://ex.org/note> "\u00fcn\u00efc\u00f6d\u00e9" .
+<http://ex.org/hank> <http://ex.org/note> "x"@EN-us .
 <http://ex.org/hank> <http://ex.org/knows> <http://ex.org/carol> .
 <http://ex.org/carol> <http://ex.org/knows> <http://ex.org/dave> .
 <http://ex.org/dave> <http://ex.org/knows> <http://ex.org/hank> .
@@ -431,6 +437,50 @@ ORDER_QUERIES = [
     "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p ORDER BY ?p",
     "SELECT ?x ?y WHERE { ?x <http://ex.org/knows> ?y } ORDER BY ?y ?x",
     "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY ?zzz ?n ?x",
+]
+
+XSD = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> "
+QUERIES += [
+    # --- VALUES: present and absent constants, UNDEF, spellings, joins, standalone
+    """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/nobody> }
+        ?x <http://ex.org/name> ?n }""",
+    """SELECT ?x ?n WHERE {
+        VALUES (?x ?n) { (<http://ex.org/bob> "Bob"@EN) (<http://ex.org/alice> UNDEF) }
+        ?x <http://ex.org/name> ?n }""",
+    XSD
+    + """SELECT ?x ?a WHERE { VALUES ?a { 42 "042"^^xsd:integer 7 "7"^^xsd:byte }
+        ?x <http://ex.org/age> ?a }""",
+    XSD
+    + """SELECT ?x WHERE { VALUES ?n { "Carol" "Alice"^^xsd:string "Bob"@en }
+        ?x <http://ex.org/name> ?n }""",
+    """SELECT ?x ?n WHERE { VALUES ?n { "q\\"uote" "" } ?x <http://ex.org/name> ?n }""",
+    """SELECT ?x ?n WHERE {
+        VALUES ?n { "tab\\there" "line\\nbreak" "back\\\\slash" "\\u0001control" }
+        ?x <http://ex.org/note> ?n }""",
+    """SELECT ?x ?n WHERE { VALUES ?n { "x"@en-US "x"@EN-US "x"@en }
+        ?x <http://ex.org/note> ?n }""",
+    """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/bob> }
+        ?x <http://ex.org/name> ?n FILTER(?x = <http://ex.org/bob>) }""",
+    "SELECT * WHERE { VALUES (?x ?y) { (1 2) (UNDEF 3) (<http://ex.org/nobody> UNDEF) } }",
+    "SELECT ?x WHERE { VALUES ?x { <http://ex.org/nobody> } }",
+    """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/bob> } { ?x <http://ex.org/name> ?n } }""",
+    """SELECT ?x ?n ?a WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/carol> }
+        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }""",
+    """SELECT (COUNT(*) AS ?c) WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/nobody> }
+        ?x <http://ex.org/name> ?n }""",
+    """SELECT ?x ?n WHERE { { VALUES ?x { <http://ex.org/bob> } }
+        { VALUES ?x { <http://ex.org/bob> <http://ex.org/alice> } } ?x <http://ex.org/name> ?n }""",
+    """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/alice> }
+        ?x <http://ex.org/name> ?n MINUS { VALUES ?x { <http://ex.org/bob> } } }""",
+    """SELECT DISTINCT ?y WHERE { VALUES ?x { <http://ex.org/alice> <http://ex.org/bob> }
+        ?x <http://ex.org/knows> ?y }""",
+    """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/nobody> <http://ex.org/bob> }
+        ?x <http://ex.org/name> ?n } ORDER BY ?x""",
+]
+ORDER_QUERIES += [
+    """SELECT ?x ?y WHERE {
+        VALUES (?x ?y) { (<http://ex.org/nobody> 3) (<http://ex.org/bob> 1) (UNDEF 2) } }
+        ORDER BY ?x ?y""",
 ]
 
 
@@ -901,3 +951,20 @@ def test_order_by_is_a_rank_sort_in_code_space(graph, monkeypatch):
     )
     assert [row[0].toPython() for row in rows] == [-3, 7]
     assert ordered == [None]  # DISTINCT narrows after the sort: no top-k
+
+
+def test_values_is_a_code_space_relation(graph, monkeypatch):
+    calls = []
+    original = pd._solve_values
+    monkeypatch.setattr(pd, "_solve_values", lambda *a: calls.append(1) or original(*a))
+    register_sparql_pushdown()
+    rows = run(
+        graph,
+        """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/nobody> }
+            ?x <http://ex.org/name> ?n }""",
+    )
+    assert rows == [(URIRef("http://ex.org/bob"), Literal("Bob", lang="en"))]
+    # a constant outside the dictionary is still yielded verbatim
+    rows = run(graph, "SELECT ?x WHERE { VALUES ?x { <http://ex.org/nobody> } }")
+    assert rows == [(URIRef("http://ex.org/nobody"),)]
+    assert calls

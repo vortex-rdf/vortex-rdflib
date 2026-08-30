@@ -13,6 +13,8 @@ a term's kind a range test on its code.
 
 import re
 
+from rdflib.term import BNode, Literal, URIRef
+
 LITERAL = "literal"
 IRI = "iri"
 BLANK = "blank"
@@ -93,6 +95,52 @@ def parse_spelling(spelling: str) -> TermView:
     if spelling.startswith("_:"):
         return TermView(BLANK, spelling[2:])
     raise ValueError(f"unrecognized term spelling: {spelling!r}")
+
+
+_XSD_STRING = "http://www.w3.org/2001/XMLSchema#string"
+_ESCAPE_TABLE = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "\b": "\\b",
+    "\f": "\\f",
+}
+
+
+def escape(text: str) -> str:
+    """The N-Triples string body the store spells ``text`` with: the minimal
+    escape set plus ``\\uXXXX`` for control characters."""
+    out = []
+    for char in text:
+        escaped = _ESCAPE_TABLE.get(char)
+        if escaped is not None:
+            out.append(escaped)
+        elif char < " " or char == "\x7f" or char in "\ufffe\uffff":
+            out.append(f"\\u{ord(char):04X}")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def canonical_spelling(node) -> str:
+    """The spelling the dictionary would hold for an rdflib term — the
+    inverse of ``parse_spelling`` for what ``encode`` needs: lowercase
+    language tags, no ``^^xsd:string``, the store's escapes."""
+    if isinstance(node, URIRef):
+        return f"<{node}>"
+    if isinstance(node, BNode):
+        return f"_:{node}"
+    if isinstance(node, Literal):
+        body = f'"{escape(str(node))}"'
+        if node.language:
+            return f"{body}@{node.language.lower()}"
+        datatype = node.datatype
+        if datatype is None or str(datatype) == _XSD_STRING:
+            return body
+        return f"{body}^^<{datatype}>"
+    raise TypeError(f"not an RDF term: {node!r}")
 
 
 def kind_bounds(term_dict) -> tuple[int, int, int]:

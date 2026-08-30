@@ -7,7 +7,7 @@ from rdflib.util import from_n3
 from vortex_rdf import VortexRdfStore
 
 from .pushdown import register_sparql_pushdown
-from .terms import kind_bounds
+from .terms import canonical_spelling, kind_bounds
 
 # The cottas-bench branch's layout names are accepted as aliases so its
 # benchmark scripts keep working. The layout is only a label here: VortexRdfStore
@@ -75,6 +75,10 @@ class VortexStore(Store):
         self._dict = None
         self._decode_cache: dict = {}
         self._kind_bounds: tuple[int, int, int] | None = None
+        # Query constants the dictionary does not hold get negative codes, so
+        # a VALUES row can be joined in code space and still yield its term.
+        self._foreign: dict[int, Node] = {}
+        self._foreign_codes: dict[Node, int] = {}
         self._use_codes = os.environ.get("VORTEX_RDF_DISABLE_CODE_PATH") != "1"
 
         # Whole-BGP pushdown into code space (no-op for non-Vortex graphs;
@@ -115,6 +119,8 @@ class VortexStore(Store):
         self._dict = self._native.term_dict() if self._use_codes else None
         self._decode_cache = {}
         self._kind_bounds = None
+        self._foreign = {}
+        self._foreign_codes = {}
         return VALID_STORE
 
     def close(self, commit_pending_transaction=False):
@@ -122,6 +128,8 @@ class VortexStore(Store):
         self._dict = None
         self._decode_cache = {}
         self._kind_bounds = None
+        self._foreign = {}
+        self._foreign_codes = {}
 
     def _store(self) -> VortexRdfStore:
         if self._native is None:
@@ -232,7 +240,17 @@ class VortexStore(Store):
             self._kind_bounds = kind_bounds(self._dict)
         return self._kind_bounds
 
+    def _foreign_code(self, term: Node) -> int:
+        """The negative code standing for a term outside the dictionary."""
+        code = self._foreign_codes.get(term)
+        if code is None:
+            code = self._foreign_codes[term] = -1 - len(self._foreign_codes)
+            self._foreign[code] = term
+        return code
+
     def _decode_term(self, code: int) -> Node:
+        if code < 0:
+            return self._foreign[code]
         node = self._decode_cache.get(code)
         if node is None:
             if self._dict is None:
@@ -272,9 +290,12 @@ class VortexStore(Store):
 
     @staticmethod
     def _node_to_n3(node: Node | None) -> str | None:
+        """A pattern term in the N-Triples spelling the native pattern parser
+        accepts (rdflib's ``n3()`` spells a multi-line literal with triple
+        quotes, which N-Triples does not have)."""
         if node is None:
             return None
-        return node.n3()
+        return canonical_spelling(node)
 
     @staticmethod
     def _from_n3_safe(value: str) -> Node:

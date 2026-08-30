@@ -865,6 +865,9 @@ def tuple_predicate(store, conjunct: Conjunct, positions: list) -> Callable[[tup
     def view_of(code):
         view = views.get(code)
         if view is None:
+            if code < 0:
+                view = views[code] = view_of_node(store._foreign[code])
+                return view
             spelling = store._dict.decode(code)
             if spelling is None:
                 raise ValueError(f"term code {code} is not in the store dictionary")
