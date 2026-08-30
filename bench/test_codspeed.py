@@ -28,7 +28,9 @@ move the number:
 
   primary config        dictionary layout, in-memory, no index, pushdown on
   pushdown              the join queries with the hook unregistered — the
-                        A/B against rdflib's per-binding nested loop
+                        A/B against rdflib's per-binding nested loop — and the
+                        graph queries, against rdflib walking the store's
+                        graphs one at a time
   residency + index     file-backed stores, where the per-call native floor
                         dominates and secondary indexes earn their keep:
                         the two lookups they target, per index config, plus
@@ -127,6 +129,14 @@ FILES: dict[str, dict] = {
 
 #: Queries whose cost is dominated by the BGP join strategy.
 JOIN_QUERIES = ("star-2", "star-3", "chain-2", "optional")
+
+#: Queries whose cost is dominated by how the graph itself is served. With the
+#: hook off, rdflib's `evalGraph` walks the store's graphs and evaluates the
+#: block once per graph, joining the graph name onto every solution; the
+#: pushdown binds it from the match's fourth column instead. One of each shape
+#: the difference shows up in: binding `?g` alongside a scan's rows, and a
+#: DISTINCT over the graph column alone.
+GRAPH_QUERIES = ("graph-var", "graph-names")
 
 #: A subject in a *named* graph (index 0 is the default graph, which no GRAPH
 #: clause can name), and the graph holding it — every statement about that
@@ -271,11 +281,12 @@ def test_query(benchmark, graphs, name):
 
 
 @pytest.mark.usefixtures("without_pushdown")
-@pytest.mark.parametrize("name", JOIN_QUERIES)
+@pytest.mark.parametrize("name", JOIN_QUERIES + GRAPH_QUERIES)
 def test_query_no_pushdown(benchmark, graphs, name):
-    """The join queries under rdflib's default evaluator — one `triples()`
-    call per candidate binding — so the pushdown's own contribution is a
-    difference between two tracked numbers, not an inference."""
+    """The join and graph queries under rdflib's default evaluator — one
+    `triples()` call per candidate binding, and one pass over the store per
+    named graph — so the pushdown's own contribution is a difference between
+    two tracked numbers, not an inference."""
     graph, query = graphs["mem_noidx"], QUERIES[name]
     assert _consume_query(graph, query) > 0
     benchmark(_consume_query, graph, query)

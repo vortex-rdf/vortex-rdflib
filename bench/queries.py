@@ -163,16 +163,19 @@ def _busiest_named_graph(subjects, m: Moduli) -> int:
     return max(counts, key=lambda g: (counts[g], -g))
 
 
-def _chain_graph(cfg: DatasetConfig, m: Moduli, p_a: int, p_b: int) -> int:
-    """The named graph whose ``p_a`` rows have the most continuations through
-    ``p_b`` — the chain's first leg is scoped to it, so it must have some.
+def _chain_graph(cfg: DatasetConfig, m: Moduli, p_a: int) -> tuple[int, int]:
+    """``(graph, p_b)`` for the graph-scoped chain: the named graph and
+    second-leg predicate with the most continuations, picked *together*.
 
-    The same walk as ``_chain_predicates``, counted per graph of the first
-    leg's subject; the continuation is wherever the middle node's own graph
-    is, which is the point of the query.
+    The same walk as ``_chain_predicates``, but its ``p_b`` is chosen over
+    every first-leg row, and the rows starting in a named graph are only a
+    subset of those — a predicate that suits the whole need not suit them, and
+    picking the graph afterwards can leave the query empty. Searching the pair
+    keeps it non-empty by construction. The continuation is wherever the
+    middle node's own graph is, which is the point of the query.
     """
     literal_cut = round(cfg.literal_frac * 10)
-    counts: dict[int, int] = {}
+    counts: dict[tuple[int, int], int] = {}
     for i in range(p_a, cfg.n, m.n_pred):  # rows carrying predicate index p_a
         j = i % m.n_obj
         if j % 10 < literal_cut or j >= m.n_subj:
@@ -181,11 +184,11 @@ def _chain_graph(cfg: DatasetConfig, m: Moduli, p_a: int, p_b: int) -> int:
         if g == 0:
             continue  # the default graph is not nameable
         for i2 in range(j, cfg.n, m.n_subj):  # rows with subject index j
-            if i2 % m.n_pred == p_b:
-                counts[g] = counts.get(g, 0) + 1
+            key = (g, i2 % m.n_pred)
+            counts[key] = counts.get(key, 0) + 1
     if not counts:
         raise ValueError("no named graph starts a chain — dataset too small or ratios off")
-    return max(counts, key=lambda g: (counts[g], -g))
+    return max(counts, key=lambda k: (counts[k], -k[0], -k[1]))
 
 
 def _carriers(cfg: DatasetConfig, m: Moduli, subjects: set[int], predicate: int) -> set[int]:
@@ -265,7 +268,9 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
     g_scan = f"<{graph_iri(_busiest_named_graph(p1_subjects, m))}>"
     star_subjects = _carriers(cfg, m, p1_subjects, opt_p)
     g_star = f"<{graph_iri(_busiest_named_graph(star_subjects, m))}>"
-    g_chain = f"<{graph_iri(_chain_graph(cfg, m, chain_a, chain_b))}>"
+    chain_graph, chain_graph_b = _chain_graph(cfg, m, chain_a)
+    g_chain = f"<{graph_iri(chain_graph)}>"
+    chain_g_pb = f"<{predicate_iri(chain_graph_b)}>"
 
     return [
         Query(
@@ -550,7 +555,7 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                   GRAPH {g_chain} {{
                     ?s {chain_pa} ?m
                   }}
-                  ?m {chain_pb} ?o
+                  ?m {chain_g_pb} ?o
                 }}
             """),
             heavy=True,

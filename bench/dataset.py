@@ -90,9 +90,15 @@ def moduli(cfg: DatasetConfig) -> Moduli:
             k += 1
         got.append(k)
     n_subj, n_pred, n_obj = got
-    # The graph is a residue of the *subject*, not of the row index, so it
-    # needs no coprimality: it partitions the subject space as asked.
+    # The graph is a residue of the *subject* (`graph_of_subject`), so it needs
+    # no coprimality with n_subj — any count partitions the subject space. It
+    # does need it with n_pred: the subjects carrying one predicate step by
+    # n_pred, so a shared factor pins the graph to the predicate for a whole
+    # block of n_subj rows, and any query reading one such block sees a single
+    # graph. Nudged up like the others.
     n_graph = max(1, cfg.graphs)
+    while gcd(n_graph, n_pred) != 1:
+        n_graph += 1
     if n_subj * n_pred * n_obj < cfg.n:
         raise ValueError(
             f"dataset cardinality too low for {cfg.n} distinct triples: "

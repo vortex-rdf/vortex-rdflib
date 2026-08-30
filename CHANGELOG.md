@@ -69,3 +69,8 @@ First standalone release. The rdflib integration previously lived in the
 - A `FILTER (NOT) EXISTS` in an `OPTIONAL`'s group was hoisted into the
   `LeftJoin` condition and then dropped, so the optional side could bind where
   it should have stayed unbound. That shape is now left to rdflib.
+- Benchmark generator: the graph count is nudged coprime with the predicate
+  count. A shared factor pinned a predicate's rows to one graph across a whole
+  block, which left the graph-scoped chain query with no rows to derive its
+  constants from at some dataset sizes — including the CodSpeed suite's
+  default, whose query set is built at import.

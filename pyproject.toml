@@ -63,6 +63,9 @@ source-include = ["tests/**"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# The repo root, so `tests/` can import `bench` — the benchmark generator is
+# not collected here, but its invariants are (tests/test_bench_dataset.py).
+pythonpath = ["."]
 # rdflib 7.6 deprecated `Dataset.default_context` and `Dataset.contexts`, then
 # went on calling both from its own graph and SPARQL evaluation code. Every
 # named-graph query raises them from inside rdflib; nothing here can avoid it.
