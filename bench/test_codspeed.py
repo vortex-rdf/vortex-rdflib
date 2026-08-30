@@ -27,7 +27,7 @@ and every other axis is isolated on the few queries where it can actually
 move the number:
 
   primary config        dictionary layout, in-memory, no index, pushdown on
-  BGP pushdown          the join queries with the hook unregistered — the
+  pushdown              the join queries with the hook unregistered — the
                         A/B against rdflib's per-binding nested loop
   residency + index     file-backed stores, where the per-call native floor
                         dominates and secondary indexes earn their keep:
@@ -249,7 +249,7 @@ def without_pushdown() -> Iterator[None]:
 @pytest.mark.parametrize("name", list(QUERIES))
 def test_query(benchmark, graphs, name):
     """One dashboard query on the primary configuration: Dictionary layout,
-    in memory, unindexed, BGP pushdown on — the shipped default, and the
+    in memory, unindexed, pushdown on — the shipped default, and the
     behaviour the dashboard's fastest vortex row reports."""
     graph, query = graphs["mem_noidx"], QUERIES[name]
     assert _consume_query(graph, query) > 0

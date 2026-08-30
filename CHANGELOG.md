@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 First standalone release. The rdflib integration previously lived in the
 [vortex-rdf](https://github.com/vortex-rdf/vortex-rdf) repository under
 `python/`; it is now a pure-Python package built on the published
-[vortex-rdf](https://pypi.org/project/vortex-rdf/) binding layer (0.5.x).
+[vortex-rdf](https://pypi.org/project/vortex-rdf/) binding layer (0.10.x).
 
 ### Added
 
@@ -38,7 +38,7 @@ First standalone release. The rdflib integration previously lived in the
   actually consumed. Registered
   automatically; disable with `VORTEX_RDF_DISABLE_PUSHDOWN=1`, narrow with
   `VORTEX_RDF_PUSHDOWN_OPS`, force the generic FILTER route with
-  `VORTEX_RDF_FILTER_FAST=0`.
+  `VORTEX_RDF_FILTER_FAST=0`. Described in `docs/pushdown.md`.
 - Benchmark: a "pushdown off" row and nine operator-shaped queries
   (`ask-var`, `limit-scan`, `filter-class`, `distinct-p`, `count-all`,
   `count-distinct`, `optional-wide`, `not-exists`, `minus`, `order-var`,
