@@ -15,8 +15,9 @@ Three groups, mirroring how the dashboard panels are organized:
   ASK over a variable pattern and a ``LIMIT 10`` over the whole store, the
   two heads a store can answer without decoding a term.
 - ``joins``    — anchored star-2/star-3, an unanchored 2-hop chain, an
-  anchored OPTIONAL, a wide OPTIONAL (a whole predicate scan as the outer
-  side), a NOT EXISTS over the same scan, and a MINUS of the filtered range
+  anchored OPTIONAL, a VALUES of 64 subjects joined to a predicate scan, a
+  wide OPTIONAL (a whole predicate scan as the outer side), a NOT EXISTS
+  over the same scan, and a MINUS of the filtered range
   against an object-kind filtered scan (heavy: rdflib's own MINUS is
   quadratic): where the join
   strategy (vortex-rdflib's code-space joins vs rdflib's per-binding
@@ -188,6 +189,7 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
     q_minus = (
         f"<{predicate_iri(_object_split_predicate(cfg, m, filter_subjects, exclude=filter_p))}>"
     )
+    values_64 = " ".join(f"<{subject_iri(j)}>" for j in sorted(p1_subjects)[:64])
 
     return [
         Query(
@@ -289,6 +291,16 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                   OPTIONAL {{
                     ?s {star_p3} ?x
                   }}
+                }}
+            """),
+        ),
+        Query(
+            "values-64",
+            "joins",
+            _sparql(f"""
+                SELECT ?s ?o WHERE {{
+                  VALUES ?s {{ {values_64} }}
+                  ?s {p1} ?o
                 }}
             """),
         ),
