@@ -176,6 +176,10 @@ def fast_answer(predicate, spelling):
     return predicate((view,))
 
 
+# `"maybe"^^xsd:boolean` is in the matrix on purpose — an ill-typed literal
+# the two routes must still agree on — and rdflib warns each time `from_n3`
+# parses one. Scoped to this test so the warning stays a signal anywhere else.
+@pytest.mark.filterwarnings("ignore:Parsing weird boolean:UserWarning")
 @pytest.mark.parametrize("sparql_expr", EXPRESSIONS)
 def test_fast_route_agrees_with_rdflib(sparql_expr):
     expr = filter_expr(sparql_expr)
