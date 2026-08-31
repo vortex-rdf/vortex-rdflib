@@ -873,6 +873,64 @@ def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
     assert probes, "the skewed join did not take the probe path"
 
 
+def test_repeated_pattern_is_matched_once(graph):
+    """Two triples that differ only in their variable names resolve to the
+    same quad — variables are `None` in a resolved pattern — so a self-chain
+    costs one native match, not one per hop."""
+    matches = []
+    inner = graph.store._store()
+
+    class _Counting:
+        def match_codes(self, *args, **kwargs):
+            matches.append(args)
+            return inner.match_codes(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+    graph.store._native = _Counting()
+    register_sparql_pushdown()
+    try:
+        rows = run(
+            graph,
+            """SELECT ?a ?c WHERE {
+                ?a <http://ex.org/knows> ?b .
+                ?b <http://ex.org/knows> ?c }""",
+        )
+    finally:
+        graph.store._native = inner
+    assert rows, "the self-chain has solutions to find"
+    assert len(matches) == 1, matches
+
+
+def test_distinct_patterns_are_matched_separately(graph):
+    """The memo is keyed by the resolved quad, so patterns that differ in a
+    bound position still get a match each."""
+    matches = []
+    inner = graph.store._store()
+
+    class _Counting:
+        def match_codes(self, *args, **kwargs):
+            matches.append(args)
+            return inner.match_codes(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+    graph.store._native = _Counting()
+    register_sparql_pushdown()
+    try:
+        run(
+            graph,
+            """SELECT ?s WHERE {
+                ?s <http://ex.org/knows> ?o .
+                ?s <http://ex.org/name> ?n }""",
+        )
+    finally:
+        graph.store._native = inner
+    assert len(matches) == 2, matches
+
+
 def test_pushdown_is_actually_used(graph, monkeypatch):
     calls = []
     original = pd._solve_bgp

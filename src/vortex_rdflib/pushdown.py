@@ -1214,7 +1214,11 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
     """
     if not triples:
         return Relation.from_rows((), [()])
-    patterns = [_match_pattern(ctx, store, s, p, o, scope) for s, p, o in triples]
+    # Variables are `None` in a resolved pattern, so triples that differ only
+    # in their variable names — the two hops of `?s <p> ?m . ?m <p> ?o`, every
+    # leg of a self-join — are one and the same native match.
+    matches: dict[tuple, tuple] = {}
+    patterns = [_match_pattern(ctx, store, s, p, o, scope, matches) for s, p, o in triples]
     if var_preds:
         for pat in patterns:
             _restrict_pattern(store, pat, var_preds)
@@ -1263,18 +1267,28 @@ def _pattern_terms(ctx, store, s, p, o, scope) -> dict:
     return {"n3": n3, "varpos": varpos, "unsatisfiable": unsatisfiable}
 
 
-def _match_pattern(ctx, store, s, p, o, scope) -> dict:
+def _match_pattern(ctx, store, s, p, o, scope, matches=None) -> dict:
     """One native match for one triple pattern; materialization is deferred.
 
     Adds ``"cols"`` (the raw code columns) and ``"nrows"`` to the pattern.
+
+    ``matches`` memoizes the native call across the patterns of one BGP, keyed
+    by the resolved quad. Only the columns are shared, and they are read-only
+    views; ``varpos`` and the ``keep`` sets built from it stay per pattern,
+    since two triples matching the same rows still bind different variables.
     """
     pat = _pattern_terms(ctx, store, s, p, o, scope)
     if pat["unsatisfiable"]:
         pat["cols"], pat["nrows"] = None, 0
         return pat
-    cols = store._store().match_codes(*pat["n3"])
+    key = tuple(pat["n3"])
+    cols = matches.get(key) if matches is not None else None
     if cols is None:
-        raise NotImplementedError
+        cols = store._store().match_codes(*pat["n3"])
+        if cols is None:
+            raise NotImplementedError
+        if matches is not None:
+            matches[key] = cols
     pat["cols"], pat["nrows"] = cols, len(cols[0])
     if scope.var is not None:
         _exclude_default_graph(store, pat, scope.var)
