@@ -112,8 +112,6 @@ _HANDLER_NAMES = {
 }
 _ALL_OPS = frozenset(_HANDLER_NAMES)
 _ENABLED_OPS = _ALL_OPS
-# Nodes a "block" is made of: a subtree solved into one code-space relation.
-_BLOCK_NODES = frozenset({"BGP", "Filter", "Join", "LeftJoin", "Minus", "ToMultiSet", "Graph"})
 
 # Solutions decode in chunks that grow geometrically: the first chunk keeps a
 # LIMIT (or any consumer that stops early) from decoding more than a few
@@ -290,7 +288,12 @@ def _plan_head(part) -> _Head:
 
 
 def _check_block(node) -> None:
-    """Eagerly reject anything the block solver does not handle."""
+    """Eagerly reject anything the block solver does not handle.
+
+    A *block* is a subtree solved into one code-space relation; this walk and
+    `_solve_block`'s dispatch are the two statements of what that subtree may
+    contain.
+    """
     name = getattr(node, "name", None)
     if name == "BGP":
         return
