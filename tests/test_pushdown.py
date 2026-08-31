@@ -873,6 +873,49 @@ def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
     assert probes, "the skewed join did not take the probe path"
 
 
+def test_hash_joined_bgp_keeps_a_columnar_body(graph, monkeypatch):
+    """A hash-joined BGP's relation is columns, not row tuples — tuples
+    appear only as rows are consumed."""
+    rels = []
+    original = pd._join_patterns
+    monkeypatch.setattr(pd, "_join_patterns", lambda *a: rels.append(original(*a)) or rels[-1])
+    register_sparql_pushdown()
+    rows = run(
+        graph,
+        """SELECT ?a ?b ?c WHERE {
+            ?a <http://ex.org/knows> ?b .
+            ?c <http://ex.org/knows> ?b }""",
+    )
+    assert rows
+    assert rels and rels[-1].cols is not None
+
+
+def test_columnar_join_matches_row_join():
+    """The columnar kernel produces the row join's exact rows, in its exact
+    order, and declines the shapes the row join handles."""
+    import random
+    from array import array
+
+    rnd = random.Random(7)
+    ka = [rnd.randrange(40) for _ in range(300)]
+    va = [rnd.randrange(1000) for _ in range(300)]
+    kb = [rnd.randrange(40) for _ in range(200)]
+    vb = [rnd.randrange(1000) for _ in range(200)]
+    schema_a, schema_b = ("k", "x"), ("k", "y")
+    expected = pd._join(
+        schema_a, list(zip(ka, va, strict=True)), schema_b, list(zip(kb, vb, strict=True))
+    )[1]
+    cols_a = (array("I", ka), array("I", va))
+    cols_b = (array("I", kb), array("I", vb))
+    joined = pd._join_columns(schema_a, cols_a, schema_b, cols_b)
+    assert joined is not None
+    schema, cols = joined
+    assert schema == ("k", "x", "y")
+    assert pd._cols_to_rows(cols) == expected
+    # Several shared variables decline: the row join handles them.
+    assert pd._join_columns(("k", "x"), cols_a, ("k", "x"), cols_a) is None
+
+
 def test_repeated_pattern_is_matched_once(graph):
     """Two triples that differ only in their variable names resolve to the
     same quad — variables are `None` in a resolved pattern — so a self-chain

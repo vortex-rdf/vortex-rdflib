@@ -12,8 +12,8 @@ What runs in code space:
 
 - a basic graph pattern is solved in one pass: every triple pattern is
   matched natively once (a match is near-constant cost, so the actual row
-  counts drive the join order), the join runs as hash joins over ``int``
-  tuples, or re-probes the store per binding when the running relation is
+  counts drive the join order), the join gathers ``u32`` code columns, or
+  re-probes the store per binding when the running relation is
   far smaller than the next pattern's match (``_probe_join``), and
   intermediate results never decode a term;
 - a ``Filter`` over a block is split into conjuncts (:mod:`.filters`):
@@ -74,10 +74,12 @@ value through rdflib's evaluator, for bisecting and A/B measurements.
 
 import heapq
 import os
+from array import array
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from itertools import islice
+from operator import itemgetter
 from typing import Any
 
 from rdflib.plugins.sparql import CUSTOM_EVALS
@@ -218,10 +220,10 @@ def _peel_graph(ctx, node, scope) -> tuple:
 class Relation:
     """A code-space relation.
 
-    ``schema`` names the variable-like terms. The body is either zero-copy
-    ``u32`` column views (``cols``, one per schema entry: a single matched
-    pattern, never copied into Python objects) or materialized ``rows`` of
-    ``int`` codes (joins). ``None`` in a row is an unbound variable and
+    ``schema`` names the variable-like terms. The body is either ``u32``
+    columns (``cols``, one per schema entry: the zero-copy views of a single
+    matched pattern, or the gathered ``array('I')`` columns of a hash join)
+    or materialized ``rows`` of ``int`` codes. ``None`` in a row is an unbound variable and
     ``nullable`` lists the variables that may hold it; ``foreign`` maps
     negative codes to terms outside the dictionary; ``preds`` are row
     predicates still to be applied while a columnar body streams (``nrows``
@@ -229,7 +231,7 @@ class Relation:
     """
 
     schema: tuple
-    cols: tuple[memoryview, ...] | None
+    cols: tuple | None  # memoryview or array('I') per entry; both slice + tolist
     rows: list[tuple] | None
     nrows: int
     nullable: frozenset = frozenset()
@@ -1397,9 +1399,69 @@ def _materialize(pat):
     return schema, list(zip(*(views[pos[0]] for pos in varpos.values()), strict=True))
 
 
+def _pattern_body(pat) -> tuple:
+    """The matched pattern as ``(schema, cols, rows)`` — columnar when it
+    can be: single-position variables and no pending restriction
+    (``_materialize`` turns repeats and ``keep`` sets into row filters)."""
+    varpos = pat["varpos"]
+    if (
+        pat["nrows"]
+        and varpos
+        and "rows" not in pat
+        and not pat.get("keep")
+        and all(len(pos) == 1 for pos in varpos.values())
+    ):
+        cols = tuple(memoryview(pat["cols"][pos[0]]).cast("I") for pos in varpos.values())
+        return tuple(varpos), cols, None
+    schema, rows = _materialize(pat)
+    return schema, None, rows
+
+
+def _cols_to_rows(cols) -> list:
+    """Columnar body to row tuples, in one zip."""
+    return list(zip(*(col.tolist() for col in cols), strict=True))
+
+
+def _join_columns(schema_a, cols_a, schema_b, cols_b):
+    """Hash join of two columnar relations sharing exactly one variable,
+    columns out — the rows exist only when a consumer materializes them.
+    ``None`` when the shape is not its case (several or no shared
+    variables); the row join handles those.
+    """
+    shared = [v for v in schema_b if v in schema_a]
+    if len(shared) != 1:
+        return None
+    ia = schema_a.index(shared[0])
+    ib = schema_b.index(shared[0])
+    keep_b = [i for i, v in enumerate(schema_b) if v not in schema_a]
+    schema = schema_a + tuple(schema_b[i] for i in keep_b)
+    table: dict = {}
+    setdefault = table.setdefault
+    for j, key in enumerate(cols_b[ib]):
+        setdefault(key, []).append(j)
+    a_idx = []
+    b_idx = []
+    get = table.get
+    for i, key in enumerate(cols_a[ia]):
+        hits = get(key)
+        if hits:
+            a_idx += [i] * len(hits)
+            b_idx += hits
+    out = [array("I", map(col.__getitem__, a_idx)) for col in cols_a]
+    out += [array("I", map(cols_b[i].__getitem__, b_idx)) for i in keep_b]
+    return schema, tuple(out)
+
+
 def _join_patterns(store, patterns) -> Relation:
     """Join matched patterns: smallest first, then greedily prefer patterns
-    sharing a variable with the schema so far (avoids cross products)."""
+    sharing a variable with the schema so far (avoids cross products).
+
+    The running relation stays columnar across hash joins — ``_join_columns``
+    gathers ``u32`` columns, and row tuples exist only where a consumer
+    materializes them — and drops to rows for
+    the shapes that need them: probe joins, restricted or repeated-variable
+    patterns, several shared variables, cross products.
+    """
     # A restricted pattern is materialized up front so its real size, not
     # the match's, drives the order.
     for pat in patterns:
@@ -1407,22 +1469,40 @@ def _join_patterns(store, patterns) -> Relation:
             _, rows = _materialize(pat)
             pat["rows"], pat["nrows"] = rows, len(rows)
     patterns.sort(key=lambda pat: pat["nrows"])
-    schema, rows = _materialize(patterns[0])
+    schema, cols, rows = _pattern_body(patterns[0])
     remaining = patterns[1:]
-    while remaining and rows:
+    while remaining and (len(cols[0]) if cols is not None else len(rows)):
         pick = next(
             (i for i, pat in enumerate(remaining) if any(v in pat["varpos"] for v in schema)),
             0,
         )
         pat = remaining.pop(pick)
         shares = any(v in pat["varpos"] for v in schema)
-        if shares and len(rows) * _PROBE_FANOUT < pat["nrows"]:
+        running = len(cols[0]) if cols is not None else len(rows)
+        if shares and running * _PROBE_FANOUT < pat["nrows"]:
+            if cols is not None:
+                rows, cols = _cols_to_rows(cols), None
             schema, rows = _probe_join(store, schema, rows, pat)
-        else:
-            schema, rows = _join(schema, rows, *_materialize(pat))
+            continue
+        schema_b, cols_b, rows_b = _pattern_body(pat)
+        joined = (
+            _join_columns(schema, cols, schema_b, cols_b)
+            if cols is not None and cols_b is not None
+            else None
+        )
+        if joined is not None:
+            schema, cols = joined
+            continue
+        if cols is not None:
+            rows, cols = _cols_to_rows(cols), None
+        if rows_b is None:
+            rows_b = _cols_to_rows(cols_b)
+        schema, rows = _join(schema, rows, schema_b, rows_b)
     # An empty result still names every variable of the pattern.
     for pat in remaining:
         schema += tuple(v for v in pat["varpos"] if v not in schema)
+    if cols is not None:
+        return Relation(schema, cols, None, len(cols[0]))
     return Relation.from_rows(schema, rows)
 
 
@@ -1515,7 +1595,12 @@ def _probe_spellings(store, rows, bound) -> dict:
 
 
 def _join(schema_a, rows_a, schema_b, rows_b):
-    """Hash join of two code-space relations on their shared variables."""
+    """Hash join of two code-space relations on their shared variables.
+
+    Keys come from :func:`~operator.itemgetter`: a bare ``int`` code for one
+    shared variable (the common case — no per-row key tuple), a tuple for
+    several.
+    """
     shared = [v for v in schema_b if v in schema_a]
     keep_b = [i for i, v in enumerate(schema_b) if v not in schema_a]
     schema = schema_a + tuple(schema_b[i] for i in keep_b)
@@ -1523,17 +1608,28 @@ def _join(schema_a, rows_a, schema_b, rows_b):
     if not shared:
         return schema, [ra + rb for ra in rows_a for rb in rows_b]
 
-    ia = [schema_a.index(v) for v in shared]
-    ib = [schema_b.index(v) for v in shared]
+    key_a = itemgetter(*(schema_a.index(v) for v in shared))
+    key_b = itemgetter(*(schema_b.index(v) for v in shared))
     table: dict = {}
-    for rb in rows_b:
-        key = tuple(rb[i] for i in ib)
-        table.setdefault(key, []).append(tuple(rb[i] for i in keep_b))
-    out = []
+    setdefault = table.setdefault
+    if not keep_b:
+        for rb in rows_b:
+            setdefault(key_b(rb), []).append(())
+    elif len(keep_b) == 1:
+        tail_of = itemgetter(keep_b[0])
+        for rb in rows_b:
+            setdefault(key_b(rb), []).append((tail_of(rb),))
+    else:
+        tail_of = itemgetter(*keep_b)
+        for rb in rows_b:
+            setdefault(key_b(rb), []).append(tail_of(rb))
+    out: list = []
+    extend = out.extend
+    get = table.get
     for ra in rows_a:
-        tails = table.get(tuple(ra[i] for i in ia))
+        tails = get(key_a(ra))
         if tails:
-            out.extend(ra + tail for tail in tails)
+            extend(ra + tail for tail in tails)
     return schema, out
 
 
