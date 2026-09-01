@@ -301,12 +301,26 @@ class VortexRdflibStore(Store):
 
         store = self._store()
 
-        # Fully-ground pattern in one graph: an existence check. Counting from
-        # the row selection materializes no term at all; multiplicity (the
-        # quad repeated in the graph) is preserved by yielding once per match.
-        if fixed is not None and s_n3 is not None and p_n3 is not None and o_n3 is not None:
-            for _ in range(store.count_quads(s_n3, p_n3, o_n3, g_n3)):
-                yield (s, p, o), fixed
+        # Fully-ground pattern: no term needs materializing. In one graph it
+        # is an existence check — counting from the row selection preserves
+        # multiplicity (the quad repeated in the graph) by yielding once per
+        # match. Under the union only the graph column is read: one row per
+        # graph holding the triple, each with that graph's context.
+        if s_n3 is not None and p_n3 is not None and o_n3 is not None:
+            triple = (s, p, o)
+            if fixed is not None:
+                for _ in range(store.count_quads(s_n3, p_n3, o_n3, g_n3)):
+                    yield triple, fixed
+                return
+            if self._dict is not None:
+                cols = store.match_codes(s_n3, p_n3, o_n3, None)
+                if cols is not None:
+                    for code in memoryview(cols[3]).cast("I").tolist():
+                        yield triple, self._context_of_code(code)
+                    return
+            *_, graphs = store.match_columns(s_n3, p_n3, o_n3, None)
+            for g_raw in graphs:
+                yield triple, self._context_tuple(g_raw)
             return
 
         if self._dict is not None:
@@ -323,19 +337,25 @@ class VortexRdflibStore(Store):
                 cached = self._decode_cache
                 # strict: the columns come from one native match and must be
                 # equally long; truncation would hide a native bug.
-                if fixed is not None:
-                    for row in zip(s_codes, p_codes, o_codes, strict=True):
-                        yield (cached[row[0]], cached[row[1]], cached[row[2]]), fixed
-                    return
-                # Union: the fourth column names each row's graph, and each
-                # distinct graph code maps to one cached context tuple.
-                g_codes = memoryview(cols[3]).cast("I").tolist()
-                contexts = self._contexts_by_code
-                for row in zip(s_codes, p_codes, o_codes, g_codes, strict=True):
-                    ctx = contexts.get(row[3])
-                    if ctx is None:
-                        ctx = self._context_of_code(row[3])
-                    yield (cached[row[0]], cached[row[1]], cached[row[2]]), ctx
+                if fixed is None:
+                    # Union: the fourth column names each row's graph. Its
+                    # distinct codes resolve to contexts before the loop; a
+                    # match whose rows all live in one graph — every match on
+                    # a single-graph file — takes the fixed-context loop
+                    # below and never pays a per-row lookup.
+                    g_codes = memoryview(cols[3]).cast("I").tolist()
+                    contexts = {code: self._context_of_code(code) for code in set(g_codes)}
+                    if len(contexts) == 1:
+                        fixed = next(iter(contexts.values()))
+                    else:
+                        for row in zip(s_codes, p_codes, o_codes, g_codes, strict=True):
+                            yield (
+                                (cached[row[0]], cached[row[1]], cached[row[2]]),
+                                contexts[row[3]],
+                            )
+                        return
+                for row in zip(s_codes, p_codes, o_codes, strict=True):
+                    yield (cached[row[0]], cached[row[1]], cached[row[2]]), fixed
                 return
 
         # String fallback (non-dictionary layouts, non-resident dictionary):

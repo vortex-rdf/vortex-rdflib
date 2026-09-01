@@ -157,6 +157,35 @@ def test_bare_graph_is_the_union_view(quad_store):
     assert len(list(whole.triples((ALICE, FOAF_NAME, None)))) == 2
 
 
+def test_ground_pattern_union_carries_each_graphs_context(quad_store):
+    """A fully-ground pattern under the union yields once per graph holding
+    the triple, each row with that graph's own context — served from the
+    graph column alone, no term materialized."""
+    rows = list(quad_store.triples((ALICE, FOAF_NAME, Literal("Alice"))))
+    assert [triple for triple, _ in rows] == [(ALICE, FOAF_NAME, Literal("Alice"))] * 2
+    assert {ctx[0].identifier for _, ctx in rows} == {G1, G2}
+    assert list(quad_store.triples((ALICE, FOAF_NAME, Literal("nobody")))) == []
+
+
+def test_union_match_in_one_graph_shares_one_context(quad_store):
+    """A union match whose rows all live in one graph yields one shared
+    context tuple (the single-distinct-graph loop), with that graph's name."""
+    rows = list(quad_store.triples((ALICE, FOAF_KNOWS, None)))
+    assert rows, "fixture holds alice-knows rows"
+    contexts = {id(ctx) for _, ctx in rows}
+    assert len(contexts) == 1
+    assert {ctx[0].identifier for _, ctx in rows} == {G1}
+
+
+def test_union_match_across_graphs_keeps_per_row_contexts(quad_store):
+    rows = list(quad_store.triples((None, FOAF_NAME, None)))
+    by_graph: dict = {}
+    for (s_, _, _), ctx in rows:
+        by_graph.setdefault(ctx[0].identifier, set()).add(s_)
+    assert set(by_graph) >= {G1, G2}
+    assert ALICE in by_graph[G1] and ALICE in by_graph[G2]
+
+
 def test_default_graph_is_not_a_named_graph(quad_store):
     dataset = Dataset(store=quad_store, default_union=True)
     named = {
