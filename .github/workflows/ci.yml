@@ -34,6 +34,10 @@ jobs:
         run: uv run ruff check
       - name: Type check
         run: uv run ty check
+      - name: Doc links
+        # The docs link into the sources by line number; this fails the job
+        # when a link points at a file or line that no longer exists.
+        run: scripts/check-doc-anchors.sh
 
   test:
     name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})

@@ -43,7 +43,7 @@ jobs:
       - name: Install the HDT builder
         run: cargo install hdt --features cli --locked
 
-      # Full scale: the code defaults (250k triples). One worker process per
+      # Full scale: the code defaults (250k quads over 8 graphs). One worker per
       # store; peak-RSS readings are per-store and uncontaminated.
       - name: Run comparative benchmark
         run: uv run python -m bench.run_bench --out bench/results.json

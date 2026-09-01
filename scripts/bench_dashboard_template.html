@@ -204,31 +204,44 @@
   <section id="overview" class="group">
     <p class="lede">
       One run of <code>bench/run_bench.py</code>: <a href="https://github.com/vortex-rdf/vortex-rdflib">vortex-rdflib</a>'s
-      <code>VortexStore</code> against rdflib, <a href="https://github.com/oxigraph/oxrdflib">oxrdflib</a>
+      <code>VortexRdflibStore</code> against rdflib, <a href="https://github.com/oxigraph/oxrdflib">oxrdflib</a>
       (Oxigraph), <a href="https://github.com/cottas-rdf/pycottas">pycottas-rdflib</a> (COTTAS) and
       <a href="https://pypi.org/project/rdflib-hdt/">rdflib-hdt</a> (HDT), over a synthetic SPARQL
-      set: lookups and scans, star and chain joins, and FILTER / DISTINCT / ORDER BY / GROUP BY.
+      set: lookups and scans, star and chain joins, FILTER / DISTINCT / ORDER BY / GROUP BY,
+      and patterns that name a graph.
       The Vortex rows are all Dictionary layout, crossed over <em>residency</em> and
       <em>secondary index</em> (none, by-copy, by-reference).
     </p>
     <p class="lede">
-      rdflib's engine evaluates every store, so the store serving triple patterns is the only
+      rdflib's engine evaluates every store, so the store serving quad patterns is the only
       variable. Each label records where a query's bytes come from:
       <em>in-mem</em> stores live fully in memory, <em>file</em> stores perform file access reads per query.
       Every query matches by construction, and row counts are cross-checked across stores.
     </p>
+    <p class="lede">
+      The dataset is composed of <strong>quads</strong>: every statement about a subject goes into one graph,
+      so the union of the graphs forms a triple set that queries that name no graph see. 
+      Each store loads it as an rdflib <code>Dataset</code> whose default
+      graph is that union. <strong>HDT and COTTAS cannot serve named graphs through rdflib</strong>
+      — HDT's format has none, and pycottas' store does not expose the ones COTTAS files can hold —
+      so those two rows load the flattened N-Triples and do not report measurements in the
+      <em>Named graphs</em> panel.
+    </p>
     <div class="kpi-row" id="kpi-row"></div>
     <p class="lede mono" id="matched-rows"></p>
+    <p class="lede mono" id="skipped-note"></p>
     <div id="failures-host"></div>
   </section>
 
   <section id="load" class="group">
     <div class="group-head">
       <span class="chan-tag mono">LOAD</span>
-      <h2>N-Triples to queryable store</h2>
+      <h2>Source file to queryable store</h2>
     </div>
     <p class="group-desc">
-      Cold start: from the shared <span class="mono">.nt</span> file to a queryable store. Most
+      Cold start: from the shared source file — <span class="mono">.nq</span> for the stores with
+      named graphs, the flattened <span class="mono">.nt</span> for HDT and COTTAS — to a
+      queryable store. Most
       libraries build their own format first — <span class="mono">serialize_rdf</span> (vortex-rdflib),
       <span class="mono">rdf2cottas</span>, <span class="mono">hdt convert</span> — then open it;
       rdflib and oxrdflib parse directly. Median of repeated full rebuilds.
@@ -327,6 +340,13 @@ function cellMb(mb){ return mb == null ? null : { median: mb.toLocaleString() + 
 
 const ADAPTERS = CONFIG.adapters || [];
 const QUERIES = CONFIG.queries || [];
+// Queries a store's format cannot express, per store: asked for by nobody, so
+// they get no id and leave a dash rather than a "missing benchmark" warning.
+const SKIPPED = new Map(
+  Object.entries(CONFIG.skipped || {}).map(([slug, names]) => [slug, new Set(names)]));
+function idFor(query, adapter){
+  return SKIPPED.get(adapter.slug)?.has(query.name) ? null : `${query.name}::${adapter.slug}`;
+}
 // Rule off the rows where what-is-measured changes: the other stores, then
 // the different-engine row.
 function rowBreak(slug){ return slug === "rdflib_memory"; }
@@ -335,12 +355,15 @@ function get(map, id){ const r = map.get(id); if(!r) console.warn("missing bench
 
 /** One panel form: a matrix table of store rows × measurement columns. Cells
  * print the median; the column-best cell is green and every other cell
- * carries its multiplier vs that best. cfg: { title, note, wide, rowHeaders,
- * columns, rows:[{labels, ids, break}], sortByColumn } */
+ * carries its multiplier vs that best. A store with no cell at all is
+ * dropped, unless `keepEmpty` — where a store answering none of a panel's
+ * queries is the point, its row of dashes has to be visible. cfg: { title,
+ * note, wide, keepEmpty, rowHeaders, columns, rows:[{labels, ids, break}],
+ * sortByColumn } */
 function renderMatrixPanel(container, cfg, map){
   const rows = cfg.rows
     .map(r => ({...r, recs: r.ids.map(id => id ? get(map, id) : null)}))
-    .filter(r => r.recs.some(Boolean));
+    .filter(r => cfg.keepEmpty || r.recs.some(Boolean));
   if (!rows.length) return;
 
   if (cfg.sortByColumn != null){
@@ -416,6 +439,10 @@ const GROUP_META = {
     tag: "SPARQL features",
     note: "rdflib operators over the BGP: a typed-numeric FILTER range, an isIRI term-kind FILTER over a predicate scan, DISTINCT over a predicate scan, ORDER BY + LIMIT top-k, a full ORDER BY of a predicate scan, and the full-scan shapes (heavy): a GROUP BY count, DISTINCT predicates, COUNT(*), and a COUNT DISTINCT per predicate.",
   },
+  graphs: {
+    tag: "Named graphs",
+    note: "The query patterns that name a graph: a predicate scan and a two-leg star inside one named graph, a chain that starts in one and continues wherever the object's own graph is, and the three an unbound GRAPH ?g drives (heavy) — a scan, the distinct graph names, and a count per graph. A dashed row is a store that cannot serve named graphs through rdflib, so it was never asked — not a store that failed; the stores it applies to are named under the tiles above.",
+  },
 };
 const queryHost = document.getElementById("query-panels");
 for (const [group, meta] of Object.entries(GROUP_META)){
@@ -425,9 +452,10 @@ for (const [group, meta] of Object.entries(GROUP_META)){
     title: meta.tag,
     note: meta.note,
     wide: true,
+    keepEmpty: true,
     rowHeaders: ["Store"],
     columns: qs.map(q => q.name + (q.heavy ? " •" : "")),
-    rows: storeRows(a => qs.map(q => `${q.name}::${a.slug}`)),
+    rows: storeRows(a => qs.map(q => idFor(q, a))),
   }, byId);
 }
 
@@ -443,8 +471,9 @@ renderMatrixPanel(memHost, {
 // ---- KPIs ----
 const tiles = [
   { label:"Stores", value:String(ADAPTERS.length), sub:"vortex-rdflib · rdflib · oxrdflib · pycottas · hdt" },
-  { label:"Queries", value:String(QUERIES.length), sub:"lookups · joins · features" },
-  { label:"Triples", value:(CONFIG.triples||0).toLocaleString(), sub:"synthetic, deterministic" },
+  { label:"Queries", value:String(QUERIES.length), sub:"lookups · joins · features · graphs" },
+  { label:"Quads", value:(CONFIG.triples||0).toLocaleString(),
+    sub:`synthetic · ${CONFIG.graphs||1} graphs` },
   { label:"Distinct terms", value:(CONFIG.cardinality?.terms||0).toLocaleString(),
     sub:`${(CONFIG.cardinality?.nSubj||0).toLocaleString()} subjects · ${CONFIG.cardinality?.nPred||0} predicates` },
 ];
@@ -456,12 +485,13 @@ for (const t of tiles){
   host.appendChild(el);
 }
 
-// ---- matched rows + failures ----
-const matched = Object.entries(CONFIG.matchedRows || {});
-if (matched.length){
-  document.getElementById("matched-rows").innerHTML =
-    "Result rows per query (cross-checked across stores): " +
-    matched.map(([q, n]) => `<strong>${q}</strong> ${Number(n).toLocaleString()}`).join(" · ");
+const skippedNote = [...SKIPPED].filter(([, names]) => names.size);
+if (skippedNote.length){
+  const labelOf = new Map(ADAPTERS.map(a => [a.slug, a.label]));
+  document.getElementById("skipped-note").innerHTML =
+    "Not asked — no named graphs through rdflib, so these cells are empty by design: " +
+    skippedNote.map(([slug, names]) =>
+      `<strong>${labelOf.get(slug) || slug}</strong> ${[...names].join(", ")}`).join(" · ");
 }
 if (FAILURES.length){
   const panel = document.createElement("div");

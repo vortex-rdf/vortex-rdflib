@@ -1,4 +1,4 @@
-"""Per-adapter benchmark worker: ``python -m bench.worker <slug> <nt> <workdir> <out.json>``.
+"""Per-adapter benchmark worker: ``python -m bench.worker <slug> <nq> <nt> <workdir> <out>``.
 
 One process per adapter, spawned by ``run_bench.py``. Process isolation is
 what makes the memory figures trustworthy: the kernel-tracked peak RSS
@@ -12,7 +12,12 @@ must not masquerade as query speed). Normal queries get one warmup run, then
 up to ``BENCH_QUERY_ITERS`` samples capped by a ``BENCH_QUERY_BUDGET_S`` time
 budget; ``heavy`` queries (full-scan class) get ``BENCH_HEAVY_ITERS`` fixed
 samples and no warmup. The load is sampled ``BENCH_LOAD_ITERS`` times, each a
-full rebuild of the store's own file from the shared ``.nt``.
+full rebuild of the store's own file from the shared source — the ``.nq`` for
+a store with named graphs, the ``.nt`` for one without.
+
+A query that names a graph is skipped for a store that does not serve them,
+and reported as ``skipped`` rather than a failure: nobody could have measured
+it.
 """
 
 import gc
@@ -104,7 +109,7 @@ def measure_query(graph, query: Query, query_kwargs: dict) -> tuple[int, list[fl
 
 
 def main() -> int:
-    slug, nt_path, work_dir, out_path = sys.argv[1:5]
+    slug, nq_path, nt_path, work_dir, out_path = sys.argv[1:6]
     adapter = BY_SLUG[slug]
     cfg = config_from_env()
     queries = build_queries(cfg, moduli(cfg))
@@ -112,10 +117,11 @@ def main() -> int:
     rows: list[dict] = []
     matched: dict[str, int] = {}
     failures: list[dict] = []
+    skipped: list[str] = []
 
     # Build the store LOAD_ITERS times, keeping the last for the queries.
-    # Every sample is a full build from the same `.nt`: the factories rewrite
-    # their own file rather than reusing one.
+    # Every sample is a full build from the same source file: the factories
+    # rewrite their own file rather than reusing one.
     #
     # The footprint is read off the FIRST build, against the baseline taken
     # before it. A later build is no good for that: freeing a store returns
@@ -133,7 +139,7 @@ def main() -> int:
             graph = None
             gc.collect()
         t0 = perf_counter_ns()
-        graph = adapter.make(nt_path, work_dir)
+        graph = adapter.make(nq_path, nt_path, work_dir)
         load_samples.append(float(perf_counter_ns() - t0))
         if iteration == 0:
             gc.collect()
@@ -146,6 +152,10 @@ def main() -> int:
     )
 
     for query in queries:
+        if query.quads and not adapter.quads:
+            skipped.append(query.name)
+            print(f"[{slug}] -- {query.name} skipped: no named graphs in rdflib", flush=True)
+            continue
         try:
             matched[query.name], samples = measure_query(graph, query, adapter.query_kwargs)
         except Exception as error:  # noqa: BLE001 — one query must not sink the rest
@@ -163,6 +173,7 @@ def main() -> int:
         "rows": rows,
         "matched": matched,
         "failures": failures,
+        "skipped": skipped,
         "baselineMb": baseline_mb,
         "loadedMb": loaded_mb,
         "peakRssMb": peak_rss_mb(),

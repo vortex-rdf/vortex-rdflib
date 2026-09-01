@@ -5,7 +5,7 @@ build-backend = "uv_build"
 [project]
 name = "vortex-rdflib"
 version = "0.1.0"
-description = "rdflib Store implementation for Vortex-RDF, a columnar RDF store"
+description = "rdflib Store implementation for Vortex-RDF, a columnar zero-copy RDF store"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -63,6 +63,16 @@ source-include = ["tests/**"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# The repo root, so `tests/` can import `bench` — the benchmark generator is
+# not collected here, but its invariants are (tests/test_bench_dataset.py).
+pythonpath = ["."]
+# rdflib 7.6 deprecated `Dataset.default_context` and `Dataset.contexts`, then
+# went on calling both from its own graph and SPARQL evaluation code. Every
+# named-graph query raises them from inside rdflib; nothing here can avoid it.
+filterwarnings = [
+  "ignore:Dataset.default_context is deprecated:DeprecationWarning",
+  "ignore:Dataset.contexts is deprecated:DeprecationWarning",
+]
 
 [tool.ruff]
 # Matches the rustfmt width used across the vortex-rdf repos.

@@ -1,17 +1,26 @@
 import pytest
-from rdflib import BNode, Graph, Literal, URIRef
+from rdflib import BNode, Dataset, Graph, Literal, URIRef
+from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, ConjunctiveGraph
 
-from conftest import LAYOUTS
-from vortex_rdflib import VortexStore
+from conftest import GRAPH_1, GRAPH_2, LAYOUTS
+from vortex_rdflib import VortexRdflibStore
 
 FOAF_NAME = URIRef("http://xmlns.com/foaf/0.1/name")
+FOAF_KNOWS = URIRef("http://xmlns.com/foaf/0.1/knows")
 ALICE = URIRef("http://ex.org/alice")
 BOB = URIRef("http://ex.org/bob")
+G1 = URIRef(GRAPH_1)
+G2 = URIRef(GRAPH_2)
 
 
 @pytest.fixture(params=LAYOUTS)
 def graph(vortex_files, request):
-    return Graph(store=VortexStore(str(vortex_files[request.param])))
+    return Graph(store=VortexRdflibStore(str(vortex_files[request.param])))
+
+
+@pytest.fixture(params=LAYOUTS)
+def quad_store(vortex_quad_files, request):
+    return VortexRdflibStore(str(vortex_quad_files[request.param]))
 
 
 def test_len(graph):
@@ -83,14 +92,151 @@ def test_read_only(graph):
         graph.store.add((ALICE, FOAF_NAME, Literal("x")), None)
     with pytest.raises(NotImplementedError):
         graph.store.remove((None, None, None))
+    with pytest.raises(NotImplementedError):
+        graph.store.remove_graph(graph)
+
+
+# ─── named graphs ───────────────────────────────────────────────────────────
+
+
+def test_contexts_are_the_files_graphs(quad_store):
+    names = {context.identifier for context in quad_store.contexts()}
+    assert names == {G1, G2, DATASET_DEFAULT_GRAPH_ID}
+
+
+def test_contexts_of_a_triple(quad_store):
+    # Alice's name is in both named graphs, her `knows` in only the first.
+    assert {c.identifier for c in quad_store.contexts((ALICE, FOAF_NAME, Literal("Alice")))} == {
+        G1,
+        G2,
+    }
+    assert {c.identifier for c in quad_store.contexts((ALICE, FOAF_KNOWS, BOB))} == {G1}
+    assert list(quad_store.contexts((ALICE, FOAF_NAME, Literal("nobody")))) == []
+
+
+def test_len_per_graph(quad_store):
+    dataset = Dataset(store=quad_store)
+    assert len(dataset.graph(G1)) == 2
+    assert len(dataset.graph(G2)) == 2
+    assert len(dataset.default_graph) == 2
+    assert len(quad_store) == 6  # the union counts quads, not distinct triples
+
+
+def test_len_of_an_absent_graph(quad_store):
+    assert len(Dataset(store=quad_store).graph(URIRef("http://ex.org/g/absent"))) == 0
+
+
+def test_quads_carry_their_graph(quad_store):
+    quads = set(Dataset(store=quad_store).quads((None, None, None, None)))
+    assert (ALICE, FOAF_NAME, Literal("Alice"), G1) in quads
+    assert (ALICE, FOAF_NAME, Literal("Alice"), G2) in quads
+    assert (ALICE, FOAF_KNOWS, BOB, G2) not in quads
+    assert len(quads) == 6
+
+
+def test_graph_restricts_the_match(quad_store):
+    dataset = Dataset(store=quad_store)
+    assert set(dataset.graph(G1).triples((None, None, None))) == {
+        (ALICE, FOAF_NAME, Literal("Alice")),
+        (ALICE, FOAF_KNOWS, BOB),
+    }
+    assert set(dataset.graph(G2).triples((ALICE, None, None))) == {
+        (ALICE, FOAF_NAME, Literal("Alice"))
+    }
+    # A ground pattern is an existence check per graph, not over the union.
+    assert list(dataset.graph(G2).triples((ALICE, FOAF_KNOWS, BOB))) == []
+    assert list(dataset.graph(G1).triples((ALICE, FOAF_KNOWS, BOB))) == [(ALICE, FOAF_KNOWS, BOB)]
+
+
+def test_bare_graph_is_the_union_view(quad_store):
+    """rdflib names an identifier-less graph with a blank node, which names
+    nothing the file holds; that is the whole-store view the README shows."""
+    whole = Graph(store=quad_store)
+    assert len(whole) == 6
+    # Alice's name is in two graphs, so the union yields it twice.
+    assert len(list(whole.triples((ALICE, FOAF_NAME, None)))) == 2
+
+
+def test_ground_pattern_union_carries_each_graphs_context(quad_store):
+    """A fully-ground pattern under the union yields once per graph holding
+    the triple, each row with that graph's own context — served from the
+    graph column alone, no term materialized."""
+    rows = list(quad_store.triples((ALICE, FOAF_NAME, Literal("Alice"))))
+    assert [triple for triple, _ in rows] == [(ALICE, FOAF_NAME, Literal("Alice"))] * 2
+    assert {ctx[0].identifier for _, ctx in rows} == {G1, G2}
+    assert list(quad_store.triples((ALICE, FOAF_NAME, Literal("nobody")))) == []
+
+
+def test_union_match_in_one_graph_shares_one_context(quad_store):
+    """A union match whose rows all live in one graph yields one shared
+    context tuple (the single-distinct-graph loop), with that graph's name."""
+    rows = list(quad_store.triples((ALICE, FOAF_KNOWS, None)))
+    assert rows, "fixture holds alice-knows rows"
+    contexts = {id(ctx) for _, ctx in rows}
+    assert len(contexts) == 1
+    assert {ctx[0].identifier for _, ctx in rows} == {G1}
+
+
+def test_union_match_across_graphs_keeps_per_row_contexts(quad_store):
+    rows = list(quad_store.triples((None, FOAF_NAME, None)))
+    by_graph: dict = {}
+    for (s_, _, _), ctx in rows:
+        by_graph.setdefault(ctx[0].identifier, set()).add(s_)
+    assert set(by_graph) >= {G1, G2}
+    assert ALICE in by_graph[G1] and ALICE in by_graph[G2]
+
+
+def test_default_graph_is_not_a_named_graph(quad_store):
+    dataset = Dataset(store=quad_store, default_union=True)
+    named = {
+        str(row.g) for row in dataset.query("SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }")
+    }
+    assert named == {GRAPH_1, GRAPH_2}
+    # ...but the union default graph does include it.
+    assert len(list(dataset.query("SELECT * WHERE { ?s ?p ?o }"))) == 6
+
+
+def test_dataset_without_union_sees_only_the_default_graph(quad_store):
+    dataset = Dataset(store=quad_store)
+    assert len(list(dataset.query("SELECT * WHERE { ?s ?p ?o }"))) == 2
+
+
+def test_union_view_is_keyed_on_default_union_not_the_class(quad_store):
+    """A view whose default graph is the union of the others sees every graph,
+    whatever class it is.
+
+    rdflib's deprecated `ConjunctiveGraph` is the one such view that exists
+    besides `Dataset`, and it is *always* a union — including when it carries
+    an identifier of its own, which recognizing only `Dataset` would have
+    read as a named graph.
+    """
+
+    class _UnionView:
+        default_union = True
+        identifier = URIRef("http://ex.org/g/1")
+
+    assert quad_store._graph_n3(_UnionView()) is None
+
+    with pytest.warns(DeprecationWarning):
+        legacy = ConjunctiveGraph(store=quad_store, identifier=URIRef("http://ex.org/g/1"))
+    assert quad_store._graph_n3(legacy) is None
+    assert len(list(legacy.triples((None, None, None)))) == 6
+
+
+def test_add_graph_is_a_no_op(quad_store):
+    # A Dataset calls it whenever it hands out a graph, so it must not raise —
+    # and it must not invent a graph either.
+    dataset = Dataset(store=quad_store)
+    dataset.graph(URIRef("http://ex.org/g/new"))
+    assert {c.identifier for c in quad_store.contexts()} == {G1, G2, DATASET_DEFAULT_GRAPH_ID}
 
 
 def test_dictionary_graph_uses_code_path(vortex_files, monkeypatch):
-    store = VortexStore(str(vortex_files["dictionary"]))
+    store = VortexRdflibStore(str(vortex_files["dictionary"]))
     assert store._dict is not None  # code path active
 
     monkeypatch.setenv("VORTEX_RDF_DISABLE_CODE_PATH", "1")
-    disabled = VortexStore(str(vortex_files["dictionary"]))
+    disabled = VortexRdflibStore(str(vortex_files["dictionary"]))
     assert disabled._dict is None  # string fallback forced
 
     # Both paths yield identical triples.
@@ -100,27 +246,27 @@ def test_dictionary_graph_uses_code_path(vortex_files, monkeypatch):
 
 
 def test_in_memory_graph_equality(vortex_files):
-    on_file = Graph(store=VortexStore(str(vortex_files["dictionary"])))
-    in_mem = Graph(store=VortexStore(str(vortex_files["dictionary"]), in_memory=True))
+    on_file = Graph(store=VortexRdflibStore(str(vortex_files["dictionary"])))
+    in_mem = Graph(store=VortexRdflibStore(str(vortex_files["dictionary"]), in_memory=True))
     assert len(in_mem) == len(on_file) == 5
     assert sorted(in_mem.triples((None, None, None))) == sorted(on_file.triples((None, None, None)))
 
 
 def test_layout_alias_and_detection(vortex_files):
     # Branch-era labels are accepted; the detected layout wins.
-    store = VortexStore(str(vortex_files["dictionary"]), layout="cottas-native-ids")
+    store = VortexRdflibStore(str(vortex_files["dictionary"]), layout="cottas-native-ids")
     assert store.layout == "dictionary"
-    store = VortexStore(str(vortex_files["default"]), layout="cottas-native-strings")
+    store = VortexRdflibStore(str(vortex_files["default"]), layout="cottas-native-strings")
     assert store.layout == "default"
 
 
 def test_from_n3_safe_dbpedia_escaped_apostrophe():
     # Language-tagged literal with a non-canonical \' escape (DBpedia quirk).
-    term = VortexStore._from_n3_safe('"L\\\'agent"@fr')
+    term = VortexRdflibStore._from_n3_safe('"L\\\'agent"@fr')
     assert term == Literal("L'agent", lang="fr")
 
 
 def test_no_path_store():
-    store = VortexStore()
+    store = VortexRdflibStore()
     assert len(store) == 0
     assert list(store.triples((None, None, None))) == []

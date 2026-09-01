@@ -6,9 +6,9 @@ dataset generator (``bench.dataset``) and the *same* SPARQL query set
 there ask the store the same question. What differs is the axis of comparison
 and how the answer is measured:
 
-* ``run_bench.py`` is **comparative and wall-clock**: VortexStore next to
+* ``run_bench.py`` is **comparative and wall-clock**: VortexRdflibStore next to
   rdflib's ``Memory``, oxrdflib, pycottas and rdflib-hdt, one worker process
-  per store so peak RSS is attributable, at 250k triples. It feeds the Pages
+  per store so peak RSS is attributable, at 250k quads. It feeds the Pages
   dashboard and is NEVER uploaded to CodSpeed.
 * THIS file is **self-referential and instrumented**: it runs under
   ``pytest --codspeed`` in simulation mode, where every task gets a
@@ -28,7 +28,9 @@ move the number:
 
   primary config        dictionary layout, in-memory, no index, pushdown on
   pushdown              the join queries with the hook unregistered — the
-                        A/B against rdflib's per-binding nested loop
+                        A/B against rdflib's per-binding nested loop — and the
+                        graph queries, against rdflib walking the store's
+                        graphs one at a time
   residency + index     file-backed stores, where the per-call native floor
                         dominates and secondary indexes earn their keep:
                         the two lookups they target, per index config, plus
@@ -38,7 +40,8 @@ move the number:
                         selectivity, below the SPARQL layer — and one
                         predicate scan across the store variants that change
                         how a match is served (code path vs string fallback
-                        vs Default layout vs file-backed)
+                        vs Default layout vs file-backed), plus the same scan
+                        scoped to one named graph and to the union
   open                  each residency, for both layouts
 
 Building (``serialize_rdf``) is not measured: it is the vortex-rdf package's
@@ -60,21 +63,23 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from rdflib import Graph
+from rdflib import Dataset, Graph
 from rdflib.term import URIRef
 from rdflib.util import from_n3
 
 from bench.dataset import (
     DatasetConfig,
     config_from_env,
+    graph_iri,
+    graph_of_subject,
     moduli,
     object_nt,
     predicate_iri,
     subject_iri,
-    write_ntriples,
+    write_nquads,
 )
 from bench.queries import Query, build_queries
-from vortex_rdflib import VortexStore, register_sparql_pushdown, unregister_sparql_pushdown
+from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
 
 # ─── Dataset shape ──────────────────────────────────────────────────────────
 # Small by default: instrumentation runs under Valgrind, so the dashboard's
@@ -95,6 +100,7 @@ CFG = DatasetConfig(
     predicates=_DEFAULTS.predicates,
     object_ratio=_DEFAULTS.object_ratio,
     literal_frac=_DEFAULTS.literal_frac,
+    graphs=_DEFAULTS.graphs,
 )
 MODULI = moduli(CFG)
 
@@ -123,6 +129,21 @@ FILES: dict[str, dict] = {
 
 #: Queries whose cost is dominated by the BGP join strategy.
 JOIN_QUERIES = ("star-2", "star-3", "chain-2", "optional")
+
+#: Queries whose cost is dominated by how the graph itself is served. With the
+#: hook off, rdflib's `evalGraph` walks the store's graphs and evaluates the
+#: block once per graph, joining the graph name onto every solution; the
+#: pushdown binds it from the match's fourth column instead. One of each shape
+#: the difference shows up in: binding `?g` alongside a scan's rows, and a
+#: DISTINCT over the graph column alone.
+GRAPH_QUERIES = ("graph-var", "graph-names")
+
+#: A subject in a *named* graph (index 0 is the default graph, which no GRAPH
+#: clause can name), and the graph holding it — every statement about that
+#: subject is in it, so the scan below has rows by construction.
+_GRAPH_SUBJECT_INDEX = next(j for j in range(MODULI.n_subj) if graph_of_subject(j, MODULI) != 0)
+GRAPH_SUBJECT = URIRef(subject_iri(_GRAPH_SUBJECT_INDEX))
+GRAPH_NAME = URIRef(graph_iri(graph_of_subject(_GRAPH_SUBJECT_INDEX, MODULI)))
 
 #: File-backed cases as `(index_tag, query)`: the two lookups the secondary
 #: indexes target, per index config, plus one join on the unindexed store as
@@ -172,9 +193,9 @@ def _consume_query(graph: Graph, query: Query) -> int:
     return sum(1 for _ in result)
 
 
-def _consume_triples(store: VortexStore, pattern: tuple) -> int:
+def _consume_triples(store: VortexRdflibStore, pattern: tuple, context=None) -> int:
     """Match and materialize every row — a lazy generator must not pass for speed."""
-    return sum(1 for _ in store.triples(pattern))
+    return sum(1 for _ in store.triples(pattern, context))
 
 
 # ─── Fixtures ───────────────────────────────────────────────────────────────
@@ -184,14 +205,14 @@ def _consume_triples(store: VortexStore, pattern: tuple) -> int:
 
 
 @pytest.fixture(scope="session")
-def source_nt(tmp_path_factory) -> Path:
-    path = tmp_path_factory.mktemp("codspeed-data") / "dataset.nt"
-    write_ntriples(str(path), CFG)
+def source_nq(tmp_path_factory) -> Path:
+    path = tmp_path_factory.mktemp("codspeed-data") / "dataset.nq"
+    write_nquads(str(path), CFG)
     return path
 
 
 @pytest.fixture(scope="session")
-def vortex_files(tmp_path_factory, source_nt) -> dict[str, str]:
+def vortex_files(tmp_path_factory, source_nq) -> dict[str, str]:
     """The `.vortex` artifacts, keyed as in `FILES`."""
     from vortex_rdf import serialize_rdf
 
@@ -199,13 +220,13 @@ def vortex_files(tmp_path_factory, source_nt) -> dict[str, str]:
     paths: dict[str, str] = {}
     for key, options in FILES.items():
         out = root / f"{key}.vortex"
-        serialize_rdf(str(source_nt), str(out), **options)
+        serialize_rdf(str(source_nq), str(out), format="nquads", **options)
         paths[key] = str(out)
     return paths
 
 
 @pytest.fixture(scope="session")
-def stores(vortex_files) -> dict[str, VortexStore]:
+def stores(vortex_files) -> dict[str, VortexRdflibStore]:
     """Opened stores, keyed `<residency>_<variant>`.
 
     `mem_nocodes` is the Dictionary layout with the u32 code path forced off:
@@ -214,14 +235,14 @@ def stores(vortex_files) -> dict[str, VortexStore]:
     cost of decoding codes versus parsing N-Triples term strings.
     """
     opened = {
-        "mem_noidx": VortexStore(vortex_files["dict_noidx"], in_memory=True),
-        "mem_default": VortexStore(vortex_files["default"], in_memory=True),
-        **{f"file_{tag}": VortexStore(vortex_files[f"dict_{tag}"]) for tag in INDEXES},
+        "mem_noidx": VortexRdflibStore(vortex_files["dict_noidx"], in_memory=True),
+        "mem_default": VortexRdflibStore(vortex_files["default"], in_memory=True),
+        **{f"file_{tag}": VortexRdflibStore(vortex_files[f"dict_{tag}"]) for tag in INDEXES},
     }
     previous = os.environ.get("VORTEX_RDF_DISABLE_CODE_PATH")
     os.environ["VORTEX_RDF_DISABLE_CODE_PATH"] = "1"
     try:
-        opened["mem_nocodes"] = VortexStore(vortex_files["dict_noidx"], in_memory=True)
+        opened["mem_nocodes"] = VortexRdflibStore(vortex_files["dict_noidx"], in_memory=True)
     finally:
         if previous is None:
             del os.environ["VORTEX_RDF_DISABLE_CODE_PATH"]
@@ -232,7 +253,10 @@ def stores(vortex_files) -> dict[str, VortexStore]:
 
 @pytest.fixture(scope="session")
 def graphs(stores) -> dict[str, Graph]:
-    return {key: Graph(store=store) for key, store in stores.items()}
+    """Each store as a Dataset whose default graph is the union of its graphs —
+    the shape the dashboard's vortex rows are measured in, and the one where a
+    `GRAPH` clause can name a graph."""
+    return {key: Dataset(store=store, default_union=True) for key, store in stores.items()}
 
 
 @pytest.fixture
@@ -257,11 +281,12 @@ def test_query(benchmark, graphs, name):
 
 
 @pytest.mark.usefixtures("without_pushdown")
-@pytest.mark.parametrize("name", JOIN_QUERIES)
+@pytest.mark.parametrize("name", JOIN_QUERIES + GRAPH_QUERIES)
 def test_query_no_pushdown(benchmark, graphs, name):
-    """The join queries under rdflib's default evaluator — one `triples()`
-    call per candidate binding — so the pushdown's own contribution is a
-    difference between two tracked numbers, not an inference."""
+    """The join and graph queries under rdflib's default evaluator — one
+    `triples()` call per candidate binding, and one pass over the store per
+    named graph — so the pushdown's own contribution is a difference between
+    two tracked numbers, not an inference."""
     graph, query = graphs["mem_noidx"], QUERIES[name]
     assert _consume_query(graph, query) > 0
     benchmark(_consume_query, graph, query)
@@ -299,16 +324,37 @@ def test_triples_p_scan(benchmark, stores, variant):
     benchmark(_consume_triples, store, pattern)
 
 
+def test_triples_in_one_graph(benchmark, stores):
+    """A subject scan restricted to one named graph: the graph is the match's
+    fourth position, and every row is in it, so the graph column is never read
+    and the contexts are one cached tuple."""
+    store = stores["mem_noidx"]
+    context = Graph(store=store, identifier=GRAPH_NAME)
+    pattern = (GRAPH_SUBJECT, None, None)
+    assert _consume_triples(store, pattern, context) > 0
+    benchmark(_consume_triples, store, pattern, context)
+
+
+def test_triples_across_graphs(benchmark, stores):
+    """The same scan over the union, where every row's graph has to be read out
+    of the fourth column and mapped to a context — the work the graph-scoped
+    task above skips."""
+    store = stores["mem_noidx"]
+    pattern = (GRAPH_SUBJECT, None, None)
+    assert _consume_triples(store, pattern) > 0
+    benchmark(_consume_triples, store, pattern)
+
+
 # ─── open::<residency>::<layout> ────────────────────────────────────────────
 
 
 @pytest.mark.parametrize("file_key", ("dict_noidx", "default"))
 def test_open_file(benchmark, vortex_files, file_key):
     """Lazy open: reads the footer and metadata, not the data."""
-    benchmark(VortexStore, vortex_files[file_key])
+    benchmark(VortexRdflibStore, vortex_files[file_key])
 
 
 @pytest.mark.parametrize("file_key", ("dict_noidx", "default"))
 def test_open_memory(benchmark, vortex_files, file_key):
     """Eager open: loads the store and, for Dictionary, the term dictionary."""
-    benchmark(VortexStore, vortex_files[file_key], in_memory=True)
+    benchmark(VortexRdflibStore, vortex_files[file_key], in_memory=True)

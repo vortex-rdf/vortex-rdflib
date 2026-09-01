@@ -288,7 +288,7 @@ def test_canonical_spelling_round_trips_every_dictionary_term(tmp_path):
     encode(canonical_spelling(decoded term)) is the code again."""
     from vortex_rdf import serialize_rdf
 
-    from vortex_rdflib import VortexStore
+    from vortex_rdflib import VortexRdflibStore
     from vortex_rdflib.terms import canonical_spelling
 
     nt = tmp_path / "spellings.nt"
@@ -310,7 +310,7 @@ def test_canonical_spelling_round_trips_every_dictionary_term(tmp_path):
     )
     out = tmp_path / "spellings.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
-    store = VortexStore(str(out))
+    store = VortexRdflibStore(str(out))
     term_dict = store._dict
     assert term_dict is not None
     for code in range(len(term_dict)):
@@ -328,7 +328,7 @@ def test_canonical_spelling_round_trips_every_dictionary_term(tmp_path):
 def test_kind_bounds_partition_the_dictionary(tmp_path):
     from vortex_rdf import serialize_rdf
 
-    from vortex_rdflib import VortexStore
+    from vortex_rdflib import VortexRdflibStore
 
     nt = tmp_path / "kinds.nt"
     nt.write_text(
@@ -340,7 +340,7 @@ def test_kind_bounds_partition_the_dictionary(tmp_path):
     )
     out = tmp_path / "kinds.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
-    store = VortexStore(str(out))
+    store = VortexRdflibStore(str(out))
     term_dict = store._dict
     assert term_dict is not None
     bounds = kind_bounds(term_dict)
