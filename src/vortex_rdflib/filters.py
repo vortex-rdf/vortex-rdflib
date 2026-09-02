@@ -329,6 +329,8 @@ def _compile(node, slots: dict, consts: dict):
     name = node.name
     if name == "RelationalExpression":
         return _compile_relational(node, slots, consts)
+    if name == "AdditiveExpression":
+        return _compile_additive(node, slots, consts)
     if name in ("ConditionalAndExpression", "ConditionalOrExpression"):
         if node.other is None:
             raise _NotFast
@@ -378,6 +380,47 @@ def _or(parts):
         if unknown:
             return UNKNOWN
         return ERROR if error else False
+
+    return fn
+
+
+def _integer_view(value: int) -> TermView:
+    """An arithmetic result in SPARQL's integer value space."""
+    return TermView(LITERAL, str(value), dt=_XSD + "integer")
+
+
+def _compile_additive(node, slots, consts):
+    """Compile integer-only ``+`` and ``-`` without rdflib term allocation.
+
+    SPARQL promotes arithmetic over integer-derived datatypes to xsd:integer.
+    Any unbound, ill-typed, non-integer or unexpected shape returns UNKNOWN,
+    so the caller uses rdflib's evaluator for that distinct binding tuple.
+    """
+    if node.other is None or node.op is None:
+        raise _NotFast
+    others = node.other if isinstance(node.other, list) else [node.other]
+    operators = node.op if isinstance(node.op, list) else [node.op]
+    if len(others) != len(operators) or any(op not in ("+", "-") for op in operators):
+        raise _NotFast
+    first = _compile(node.expr, slots, consts)
+    rest = [_compile(part, slots, consts) for part in others]
+
+    def integer(value):
+        if not isinstance(value, TermView) or value.kind != LITERAL or value.dt not in _INT_LIKE:
+            return UNKNOWN
+        converted = numeric_value(value)
+        return converted if isinstance(converted, int) else UNKNOWN
+
+    def fn(env):
+        value = integer(first(env))
+        if value is UNKNOWN:
+            return UNKNOWN
+        for operator, operand in zip(operators, rest, strict=True):
+            other = integer(operand(env))
+            if other is UNKNOWN:
+                return UNKNOWN
+            value = value + other if operator == "+" else value - other
+        return _integer_view(value)
 
     return fn
 

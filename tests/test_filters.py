@@ -250,7 +250,6 @@ def test_fast_route_defers_outside_its_domain(sparql_expr, spelling):
 @pytest.mark.parametrize(
     "sparql_expr",
     [
-        "?v + 1 > 3",
         "coalesce(?v, 0) = 1",
         "regex(?v, str(?v))",
         'ucase(?v) = "A"',
@@ -258,6 +257,48 @@ def test_fast_route_defers_outside_its_domain(sparql_expr, spelling):
 )
 def test_outside_the_whitelist_is_not_compiled(sparql_expr):
     assert filters.compile_fast(filter_expr(sparql_expr), (V,), {}) is None
+
+
+@pytest.mark.parametrize(
+    ("sparql_expr", "spelling", "expected"),
+    [
+        ("?v + 1 > 3", typed("5", "integer"), True),
+        ("?v - 10 < 0", typed("7", "byte"), True),
+        ("?v + 1 = 6", typed("5", "unsignedInt"), True),
+    ],
+)
+def test_integer_additive_fast_route(sparql_expr, spelling, expected):
+    predicate = filters.compile_fast(filter_expr(sparql_expr), (V,), {})
+    assert predicate is not None
+    assert fast_answer(predicate, spelling) is expected
+    assert fast_answer(predicate, spelling) == rdflib_answer(filter_expr(sparql_expr), spelling)
+
+
+def test_integer_additive_over_two_variables_matches_rdflib():
+    expr = filter_expr("?v > ?w - 120 && ?v < ?w + 120")
+    w = Variable("w")
+    predicate = filters.compile_fast(expr, (V, w), {})
+    assert predicate is not None
+    cases = [
+        (typed("100", "integer"), typed("150", "integer")),
+        (typed("1", "byte"), typed("200", "integer")),
+        (typed("300", "integer"), typed("150", "integer")),
+    ]
+    for left, right in cases:
+        views = (parse_spelling(left), parse_spelling(right))
+        fast = predicate(views)
+        bindings = {V: from_n3(left), w: from_n3(right)}
+        expected = _ebv(expr, FrozenBindings(CTX, bindings))
+        assert fast is expected
+
+
+def test_additive_non_integer_defers_to_rdflib():
+    predicate = filters.compile_fast(filter_expr("?v + 1 > 3"), (V,), {})
+    assert predicate is not None
+    assert fast_answer(predicate, typed("2.5", "decimal")) is filters.UNKNOWN
+    assert fast_answer(predicate, typed("1e2", "double")) is filters.UNKNOWN
+    assert fast_answer(predicate, typed("abc", "integer")) is filters.UNKNOWN
+    assert fast_answer(predicate, None) is filters.UNKNOWN
 
 
 def test_ctx_bound_constants_are_substituted():
