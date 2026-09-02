@@ -31,16 +31,43 @@ and the dashboard leaves empty.
 before Python starts, so process-wide switches like
 ``VORTEX_RDF_DISABLE_PUSHDOWN`` are in place before any import runs.
 
-Engines: SPARQL evaluation is rdflib's engine for every adapter, so the store
-serving triple patterns is the only variable. A store's own evaluator is
-deliberately out of scope — it skips rdflib's parse and algebra entirely,
-which dominates the cheap queries, so its rows would not be comparable with
-the rest and would capture the "fastest" marker on most columns.
-For vortex adapters with a resident dictionary, rdflib's engine hands the
-algebra nodes this package understands to its code-space pushdown. The
+Engines: SPARQL evaluation is rdflib's engine for every adapter but one, so
+the store serving triple patterns is the only variable across the comparable
+rows. For vortex adapters with a resident dictionary, rdflib's engine hands
+the algebra nodes this package understands to its code-space pushdown. The
 ``pushdown off`` row runs the primary configuration with
 ``VORTEX_RDF_DISABLE_PUSHDOWN=1``, so the pushdown's own contribution is the
 difference between two rows of the same store.
+
+The exception is ``oxrdflib (pyoxigraph engine)``: the same Oxigraph store,
+asked without ``use_store_provided=False``, so ``OxigraphStore.query`` answers
+from pyoxigraph's own Rust engine and rdflib evaluates nothing. It is here as
+the reference point the rdflib rows are all working against, rather than a
+like-for-like row — it parses its own SPARQL, plans its own joins and never
+builds an rdflib solution per intermediate binding, so it takes the
+dashboard's "fastest" marker on most end-to-end columns by not doing the same
+work.
+
+It is emphatically **not** a measurement of pyoxigraph. Every solution still
+crosses into Python through ``oxrdflib``'s ``from_ox``, one value at a time,
+because the row has to produce the rdflib terms every other row produces. For
+a query that returns rows that conversion, not the engine, is most of the
+number: measured at 20k against the same query text run straight on the
+underlying ``pyoxigraph.Store``, the predicate scan is 2.66 ms here against
+0.23 ms there, the ``DISTINCT`` 2.16 against 0.25, ``GRAPH ?g`` 2.77 against
+0.25 — 88-91% of this row is oxrdflib. Only where the answer is a scalar does
+the engine dominate (``COUNT(*)``: 2.91 against 2.47).
+
+Two more consequences worth knowing:
+
+- It reports no ``exec only`` figure (``prepared=False``). rdflib's prepared
+  algebra cannot cross that boundary: ``OxigraphStore.query`` raises
+  ``NotImplementedError`` for a parsed ``Query``, and ``Graph.query``
+  *catches* it and quietly falls back to its own evaluator — so a timing
+  taken that way would be rdflib's engine wearing this row's label.
+- Its ``full`` figure includes Oxigraph's own parse, which is the honest
+  end-to-end comparison: both columns' ``full`` is "here is a query string,
+  here are the rows".
 
 The Vortex rows are all Dictionary layout — the layout that enables the term
 code path and so the only one worth tuning — crossed over the two axes that
@@ -70,6 +97,11 @@ class Adapter:
     # Whether the store's format has named graphs. False means the `graphs`
     # query group is not asked of it (see the module docstring).
     quads: bool = True
+    # Whether a prepared algebra reaches this adapter's evaluator, so the run
+    # can be split into "prepare" and "evaluate". False for a store that
+    # answers the query string itself, below rdflib: there is no algebra to
+    # prepare, so only the end-to-end figure exists (see the module docstring).
+    prepared: bool = True
     # Import name of the third-party package this adapter needs from the
     # project environment, so the orchestrator can fail fast with the fix
     # instead of losing a worker.
@@ -233,6 +265,16 @@ ADAPTERS: list[Adapter] = [
         venv_packages=("rdflib-hdt>=3.2",),
         requires_cli="hdt",
         quads=False,
+    ),
+    # Last, and ruled off in the dashboard: a different engine, not a
+    # different store. See the module docstring on how to read it.
+    Adapter(
+        "oxrdflib_native",
+        "oxrdflib (in-mem · pyoxigraph engine)",
+        "native",
+        _make_oxrdflib,
+        requires="oxrdflib",
+        prepared=False,
     ),
 ]
 

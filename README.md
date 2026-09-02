@@ -153,10 +153,30 @@ and dataset.
 It executes a synthetic representative SPARQL set (lookups/scans, star and
 chain joins, FILTER/DISTINCT/ORDER BY/GROUP BY, and the shapes that name a
 graph) and records per-store peak RSS; each store's full lifecycle runs in its
-own process. SPARQL evaluation is rdflib's engine for every store, so the
-store serving quad patterns is the only variable — a store's own SPARQL engine
-is out of scope, since it skips rdflib's parse and algebra and is not
-measuring the same work.
+own process. SPARQL evaluation is rdflib's engine for every store but one, so
+the store serving quad patterns is the only variable among the rows ranked
+against each other. The exception is a final, ruled-off row: the same Oxigraph
+store answering through pyoxigraph's own engine instead of rdflib's. It is the
+reference point the rdflib rows are all working against rather than a
+like-for-like row — and it reports no `exec only` figure, because rdflib's prepared
+algebra cannot reach a store that parses the query itself. It is not a
+measurement of pyoxigraph either: the solutions still cross into Python as
+rdflib terms through oxrdflib, which is most of that row on any query that
+returns rows.
+
+Row counts are cross-checked across stores after every run: same data, same
+query, so a store that returns a different number is reported as a failure on
+the dashboard, measured against what the majority found rather than against
+whichever store ran first.
+
+The dashboard reports two figures per query, both from one run split where
+rdflib's own string path splits: **exec only** is the evaluation of an
+already-translated algebra — what a store's speed can move — and **full**
+adds the parse and algebra translation in front of it, which rdflib repeats
+on every string query. `full` is what an application passing a string waits
+for; on a selective query it is mostly rdflib's parser, which no store can
+undercut. `tests/test_bench_worker.py` pins the two rdflib properties that
+make the split faithful.
 
 The dataset is a set of quads — every statement about a subject goes into
 one graph, so the union of the graphs is exactly the triple set — and each

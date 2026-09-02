@@ -127,15 +127,34 @@
   .failures ul { margin:6px 0 0; padding-left:18px; font-size:12.5px; color:var(--ink-2); }
 
   /* ---- matrix tables (store rows × query columns) ---- */
-  .matrix-table { width:100%; border-collapse:collapse; margin-top:10px; font-size:12.5px; }
+  /* `separate` rather than `collapse` so the frozen store column keeps its
+     rules: a collapsed border belongs to the table, which scrolls away, and
+     browsers drop it from a sticky cell. Spacing 0 renders the same. */
+  .matrix-table { width:100%; border-collapse:separate; border-spacing:0; margin-top:10px; font-size:12.5px; }
   .matrix-table th, .matrix-table td { padding:7px 10px; border-bottom:1px solid var(--border); text-align:right; white-space:nowrap; }
   .matrix-table th { color:var(--ink-muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; }
   .matrix-table th.rowh, .matrix-table td.rowh { text-align:left; }
   .matrix-table td.rowh.sub { color:var(--ink-muted); }
+  /* The store name stays readable while the query columns scroll under it.
+     Only the first header cell freezes — a second would need its own offset,
+     and every panel here has exactly one. The opaque background is what the
+     scrolled cells slide behind; the right rule marks the seam. */
+  .matrix-table th.rowh:first-child, .matrix-table td.rowh:first-child {
+    position:sticky; left:0; z-index:1;
+    background:var(--surface); border-right:1px solid var(--border);
+  }
+  /* Two header rows: the query name over its measurement modes, with a rule
+     down each query's left edge so a pair reads as one block. */
+  .matrix-table th.colgroup { text-align:center; color:var(--ink-2); }
+  .matrix-table th.colgroup[title] { cursor:help; }
+  .matrix-table th.subcol { font-size:10px; text-transform:none; letter-spacing:0.02em; font-weight:500; }
+  .matrix-table .gsep { border-left:1px solid var(--border); }
   .matrix-table td.num { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
   .matrix-table td.num .ratio { color:var(--ink-muted); font-size:10.5px; margin-left:5px; }
   .matrix-table td.num.best { color:var(--good); font-weight:700; }
+  /* Uncollapsed, the break rule would stack on the preceding row's own. */
   .matrix-table tbody tr.group-break td { border-top:1px solid var(--border-strong); }
+  .matrix-table tbody tr:has(+ tr.group-break) td { border-bottom:0; }
   .table-wrap { overflow-x:auto; border:1px solid var(--border); border-radius:8px; }
 
   /* ---- query text ---- */
@@ -213,8 +232,11 @@
       <em>secondary index</em> (none, by-copy, by-reference).
     </p>
     <p class="lede">
-      rdflib's engine evaluates every store, so the store serving quad patterns is the only
-      variable. Each label records where a query's bytes come from:
+      rdflib's engine evaluates every store but the last, so the store serving quad patterns is
+      the only variable among the rows that are ranked against each other. The exception is
+      <em>oxrdflib (pyoxigraph engine)</em>: the same Oxigraph store answering through
+      pyoxigraph's own SPARQL engine instead, ruled off as the reference point the rdflib rows
+      are working against. Each label records where a query's bytes come from:
       <em>in-mem</em> stores live fully in memory, <em>file</em> stores perform file access reads per query.
       Every query matches by construction, and row counts are cross-checked across stores.
     </p>
@@ -241,7 +263,9 @@
     <p class="group-desc">
       Cold start: from the shared source file — <span class="mono">.nq</span> for the stores with
       named graphs, the flattened <span class="mono">.nt</span> for HDT and COTTAS — to a
-      queryable store. Most
+      queryable store. The same statements either way, but <strong>not the same bytes</strong>:
+      dropping the graph column makes the <span class="mono">.nt</span> about 18% smaller, so
+      those two rows have that much less to parse. Most
       libraries build their own format first — <span class="mono">serialize_rdf</span> (vortex-rdflib),
       <span class="mono">rdf2cottas</span>, <span class="mono">hdt convert</span> — then open it;
       rdflib and oxrdflib parse directly. Median of repeated full rebuilds.
@@ -259,9 +283,49 @@
       <h2>SPARQL execution, per query</h2>
     </div>
     <p class="group-desc">
-      Median wall-clock time to execute <em>and fully consume</em> each query.
-      <b>Green</b> marks the fastest store in each column; the grey multiplier is the slowdown
-      vs that column's best.
+      Median wall-clock time to execute <em>and fully consume</em> each query, reported as a pair
+      of figures taken from one run, split where rdflib's own string path splits:
+      <b>exec only</b> is the evaluation of an already-translated algebra — the part a store's
+      speed can move; <b>full</b> adds the parse and algebra translation in front of it, which
+      rdflib repeats on <em>every</em> string query. <b>full</b> is what an application passing a
+      query string waits for, and on a selective query it is nearly all of it — no store can be
+      faster than rdflib's parser.
+      <b>Green</b> marks the fastest cell in each column outright, whichever engine produced it,
+      and the grey multiplier is every other cell's slowdown against it. In the <b>full</b>
+      columns that is usually the ruled-off pyoxigraph-engine row; the <b>exec only</b> column
+      beside it is where the same question is answered among the stores rdflib evaluates, since
+      that row has no cell there.
+    </p>
+    <p class="group-desc">
+      Two marks on the column headers. <b>•</b> is a <em>heavy</em> query — it touches the whole
+      dataset, and runs on a lower iteration budget. <b>‡</b> is a query whose answer is a
+      <em>cardinality</em>, not rows: a ground <span class="mono">ASK</span>, or an ungrouped
+      <span class="mono">COUNT(*)</span> over one pattern. A store that can count a selection
+      without materializing it answers those without decoding a single term, so those columns
+      compare an <em>approach</em> — whether the store can answer from counts at all — and not
+      how fast one implementation walks rows. The ratios there are real, and they do not
+      generalize to the other columns.
+    </p>
+    <p class="group-desc">
+      The last row, <b>oxrdflib (pyoxigraph engine)</b>, is ruled off because it is a different
+      engine rather than a different store: the same Oxigraph store asked without
+      <span class="mono">use_store_provided=False</span>, so pyoxigraph parses the SPARQL,
+      plans the joins and returns the rows, and rdflib evaluates nothing. Read it as the
+      reference point every rdflib row is working against, rather than a like-for-like row —
+      it takes the green marker on most <b>full</b> columns because it is genuinely fastest
+      there, not because it is doing the same work.
+      It is <em>not</em> a measurement of pyoxigraph: every solution still crosses into Python
+      through oxrdflib one value at a time, to produce the rdflib terms every other row
+      produces, and for a query that returns rows that conversion — not the engine — is most of
+      the number. Against the raw <span class="mono">pyoxigraph.Store</span> it stands in for,
+      this row runs roughly an order of magnitude slower on the row-returning queries.
+      Its <b>exec only</b> cells are empty because rdflib's prepared algebra cannot cross that
+      boundary — <span class="mono">OxigraphStore.query</span> rejects a parsed query and
+      rdflib silently falls back to its own evaluator, so a figure taken that way would be
+      rdflib's engine under this row's name. Its <b>full</b> figure is the honest comparison:
+      every <b>full</b> cell answers "here is a query string, here are the rows".
+    </p>
+    <p class="group-desc">
       <b>rdflib-hdt</b>'s own <span class="mono">optimize_sparql()</span> fast path is switched
       off: it answers two of these joins wrongly — <span class="mono">chain-2</span> with 26 rows
       and <span class="mono">optional</span> with 152, against the 18 and 1 that rdflib and
@@ -302,7 +366,11 @@
       <span class="chan-tag mono">DATA</span>
       <h2>Every measurement</h2>
     </div>
-    <p class="group-desc">Every (query, store) measurement from this run. Click a column to sort.</p>
+    <p class="group-desc">
+      Every (query, store, mode) measurement from this run. Click a column to sort. An id ending
+      in <span class="mono">::exec</span> is the prepared-algebra run; the plain id is the full
+      one, including rdflib's parse and algebra translation.
+    </p>
     <div class="table-toolbar">
       <input id="table-filter" type="text" placeholder="filter by name…" autocomplete="off" />
       <span class="count" id="table-count"></span>
@@ -344,12 +412,16 @@ const QUERIES = CONFIG.queries || [];
 // they get no id and leave a dash rather than a "missing benchmark" warning.
 const SKIPPED = new Map(
   Object.entries(CONFIG.skipped || {}).map(([slug, names]) => [slug, new Set(names)]));
-function idFor(query, adapter){
-  return SKIPPED.get(adapter.slug)?.has(query.name) ? null : `${query.name}::${adapter.slug}`;
+function idFor(query, adapter, mode){
+  if (SKIPPED.get(adapter.slug)?.has(query.name)) return null;
+  // A store that answers the query string itself has no prepared algebra to
+  // time, so it reports `full` only and its `exec only` cell stays empty.
+  if (adapter.modes && !adapter.modes.includes(mode)) return null;
+  return `${query.name}::${adapter.slug}` + (mode === "full" ? "" : `::${mode}`);
 }
 // Rule off the rows where what-is-measured changes: the other stores, then
 // the different-engine row.
-function rowBreak(slug){ return slug === "rdflib_memory"; }
+function rowBreak(slug){ return slug === "rdflib_memory" || slug === "oxrdflib_native"; }
 
 function get(map, id){ const r = map.get(id); if(!r) console.warn("missing bench id", id); return r; }
 
@@ -357,9 +429,18 @@ function get(map, id){ const r = map.get(id); if(!r) console.warn("missing bench
  * print the median; the column-best cell is green and every other cell
  * carries its multiplier vs that best. A store with no cell at all is
  * dropped, unless `keepEmpty` — where a store answering none of a panel's
- * queries is the point, its row of dashes has to be visible. cfg: { title,
- * note, wide, keepEmpty, rowHeaders, columns, rows:[{labels, ids, break}],
- * sortByColumn } */
+ * queries is the point, its row of dashes has to be visible.
+ *
+ * Columns come either flat (`columns`) or as two header rows
+ * (`columnGroups: [{label, title, sub:[...]}]`, one measurement per
+ * sub-column, a rule down each group's left edge; `title` is the hover text
+ * that explains the header's marks where they are, not in a legend the
+ * reader has to scroll back to). Either way a row's `ids` are the
+ * flattened columns in order, and "best" is per sub-column: the fastest
+ * execution and the fastest end-to-end are different questions.
+ *
+ * cfg: { title, note, wide, keepEmpty, rowHeaders, columns | columnGroups,
+ * rows:[{labels, ids, break}], sortByColumn } */
 function renderMatrixPanel(container, cfg, map){
   const rows = cfg.rows
     .map(r => ({...r, recs: r.ids.map(id => id ? get(map, id) : null)}))
@@ -372,7 +453,15 @@ function renderMatrixPanel(container, cfg, map){
     rows.forEach(r => delete r.break);
   }
 
-  const best = cfg.columns.map((_, i) => Math.min(
+  // Flattened columns, plus where each group's left rule falls (never on the
+  // first, which would double the frozen store column's own right border).
+  const groups = cfg.columnGroups || null;
+  const columns = groups ? groups.flatMap(g => g.sub) : cfg.columns;
+  const sep = new Set();
+  if (groups){ let i = 0; for (const g of groups){ if (i) sep.add(i); i += g.sub.length; } }
+  const cls = (i, extra) => `class="num${sep.has(i) ? " gsep" : ""}${extra}"`;
+
+  const best = columns.map((_, i) => Math.min(
     ...rows.map(r => r.recs[i]?.median_ns ?? Infinity)));
 
   const panel = document.createElement("div");
@@ -383,9 +472,17 @@ function renderMatrixPanel(container, cfg, map){
   wrap.className = "table-wrap";
   const table = document.createElement("table");
   table.className = "matrix-table";
-  table.innerHTML = "<thead><tr>" +
-    cfg.rowHeaders.map(h => `<th class="rowh">${h}</th>`).join("") +
-    cfg.columns.map(c => `<th>${c}</th>`).join("") + "</tr></thead>";
+  table.innerHTML = "<thead>" + (groups
+    ? "<tr>" +
+      cfg.rowHeaders.map(h => `<th class="rowh" rowspan="2">${h}</th>`).join("") +
+      groups.map((g, i) => `<th class="colgroup${i ? " gsep" : ""}" colspan="${g.sub.length}"${g.title ? ` title="${g.title}"` : ""}>${g.label}</th>`).join("") +
+      "</tr><tr>" +
+      columns.map((c, i) => `<th class="subcol${sep.has(i) ? " gsep" : ""}">${c}</th>`).join("") +
+      "</tr>"
+    : "<tr>" +
+      cfg.rowHeaders.map(h => `<th class="rowh">${h}</th>`).join("") +
+      columns.map(c => `<th>${c}</th>`).join("") +
+      "</tr>") + "</thead>";
   const tbody = document.createElement("tbody");
 
   for (const r of rows){
@@ -394,12 +491,12 @@ function renderMatrixPanel(container, cfg, map){
     tr.innerHTML =
       r.labels.map((l, i) => `<td class="rowh${i ? " sub" : ""}">${l}</td>`).join("") +
       r.recs.map((rec, i) => {
-        if (!rec) return `<td class="num">—</td>`;
+        if (!rec) return `<td ${cls(i, "")}>—</td>`;
         const isBest = rec.median_ns === best[i];
         const mult = rec.median_ns / best[i];
         const multStr = mult >= 100 ? Math.round(mult).toLocaleString() : mult.toFixed(1);
         const ratio = isBest ? "" : `<span class="ratio">${multStr}×</span>`;
-        return `<td class="num${isBest ? " best" : ""}">${rec.median}${ratio}</td>`;
+        return `<td ${cls(i, isBest ? " best" : "")}>${rec.median}${ratio}</td>`;
       }).join("");
     tbody.appendChild(tr);
   }
@@ -444,6 +541,22 @@ const GROUP_META = {
     note: "The query patterns that name a graph: a predicate scan and a two-leg star inside one named graph, a chain that starts in one and continues wherever the object's own graph is, and the three an unbound GRAPH ?g drives (heavy) — a scan, the distinct graph names, and a count per graph. A dashed row is a store that cannot serve named graphs through rdflib, so it was never asked — not a store that failed; the stores it applies to are named under the tiles above.",
   },
 };
+// Two figures out of one run, split where rdflib's string path splits: `exec
+// only` is the evaluation, `full` is that plus the parse and algebra
+// translation rdflib redoes on every string query. Only the first is a
+// store's own work; the second is what an application actually waits for,
+// and on a selective query it is nearly all of it.
+const MODES = [{ key: "exec", label: "exec only" }, { key: "full", label: "full" }];
+// What the marks on a query's header mean, as hover text on that header.
+const MARKS = [
+  { flag: "heavy", glyph: "•",
+    hint: "heavy: one execution touches the whole dataset, so it runs on a lower iteration budget" },
+  { flag: "countable", glyph: "‡",
+    hint: "the answer is a cardinality, not rows (a ground ASK, or an ungrouped COUNT(*) over one "
+        + "pattern): a store that can count a selection without materializing it answers without "
+        + "decoding a term, so this column compares an approach rather than an implementation's speed" },
+];
+function marksFor(q){ return MARKS.filter(m => q[m.flag]); }
 const queryHost = document.getElementById("query-panels");
 for (const [group, meta] of Object.entries(GROUP_META)){
   const qs = QUERIES.filter(q => q.group === group);
@@ -454,8 +567,12 @@ for (const [group, meta] of Object.entries(GROUP_META)){
     wide: true,
     keepEmpty: true,
     rowHeaders: ["Store"],
-    columns: qs.map(q => q.name + (q.heavy ? " •" : "")),
-    rows: storeRows(a => qs.map(q => idFor(q, a))),
+    columnGroups: qs.map(q => ({
+      label: q.name + marksFor(q).map(m => " " + m.glyph).join(""),
+      title: marksFor(q).map(m => `${m.glyph} ${m.hint}`).join("\n\n") || null,
+      sub: MODES.map(m => m.label),
+    })),
+    rows: storeRows(a => qs.flatMap(q => MODES.map(m => idFor(q, a, m.key)))),
   }, byId);
 }
 
@@ -471,6 +588,8 @@ renderMatrixPanel(memHost, {
 // ---- KPIs ----
 const tiles = [
   { label:"Stores", value:String(ADAPTERS.length), sub:"vortex-rdflib · rdflib · oxrdflib · pycottas · hdt" },
+  { label:"Engines", value:String(new Set(ADAPTERS.map(a => a.engine)).size),
+    sub:"rdflib's, plus Oxigraph's own as the reference point" },
   { label:"Queries", value:String(QUERIES.length), sub:"lookups · joins · features · graphs" },
   { label:"Quads", value:(CONFIG.triples||0).toLocaleString(),
     sub:`synthetic · ${CONFIG.graphs||1} graphs` },
@@ -484,6 +603,16 @@ for (const t of tiles){
   el.innerHTML = `<span class="label">${t.label}</span><span class="value mono">${t.value}</span><span class="sub mono">${t.sub}</span>`;
   host.appendChild(el);
 }
+
+// The cross-check every store's rows rest on: same data, same query, so the
+// row counts must agree. Silence here would leave the query set's per-query
+// counts looking authoritative whether or not anyone agreed on them.
+const disputed = CONFIG.disputedRows || [];
+const nQueries = QUERIES.length;
+document.getElementById("matched-rows").innerHTML = disputed.length
+  ? `Row counts cross-checked across stores: <strong>${disputed.length} of ${nQueries} disputed</strong> — ` +
+    `${disputed.join(", ")}. The dissenting stores are listed under failures; the query set below shows the majority count.`
+  : `Row counts cross-checked across stores: all ${nQueries} queries agree.`;
 
 const skippedNote = [...SKIPPED].filter(([, names]) => names.size);
 if (skippedNote.length){

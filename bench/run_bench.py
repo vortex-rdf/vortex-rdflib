@@ -4,7 +4,9 @@ Generates the synthetic dataset once, then runs one worker process per
 adapter (see ``worker.py`` for why isolation matters), merges their rows into
 the dashboard-shaped JSON consumed by ``scripts/render_bench_dashboard.py``,
 and cross-checks that every store returned the same result count for every
-query.
+query. Each worker emits two rows per query — the evaluation alone, and that
+same run including the parse and algebra translation in front of it — which
+the dashboard shows as a pair of columns (see ``worker.py``'s modes).
 
 The dataset is generated twice, from one deterministic generator: as
 N-Quads for the stores that serve named graphs, and as the N-Triples
@@ -26,6 +28,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from datetime import UTC, datetime
 from importlib import metadata, util
 from pathlib import Path
@@ -124,6 +127,41 @@ def provenance(n: int, terms: int, graphs: int) -> str:
     )
 
 
+def reconcile(
+    counted: dict[str, dict[str, int]], adapters: list[Adapter], failures: list[dict]
+) -> tuple[dict[str, int], list[str]]:
+    """Agree one row count per query; report every store that dissents.
+
+    The agreed count is the majority, not the first store to answer — the
+    vortex rows run first, so first-wins would make this package's own output
+    the reference it is being checked against.
+    """
+    label_of = {a.slug: a.label for a in adapters}
+    agreed: dict[str, int] = {}
+    disputed: list[str] = []
+    for name, per_store in counted.items():
+        tally = Counter(per_store.values())
+        consensus, votes = tally.most_common(1)[0]
+        agreed[name] = consensus
+        if len(tally) == 1:
+            continue
+        disputed.append(name)
+        others = f"{votes} of {len(per_store)} stores returned {consensus}"
+        for slug, n in sorted(per_store.items()):
+            if n == consensus:
+                continue
+            print(f"  !! {label_of.get(slug, slug)} returned {n} rows for '{name}'; {others}")
+            failures.append(
+                {
+                    "slug": slug,
+                    "label": label_of.get(slug, slug),
+                    "phase": name,
+                    "error": f"returned {n} rows; {others}",
+                }
+            )
+    return agreed, disputed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default="bench/results.json", help="output JSON path")
@@ -169,7 +207,10 @@ def main() -> int:
 
     results: list[dict] = []
     memory: list[dict] = []
-    matched: dict[str, int] = {}
+    # query -> {slug: rows}. Reconciled after every worker has reported, so a
+    # store that disagrees is named against what the others found, rather than
+    # against whichever store happened to run first.
+    counted: dict[str, dict[str, int]] = {}
     failures: list[dict] = []
     # Queries a store's format cannot express (a GRAPH clause against HDT or
     # COTTAS). Kept apart from `failures`: an empty cell there is a question
@@ -223,21 +264,19 @@ def main() -> int:
             failures.append({"slug": adapter.slug, "label": adapter.label, **f})
         if out.get("skipped"):
             skipped[adapter.slug] = out["skipped"]
-        # Same query, same data -> the counts must agree across stores. A
-        # mismatch is a correctness bug in one of them; surface it loudly
-        # rather than keeping whichever store reported last.
         for name, n in out.get("matched", {}).items():
-            if name not in matched:
-                matched[name] = n
-            elif matched[name] != n:
-                print(
-                    f"  !! {adapter.label} returned {n} rows for '{name}', "
-                    f"but an earlier store returned {matched[name]}"
-                )
+            counted.setdefault(name, {})[adapter.slug] = n
+
+    # Same query, same data -> every store must return the same number of
+    # rows. A disagreement is a correctness bug in one of them, so it becomes
+    # a reported failure: printing it would leave the dashboard showing a
+    # single agreed count that nobody agreed on.
+    matched, disputed = reconcile(counted, adapters, failures)
 
     config = {
         "triples": cfg.n,
         "graphs": m.n_graph,
+        "disputedRows": disputed,
         "cardinality": {
             "nSubj": m.n_subj,
             "nPred": m.n_pred,
@@ -248,7 +287,15 @@ def main() -> int:
         "matchedRows": matched,
         "skipped": skipped,
         "adapters": [
-            {"slug": a.slug, "label": a.label, "engine": a.engine, "quads": a.quads}
+            {
+                "slug": a.slug,
+                "label": a.label,
+                "engine": a.engine,
+                "quads": a.quads,
+                # Which measurement modes this row has: a store that answers
+                # the query string itself reports only the end-to-end one.
+                "modes": ["exec", "full"] if a.prepared else ["full"],
+            }
             for a in adapters
         ],
         "queries": [
@@ -257,6 +304,7 @@ def main() -> int:
                 "group": q.group,
                 "heavy": q.heavy,
                 "quads": q.quads,
+                "countable": q.countable,
                 "sparql": q.sparql,
             }
             for q in queries
