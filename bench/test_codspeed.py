@@ -31,6 +31,11 @@ move the number:
                         A/B against rdflib's per-binding nested loop — and the
                         graph queries, against rdflib walking the store's
                         graphs one at a time
+  FILTER route          the two numeric FILTER queries with the fast route
+                        off, so the compiled predicates' contribution is the
+                        difference between two tracked numbers rather than
+                        an inference — the pushdown is still on, and every
+                        value goes through rdflib's evaluator instead
   residency + index     file-backed stores, where the per-call native floor
                         dominates and secondary indexes earn their keep:
                         the two lookups they target, per index config, plus
@@ -79,7 +84,12 @@ from bench.dataset import (
     write_nquads,
 )
 from bench.queries import Query, build_queries
-from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
+from vortex_rdflib import (
+    VortexRdflibStore,
+    filters,
+    register_sparql_pushdown,
+    unregister_sparql_pushdown,
+)
 
 # ─── Dataset shape ──────────────────────────────────────────────────────────
 # Small by default: instrumentation runs under Valgrind, so the dashboard's
@@ -129,6 +139,12 @@ FILES: dict[str, dict] = {
 
 #: Queries whose cost is dominated by the BGP join strategy.
 JOIN_QUERIES = ("star-2", "star-3", "chain-2", "optional")
+
+#: Queries whose cost is dominated by evaluating a numeric FILTER: a typed
+#: range over one variable, and an integer arithmetic band over two (BSBM
+#: Explore Q5's shape, memoized per distinct code pair rather than per row).
+#: Run against the fast route and against rdflib's evaluator.
+FILTER_QUERIES = ("filter-range", "filter-arith")
 
 #: Queries whose cost is dominated by how the graph itself is served. With the
 #: hook off, rdflib's `evalGraph` walks the store's graphs and evaluates the
@@ -267,6 +283,16 @@ def without_pushdown() -> Iterator[None]:
     register_sparql_pushdown()
 
 
+@pytest.fixture
+def generic_filter() -> Iterator[None]:
+    """Force every FILTER value through rdflib's own evaluator for one task —
+    the `VORTEX_RDF_FILTER_FAST=0` route, which the env switch sets at store
+    construction and these stores are built once per session."""
+    filters._FAST_ENABLED = False
+    yield
+    filters._FAST_ENABLED = True
+
+
 # ─── query::<name> — the full set on the primary configuration ──────────────
 
 
@@ -287,6 +313,18 @@ def test_query_no_pushdown(benchmark, graphs, name):
     `triples()` call per candidate binding, and one pass over the store per
     named graph — so the pushdown's own contribution is a difference between
     two tracked numbers, not an inference."""
+    graph, query = graphs["mem_noidx"], QUERIES[name]
+    assert _consume_query(graph, query) > 0
+    benchmark(_consume_query, graph, query)
+
+
+@pytest.mark.usefixtures("generic_filter")
+@pytest.mark.parametrize("name", FILTER_QUERIES)
+def test_query_generic_filter(benchmark, graphs, name):
+    """The numeric FILTER queries with the compiled predicates off. The
+    pushdown still evaluates them once per distinct value, so the difference
+    from `test_query` is what compiling the expression buys, and nothing
+    else."""
     graph, query = graphs["mem_noidx"], QUERIES[name]
     assert _consume_query(graph, query) > 0
     benchmark(_consume_query, graph, query)
