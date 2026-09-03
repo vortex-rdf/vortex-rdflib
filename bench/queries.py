@@ -22,11 +22,12 @@ Four groups, mirroring how the dashboard panels are organized:
   quadratic): where the join
   strategy (vortex-rdflib's code-space joins vs rdflib's per-binding
   nested loop) dominates.
-- ``features`` — FILTER on a typed range, a term-kind FILTER (``isIRI``),
-  DISTINCT over a predicate scan and over the whole store, ORDER BY + LIMIT,
-  a full ORDER BY of a predicate scan, and full-scan aggregates (a GROUP BY
-  count, a COUNT(*), a COUNT DISTINCT per group): rdflib operators layered
-  over the BGP.
+- ``features`` — FILTER on a typed range, an integer arithmetic band around
+  a reference binding (BSBM Explore Q5's shape: two variables in one
+  conjunct), a term-kind FILTER (``isIRI``), DISTINCT over a predicate scan
+  and over the whole store, ORDER BY + LIMIT, a full ORDER BY of a predicate
+  scan, and full-scan aggregates (a GROUP BY count, a COUNT(*), a COUNT
+  DISTINCT per group): rdflib operators layered over the BGP.
 - ``graphs``   — the shapes that name a graph: a scan and a star inside one
   named graph, a chain that starts in one and continues wherever the object
   lives, and the three an unbound ``GRAPH ?g`` drives — a scan, the distinct
@@ -221,6 +222,42 @@ def _filter_predicate(cfg: DatasetConfig, m: Moduli) -> tuple[int, int]:
     return p, values[max(1, len(values) // 8)]
 
 
+def _band_anchor(cfg: DatasetConfig, m: Moduli, filter_p: int) -> tuple[int, int]:
+    """``(anchor_subject, band)`` for the two-variable arithmetic FILTER.
+
+    BSBM Explore Q5 keeps the products whose numeric property is within a
+    fixed distance of one reference product's: ``?v < ?ref + N && ?v > ?ref
+    - N``, two variables in one arithmetic conjunct. The reference here is
+    the subject nearest the median of ``filter_p``'s integer bindings that
+    carries the predicate exactly once — so ``?ref`` is a single value, as
+    Q5's anchor product is — and ``N`` is its distance to the value an
+    eighth of the way below the median, which puts the band on the scale of
+    ``filter-range``. The anchor's own row is always inside its own band, so
+    the query is non-empty by construction.
+    """
+    literal_cut = round(cfg.literal_frac * 10)
+    carried: dict[int, int] = {}
+    integers: list[tuple[int, int]] = []  # (integer value, subject index)
+    for i in range(filter_p, cfg.n, m.n_pred):  # rows carrying filter_p
+        subject = i % m.n_subj
+        carried[subject] = carried.get(subject, 0) + 1
+        j = i % m.n_obj
+        if j % 10 < literal_cut and j % 3 == 0:
+            integers.append((j, subject))
+    if not integers:
+        raise ValueError("the filter predicate has no integer bindings — dataset too small")
+    integers.sort()
+    mid = len(integers) // 2
+    lower = integers[max(0, mid - max(1, len(integers) // 8))][0]
+    # Outwards from the median until a subject that carries filter_p once.
+    for step in range(len(integers)):
+        for index in (mid + step, mid - step):
+            if 0 <= index < len(integers) and carried[integers[index][1]] == 1:
+                value, subject = integers[index]
+                return subject, max(1, value - lower)
+    raise ValueError("no subject carries the filter predicate exactly once — dataset too small")
+
+
 def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
     s0 = f"<{subject_iri(0)}>"
     p0 = f"<{predicate_iri(0)}>"
@@ -243,6 +280,8 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
 
     filter_p, int_cut = _filter_predicate(cfg, m)
     pf = f"<{predicate_iri(filter_p)}>"
+    band_subject, band = _band_anchor(cfg, m, filter_p)
+    band_anchor = f"<{subject_iri(band_subject)}>"
 
     # Subjects of the p1 scan, and of the filter-range rows: the outer sides
     # of the OPTIONAL and MINUS shapes, paired with a predicate half of them carry.
@@ -435,6 +474,17 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                 SELECT ?s ?v WHERE {{
                   ?s {pf} ?v .
                   FILTER(datatype(?v) = xsd:integer && ?v < {int_cut})
+                }}
+            """),
+        ),
+        Query(
+            "filter-arith",
+            "features",
+            _sparql(f"""
+                SELECT ?s ?v WHERE {{
+                  {band_anchor} {pf} ?ref .
+                  ?s {pf} ?v
+                  FILTER(?v < ?ref + {band} && ?v > ?ref - {band})
                 }}
             """),
         ),

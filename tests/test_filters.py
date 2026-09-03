@@ -1,6 +1,9 @@
 """The fast FILTER predicates must agree with rdflib's own evaluator on every
 value they answer: a matrix of literal spellings x expressions, each fast
-answer other than UNKNOWN compared with `_ebv` over the same term."""
+answer other than UNKNOWN compared with `_ebv` over the same term. Two
+matrices, one per route — one variable (the per-variable predicate applied to
+a pattern scan) and every ordered pair of spellings for two (the row
+predicate applied to joined rows)."""
 
 import pytest
 from rdflib import Graph
@@ -20,6 +23,7 @@ PREFIXES = (
     "PREFIX ex: <http://ex.org/> "
 )
 V = Variable("v")
+W = Variable("w")
 
 
 def typed(lexical: str, datatype: str) -> str:
@@ -143,6 +147,35 @@ EXPRESSIONS = [
     "?v = ?v",
     "?v < ?v",
     "?v != ?v || isBlank(?v)",
+    # integer arithmetic: the compiled `+`/`-` route, its result under the
+    # builtins that inspect a term, and an operand that is itself a sum
+    "?v + 1 > 3",
+    "?v - 1 = 4",
+    "?v + 1 - 2 > 0",
+    "5 - ?v > 0",
+    "?v + 1 > ?v",
+    "?v + 1",
+    "?v + 1 > 3 && ?v < 100",
+    "datatype(?v + 1) = xsd:integer",
+    "isNumeric(?v - 1)",
+    "sameTerm(?v + 1, 6)",
+    "?v + 1 IN (6, 7)",
+]
+
+#: Expressions over *two* block variables — the `tuple_predicate` route,
+#: where a conjunct sees a whole binding tuple rather than one value. The
+#: first is BSBM Explore Q5's similarity band, the shape the integer
+#: arithmetic route exists for; the rest are the controls it must not break.
+TWO_VAR_EXPRESSIONS = [
+    "?v < ?w + 120 && ?v > ?w - 120",
+    "?v + ?w > 10",
+    "?v - ?w = 0",
+    "?v - 1 > ?w",
+    "?v + ?w + 1 > 10",
+    "datatype(?v + ?w) = xsd:integer",
+    "?v < ?w",
+    "?v = ?w",
+    "sameTerm(?v, ?w)",
 ]
 
 
@@ -197,6 +230,35 @@ def test_fast_route_agrees_with_rdflib(sparql_expr):
     assert answered > 0, sparql_expr
 
 
+@pytest.mark.filterwarnings("ignore:Parsing weird boolean:UserWarning")
+@pytest.mark.parametrize("sparql_expr", TWO_VAR_EXPRESSIONS)
+def test_two_variable_fast_route_agrees_with_rdflib(sparql_expr):
+    """The same differential over every *ordered pair* of spellings — the
+    route a conjunct takes when it references two block variables. It is also
+    the only route on which one operand can be unbound while another carries
+    a value rdflib would raise on."""
+    expr = filter_expr(sparql_expr)
+    predicate = filters.compile_fast(expr, (V, W), {})
+    assert predicate is not None, "expression is in the whitelist"
+    # 45x45 lookups of each spelling: parse every one once.
+    terms = {s: None if s is None else from_n3(s) for s in SPELLINGS}
+    views = {s: None if s is None else parse_spelling(s) for s in SPELLINGS}
+    answered = 0
+    for left in SPELLINGS:
+        for right in SPELLINGS:
+            fast = predicate((views[left], views[right]))
+            if fast is filters.UNKNOWN:
+                continue
+            answered += 1
+            bound = {var: terms[s] for var, s in ((V, left), (W, right)) if s is not None}
+            try:
+                expected = _ebv(expr, FrozenBindings(CTX, bound))
+            except Exception:  # noqa: BLE001 - a raise is an answer the fast route must not give
+                expected = RAISES
+            assert fast == expected, (sparql_expr, left, right)
+    assert answered > 0, sparql_expr
+
+
 @pytest.mark.parametrize(
     ("sparql_expr", "spelling", "expected"),
     [
@@ -220,6 +282,9 @@ def test_fast_route_agrees_with_rdflib(sparql_expr):
         ('regex(str(?v), "^A", "i")', '"abc"', True),
         ('strstarts(str(?v), "http")', "<http://ex.org/x>", True),
         ("?v < 5 && isLiteral(?v)", "<http://ex.org/x>", False),
+        ("?v + 1 > 3", typed("5", "integer"), True),
+        ("?v - 10 < 0", typed("7", "byte"), True),  # promoted to xsd:integer, as rdflib
+        ("?v + 1 = 6", typed("5", "unsignedInt"), True),
     ],
 )
 def test_fast_route_answers_the_common_shapes(sparql_expr, spelling, expected):
@@ -260,45 +325,24 @@ def test_outside_the_whitelist_is_not_compiled(sparql_expr):
 
 
 @pytest.mark.parametrize(
-    ("sparql_expr", "spelling", "expected"),
+    "spelling",
     [
-        ("?v + 1 > 3", typed("5", "integer"), True),
-        ("?v - 10 < 0", typed("7", "byte"), True),
-        ("?v + 1 = 6", typed("5", "unsignedInt"), True),
+        typed("2.5", "decimal"),  # rdflib promotes to xsd:decimal, not integer
+        typed("1e2", "double"),
+        typed("abc", "integer"),  # ill-typed: rdflib computes with the lexical form
+        typed("300", "byte"),  # out of range: rdflib computes with the value anyway
+        typed("2020-01-01", "date"),  # rdflib's date arithmetic
+        "<http://ex.org/x>",
+        None,
     ],
 )
-def test_integer_additive_fast_route(sparql_expr, spelling, expected):
-    predicate = filters.compile_fast(filter_expr(sparql_expr), (V,), {})
-    assert predicate is not None
-    assert fast_answer(predicate, spelling) is expected
-    assert fast_answer(predicate, spelling) == rdflib_answer(filter_expr(sparql_expr), spelling)
-
-
-def test_integer_additive_over_two_variables_matches_rdflib():
-    expr = filter_expr("?v > ?w - 120 && ?v < ?w + 120")
-    w = Variable("w")
-    predicate = filters.compile_fast(expr, (V, w), {})
-    assert predicate is not None
-    cases = [
-        (typed("100", "integer"), typed("150", "integer")),
-        (typed("1", "byte"), typed("200", "integer")),
-        (typed("300", "integer"), typed("150", "integer")),
-    ]
-    for left, right in cases:
-        views = (parse_spelling(left), parse_spelling(right))
-        fast = predicate(views)
-        bindings = {V: from_n3(left), w: from_n3(right)}
-        expected = _ebv(expr, FrozenBindings(CTX, bindings))
-        assert fast is expected
-
-
-def test_additive_non_integer_defers_to_rdflib():
+def test_additive_outside_the_integer_domain_defers(spelling):
+    """Every operand rdflib would treat by a rule the fast route does not
+    reproduce has to come back UNKNOWN, not a guess: the value then goes to
+    rdflib alone, and a query that raises there raises with the pushdown too."""
     predicate = filters.compile_fast(filter_expr("?v + 1 > 3"), (V,), {})
     assert predicate is not None
-    assert fast_answer(predicate, typed("2.5", "decimal")) is filters.UNKNOWN
-    assert fast_answer(predicate, typed("1e2", "double")) is filters.UNKNOWN
-    assert fast_answer(predicate, typed("abc", "integer")) is filters.UNKNOWN
-    assert fast_answer(predicate, None) is filters.UNKNOWN
+    assert fast_answer(predicate, spelling) is filters.UNKNOWN
 
 
 def test_ctx_bound_constants_are_substituted():

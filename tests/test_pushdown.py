@@ -51,6 +51,12 @@ _:b0 <http://ex.org/knows> <http://ex.org/alice> .
 <http://ex.org/hank> <http://ex.org/knows> <http://ex.org/carol> .
 <http://ex.org/carol> <http://ex.org/knows> <http://ex.org/dave> .
 <http://ex.org/dave> <http://ex.org/knows> <http://ex.org/hank> .
+<http://ex.org/ivan> <http://ex.org/rating> "10"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://ex.org/ivan> <http://ex.org/weight> "3"^^<http://www.w3.org/2001/XMLSchema#byte> .
+<http://ex.org/jane> <http://ex.org/rating> "150"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://ex.org/jane> <http://ex.org/weight> "-4"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://ex.org/kim> <http://ex.org/rating> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://ex.org/kim> <http://ex.org/weight> "1.5"^^<http://www.w3.org/2001/XMLSchema#decimal> .
 """ + (
     "<http://ex.org/dave> <http://ex.org/born> "
     '"2020-01-01T00:00:00"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n'
@@ -184,6 +190,18 @@ QUERIES = [
     "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(sameTerm(?a, 42)) }",
     "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(isNumeric(?a)) }",
     "SELECT ?x WHERE { ?x <http://ex.org/score> ?v FILTER(?v + 1 > 2) }",
+    # --- FILTER: integer + and - (compiled), and an operand that defers.
+    # `rating` and `weight` are the only well-formed integer columns: `age`
+    # holds an ill-typed "abc", which rdflib's own arithmetic raises on.
+    "SELECT ?x ?r WHERE { ?x <http://ex.org/rating> ?r FILTER(?r - 8 > 0) }",
+    "SELECT ?x ?r WHERE { ?x <http://ex.org/rating> ?r FILTER(?r + 1 - 3 < 40) }",
+    "SELECT ?x ?w WHERE { ?x <http://ex.org/weight> ?w FILTER(?w + 1 > 0) }",
+    # BSBM Explore Q5's similarity band: two block variables in one
+    # arithmetic conjunct, so it is memoized per distinct code pair.
+    """SELECT ?x ?r WHERE {
+        <http://ex.org/kim> <http://ex.org/rating> ?ref .
+        ?x <http://ex.org/rating> ?r
+        FILTER(?r < ?ref + 100 && ?r > ?ref - 100) }""",
     "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(coalesce(?zzz, ?a) = 42) }",
     'SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(str(?a) = "42") }',
     'SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(?a = "42") }',
