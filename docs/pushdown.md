@@ -219,12 +219,13 @@ two routes:
   `lang`, `langMatches` (rdflib's own `_lang_range_check`), `isIRI`,
   `isBlank`, `isLiteral` (pure code-range tests, no decode at all),
   `isNumeric`, `bound`, `str`, `regex` (Python `re`, as rdflib), `strstarts`,
-  `strends`, `contains`, and `&&`, `||`, `!` with rdflib's three-valued
-  short-circuit rules. A leaf answers true, false, *error* (rdflib would
-  raise, which a filter turns into false) or **unknown** — the value is
-  outside the domain the fast path reproduces exactly: an ill-typed number,
-  a datatype rdflib orders by its own rules, a normalized lexical form under
-  `str()`, a NaN against a decimal. Unknown values, alone, go to
+  `strends`, `contains`, `+` and `-` over integer-derived literals, and
+  `&&`, `||`, `!` with rdflib's three-valued short-circuit rules. A leaf
+  answers true, false, *error* (rdflib would raise, which a filter turns
+  into false) or **unknown** — the value is outside the domain the fast path
+  reproduces exactly: an ill-typed number, a datatype rdflib orders by its
+  own rules, a normalized lexical form under `str()`, a NaN against a
+  decimal. Unknown values, alone, go to
 - the **generic route**: rdflib's own evaluator (`_ebv`) on a
   `FrozenBindings` holding the decoded term. Semantics-exact by
   construction, at rdflib's cost per evaluation (≈24 µs), but paid once per
@@ -237,6 +238,20 @@ variables, the context's bindings that its node's `_vars` or the query's
 `initBindings` keep (the rest was forgotten), and everything when it sits
 directly inside an `EXISTS` body.
 
+**Arithmetic.** `+` and `-` compile only when every operand is an
+integer-derived literal rdflib itself considers well-formed. That is the
+one case reproducible without building a term: rdflib's `type_promotion`
+sends every integer-derived datatype to `xsd:integer`, and
+`Literal(int, datatype=xsd:integer)` spells its value with `str`, so the sum
+matches rdflib's own result in both value and lexical form. A decimal,
+double, `dateTime` or ill-typed operand is unknown and defers — including
+the ones rdflib does not merely order differently but *raises* on, such as
+`"abc"^^xsd:integer`, which its `numeric()` computes with as a string. An
+unreproducible operand therefore outranks an unbound one when a comparison
+routes its answer: rdflib evaluates the operands in order and can raise on
+the first, outside the `SPARQLError` catch that turns an unbound variable
+into false.
+
 **Why it is faster.** rdflib evaluates the expression tree per row through
 its `CompValue`/`Literal` machinery, ≈33 µs per row; the fast predicate is
 ≈0.5 µs per distinct value, and single-variable conjuncts also shrink the
@@ -245,6 +260,14 @@ pattern before it is joined or decoded. `filter-range`
 scan, 38 rows kept): 48.7 ms → 3.8 ms. `isIRI(?o)` over the same scan:
 26 ms → 6.6 ms; a `regex(str(?o), ...)`: 36 ms → 4.3 ms; `lang(?o) = "fr"`:
 34 ms → 4.7 ms.
+
+A conjunct over *several* variables is memoized per distinct code tuple
+instead, which is what makes arithmetic worth compiling: BSBM Explore Q5
+brackets two numeric properties against a reference product's
+(`?v < ?ref + N && ?v > ?ref - N`), so each band is one integer add per
+distinct pair. Over a 374,911-triple store, prepared, median of 30 runs:
+52.8 ms → 35.0 ms once those bands compile instead of taking the generic
+route. `filter-arith` in the benchmark query set is that shape.
 
 **Steps aside.** Impure builtins (`RAND`, `UUID`, `STRUUID`, `BNODE()`) —
 memoizing them per value would change observable behaviour — and a conjunct
@@ -568,7 +591,8 @@ register_sparql_pushdown()
 ```
 
 The benchmark's query set (`bench/queries.py`) has a query per pushdown —
-`ask-var`, `limit-scan`, `filter-range`, `filter-class`, `distinct`,
+`ask-var`, `limit-scan`, `filter-range`, `filter-arith`, `filter-class`,
+`distinct`,
 `distinct-p`, `count-all`, `count-distinct`, `agg-count`, `optional-wide`,
 `not-exists`, `minus`, `order-var`, `order-limit`, `values-64` and the six
 `graph-*` queries — next to the lookups and joins.

@@ -59,6 +59,7 @@ UNKNOWN = _Sentinel("UNKNOWN")
 _XSD = "http://www.w3.org/2001/XMLSchema#"
 _XSD_STRING = _XSD + "string"
 _XSD_BOOLEAN = _XSD + "boolean"
+_XSD_INTEGER = _XSD + "integer"
 _RDF_LANGSTRING = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
 _XML_COMPARABLE = frozenset(
     {
@@ -329,6 +330,8 @@ def _compile(node, slots: dict, consts: dict):
     name = node.name
     if name == "RelationalExpression":
         return _compile_relational(node, slots, consts)
+    if name == "AdditiveExpression":
+        return _compile_additive(node, slots, consts)
     if name in ("ConditionalAndExpression", "ConditionalOrExpression"):
         if node.other is None:
             raise _NotFast
@@ -382,6 +385,60 @@ def _or(parts):
     return fn
 
 
+def _integer(value):
+    """The Python ``int`` an evaluated operand contributes to integer
+    arithmetic, or ``UNKNOWN``.
+
+    Narrower than rdflib's ``numeric()``, which computes with
+    ``Literal.value`` whatever its well-formedness — an out-of-range
+    ``xsd:byte`` still has one. ``numeric_value`` refuses those, so they
+    defer instead of being reproduced from a different rule.
+    """
+    if not isinstance(value, TermView) or value.dt not in _INT_LIKE:
+        return UNKNOWN
+    converted = numeric_value(value)
+    return UNKNOWN if converted is None else converted
+
+
+def _compile_additive(node, slots, consts):
+    """Compile ``+`` and ``-`` over integer-derived literals.
+
+    rdflib's ``type_promotion`` sends every integer-derived datatype to
+    ``xsd:integer``, and ``Literal(int, datatype=xsd:integer)`` spells its
+    value with ``str``, so an all-integer sum is reproduced exactly — value
+    *and* lexical form — without building one rdflib term. Every other
+    operand (unbound, ill-typed, decimal, double, dateTime, a shape outside
+    the whitelist) yields ``UNKNOWN``, and that binding alone goes to rdflib.
+    """
+    if node.other is None:
+        # The add-expr production wraps a bare operand; rdflib's own
+        # evaluator returns `expr` unchanged, so compile straight through.
+        return _compile(node.expr, slots, consts)
+    others = node.other if isinstance(node.other, list) else [node.other]
+    operators = node.op if isinstance(node.op, list) else [node.op]
+    if len(others) != len(operators) or any(op not in ("+", "-") for op in operators):
+        raise _NotFast
+    first = _compile(node.expr, slots, consts)
+    # The sign is settled at compile time, so the loop below only ever adds.
+    signed = [
+        (1 if op == "+" else -1, _compile(part, slots, consts))
+        for op, part in zip(operators, others, strict=True)
+    ]
+
+    def fn(env):
+        total = _integer(first(env))
+        if total is UNKNOWN:
+            return UNKNOWN
+        for sign, operand in signed:
+            value = _integer(operand(env))
+            if value is UNKNOWN:
+                return UNKNOWN
+            total += sign * value
+        return TermView(LITERAL, str(total), dt=_XSD_INTEGER)
+
+    return fn
+
+
 def _compile_relational(node, slots, consts):
     op = node.op
     if node.other is None:
@@ -416,10 +473,13 @@ def _compile_relational(node, slots, consts):
 
     def fn(env):
         a, b = left(env), right(env)
-        if a is None or b is None or a is ERROR or b is ERROR:
-            return ERROR
+        # UNKNOWN first: rdflib evaluates the operands before comparing them,
+        # so one the fast route cannot reproduce may raise there — outside
+        # `_ebv`'s SPARQLError catch — before an unbound operand is reached.
         if a is UNKNOWN or b is UNKNOWN or isinstance(a, bool) or isinstance(b, bool):
             return UNKNOWN
+        if a is None or b is None or a is ERROR or b is ERROR:
+            return ERROR
         return _relational(op, a, b)
 
     return fn
@@ -555,10 +615,12 @@ def _str_op(op: Callable[[str, str], bool]):
 
 
 def _same_term(a, b):
-    if a is None or b is None:
-        return ERROR
+    # UNKNOWN before unbound, as in `_compile_relational`: an argument the
+    # fast route cannot reproduce is evaluated first and may raise there.
     if a is UNKNOWN or b is UNKNOWN:
         return UNKNOWN
+    if a is None or b is None:
+        return ERROR
     if a is ERROR or b is ERROR or isinstance(a, bool) or isinstance(b, bool):
         return False
     return term_eq(a, b)
