@@ -1412,26 +1412,103 @@ def _filter_relation(rel: Relation, preds) -> Relation:
 _PROBE_FANOUT = 100
 
 
-def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
-    """Evaluate a basic graph pattern into a code-space relation.
+def _pattern_trace_shape(ctx, triple) -> dict:
+    resolved = [ctx[term] for term in triple]
+    bound = [value is not None for value in resolved]
+    variables = [term for term, value in zip(triple, resolved, strict=True) if value is None]
+    return {
+        "bound_subject": bound[0],
+        "bound_predicate": bound[1],
+        "bound_object": bound[2],
+        "variable_count": len(set(variables)),
+        "repeated_variable_count": len(variables) - len(set(variables)),
+        "pattern_shape": "".join("B" if item else "V" for item in bound),
+    }
 
-    ``var_preds`` maps a variable to the filter conjuncts over it alone; they
-    restrict every pattern scan binding the variable before the join, so
-    filter selectivity drives the join order and the probe decision.
-    """
+
+def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
+    """Evaluate a basic graph pattern into a code-space relation."""
+    trace = _TRACE.get()
+    traced = trace is not None
+    started = time.perf_counter_ns() if traced else 0
+    _trace_event("bgp_start", pattern_count=len(triples), initial_bound_variable_count=0)
     if not triples:
-        return Relation.from_rows((), [()])
-    # Variables are `None` in a resolved pattern, so triples that differ only
-    # in their variable names — the two hops of `?s <p> ?m . ?m <p> ?o`, every
-    # leg of a self-join — are one and the same native match.
+        rel = Relation.from_rows((), [()])
+        _trace_event(
+            "bgp_complete",
+            pattern_count=0,
+            output_rows=1,
+            output_columns=0,
+            native_call_count=0,
+            native_match_ns=0,
+            restriction_ns=0,
+            join_ns=0,
+            other_ns=0,
+            elapsed_ns=0,
+            timing_reconciled=True,
+        )
+        return rel
+
     matches: dict[tuple, tuple] = {}
-    patterns = [_match_pattern(ctx, store, s, p, o, scope, matches) for s, p, o in triples]
+    patterns = []
+    native_match_ns = 0
+    native_calls = 0
+    for original_index, triple in enumerate(triples):
+        shape = _pattern_trace_shape(ctx, triple) if traced else None
+        _trace_event("bgp_pattern_start", original_pattern_index=original_index, **(shape or {}))
+        pattern_started = time.perf_counter_ns() if traced else 0
+        before = len(matches)
+        pat = _match_pattern(ctx, store, *triple, scope, matches)
+        elapsed = time.perf_counter_ns() - pattern_started if traced else 0
+        call_count = int(len(matches) > before)
+        native_calls += call_count
+        native_match_ns += elapsed
+        if traced:
+            pat["_trace_original_index"] = original_index
+        patterns.append(pat)
+        _trace_event(
+            "bgp_pattern_complete",
+            original_pattern_index=original_index,
+            native_call_count=call_count,
+            matched_rows=pat["nrows"],
+            native_match_ns=elapsed,
+            restriction_ns=0,
+            relation_extend_ns=0,
+            other_ns=0,
+            elapsed_ns=elapsed,
+            timing_reconciled=True,
+            **(shape or {}),
+        )
+
+    restriction_started = time.perf_counter_ns() if traced else 0
     if var_preds:
         for pat in patterns:
             _restrict_pattern(store, pat, var_preds)
+    restriction_ns = time.perf_counter_ns() - restriction_started if traced else 0
+
+    join_started = time.perf_counter_ns() if traced else 0
     if len(patterns) == 1:
-        return _rel_from_pattern(patterns[0])
-    return _join_patterns(store, patterns)
+        rel = _rel_from_pattern(patterns[0])
+    else:
+        rel = _join_patterns(store, patterns)
+    join_ns = time.perf_counter_ns() - join_started if traced else 0
+    elapsed_ns = time.perf_counter_ns() - started if traced else 0
+    known = native_match_ns + restriction_ns + join_ns
+    other_ns = max(0, elapsed_ns - known)
+    _trace_event(
+        "bgp_complete",
+        pattern_count=len(patterns),
+        output_rows=_relation_rows(rel),
+        output_columns=len(rel.schema),
+        native_call_count=native_calls,
+        native_match_ns=native_match_ns,
+        restriction_ns=restriction_ns,
+        join_ns=join_ns,
+        other_ns=other_ns,
+        elapsed_ns=known + other_ns,
+        timing_reconciled=True,
+    )
+    return rel
 
 
 def _pattern_terms(ctx, store, s, p, o, scope) -> dict:
@@ -1674,8 +1751,19 @@ def _join_patterns(store, patterns) -> Relation:
             _, rows = _materialize(pat)
             pat["rows"], pat["nrows"] = rows, len(rows)
     patterns.sort(key=lambda pat: pat["nrows"])
+    execution_order = [pat.get("_trace_original_index") for pat in patterns]
+    _trace_event(
+        "bgp_plan_complete",
+        pattern_count=len(patterns),
+        execution_order=execution_order,
+        seed_pattern_index=execution_order[0],
+        estimated_cardinalities=None,
+        estimate_calls=0,
+        elapsed_ns=0,
+    )
     schema, cols, rows = _pattern_body(patterns[0])
     remaining = patterns[1:]
+    execution_index = 1
     while remaining and (len(cols[0]) if cols is not None else len(rows)):
         pick = next(
             (i for i, pat in enumerate(remaining) if any(v in pat["varpos"] for v in schema)),
@@ -1684,25 +1772,44 @@ def _join_patterns(store, patterns) -> Relation:
         pat = remaining.pop(pick)
         shares = any(v in pat["varpos"] for v in schema)
         running = len(cols[0]) if cols is not None else len(rows)
+        step_started = time.perf_counter_ns() if _TRACE.get() is not None else 0
+        strategy = "hash_rows"
         if shares and running * _PROBE_FANOUT < pat["nrows"]:
+            strategy = "probe"
             if cols is not None:
                 rows, cols = _cols_to_rows(cols), None
             schema, rows = _probe_join(store, schema, rows, pat)
-            continue
-        schema_b, cols_b, rows_b = _pattern_body(pat)
-        joined = (
-            _join_columns(schema, cols, schema_b, cols_b)
-            if cols is not None and cols_b is not None
-            else None
+        else:
+            schema_b, cols_b, rows_b = _pattern_body(pat)
+            joined = (
+                _join_columns(schema, cols, schema_b, cols_b)
+                if cols is not None and cols_b is not None
+                else None
+            )
+            if joined is not None:
+                strategy = "hash_columns"
+                schema, cols = joined
+            else:
+                if cols is not None:
+                    rows, cols = _cols_to_rows(cols), None
+                if rows_b is None:
+                    rows_b = _cols_to_rows(cols_b)
+                schema, rows = _join(schema, rows, schema_b, rows_b)
+        output_rows = len(cols[0]) if cols is not None else len(rows)
+        elapsed_ns = time.perf_counter_ns() - step_started if step_started else 0
+        _trace_event(
+            "bgp_join_step_complete",
+            execution_index=execution_index,
+            original_pattern_index=pat.get("_trace_original_index"),
+            strategy=strategy,
+            input_rows=running,
+            pattern_match_rows=pat["nrows"],
+            output_rows=output_rows,
+            output_columns=len(schema),
+            shared_variable_count=sum(v in schema for v in pat["varpos"]),
+            elapsed_ns=elapsed_ns,
         )
-        if joined is not None:
-            schema, cols = joined
-            continue
-        if cols is not None:
-            rows, cols = _cols_to_rows(cols), None
-        if rows_b is None:
-            rows_b = _cols_to_rows(cols_b)
-        schema, rows = _join(schema, rows, schema_b, rows_b)
+        execution_index += 1
     # An empty result still names every variable of the pattern.
     for pat in remaining:
         schema += tuple(v for v in pat["varpos"] if v not in schema)
