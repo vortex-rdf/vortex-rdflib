@@ -73,10 +73,14 @@ value through rdflib's evaluator, for bisecting and A/B measurements.
 """
 
 import heapq
+import json
 import os
+import sys
+import time
 from array import array
 from collections import Counter
 from collections.abc import Callable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from itertools import islice
 from operator import itemgetter
@@ -121,6 +125,62 @@ _ENABLED_OPS = _ALL_OPS
 _CHUNK_START = 64
 _CHUNK_MAX = 4096
 
+_TRACE_PREFIX = "VORTEX_RDF_QUERY_TRACE "
+_TRACE_SCHEMA = "vortex-rdf-query-trace-v1"
+_TRACE_ENV = "VORTEX_RDF_TRACE_QUERY"
+_TRACE_ID_ENV = "VORTEX_RDF_TRACE_QUERY_ID"
+
+
+@dataclass(slots=True)
+class _QueryTrace:
+    query_id: str | None
+    sequence: int = 0
+    depth: int = 0
+
+    def emit(self, event: str, **fields) -> None:
+        self.sequence += 1
+        payload = {
+            "schema": _TRACE_SCHEMA,
+            "event": event,
+            "sequence": self.sequence,
+            "query_id": self.query_id,
+            **fields,
+        }
+        try:
+            print(
+                _TRACE_PREFIX + json.dumps(payload, separators=(",", ":"), allow_nan=False),
+                file=sys.stderr,
+                flush=True,
+            )
+        except (OSError, TypeError, ValueError):
+            _TRACE.set(None)
+
+
+_TRACE: ContextVar[_QueryTrace | None] = ContextVar("vortex_rdf_query_trace", default=None)
+
+
+def _trace_enabled() -> bool:
+    value = os.environ.get(_TRACE_ENV)
+    if value is None or value == "0":
+        return False
+    if value != "1":
+        raise ValueError(f"{_TRACE_ENV} must be 0 or 1, got {value!r}")
+    return True
+
+
+def _trace_event(event: str, **fields) -> None:
+    trace = _TRACE.get()
+    if trace is not None:
+        trace.emit(event, **fields)
+
+
+def _relation_rows(rel: "Relation") -> int | None:
+    if rel.rows is not None:
+        return len(rel.rows)
+    if rel.cols is not None and not rel.preds:
+        return rel.nrows
+    return None
+
 
 def register_sparql_pushdown():
     """Install the hook into rdflib's CUSTOM_EVALS (idempotent)."""
@@ -163,9 +223,65 @@ def _eval_part(ctx, part):
     store = getattr(getattr(ctx, "graph", None), "store", None)
     if not isinstance(store, VortexRdflibStore) or store._dict is None:
         raise NotImplementedError
-    # Everything that can raise NotImplementedError — shape checks and native
-    # calls — happens inside this call; only decoding is deferred.
-    return globals()[handler](ctx, store, part)
+    active = _TRACE.get()
+    token = None
+    if active is None and _trace_enabled():
+        active = _QueryTrace(os.environ.get(_TRACE_ID_ENV))
+        token = _TRACE.set(active)
+    started = time.perf_counter_ns() if active is not None else 0
+    _trace_event("eval_part_start", algebra_node=part.name, enabled_ops=sorted(_ENABLED_OPS))
+    try:
+        result = globals()[handler](ctx, store, part)
+    except NotImplementedError:
+        _trace_event("eval_part_fallback", algebra_node=part.name)
+        if token is not None:
+            _TRACE.reset(token)
+        raise
+    except Exception as error:
+        _trace_event("eval_part_failed", algebra_node=part.name, error_type=type(error).__name__)
+        if token is not None:
+            _TRACE.reset(token)
+        raise
+    _trace_event(
+        "eval_part_complete",
+        algebra_node=part.name,
+        handled=True,
+        elapsed_ns=time.perf_counter_ns() - started if active is not None else 0,
+    )
+    if token is not None:
+        # Generators keep the trace object explicitly through _yield_rows.
+        if hasattr(result, "__next__"):
+            result = _trace_generator(result, active, token)
+        else:
+            _TRACE.reset(token)
+    return result
+
+
+def _trace_generator(iterator, trace: _QueryTrace, token):
+    _TRACE.reset(token)
+    started = time.perf_counter_ns()
+    rows = 0
+    try:
+        while True:
+            inner_token = _TRACE.set(trace)
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
+            finally:
+                _TRACE.reset(inner_token)
+            rows += 1
+            yield item
+    finally:
+        inner_token = _TRACE.set(trace)
+        try:
+            _trace_event(
+                "query_iterator_complete",
+                rows_yielded=rows,
+                elapsed_ns=time.perf_counter_ns() - started,
+            )
+        finally:
+            _TRACE.reset(inner_token)
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,8 +501,27 @@ def _block_nullable(node) -> frozenset:
 
 
 def _eval_head(ctx, store, part):
+    started = time.perf_counter_ns() if _TRACE.get() is not None else 0
     head = _plan_head(part)
+    _trace_event(
+        "head_planned",
+        entry_node=part.name,
+        project_variable_count=0 if head.pv is None else len(head.pv),
+        order_key_count=len(head.order),
+        descending_key_count=sum(descending for _, descending in head.order),
+        distinct=head.distinct,
+        offset=head.start,
+        limit=None if head.stop is None else head.stop - head.start,
+    )
     rel = _solve_block(ctx, store, head.block)
+    _trace_event(
+        "block_solve_complete",
+        rows=_relation_rows(rel),
+        columns=len(rel.schema),
+        nullable_columns=len(rel.nullable),
+        foreign_terms=len(rel.foreign),
+        elapsed_ns=time.perf_counter_ns() - started if started else 0,
+    )
     if head.order:
         # DISTINCT narrows the rows after the sort, so only a plain LIMIT
         # can stop the sort at the top k.
@@ -406,13 +541,31 @@ def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
     keeps only the top ``stop`` rows. A variable the block does not bind
     ties every row, as it does for rdflib.
     """
+    started = time.perf_counter_ns() if _TRACE.get() is not None else 0
     rows = _rows_of(rel)
+    _trace_event(
+        "order_start",
+        input_rows=len(rows),
+        order_key_count=len(order),
+        descending_key_count=sum(descending for _, descending in order),
+        limit=stop,
+    )
     keys = []
-    for var, descending in order:
+    for key_index, (var, descending) in enumerate(order):
         if var not in rel.schema:
             continue
         index = rel.schema.index(var)
-        ranks = _rank_codes(store, rel.foreign, {row[index] for row in rows})
+        distinct_codes = {row[index] for row in rows}
+        key_started = time.perf_counter_ns() if _TRACE.get() is not None else 0
+        ranks = _rank_codes(store, rel.foreign, distinct_codes)
+        _trace_event(
+            "order_key_ranked",
+            key_index=key_index,
+            descending=descending,
+            input_rows=len(rows),
+            distinct_codes=len(distinct_codes),
+            elapsed_ns=time.perf_counter_ns() - key_started if key_started else 0,
+        )
         keys.append((index, ranks, -1 if descending else 1))
     if not keys:
         return rows
@@ -421,8 +574,21 @@ def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
         return tuple(sign * ranks[row[i]] for i, ranks, sign in keys)
 
     if stop is not None and stop < len(rows):
-        return heapq.nsmallest(stop, rows, key=sort_key)
-    return sorted(rows, key=sort_key)
+        output = heapq.nsmallest(stop, rows, key=sort_key)
+        algorithm = "bounded_heap_nsmallest"
+    else:
+        output = sorted(rows, key=sort_key)
+        algorithm = "full_stable_sort"
+    _trace_event(
+        "order_complete",
+        algorithm=algorithm,
+        input_rows=len(rows),
+        output_rows=len(output),
+        limit=stop,
+        limit_applied_during_order=algorithm == "bounded_heap_nsmallest",
+        elapsed_ns=time.perf_counter_ns() - started if started else 0,
+    )
+    return output
 
 
 def _rank_codes(store, foreign: dict, codes) -> dict:
@@ -432,6 +598,9 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
     decoded and sorted with rdflib's own comparator, adjacent terms that
     compare equal sharing a rank so the stable sort keeps their input
     order."""
+    started = time.perf_counter_ns() if _TRACE.get() is not None else 0
+    codes = set(codes)
+    cache_before = set(store._decode_cache) if _TRACE.get() is not None else set()
     ranks = {None: -1}
     literal_lo, iri_lo, blank_lo = store._term_kind_bounds()
     blanks, iris, others = [], [], []
@@ -460,6 +629,22 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
                 rank += 1
             ranks[code] = rank
             previous = key
+    if _TRACE.get() is not None:
+        nonnegative_others = {code for code in others if code >= 0}
+        _trace_event(
+            "rank_codes_complete",
+            input_codes=len(codes),
+            unique_codes=len(codes),
+            null_codes=int(None in codes),
+            blank_codes=len(blanks),
+            iri_codes=len(iris),
+            other_codes=len(others),
+            foreign_codes=sum(code < 0 for code in others),
+            decoded_codes=len(nonnegative_others),
+            decode_cache_hits=len(nonnegative_others & cache_before),
+            decode_cache_misses=len(nonnegative_others - cache_before),
+            elapsed_ns=time.perf_counter_ns() - started,
+        )
     return ranks
 
 
@@ -771,21 +956,41 @@ def _solve_block(ctx, store, node, env=frozenset(), var_preds=None, scope=None) 
     if scope is None:
         scope = _active_scope(ctx, store)
     name = node.name
-    if name == "BGP":
-        return _solve_bgp(ctx, store, node.triples, scope, var_preds)
-    if name == "Filter":
-        return _solve_filter(ctx, store, node, env, var_preds, scope)
-    if name == "Join":
-        return _solve_join(ctx, store, node, env, var_preds, scope)
-    if name == "LeftJoin":
-        return _solve_left_join(ctx, store, node, env, var_preds, scope)
-    if name == "Minus":
-        return _solve_minus(ctx, store, node, env, var_preds, scope)
-    if name == "ToMultiSet":
-        return _solve_values(ctx, store, node, scope)
-    if name == "Graph":
-        return _solve_block(ctx, store, node.p, env, var_preds, _graph_scope(ctx, node))
-    raise NotImplementedError
+    trace = _TRACE.get()
+    started = time.perf_counter_ns() if trace is not None else 0
+    if trace is not None:
+        trace.depth += 1
+    try:
+        if name == "BGP":
+            rel = _solve_bgp(ctx, store, node.triples, scope, var_preds)
+        elif name == "Filter":
+            rel = _solve_filter(ctx, store, node, env, var_preds, scope)
+        elif name == "Join":
+            rel = _solve_join(ctx, store, node, env, var_preds, scope)
+        elif name == "LeftJoin":
+            rel = _solve_left_join(ctx, store, node, env, var_preds, scope)
+        elif name == "Minus":
+            rel = _solve_minus(ctx, store, node, env, var_preds, scope)
+        elif name == "ToMultiSet":
+            rel = _solve_values(ctx, store, node, scope)
+        elif name == "Graph":
+            rel = _solve_block(ctx, store, node.p, env, var_preds, _graph_scope(ctx, node))
+        else:
+            raise NotImplementedError
+    finally:
+        if trace is not None:
+            trace.depth -= 1
+    _trace_event(
+        "block_operator_complete",
+        operator=name,
+        depth=0 if trace is None else trace.depth,
+        rows=_relation_rows(rel),
+        columns=len(rel.schema),
+        nullable_columns=len(rel.nullable),
+        elapsed_ns=time.perf_counter_ns() - started if started else 0,
+        pattern_count=len(node.triples) if name == "BGP" else None,
+    )
+    return rel
 
 
 def _solve_values(ctx, store, node, scope) -> Relation:
@@ -1695,18 +1900,37 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, sta
     rows = islice(rows, start, stop)
     cached = store._decode_cache
     size = _CHUNK_START
-    while True:
-        chunk = list(islice(rows, size))
-        if not chunk:
-            return
-        store._prime_decode_cache(
-            [c for row in chunk for c in (row[i] for i in idx) if c is not None and c >= 0]
-        )
-        for row in chunk:
-            solution = dict(base)
-            for v, i in zip(keys, idx, strict=True):
-                c = row[i]
-                if c is not None:
-                    solution[v] = cached[c] if c >= 0 else foreign[c]
-            yield FrozenBindings(ctx.push() if own_context else ctx, solution)
-        size = min(size * 4, _CHUNK_MAX)
+    traced = _TRACE.get() is not None
+    started = time.perf_counter_ns() if traced else 0
+    yielded = chunks = submitted = 0
+    try:
+        while True:
+            chunk = list(islice(rows, size))
+            if not chunk:
+                return
+            codes = [c for row in chunk for c in (row[i] for i in idx) if c is not None and c >= 0]
+            if traced:
+                chunks += 1
+                submitted += len(codes)
+            store._prime_decode_cache(codes)
+            for row in chunk:
+                solution = dict(base)
+                for v, i in zip(keys, idx, strict=True):
+                    c = row[i]
+                    if c is not None:
+                        solution[v] = cached[c] if c >= 0 else foreign[c]
+                yielded += 1
+                yield FrozenBindings(ctx.push() if own_context else ctx, solution)
+            size = min(size * 4, _CHUNK_MAX)
+    finally:
+        if traced:
+            _trace_event(
+                "yield_rows_complete",
+                offset=start,
+                stop=stop,
+                rows_yielded=yielded,
+                chunks=chunks,
+                projected_columns=len(idx),
+                codes_submitted_for_decode=submitted,
+                elapsed_ns=time.perf_counter_ns() - started,
+            )
