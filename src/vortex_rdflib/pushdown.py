@@ -1310,9 +1310,16 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
         )
 
     if p2.name == "BGP" and len(p2.triples) == 1:
-        pat = _match_pattern(ctx, store, *p2.triples[0], scope=scope)
+        # Resolve and count before matching. A selective left relation can
+        # drive OPTIONAL probes without first materializing the complete
+        # predicate relation that the probes are intended to avoid.
+        plan_started = time.perf_counter_ns() if _TRACE.get() is not None else 0
+        pat = _pattern_terms(ctx, store, *p2.triples[0], scope=scope)
         shares = any(v in left.schema for v in pat["varpos"])
-        if shares and len(left_rows) * _PROBE_FANOUT < pat["nrows"]:
+        estimate_started = time.perf_counter_ns() if _TRACE.get() is not None else 0
+        estimate_rows = 0 if pat["unsatisfiable"] else store._store().count_quads(*pat["n3"])
+        estimate_ns = time.perf_counter_ns() - estimate_started if estimate_started else 0
+        if shares and len(left_rows) * _PROBE_FANOUT < estimate_rows:
             _shared_key_ok(
                 left, Relation((), None, [], 0), [v for v in pat["varpos"] if v in left.schema]
             )
@@ -1320,11 +1327,66 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
             preds = condition_preds(schema)
             if preds is None:
                 rows = [row + (None,) * len(extra) for row in left_rows]
+                _trace_event(
+                    "left_join_plan_complete",
+                    strategy="constant_false",
+                    input_rows=len(left_rows),
+                    estimated_right_rows=estimate_rows,
+                    estimate_calls=int(not pat["unsatisfiable"]),
+                    native_initial_match_count=0,
+                    native_probe_call_count=0,
+                    matched_left_rows=0,
+                    unmatched_left_rows=len(left_rows),
+                    output_rows=len(rows),
+                    estimate_ns=estimate_ns,
+                    elapsed_ns=time.perf_counter_ns() - plan_started if plan_started else 0,
+                )
                 return Relation(left.schema + extra, None, rows, len(rows), nullable, left.foreign)
+            probe_started = time.perf_counter_ns() if _TRACE.get() is not None else 0
             schema, rows = _probe_join(
                 store, left.schema, left_rows, pat, keep_unmatched=True, row_preds=preds
             )
+            probe_ns = time.perf_counter_ns() - probe_started if probe_started else 0
+            free_count = sum(v not in left.schema for v in pat["varpos"])
+            unmatched = (
+                sum(all(value is None for value in row[-free_count:]) for row in rows)
+                if free_count
+                else 0
+            )
+            _trace_event(
+                "left_join_plan_complete",
+                strategy="probe",
+                input_rows=len(left_rows),
+                estimated_right_rows=estimate_rows,
+                estimate_calls=int(not pat["unsatisfiable"]),
+                native_initial_match_count=0,
+                native_probe_call_count=len(left_rows),
+                matched_left_rows=len(left_rows) - unmatched,
+                unmatched_left_rows=unmatched,
+                output_rows=len(rows),
+                estimate_ns=estimate_ns,
+                probe_ns=probe_ns,
+                elapsed_ns=time.perf_counter_ns() - plan_started if plan_started else 0,
+            )
             return Relation(schema, None, rows, len(rows), nullable, left.foreign)
+        match_started = time.perf_counter_ns() if _TRACE.get() is not None else 0
+        pat = _match_pattern(ctx, store, *p2.triples[0], scope=scope)
+        match_ns = time.perf_counter_ns() - match_started if match_started else 0
+        _trace_event(
+            "left_join_plan_complete",
+            strategy="hash",
+            input_rows=len(left_rows),
+            estimated_right_rows=estimate_rows,
+            estimate_calls=int(not pat["unsatisfiable"]),
+            native_initial_match_count=int(not pat["unsatisfiable"]),
+            native_probe_call_count=0,
+            matched_left_rows=None,
+            unmatched_left_rows=None,
+            output_rows=None,
+            estimate_ns=estimate_ns,
+            native_match_ns=match_ns,
+            elapsed_ns=time.perf_counter_ns() - plan_started if plan_started else 0,
+        )
         right = _rel_from_pattern(pat)
     else:
         right = _solve_block(ctx, store, p2, env | frozenset(vars1), None, scope)
