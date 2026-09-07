@@ -1482,8 +1482,13 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
 
     restriction_started = time.perf_counter_ns() if traced else 0
     if var_preds:
-        for pat in patterns:
-            _restrict_pattern(store, pat, var_preds)
+        if len(patterns) == 1:
+            _restrict_pattern(store, patterns[0], var_preds)
+        else:
+            for pat in patterns:
+                pending = {var: var_preds[var] for var in pat["varpos"] if var in var_preds}
+                if pending:
+                    pat["deferred_var_preds"] = pending
     restriction_ns = time.perf_counter_ns() - restriction_started if traced else 0
 
     join_started = time.perf_counter_ns() if traced else 0
@@ -1600,27 +1605,51 @@ def _exclude_default_graph(store, pat, var) -> None:
 
 
 def _restrict_pattern(store, pat, var_preds) -> None:
-    """Turn the per-variable filter conjuncts into a row restriction
-    (``keep``: variable -> allowed codes), evaluated once over the distinct
-    codes of the variable's column.
-
-    A restriction already on the pattern — the default graph excluded from a
-    graph variable — narrows the codes the conjuncts are evaluated over and is
-    intersected with their verdict, so the two compose, and the default
-    graph's empty name (which is no RDF term) never reaches a predicate.
-    """
+    """Turn per-variable conjuncts into allowed-code restrictions."""
     if pat["nrows"] == 0:
         return
+    traced = _TRACE.get() is not None
     keep = dict(pat.get("keep") or {})
+    trace_records = []
     for var, positions in pat["varpos"].items():
         conjuncts = var_preds.get(var)
         if conjuncts:
+            started = time.perf_counter_ns() if traced else 0
             values = set(memoryview(pat["cols"][positions[0]]).cast("I"))
             if var in keep:
                 values &= keep[var]
-            keep[var] = filters.evaluate_column(store, conjuncts, values)
+            distinct_binding_count = len(values)
+            allowed = filters.evaluate_column(store, conjuncts, values)
+            keep[var] = allowed
+            if traced:
+                trace_records.append(
+                    {
+                        "variable": str(var),
+                        "predicate_count": len(conjuncts),
+                        "fast_predicate_count": sum(c.fast is not None for c in conjuncts),
+                        "kind_only_predicate_count": sum(c.kind_only for c in conjuncts),
+                        "generic_only_predicate_count": sum(c.fast is None for c in conjuncts),
+                        "distinct_binding_count": distinct_binding_count,
+                        "allowed_binding_count": len(allowed),
+                        "elapsed_ns": time.perf_counter_ns() - started,
+                    }
+                )
     if keep:
         pat["keep"] = keep
+    if trace_records:
+        pat["_trace_restrictions"] = trace_records
+
+
+def _emit_restriction_trace(pat, output_rows: int) -> None:
+    """Emit deferred restriction events after row compaction gives a row count."""
+    for record in pat.pop("_trace_restrictions", ()):
+        _trace_event(
+            "bgp_restriction_complete",
+            original_pattern_index=pat.get("_trace_original_index"),
+            input_rows=pat["nrows"],
+            output_rows=output_rows,
+            **record,
+        )
 
 
 def _rel_from_pattern(pat) -> Relation:
@@ -1734,23 +1763,24 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
     return schema, tuple(out)
 
 
-def _join_patterns(store, patterns) -> Relation:
-    """Join matched patterns: smallest first, then greedily prefer patterns
-    sharing a variable with the schema so far (avoids cross products).
+def _materialize_eager_restrictions(store, pat) -> None:
+    """Apply deferred predicates before a non-probe pattern path."""
+    pending = pat.pop("deferred_var_preds", None)
+    if pending:
+        _restrict_pattern(store, pat, pending)
+    if pat.get("keep") and pat["nrows"]:
+        input_rows = pat["nrows"]
+        _, rows = _materialize(pat)
+        _emit_restriction_trace(pat, len(rows))
+        pat["rows"], pat["nrows"] = rows, len(rows)
+        pat["_trace_match_rows"] = input_rows
 
-    The running relation stays columnar across hash joins — ``_join_columns``
-    gathers ``u32`` columns, and row tuples exist only where a consumer
-    materializes them — and drops to rows for
-    the shapes that need them: probe joins, restricted or repeated-variable
-    patterns, several shared variables, cross products.
-    """
-    # A restricted pattern is materialized up front so its real size, not
-    # the match's, drives the order.
-    for pat in patterns:
-        if pat.get("keep") and pat["nrows"]:
-            _, rows = _materialize(pat)
-            pat["rows"], pat["nrows"] = rows, len(rows)
+
+def _join_patterns(store, patterns) -> Relation:
+    """Join patterns and defer eligible filters to selective probes."""
     patterns.sort(key=lambda pat: pat["nrows"])
+    seed = patterns[0]
+    _materialize_eager_restrictions(store, seed)
     execution_order = [pat.get("_trace_original_index") for pat in patterns]
     _trace_event(
         "bgp_plan_complete",
@@ -1761,7 +1791,7 @@ def _join_patterns(store, patterns) -> Relation:
         estimate_calls=0,
         elapsed_ns=0,
     )
-    schema, cols, rows = _pattern_body(patterns[0])
+    schema, cols, rows = _pattern_body(seed)
     remaining = patterns[1:]
     execution_index = 1
     while remaining and (len(cols[0]) if cols is not None else len(rows)):
@@ -1772,14 +1802,18 @@ def _join_patterns(store, patterns) -> Relation:
         pat = remaining.pop(pick)
         shares = any(v in pat["varpos"] for v in schema)
         running = len(cols[0]) if cols is not None else len(rows)
+        match_rows = pat["nrows"]
         step_started = time.perf_counter_ns() if _TRACE.get() is not None else 0
         strategy = "hash_rows"
-        if shares and running * _PROBE_FANOUT < pat["nrows"]:
+        if shares and running * _PROBE_FANOUT < match_rows:
             strategy = "probe"
             if cols is not None:
                 rows, cols = _cols_to_rows(cols), None
             schema, rows = _probe_join(store, schema, rows, pat)
+            restricted_rows = pat.pop("_trace_probe_restricted_rows", match_rows)
         else:
+            _materialize_eager_restrictions(store, pat)
+            restricted_rows = pat["nrows"]
             schema_b, cols_b, rows_b = _pattern_body(pat)
             joined = (
                 _join_columns(schema, cols, schema_b, cols_b)
@@ -1803,14 +1837,14 @@ def _join_patterns(store, patterns) -> Relation:
             original_pattern_index=pat.get("_trace_original_index"),
             strategy=strategy,
             input_rows=running,
-            pattern_match_rows=pat["nrows"],
+            pattern_match_rows=match_rows,
+            pattern_restricted_rows=restricted_rows,
             output_rows=output_rows,
             output_columns=len(schema),
             shared_variable_count=sum(v in schema for v in pat["varpos"]),
             elapsed_ns=elapsed_ns,
         )
         execution_index += 1
-    # An empty result still names every variable of the pattern.
     for pat in remaining:
         schema += tuple(v for v in pat["varpos"] if v not in schema)
     if cols is not None:
@@ -1889,7 +1923,35 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
                         matched = True
         if keep_unmatched and not matched:
             out.append(row + pad)
-    return schema + tuple(free.keys()), out
+    combined_schema = schema + tuple(free.keys())
+    pending = pat.pop("deferred_var_preds", None)
+    if pending and out:
+        restriction_input_rows = len(out)
+        for var, conjuncts in pending.items():
+            position = combined_schema.index(var)
+            values = {row[position] for row in out}
+            started = time.perf_counter_ns() if _TRACE.get() is not None else 0
+            allowed = filters.evaluate_column(store, conjuncts, values)
+            elapsed_ns = time.perf_counter_ns() - started if started else 0
+            out = [row for row in out if row[position] in allowed]
+            _trace_event(
+                "bgp_restriction_complete",
+                original_pattern_index=pat.get("_trace_original_index"),
+                variable=str(var),
+                mode="probe",
+                input_rows=restriction_input_rows,
+                output_rows=len(out),
+                predicate_count=len(conjuncts),
+                fast_predicate_count=sum(c.fast is not None for c in conjuncts),
+                kind_only_predicate_count=sum(c.kind_only for c in conjuncts),
+                generic_only_predicate_count=sum(c.fast is None for c in conjuncts),
+                distinct_binding_count=len(values),
+                allowed_binding_count=len(allowed),
+                elapsed_ns=elapsed_ns,
+            )
+            restriction_input_rows = len(out)
+        pat["_trace_probe_restricted_rows"] = len(out)
+    return combined_schema, out
 
 
 def _probe_spellings(store, rows, bound) -> dict:
