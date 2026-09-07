@@ -1427,7 +1427,7 @@ def _pattern_trace_shape(ctx, triple) -> dict:
 
 
 def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
-    """Evaluate a basic graph pattern into a code-space relation."""
+    """Evaluate a BGP by matching one seed and probing connected patterns."""
     trace = _TRACE.get()
     traced = trace is not None
     started = time.perf_counter_ns() if traced else 0
@@ -1440,6 +1440,8 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
             output_rows=1,
             output_columns=0,
             native_call_count=0,
+            native_initial_match_count=0,
+            native_probe_call_count=0,
             native_match_ns=0,
             restriction_ns=0,
             join_ns=0,
@@ -1449,64 +1451,101 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
         )
         return rel
 
-    matches: dict[tuple, tuple] = {}
-    patterns = []
-    native_match_ns = 0
-    native_calls = 0
-    for original_index, triple in enumerate(triples):
-        shape = _pattern_trace_shape(ctx, triple) if traced else None
-        _trace_event("bgp_pattern_start", original_pattern_index=original_index, **(shape or {}))
-        pattern_started = time.perf_counter_ns() if traced else 0
-        before = len(matches)
-        pat = _match_pattern(ctx, store, *triple, scope, matches)
-        elapsed = time.perf_counter_ns() - pattern_started if traced else 0
-        call_count = int(len(matches) > before)
-        native_calls += call_count
-        native_match_ns += elapsed
+    # Keep the established single-pattern path unchanged in behavior.
+    if len(triples) == 1:
+        shape = _pattern_trace_shape(ctx, triples[0]) if traced else None
+        _trace_event("bgp_pattern_start", original_pattern_index=0, **(shape or {}))
+        then = time.perf_counter_ns() if traced else 0
+        pat = _match_pattern(ctx, store, *triples[0], scope)
+        native_ns = time.perf_counter_ns() - then if then else 0
         if traced:
-            pat["_trace_original_index"] = original_index
-        patterns.append(pat)
+            pat["_trace_original_index"] = 0
         _trace_event(
             "bgp_pattern_complete",
-            original_pattern_index=original_index,
-            native_call_count=call_count,
+            original_pattern_index=0,
+            cardinality_source="matched",
+            native_call_count=1,
             matched_rows=pat["nrows"],
-            native_match_ns=elapsed,
+            native_match_ns=native_ns,
             restriction_ns=0,
             relation_extend_ns=0,
             other_ns=0,
-            elapsed_ns=elapsed,
+            elapsed_ns=native_ns,
+            timing_reconciled=True,
+            **(shape or {}),
+        )
+        then = time.perf_counter_ns() if traced else 0
+        if var_preds:
+            _restrict_pattern(store, pat, var_preds)
+        restriction_ns = time.perf_counter_ns() - then if then else 0
+        then = time.perf_counter_ns() if traced else 0
+        rel = _rel_from_pattern(pat)
+        join_ns = time.perf_counter_ns() - then if then else 0
+        elapsed = time.perf_counter_ns() - started if started else 0
+        known = native_ns + restriction_ns + join_ns
+        other_ns = max(0, elapsed - known)
+        _trace_event(
+            "bgp_complete",
+            pattern_count=1,
+            output_rows=_relation_rows(rel),
+            output_columns=len(rel.schema),
+            native_call_count=1,
+            native_initial_match_count=1,
+            native_probe_call_count=0,
+            native_match_ns=native_ns,
+            restriction_ns=restriction_ns,
+            join_ns=join_ns,
+            other_ns=other_ns,
+            elapsed_ns=known + other_ns,
+            timing_reconciled=True,
+        )
+        return rel
+
+    patterns = []
+    for index, triple in enumerate(triples):
+        shape = _pattern_trace_shape(ctx, triple) if traced else None
+        _trace_event("bgp_pattern_start", original_pattern_index=index, **(shape or {}))
+        pat = _pattern_terms(ctx, store, *triple, scope)
+        pat["_trace_original_index"] = index
+        if var_preds:
+            pending = {v: var_preds[v] for v in pat["varpos"] if v in var_preds}
+            if pending:
+                pat["deferred_var_preds"] = pending
+        patterns.append(pat)
+        _trace_event(
+            "bgp_pattern_complete",
+            original_pattern_index=index,
+            cardinality_source="unmatched",
+            native_call_count=0,
+            matched_rows=None,
+            native_match_ns=0,
+            restriction_ns=0,
+            relation_extend_ns=0,
+            other_ns=0,
+            elapsed_ns=0,
             timing_reconciled=True,
             **(shape or {}),
         )
 
-    restriction_started = time.perf_counter_ns() if traced else 0
-    if var_preds:
-        if len(patterns) == 1:
-            _restrict_pattern(store, patterns[0], var_preds)
-        else:
-            for pat in patterns:
-                pending = {var: var_preds[var] for var in pat["varpos"] if var in var_preds}
-                if pending:
-                    pat["deferred_var_preds"] = pending
-    restriction_ns = time.perf_counter_ns() - restriction_started if traced else 0
-
-    join_started = time.perf_counter_ns() if traced else 0
-    if len(patterns) == 1:
-        rel = _rel_from_pattern(patterns[0])
-    else:
-        rel = _join_patterns(store, patterns)
-    join_ns = time.perf_counter_ns() - join_started if traced else 0
-    elapsed_ns = time.perf_counter_ns() - started if traced else 0
-    known = native_match_ns + restriction_ns + join_ns
-    other_ns = max(0, elapsed_ns - known)
+    then = time.perf_counter_ns() if traced else 0
+    stats = {}
+    rel = _join_patterns(store, patterns, stats)
+    total_join_ns = time.perf_counter_ns() - then if then else 0
+    native_ns = stats["native_ns"]
+    restriction_ns = stats["restriction_ns"]
+    join_ns = max(0, total_join_ns - native_ns - restriction_ns)
+    elapsed = time.perf_counter_ns() - started if started else 0
+    known = native_ns + restriction_ns + join_ns
+    other_ns = max(0, elapsed - known)
     _trace_event(
         "bgp_complete",
         pattern_count=len(patterns),
         output_rows=_relation_rows(rel),
         output_columns=len(rel.schema),
-        native_call_count=native_calls,
-        native_match_ns=native_match_ns,
+        native_call_count=len(patterns),
+        native_initial_match_count=stats["initial_calls"],
+        native_probe_call_count=stats["probe_calls"],
+        native_match_ns=native_ns,
         restriction_ns=restriction_ns,
         join_ns=join_ns,
         other_ns=other_ns,
@@ -1514,6 +1553,165 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
         timing_reconciled=True,
     )
     return rel
+
+
+# Incremental probes use the established fanout rule. count_quads supplies a
+# cardinality estimate without materializing the complete predicate relation.
+
+
+def _pattern_static_rank(pat):
+    """Rank a resolved pattern without a native cardinality call."""
+    n3 = pat["n3"]
+    repeated = sum(len(pos) - 1 for pos in pat["varpos"].values())
+    return (
+        -sum(value is not None for value in n3),
+        -int(n3[1] is not None),
+        -int(n3[0] is not None),
+        -int(n3[2] is not None),
+        -repeated,
+        pat.get("_trace_original_index", 0),
+    )
+
+
+def _match_resolved_pattern(store, pat, memo):
+    """Attach native columns to a resolved pattern and preserve match memoization."""
+    then = time.perf_counter_ns() if _TRACE.get() is not None else 0
+    if pat["unsatisfiable"]:
+        pat["cols"], pat["nrows"] = None, 0
+        return 0, 0
+    key = tuple(pat["n3"])
+    cols = memo.get(key)
+    calls = 0
+    if cols is None:
+        cols = store._store().match_codes(*pat["n3"])
+        if cols is None:
+            raise NotImplementedError
+        memo[key] = cols
+        calls = 1
+    pat["cols"], pat["nrows"] = cols, len(cols[0])
+    graph_vars = [var for var, positions in pat["varpos"].items() if 3 in positions]
+    if graph_vars:
+        _exclude_default_graph(store, pat, graph_vars[0])
+    return calls, time.perf_counter_ns() - then if then else 0
+
+
+def _join_incremental_bgp(store, patterns):
+    """Match one selective seed, then probe connected unresolved patterns."""
+    memo = {}
+    stats = {"initial_calls": 0, "probe_calls": 0, "native_ns": 0, "restriction_ns": 0}
+    remaining = list(patterns)
+    seed = min(remaining, key=_pattern_static_rank)
+    remaining.remove(seed)
+    calls, native_ns = _match_resolved_pattern(store, seed, memo)
+    stats["initial_calls"] += calls
+    stats["native_ns"] += native_ns
+    then = time.perf_counter_ns() if _TRACE.get() is not None else 0
+    _materialize_eager_restrictions(store, seed)
+    stats["restriction_ns"] += time.perf_counter_ns() - then if then else 0
+    schema, cols, rows = _pattern_body(seed)
+    order = [seed.get("_trace_original_index")]
+    estimate_calls = 0
+    _trace_event(
+        "bgp_seed_complete",
+        original_pattern_index=order[0],
+        cardinality_source="matched",
+        matched_rows=seed["nrows"],
+        native_call_count=calls,
+        native_match_ns=native_ns,
+    )
+
+    execution_index = 1
+    while remaining and (len(cols[0]) if cols is not None else len(rows)):
+        connected = [pat for pat in remaining if any(v in schema for v in pat["varpos"])]
+        pat = min(connected or remaining, key=_pattern_static_rank)
+        remaining.remove(pat)
+        order.append(pat.get("_trace_original_index"))
+        running = len(cols[0]) if cols is not None else len(rows)
+        step_then = time.perf_counter_ns() if _TRACE.get() is not None else 0
+        probe_calls = 0
+        probe_ns = 0
+
+        estimate_rows = None
+        if connected and not pat["unsatisfiable"]:
+            estimate_rows = store._store().count_quads(*pat["n3"])
+            estimate_calls += 1
+        if connected and estimate_rows is not None and running * _PROBE_FANOUT < estimate_rows:
+            if cols is not None:
+                rows, cols = _cols_to_rows(cols), None
+            probe_calls = len(rows)
+            then = time.perf_counter_ns() if _TRACE.get() is not None else 0
+            schema, rows = _probe_join(store, schema, rows, pat)
+            probe_ns = time.perf_counter_ns() - then if then else 0
+            stats["probe_calls"] += probe_calls
+            stats["native_ns"] += probe_ns
+            strategy = "probe"
+            source = "probed"
+            match_rows = estimate_rows
+            restricted_rows = pat.pop("_trace_probe_restricted_rows", len(rows))
+        else:
+            calls, native_ns = _match_resolved_pattern(store, pat, memo)
+            stats["initial_calls"] += calls
+            stats["native_ns"] += native_ns
+            then = time.perf_counter_ns() if _TRACE.get() is not None else 0
+            _materialize_eager_restrictions(store, pat)
+            stats["restriction_ns"] += time.perf_counter_ns() - then if then else 0
+            match_rows = pat["nrows"]
+            restricted_rows = match_rows
+            schema_b, cols_b, rows_b = _pattern_body(pat)
+            joined = (
+                _join_columns(schema, cols, schema_b, cols_b)
+                if cols is not None and cols_b is not None
+                else None
+            )
+            if joined is not None:
+                schema, cols = joined
+                strategy = "hash_columns"
+            else:
+                if cols is not None:
+                    rows, cols = _cols_to_rows(cols), None
+                if rows_b is None:
+                    rows_b = _cols_to_rows(cols_b)
+                schema, rows = _join(schema, rows, schema_b, rows_b)
+                strategy = "hash_rows"
+            source = "matched"
+
+        output_rows = len(cols[0]) if cols is not None else len(rows)
+        _trace_event(
+            "bgp_join_step_complete",
+            execution_index=execution_index,
+            original_pattern_index=pat.get("_trace_original_index"),
+            strategy=strategy,
+            cardinality_source=source,
+            input_rows=running,
+            pattern_match_rows=match_rows,
+            pattern_restricted_rows=restricted_rows,
+            native_initial_match_count=int(source == "matched"),
+            native_probe_call_count=probe_calls,
+            native_probe_ns=probe_ns,
+            output_rows=output_rows,
+            output_columns=len(schema),
+            shared_variable_count=sum(v in schema for v in pat["varpos"]),
+            elapsed_ns=time.perf_counter_ns() - step_then if step_then else 0,
+        )
+        execution_index += 1
+
+    for pat in remaining:
+        schema += tuple(v for v in pat["varpos"] if v not in schema)
+    _trace_event(
+        "bgp_plan_complete",
+        pattern_count=len(patterns),
+        execution_order=order + [pat.get("_trace_original_index") for pat in remaining],
+        seed_pattern_index=seed.get("_trace_original_index"),
+        seed_selection="static_bound_positions",
+        estimated_cardinalities=True,
+        estimate_calls=estimate_calls,
+        native_initial_match_count=stats["initial_calls"],
+        native_probe_call_count=stats["probe_calls"],
+        elapsed_ns=0,
+    )
+    if cols is not None:
+        return Relation(schema, cols, None, len(cols[0])), stats
+    return Relation.from_rows(schema, rows), stats
 
 
 def _pattern_terms(ctx, store, s, p, o, scope) -> dict:
@@ -1776,80 +1974,18 @@ def _materialize_eager_restrictions(store, pat) -> None:
         pat["_trace_match_rows"] = input_rows
 
 
-def _join_patterns(store, patterns) -> Relation:
-    """Join patterns and defer eligible filters to selective probes."""
-    patterns.sort(key=lambda pat: pat["nrows"])
-    seed = patterns[0]
-    _materialize_eager_restrictions(store, seed)
-    execution_order = [pat.get("_trace_original_index") for pat in patterns]
-    _trace_event(
-        "bgp_plan_complete",
-        pattern_count=len(patterns),
-        execution_order=execution_order,
-        seed_pattern_index=execution_order[0],
-        estimated_cardinalities=None,
-        estimate_calls=0,
-        elapsed_ns=0,
-    )
-    schema, cols, rows = _pattern_body(seed)
-    remaining = patterns[1:]
-    execution_index = 1
-    while remaining and (len(cols[0]) if cols is not None else len(rows)):
-        pick = next(
-            (i for i, pat in enumerate(remaining) if any(v in pat["varpos"] for v in schema)),
-            0,
-        )
-        pat = remaining.pop(pick)
-        shares = any(v in pat["varpos"] for v in schema)
-        running = len(cols[0]) if cols is not None else len(rows)
-        match_rows = pat["nrows"]
-        step_started = time.perf_counter_ns() if _TRACE.get() is not None else 0
-        strategy = "hash_rows"
-        if shares and running * _PROBE_FANOUT < match_rows:
-            strategy = "probe"
-            if cols is not None:
-                rows, cols = _cols_to_rows(cols), None
-            schema, rows = _probe_join(store, schema, rows, pat)
-            restricted_rows = pat.pop("_trace_probe_restricted_rows", match_rows)
-        else:
-            _materialize_eager_restrictions(store, pat)
-            restricted_rows = pat["nrows"]
-            schema_b, cols_b, rows_b = _pattern_body(pat)
-            joined = (
-                _join_columns(schema, cols, schema_b, cols_b)
-                if cols is not None and cols_b is not None
-                else None
-            )
-            if joined is not None:
-                strategy = "hash_columns"
-                schema, cols = joined
-            else:
-                if cols is not None:
-                    rows, cols = _cols_to_rows(cols), None
-                if rows_b is None:
-                    rows_b = _cols_to_rows(cols_b)
-                schema, rows = _join(schema, rows, schema_b, rows_b)
-        output_rows = len(cols[0]) if cols is not None else len(rows)
-        elapsed_ns = time.perf_counter_ns() - step_started if step_started else 0
-        _trace_event(
-            "bgp_join_step_complete",
-            execution_index=execution_index,
-            original_pattern_index=pat.get("_trace_original_index"),
-            strategy=strategy,
-            input_rows=running,
-            pattern_match_rows=match_rows,
-            pattern_restricted_rows=restricted_rows,
-            output_rows=output_rows,
-            output_columns=len(schema),
-            shared_variable_count=sum(v in schema for v in pat["varpos"]),
-            elapsed_ns=elapsed_ns,
-        )
-        execution_index += 1
-    for pat in remaining:
-        schema += tuple(v for v in pat["varpos"] if v not in schema)
-    if cols is not None:
-        return Relation(schema, cols, None, len(cols[0]))
-    return Relation.from_rows(schema, rows)
+def _join_patterns(store, patterns, stats=None) -> Relation:
+    """Join a BGP through the incremental planner.
+
+    Keep this function as the observable BGP join boundary. Existing tests,
+    diagnostics, and callers can continue to wrap it with the historical
+    two-argument signature. _solve_bgp passes an optional dictionary to
+    receive physical native-call and timing counters.
+    """
+    rel, measured = _join_incremental_bgp(store, patterns)
+    if stats is not None:
+        stats.update(measured)
+    return rel
 
 
 def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
