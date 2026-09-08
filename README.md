@@ -138,6 +138,7 @@ fits the residency budget; pass `VortexRdflibStore(path, max_resident_bytes=...)
 | `VORTEX_RDF_PUSHDOWN_OPS=<list>` | Only push down the listed algebra nodes (`bgp` = basic graph patterns only) |
 | `VORTEX_RDF_FILTER_FAST=0` | Evaluate every FILTER value through rdflib's expression evaluator (still once per distinct value) |
 | `VORTEX_RDF_TRACE_TRIPLES=1` | Print every `triples()` pattern (debugging) |
+| `VORTEX_RDF_TRACE_QUERY=1` | Print the pushdown's query plan as JSON lines on stderr — counts, matches, probes, restrictions, joins, with row counts and timings (debugging; `VORTEX_RDF_TRACE_QUERY_ID` labels the lines) |
 
 ## Benchmarks
 

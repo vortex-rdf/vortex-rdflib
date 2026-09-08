@@ -1,12 +1,13 @@
 # SPARQL pushdown
 
 `vortex-rdflib` answers SPARQL with rdflib's engine, but a
-`VortexRdflibStore` can do more than serve quad patterns: it hooks into rdflib's algebra evaluation
-and answers the operators it understands in **code space**, i.e., over the `u32`
-term codes of a Dictionary-layout store, handing everything else back to
-rdflib node by node. This document explains, for each pushdown, the algebra
-shape it intercepts, what runs in code space, what stays in rdflib and how
-it makes it faster.
+[`VortexRdflibStore`](../src/vortex_rdflib/store.py#L44) can do more than
+serve quad patterns: it hooks into rdflib's algebra evaluation and answers
+the operators it understands in **code space**, i.e., over the `u32` term
+codes of a Dictionary-layout store, handing everything else back to rdflib
+node by node. This document explains, for each pushdown, the algebra shape
+it intercepts, what runs in code space, what stays in rdflib and how it
+makes it faster.
 
 **Measurement numbers.** Unless marked *end-to-end*, every timing below is
 the best of 5–7 runs of a *prepared* query (`prepareQuery`; rdflib's parse
@@ -23,11 +24,13 @@ reference, at 250,000 quads over 8 graphs and across the other stores.
 
 ## How the hook works
 
-rdflib evaluates a query as a tree of algebra operators (`Project`, `Filter`,
-`LeftJoin`, `BGP`, ...) and, for **every** node, offers it to the functions
-registered in `rdflib.plugins.sparql.CUSTOM_EVALS` before running its own
-evaluator. Constructing a `VortexRdflibStore` registers one such hook
-([`pushdown.register_sparql_pushdown`](../src/vortex_rdflib/pushdown.py#L125)).
+rdflib evaluates a query as a tree of algebra operators (`Project`,
+`Filter`, `LeftJoin`, `BGP`, ...) and, for **every** node, offers it to the
+functions registered in `rdflib.plugins.sparql.CUSTOM_EVALS` before running
+its own evaluator. Constructing a
+[`VortexRdflibStore`](../src/vortex_rdflib/store.py#L44) registers one such
+hook
+([`pushdown.register_sparql_pushdown`](../src/vortex_rdflib/pushdown.py#L193)).
 The hook looks at the node's name and for:
 
 - a node it handles, over a graph whose store is a `VortexRdflibStore` with the
@@ -55,7 +58,7 @@ code — no decode needed.
 **Blocks and heads.** The hook solves a *block* — a subtree of the grammar
 `BGP` | `Filter(block)` | `Join(block, block)` | `LeftJoin(block, block,
 expr)` | `Minus(block, block)` | `ToMultiSet(values)` | `Graph(block)` —
-into a [`Relation`](../src/vortex_rdflib/pushdown.py#L337): a schema of
+into a [`Relation`](../src/vortex_rdflib/pushdown.py#L345): a schema of
 variables and a body of `u32` columns (a matched pattern's zero-copy views,
 or a join's gathered columns) or of materialized code-tuple rows (an
 unbound variable is `None`). Above a block it recognizes the *heads* rdflib
@@ -98,12 +101,12 @@ SelectQuery                    ← offered to the hook, declined
 rdflib evaluates it itself and offers `Slice`, which the hook takes — and
 with it everything below, which rdflib never sees again. In that one call:
 
-1. [`_plan_head`](../src/vortex_rdflib/pushdown.py#L373) splits
+1. [`_plan_head`](../src/vortex_rdflib/pushdown.py#L381) splits
    `Slice -> Distinct -> Project` and hands the `Filter` below it to
-   [`_solve_block`](../src/vortex_rdflib/pushdown.py#L945).
+   [`_solve_block`](../src/vortex_rdflib/pushdown.py#L953).
 2. `isIRI(?o)` references a single block variable, so it becomes a
    *per-variable predicate*
-   [pushed into the scans](../src/vortex_rdflib/pushdown.py#L872-L879) rather
+   [pushed into the scans](../src/vortex_rdflib/pushdown.py#L1088-L1092) rather
    than a test applied to returned solutions.
 3. Both triple patterns resolve to the same quad pattern, scoped to the
    active graph — a variable is `None` in a resolved pattern, so only the
@@ -124,8 +127,9 @@ with it everything below, which rdflib never sees again. In that one call:
 
 Prepared and without the `LIMIT`, this is 2.9 ms against rdflib's 61 ms.
 With it, rdflib's nested loop also stops after five solutions and wins,
-1.9 ms to 2.3 ms: the up-front matching is what the pushdown pays to learn
-the sizes, and what it earns back on every shape that cannot stop early.
+1.9 ms to 2.3 ms: the up-front counting and matching is what the pushdown
+pays to learn the sizes, and what it earns back on every shape that cannot
+stop early.
 
 ## Basic graph patterns
 
@@ -141,27 +145,34 @@ SELECT ?s ?o WHERE {
 }
 ```
 
-**In code space.** Every triple pattern is matched natively once, up front —
-a match is near-constant cost (45–67 µs in memory, ≈1 ms file-backed,
-regardless of how many rows it selects), so the actual row counts are known
-before any join. Patterns that resolve to the same quad pattern share that one match:
-a variable is `None` in a resolved pattern, so the hops of a self-join
-(`?s <p> ?m . ?m <p> ?o`) differ only in names the match never sees, and each
-keeps its own reading of the shared columns. Patterns join smallest first,
-greedily preferring one that shares a variable with the relation so far. Each
-join gathers the matching rows into fresh `u32` columns — an index-gather,
-[`_join_columns`](../src/vortex_rdflib/pushdown.py#L1997) — so the running
+**In code space.** Every triple pattern is *counted* natively before
+anything is matched (`count_quads`: the row selection's size, no columns — a
+fraction of a match, which costs 9 µs for a point lookup but 60 µs for a
+predicate scan of 1,024 rows and 580 µs for one of 7,576). The patterns are
+counted in shape order, most bound positions first, so an anchor that
+selects nothing ends the block before a scan is even counted; and patterns
+that resolve to the same quad pattern share one count and one match: a
+variable is `None` in a resolved pattern, so the hops of a self-join
+(`?s <p> ?m . ?m <p> ?o`) differ only in names the match never sees, and
+each keeps its own reading of the shared columns. The smallest pattern is
+matched and seeds the relation
+([`_join_incremental_bgp`](../src/vortex_rdflib/pushdown.py#L1663)). Each
+further step takes the smallest pattern sharing a variable with the relation
+so far (the smallest of all for a cross product) and decides by the counts:
+when the relation is at least
+[`_PROBE_FANOUT`](../src/vortex_rdflib/pushdown.py#L1458) (100) times
+smaller than the pattern's count, the pattern is re-matched natively per row
+of the relation ([`_probe_join`](../src/vortex_rdflib/pushdown.py#L2118))
+and is never matched whole — an anchored star, a subject fixed by one
+selective pattern joined to two unselective legs, costs one match and one
+probe per leg; otherwise the pattern is matched once and hash-joined,
+gathering the matching rows into fresh `u32` columns — an index-gather,
+[`_join_columns`](../src/vortex_rdflib/pushdown.py#L2056) — so the running
 relation stays columnar and row tuples exist only where a consumer
-materializes them; a restricted or repeated-variable pattern, several
-shared variables, or a cross product drop to the row hash join. Either way,
-when the running relation is at least `_PROBE_FANOUT` (100) times smaller
-than the next pattern's match, that pattern is re-matched natively per
-binding of the relation
-(`_probe_join`), so an anchored star — a subject fixed by one selective
-pattern, joined to two unselective ones — never materializes the unselective
-legs. A block that is a single pattern is not even turned into tuples: its
-column views are the relation, and rows are zipped a chunk at a time as they
-are consumed.
+materializes them (a restricted or repeated-variable pattern, several shared
+variables, or a cross product drop to the row hash join). A block that is a
+single pattern is not even turned into tuples: its column views are the
+relation, and rows are zipped a chunk at a time as they are consumed.
 
 **Why it is faster.** rdflib's `evalBGP` is a nested loop: one
 `Store.triples()` call per candidate binding, each paying the native match
@@ -169,12 +180,13 @@ floor and decoding its rows. A two-hop chain over a predicate
 (`?s <p> ?m . ?m <p> ?o`, 1,516 matches per pattern, 181 solutions) is
 55 ms under rdflib and 1.8 ms here. The anchored shapes are where rdflib's
 nested loop is already near-optimal — it issues one selective match then
-probes — and the pushdown pays two extra up-front matches to learn the
-sizes: 0.36 ms against rdflib's 0.17 ms for a three-leg anchored star,
-invisible behind the ≈1.2 ms parse. The columnar kernel is what the wide
-shapes gain: an unanchored two-leg star (1,516 rows a side, 1,213 solutions)
-9.2 ms -> 8.0 ms, and under a `LIMIT 10` the join's columns are gathered but
-barely tupled or decoded, 1.1 ms end to end.
+probes — and the pushdown now does the same, at the price of one count per
+pattern instead of one match: a three-leg anchored star over 32,768 quads
+issues 3 counts, 1 match and 2 probes, and selects 3 rows in total where
+matching every leg up front selected 2,051. The columnar kernel is what
+the wide shapes gain: an unanchored two-leg star (1,516 rows a side, 1,213
+solutions) 9.2 ms -> 8.0 ms, and under a `LIMIT 10` the join's columns are
+gathered but barely tupled or decoded, 1.1 ms end to end.
 
 **Steps aside.** A literal propagated into subject or predicate position
 makes the pattern unsatisfiable (empty, not an error), exactly as
@@ -204,28 +216,35 @@ conjunct is classified by the block variables it references:
 - **none** — evaluated once; a false constant conjunct empties the block
   before anything is matched;
 - **one** — a *per-variable predicate*, evaluated once per distinct code of
-  the variable and applied to every pattern scan that binds it *before* the
-  join, so filter selectivity drives the join order and the probe decision;
+  the variable, on the pattern that binds it. A pattern that is matched
+  whole evaluates it over its column's distinct codes and is compacted to
+  the rows that pass before it joins, so the filter's selectivity is what
+  the join sees; a pattern the relation *probes* evaluates it over the
+  codes the probes actually reach — BSBM Q8's `langMatches(lang(?text),
+  "EN")` runs over one product's reviews, not over every review text in
+  the store. A variable the relation already binds is not restricted
+  again: the pattern that bound it did;
 - **several** — applied to the joined rows, memoized per distinct code tuple.
 
 Every conjunct is evaluated **per distinct value, never per row**, through
 two routes:
 
 - the **fast route** compiles a whitelist of expression shapes into a
-  predicate over the term's parsed spelling (`terms.parse_spelling`), each
-  leaf mirroring the exact rdflib code path: numeric comparisons (`< <= > >=
-  = !=` with rdflib's numeric fast path and its datatype-IRI ordering
-  otherwise), `IN`/`NOT IN` and `sameTerm` (term equality), `datatype`,
-  `lang`, `langMatches` (rdflib's own `_lang_range_check`), `isIRI`,
-  `isBlank`, `isLiteral` (pure code-range tests, no decode at all),
-  `isNumeric`, `bound`, `str`, `regex` (Python `re`, as rdflib), `strstarts`,
-  `strends`, `contains`, `+` and `-` over integer-derived literals, and
-  `&&`, `||`, `!` with rdflib's three-valued short-circuit rules. A leaf
-  answers true, false, *error* (rdflib would raise, which a filter turns
-  into false) or **unknown** — the value is outside the domain the fast path
-  reproduces exactly: an ill-typed number, a datatype rdflib orders by its
-  own rules, a normalized lexical form under `str()`, a NaN against a
-  decimal. Unknown values, alone, go to
+  predicate over the term's parsed spelling
+  ([`terms.parse_spelling`](../src/vortex_rdflib/terms.py#L74)), each leaf
+  mirroring the exact rdflib code path: numeric comparisons
+  (`< <= > >= = !=` with rdflib's numeric fast path and its datatype-IRI
+  ordering otherwise), `IN`/`NOT IN` and `sameTerm` (term equality),
+  `datatype`, `lang`, `langMatches` (rdflib's own `_lang_range_check`),
+  `isIRI`, `isBlank`, `isLiteral` (pure code-range tests, no decode at all),
+  `isNumeric`, `bound`, `str`, `regex` (Python `re`, as rdflib),
+  `strstarts`, `strends`, `contains`, `+` and `-` over integer-derived
+  literals, and `&&`, `||`, `!` with rdflib's three-valued short-circuit
+  rules. A leaf answers true, false, *error* (rdflib would raise, which a
+  filter turns into false) or **unknown** — the value is outside the domain
+  the fast path reproduces exactly: an ill-typed number, a datatype rdflib
+  orders by its own rules, a normalized lexical form under `str()`, a NaN
+  against a decimal. Unknown values, alone, go to
 - the **generic route**: rdflib's own evaluator (`_ebv`) on a
   `FrozenBindings` holding the decoded term. Semantics-exact by
   construction, at rdflib's cost per evaluation (≈24 µs), but paid once per
@@ -274,10 +293,11 @@ memoizing them per value would change observable behaviour — and a conjunct
 that could see a variable an enclosing lazy join binds row by row (see
 *OPTIONAL, MINUS and group joins*) hand the whole `Filter` to rdflib.
 `VORTEX_RDF_FILTER_FAST=0` forces the generic route everywhere; the
-equivalence tests run the matrix both ways, and `tests/test_filters.py`
-checks every fast leaf against rdflib's evaluator over a matrix of literal
-spellings (ill-typed integers, NaN and INF doubles, out-of-range bytes,
-escaped quotes, language tags, custom datatypes, unbound).
+equivalence tests run the matrix both ways, and
+[`tests/test_filters.py`](../tests/test_filters.py) checks every fast leaf
+against rdflib's evaluator over a matrix of literal spellings (ill-typed
+integers, NaN and INF doubles, out-of-range bytes, escaped quotes, language
+tags, custom datatypes, unbound).
 
 ## Projection, LIMIT/OFFSET and ASK
 
@@ -376,15 +396,21 @@ SELECT ?s ?o ?x WHERE {
 
 **In code space.** Both sides are solved into relations and combined on
 their shared variables: a hash left join whose unmatched rows are padded
-with unbound variables (the hoisted condition is applied to candidate
-pairs before a row counts as matched), an anti-join, or a hash join (the
-right side deduplicated for a non-lazy join, as rdflib's `set(b)` does).
-When the inner side is one pattern and the outer relation is small, the
-inner pattern is re-probed per outer row instead — today's probe rule — so
-an anchored `OPTIONAL` still costs one native match. A `MINUS` without
-shared block variables follows rdflib's compatibility test on the
-context's own bindings: nothing is removed at top level, everything is
-when the right side is non-empty inside a lazy join.
+with unbound variables (the hoisted condition is applied to candidate pairs
+before a row counts as matched), an anti-join, or a hash join (the right
+side deduplicated for a non-lazy join, as rdflib's `set(b)` does). When the
+inner side is one pattern, it is counted before it is matched
+([`_plan_pattern_side`](../src/vortex_rdflib/pushdown.py#L1827)): an outer
+relation at least [`_PROBE_FANOUT`](../src/vortex_rdflib/pushdown.py#L1458)
+times smaller than the count re-probes the pattern per outer row — unmatched
+rows padded, the hoisted condition applied per candidate — and the inner
+side's complete match is never made; otherwise it is matched once for the
+hash join. An anchored `OPTIONAL` thus costs one count and one probe per
+outer row, and the filter conjuncts a lazy join pushes into its inner
+pattern travel with the probe, over the codes it reaches. A `MINUS` without
+shared block variables follows rdflib's compatibility test on the context's
+own bindings: nothing is removed at top level, everything is when the right
+side is non-empty inside a lazy join.
 
 **Why it is faster.** rdflib's `evalLeftJoin` and lazy `evalJoin` evaluate
 the inner side *once per outer solution* — through the BGP hook, ≈85 µs
@@ -479,13 +505,13 @@ SELECT ?s ?o WHERE {
 ```
 
 **In code space.** Every constant is looked up by its canonical dictionary
-spelling (`terms.canonical_spelling`: the store's escapes, lowercase
-language tags, no `^^xsd:string`) and becomes a code, `UNDEF` an unbound
-variable; the table joins like any relation. A constant the dictionary does
-not hold gets a private negative code (it joins nothing but is still
-yielded verbatim), after a spelling-tolerant `count_quads` check that the
-store really lacks the term — a mismatch between our spelling and the
-store's is never guessed.
+spelling ([`terms.canonical_spelling`](../src/vortex_rdflib/terms.py#L127):
+the store's escapes, lowercase language tags, no `^^xsd:string`) and becomes
+a code, `UNDEF` an unbound variable; the table joins like any relation. A
+constant the dictionary does not hold gets a private negative code (it joins
+nothing but is still yielded verbatim), after a spelling-tolerant
+`count_quads` check that the store really lacks the term — a mismatch
+between our spelling and the store's is never guessed.
 
 **Why it is faster.** rdflib joins a `VALUES` table lazily, one `triples()`
 call per row. Sixty-four subjects joined to a predicate scan: 3.8 ms →
@@ -500,37 +526,42 @@ described above.
 ## Named graphs
 
 **Shape.** Not an algebra node of its own: every pattern above carries the
-graph the query is active in. `_pattern_terms` builds a **quad** pattern,
-whose fourth position is `VortexRdflibStore._graph_n3(ctx.graph)` — `None`
-(the wildcard over every graph) for a union default graph, `""` for the
-default graph of a `Dataset` without union, the graph's own name inside a
-`GRAPH` block. Every `match_codes` and `count_quads` in this document takes
-that position, so a pushed-down block reads exactly the rows rdflib's own
-evaluator would have asked `ctx.graph` for, and an absent graph selects
+graph the query is active in.
+[`_pattern_terms`](../src/vortex_rdflib/pushdown.py#L1858) builds a **quad**
+pattern, whose fourth position is
+[`VortexRdflibStore._graph_n3(ctx.graph)`](../src/vortex_rdflib/store.py#L174)
+— `None` (the wildcard over every graph) for a union default graph, `""` for
+the default graph of a `Dataset` without union, the graph's own name inside
+a `GRAPH` block. Every `match_codes` and `count_quads` in this document
+takes that position, so a pushed-down block reads exactly the rows rdflib's
+own evaluator would have asked `ctx.graph` for, and an absent graph selects
 nothing without materializing a row.
 
 ```sparql
 SELECT ?g ?s WHERE { GRAPH ?g { ?s <p> ?o } }
 ```
 
-**In code space.** A `Graph` node is a block node like any other: it does not
-match anything itself, it sets the scope of the block below it (`_solve_block`
-recurses into `node.p` with the new scope, so a nested `GRAPH` simply wins).
-A bound name becomes the constant above. An **unbound variable becomes a
-column**: the pattern is matched with the graph wildcard and `?g` takes
-position 3 in `varpos`, which makes it an ordinary variable of the relation —
-joined, filtered, grouped, ordered and decoded like any other, out of the
-fourth column the native match already returns. Two patterns under the same
-`GRAPH ?g` therefore join on `?g`, which is exactly the requirement that they
-come from the same graph.
+**In code space.** A `Graph` node is a block node like any other: it does
+not match anything itself, it sets the scope of the block below it
+([`_solve_block`](../src/vortex_rdflib/pushdown.py#L953) recurses into
+`node.p` with the new scope, so a nested `GRAPH` simply wins). A bound name
+becomes the constant above. An **unbound variable becomes a column**: the
+pattern is matched with the graph wildcard and `?g` takes position 3 in
+`varpos`, which makes it an ordinary variable of the relation — joined,
+filtered, grouped, ordered and decoded like any other, out of the fourth
+column the native match already returns. Two patterns under the same
+`GRAPH ?g` therefore join on `?g`, which is exactly the requirement that
+they come from the same graph.
 
 `GRAPH` ranges over the *named* graphs, so the default graph's rows are
 dropped from a variable-scoped match. There is no "any named graph" native
-pattern, so `_exclude_default_graph` restricts the wildcard match afterwards:
-the graph column's distinct codes minus the default graph's, as a `keep` set,
-which every row path already applies (and which then narrows the values a
-`FILTER` on `?g` is evaluated over, so the default graph's empty name — which
-is no RDF term — never reaches a predicate).
+pattern, so
+[`_exclude_default_graph`](../src/vortex_rdflib/pushdown.py#L1907) restricts
+the wildcard match afterwards: the graph column's distinct codes minus the
+default graph's, as a `keep` set, which every row path already applies (and
+which then narrows the values a `FILTER` on `?g` is evaluated over, so the
+default graph's empty name — which is no RDF term — never reaches a
+predicate).
 
 **Why it is faster.** rdflib's `evalGraph` walks the dataset's graphs and
 evaluates the block once per graph, joining `{?g: <name>}` onto every
@@ -542,15 +573,17 @@ it is now intercepted at the same time as the block: a scan inside one named
 graph 13.3 ms -> 5.6 ms.
 
 **Steps aside.** `FILTER (NOT) EXISTS` under a graph *variable*: rdflib
-evaluates an EXISTS body against the active graph, and under a variable there
-is no single active graph — the row's graph is a column — so the block goes
-back to rdflib, which walks the graphs itself. A term bound to something that
-cannot name a graph (a literal) is rdflib's too. And when rdflib does evaluate
-a `Graph` node — in `bgp` mode, or above a block it declined — it writes
-`solution.ctx.graph` back as it yields, so the solutions of a block below it
-each carry their own context rather than sharing the caller's
-(`_pushed_graph`); otherwise that write would reach the rows still to come and
-send an OPTIONAL's right side to the wrong graph.
+evaluates an EXISTS body against the active graph, and under a variable
+there is no single active graph — the row's graph is a column — so the block
+goes back to rdflib, which walks the graphs itself. A term bound to
+something that cannot name a graph (a literal) is rdflib's too. And when
+rdflib does evaluate a `Graph` node — in `bgp` mode, or above a block it
+declined — it writes `solution.ctx.graph` back as it yields, so the
+solutions of a block below it each carry their own context rather than
+sharing the caller's
+([`_pushed_graph`](../src/vortex_rdflib/pushdown.py#L2309)); otherwise that
+write would reach the rows still to come and send an OPTIONAL's right side
+to the wrong graph.
 
 ## Switches and the test oracle
 
@@ -559,16 +592,19 @@ send an OPTIONAL's right side to the wrong graph.
 | `VORTEX_RDF_DISABLE_PUSHDOWN=1` | Never register the hook: rdflib's default evaluator for every operator. |
 | `VORTEX_RDF_PUSHDOWN_OPS=<list>` | Intercept only the listed algebra nodes (`BGP,Filter,Project,...`); `bgp` is basic graph patterns only, the behaviour of the first releases. |
 | `VORTEX_RDF_FILTER_FAST=0` | Route every FILTER value through rdflib's evaluator (still once per distinct value). |
+| `VORTEX_RDF_TRACE_QUERY=1` | Print the plan of every intercepted query as JSON lines on stderr, one per step — each prefixed `VORTEX_RDF_QUERY_TRACE ` and carrying `schema: vortex-rdf-query-trace-v1`, the event name and a sequence number: the head planned, each pattern counted/matched/probed/restricted, each join step and its strategy, the ORDER BY ranking, the rows decoded. `VORTEX_RDF_TRACE_QUERY_ID` labels the lines of one query. Read at query time, not at construction. |
 
-The switches are read when a `VortexRdflibStore` is constructed. The default
-evaluator is the oracle of the test suite: `tests/test_pushdown.py` runs
-every query shape (≈280) with the pushdown and without, on a file-backed
-and an in-memory store, in four modes — the shipped configuration, the
-per-binding probe path forced (`_PROBE_FANOUT = 0`), basic graph patterns
-only, and the generic FILTER route — and compares the answers as multisets
-(as sequences for `ORDER BY` queries with a total order).
-`tests/test_filters.py` is the differential matrix for the fast FILTER
-route.
+The switches are read when a
+[`VortexRdflibStore`](../src/vortex_rdflib/store.py#L44) is constructed. The
+default evaluator is the oracle of the test suite:
+[`tests/test_pushdown.py`](../tests/test_pushdown.py) runs every query shape
+(≈280) with the pushdown and without, on a file-backed and an in-memory
+store, in four modes — the shipped configuration, the per-binding probe path
+forced (`_PROBE_FANOUT = 0`), basic graph patterns only, and the generic
+FILTER route — and compares the answers as multisets (as sequences for
+`ORDER BY` queries with a total order).
+[`tests/test_filters.py`](../tests/test_filters.py) is the differential
+matrix for the fast FILTER route.
 
 ## Measuring
 
@@ -590,12 +626,17 @@ rows_off = list(graph.query(query))
 register_sparql_pushdown()
 ```
 
-The benchmark's query set (`bench/queries.py`) has a query per pushdown —
-`ask-var`, `limit-scan`, `filter-range`, `filter-arith`, `filter-class`,
-`distinct`,
-`distinct-p`, `count-all`, `count-distinct`, `agg-count`, `optional-wide`,
+The benchmark's query set ([`bench/queries.py`](../bench/queries.py)) has a
+query per pushdown — `ask-var`, `limit-scan`, `filter-range`,
+`filter-arith`, `filter-class`, `filter-probe`, `distinct`, `distinct-p`,
+`count-all`, `count-distinct`, `agg-count`, `optional`, `optional-wide`,
 `not-exists`, `minus`, `order-var`, `order-limit`, `values-64` and the six
-`graph-*` queries — next to the lookups and joins.
+`graph-*` queries — next to the lookups and joins. The CodSpeed suite
+([`bench/test_codspeed.py`](../bench/test_codspeed.py)) runs the same set
+under instruction counting on every pull request, with the join queries —
+the anchored stars, the chain, the anchored `OPTIONAL` and `filter-probe` —
+also run with the hook unregistered, so a planning regression shows as a
+change in a tracked number rather than as a hunch.
 
 ## What stays with rdflib
 
@@ -617,22 +658,24 @@ primitives in the native layer — no join or planning logic — would make
 some pushdowns cheaper at scale; the Python side would detect them with
 `hasattr` and keep the 0.10 path. In order of value:
 
-1. **`VortexRdfStore.match_codes_many(patterns)` / `count_quads_many(patterns)`**
-   — element-wise `match_codes`/`count_quads` in one call: all patterns
-   parsed first (any malformed one → `ValueError`, nothing evaluated), one
-   GIL release, results in input order, file-backed scans free to run
-   concurrently. Used by every probe (`_probe_join`, `_probe_exists`, the
-   OPTIONAL probe): today 1,516 probes cost 1,516 × 45 µs in memory and
-   1,516 × ≈1 ms file-backed.
+1. **`VortexRdfStore.match_codes_many(patterns)` /
+   `count_quads_many(patterns)`** — element-wise `match_codes`/`count_quads`
+   in one call: all patterns parsed first (any malformed one → `ValueError`,
+   nothing evaluated), one GIL release, results in input order, file-backed
+   scans free to run concurrently. Used by every probe
+   ([`_probe_join`](../src/vortex_rdflib/pushdown.py#L2118),
+   [`_probe_exists`](../src/vortex_rdflib/pushdown.py#L1175), the OPTIONAL
+   probe): today 1,516 probes cost 1,516 × 45 µs in memory and 1,516 × ≈1 ms
+   file-backed.
 2. **`TermDict.filter_codes(kind, arg) -> (true_codes, unknown_codes)`** —
    one scan of the dictionary (the literal range for literal predicates)
    returning the ascending codes for which the predicate is definitely true
    under the same rules as the Python fast path, and the codes outside its
    exact domain (which Python resolves with rdflib). Kinds: `is_literal`,
-   `is_iri`, `is_blank`, `datatype`, `lang`, `lang_matches`, `num_lt`…`num_ne`
-   (numeric datatypes, lexical parsed with the same rules), `str_prefix`.
-   Cached per dictionary by `(kind, arg)`. Turns the per-query
-   "decode + predicate per distinct value" into a one-time scan.
+   `is_iri`, `is_blank`, `datatype`, `lang`, `lang_matches`,
+   `num_lt`…`num_ne` (numeric datatypes, lexical parsed with the same
+   rules), `str_prefix`. Cached per dictionary by `(kind, arg)`. Turns the
+   per-query "decode + predicate per distinct value" into a one-time scan.
 3. **A `keep` constraint on `match_codes` (per position: a code set or a
    `(lo, hi)` range)** — the per-variable restriction applied inside the
    native scan instead of over the gathered rows, so rows whose code falls
@@ -643,11 +686,12 @@ some pushdowns cheaper at scale; the Python side would detect them with
    today gathers 30,303 rows to keep 757.
 4. **Spelling-tolerant `TermDict.encode`** (parse with the pattern parser,
    canonicalize, look up) and **`encode_many(terms)`** — removes
-   `canonical_spelling` and the `count_quads` guard from the `VALUES` path.
+   [`canonical_spelling`](../src/vortex_rdflib/terms.py#L127) and the
+   `count_quads` guard from the `VALUES` path.
 5. **`match_codes(..., limit, offset)` and `count_quads(..., limit)`** — the
-   first rows of a match in base order, an existence test that stops at
-   the first hit: `LIMIT` over a single pattern and `ASK` on file-backed
-   stores, where a match gathers every row today.
+   first rows of a match in base order, an existence test that stops at the
+   first hit: `LIMIT` over a single pattern and `ASK` on file-backed stores,
+   where a match gathers every row today.
 6. **`TermDict.prefix_range(prefix) -> (lo, hi)`** — the code range of a
    spelling prefix: kind bounds without the bisection, IRI namespaces as
    ranges for `strstarts(str(?s), ...)`.
@@ -656,7 +700,8 @@ some pushdowns cheaper at scale; the Python side would detect them with
    millions of rows (Python's `set`/`Counter` cost 15–37 ns per element).
 8. **Native equi-join over code columns** — the matching row pairs of two
    matches' key columns, gathered into result columns in one GIL-released
-   call: it would replace `_join_columns`' Python kernel. numpy was
-   prototyped for that kernel and deliberately not shipped — the stdlib
-   index-gather already captures most of the win (1M-row wide star: 130 ms
-   against numpy's 118 ms) and this primitive obsoletes both.
+   call: it would replace
+   [`_join_columns`](../src/vortex_rdflib/pushdown.py#L2056)' Python kernel.
+   numpy was prototyped for that kernel and deliberately not shipped — the
+   stdlib index-gather already captures most of the win (1M-row wide star:
+   130 ms against numpy's 118 ms) and this primitive obsoletes both.

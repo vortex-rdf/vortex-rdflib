@@ -96,6 +96,34 @@ def test_probe_filter_generic_fallback_is_once_per_reached_code(tmp_path, monkey
     assert len(calls) == 1
 
 
+def test_lazy_join_probe_evaluates_only_reached_codes(tmp_path, monkeypatch):
+    """The same filter over nested groups — a lazy join rather than one
+    BGP — reaches the probe with the restriction deferred, so it is
+    evaluated over the one name the probe returns, not the 300 of the scan."""
+    graph = _graph(tmp_path)
+    seen = []
+    original = filters.evaluate_column
+
+    def spy(store, conjuncts, codes):
+        seen.append(set(codes))
+        return original(store, conjuncts, codes)
+
+    monkeypatch.setattr(filters, "evaluate_column", spy)
+    register_sparql_pushdown()
+    rows = list(
+        graph.query(
+            """SELECT ?s ?name WHERE {
+                { ?s <http://ex/anchor> "yes" }
+                { ?s <http://ex/name> ?name }
+                FILTER(langMatches(lang(?name), "EN"))
+            }"""
+        )
+    )
+    assert rows == [(URIRef("http://ex/s0"), rows[0][1])]
+    assert len(seen) == 1
+    assert len(seen[0]) == 1
+
+
 def test_non_probe_filter_keeps_eager_route(tmp_path, monkeypatch):
     graph = _graph(tmp_path)
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 10**9)

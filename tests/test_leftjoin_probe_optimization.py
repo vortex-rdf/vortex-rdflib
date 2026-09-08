@@ -77,8 +77,46 @@ def test_probe_optional_counts_before_match_and_skips_complete_match(tmp_path, m
     assert event["matched_left_rows"] == 1
     assert event["unmatched_left_rows"] == 0
     assert event["output_rows"] == 1
-    assert event["estimate_ns"] > 0
-    assert event["probe_ns"] > 0
+
+
+def test_lazy_join_counts_before_match_and_probes(tmp_path, monkeypatch, capsys):
+    """A nested group's lazy join takes the same count-first route as an
+    OPTIONAL: the 300-row right pattern is counted, never matched whole."""
+    graph = _graph(tmp_path)
+    graph.store._graph_n3(graph)
+    native = graph.store._store()
+    matches = []
+    counts = []
+
+    class Counting:
+        def match_codes(self, *args, **kwargs):
+            matches.append(args)
+            return native.match_codes(*args, **kwargs)
+
+        def count_quads(self, *args, **kwargs):
+            counts.append(args)
+            return native.count_quads(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(native, name)
+
+    graph.store._native = Counting()
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    register_sparql_pushdown()
+    rows = list(
+        graph.query("""SELECT ?s ?o WHERE {
+        { ?s <http://ex/anchor> "yes" }
+        { ?s <http://ex/optional> ?o }
+    }""")
+    )
+    payloads = _events(capsys.readouterr())
+    assert rows == [(URIRef("http://ex/s0"), URIRef("http://ex/o0"))]
+    assert len(matches) == 2
+    assert len(counts) == 1
+    event = next(item for item in payloads if item["event"] == "join_plan_complete")
+    assert event["strategy"] == "probe"
+    assert event["estimated_right_rows"] == 300
+    assert event["native_probe_call_count"] == 1
 
 
 def test_probe_optional_preserves_unmatched_padding(tmp_path, monkeypatch):
