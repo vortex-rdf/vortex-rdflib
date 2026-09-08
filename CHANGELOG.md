@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.1.1...v0.1.2) - 2026-09-08
+
+### Added
+
+- Add opt-in SPARQL pushdown diagnostics ([`f961b87`](https://github.com/vortex-rdf/vortex-rdflib/commit/f961b8788557391c48eef4bbafe0d25ebd5a1dc2) by @fothot2)
+- Add pattern-level BGP query diagnostics ([`6c36662`](https://github.com/vortex-rdf/vortex-rdflib/commit/6c36662496b716efb178265ec6c3f0ceda3bfaa5) by @fothot2)
+
+### Changed
+
+- Defer BGP filters to selective probe joins ([`5092f73`](https://github.com/vortex-rdf/vortex-rdflib/commit/5092f73fdddf002a7daa2160c1f3410929f36057) by @fothot2)
+- Plan BGP joins through incremental native probes ([`14940cb`](https://github.com/vortex-rdf/vortex-rdflib/commit/14940cbcfa9813476037f6c3b35d8d1fb971e087) by @fothot2)
+- Plan optional probes before matching right patterns ([`9721a50`](https://github.com/vortex-rdf/vortex-rdflib/commit/9721a509dedef55939e4d766153a7c48a966be29) by @fothot2)
+- Plan BGP and OPTIONAL joins from native counts (pushdown) ([`6871a2f`](https://github.com/vortex-rdf/vortex-rdflib/commit/6871a2f8568c9e0a39a02abd6035e914f6348415) by @julianrojas87)
+
 ## [0.1.1](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.1.0...v0.1.1) - 2026-09-03
 
 ### Changed

@@ -15,7 +15,10 @@ Four groups, mirroring how the dashboard panels are organized:
   ASK over a variable pattern and a ``LIMIT 10`` over the whole store, the
   two heads a store can answer without decoding a term.
 - ``joins``    — anchored star-2/star-3, an unanchored 2-hop chain, an
-  anchored OPTIONAL, a VALUES of 64 subjects joined to a predicate scan, a
+  anchored OPTIONAL, an anchored join to a predicate scan under a language
+  FILTER (BSBM Explore Q8's core: the filter must be evaluated over the
+  rows the anchor reaches, not the whole scan), a VALUES of 64 subjects
+  joined to a predicate scan, a
   wide OPTIONAL (a whole predicate scan as the outer side), a NOT EXISTS
   over the same scan, and a MINUS of the filtered range
   against an object-kind filtered scan (heavy: rdflib's own MINUS is
@@ -222,6 +225,40 @@ def _filter_predicate(cfg: DatasetConfig, m: Moduli) -> tuple[int, int]:
     return p, values[max(1, len(values) // 8)]
 
 
+def _filter_probe(cfg: DatasetConfig, m: Moduli) -> tuple[int, int, int]:
+    """``(predicate, anchor_predicate, anchor_object)`` indices for the
+    filtered probe.
+
+    BSBM Explore Q8's core is an anchor (``?review bsbm:reviewFor
+    <product>``) whose few rows are joined to wide predicate scans, one of
+    them under ``FILTER langMatches(lang(?text), "EN")``. The scanned
+    predicate is the one with the most language-tagged objects (as with the
+    integer filter, the kind selector ``j % 3`` can starve some predicates
+    when 3 divides the predicate modulus). The anchor is another statement
+    of the first subject whose object under it is language-tagged: that
+    subject passes the filter, so the query is non-empty by construction,
+    and a ``(predicate, object)`` pair selects the rows on one residue class
+    of both moduli — one row at the sizes the suites run.
+    """
+    literal_cut = round(cfg.literal_frac * 10)
+    per_pred: dict[int, int] = {}
+    for i in range(cfg.n):
+        j = i % m.n_obj
+        if j % 10 < literal_cut and j % 3 == 2:
+            per_pred[i % m.n_pred] = per_pred.get(i % m.n_pred, 0) + 1
+    if not per_pred:
+        raise ValueError("no language-tagged objects generated — dataset too small")
+    p = max(per_pred, key=lambda k: per_pred[k])
+    for i in range(p, cfg.n, m.n_pred):  # rows carrying p
+        j = i % m.n_obj
+        if j % 10 < literal_cut and j % 3 == 2:  # a language-tagged literal
+            subject = i % m.n_subj
+            for i2 in range(subject, cfg.n, m.n_subj):  # the subject's other rows
+                if i2 % m.n_pred != p:
+                    return p, i2 % m.n_pred, i2 % m.n_obj
+    raise ValueError("no subject carries a second predicate — dataset too small")
+
+
 def _band_anchor(cfg: DatasetConfig, m: Moduli, filter_p: int) -> tuple[int, int]:
     """``(anchor_subject, band)`` for the two-variable arithmetic FILTER.
 
@@ -282,6 +319,9 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
     pf = f"<{predicate_iri(filter_p)}>"
     band_subject, band = _band_anchor(cfg, m, filter_p)
     band_anchor = f"<{subject_iri(band_subject)}>"
+    probe_filter_p, probe_p, probe_o = _filter_probe(cfg, m)
+    p_probe = f"<{predicate_iri(probe_filter_p)}>"
+    probe_anchor = f"<{predicate_iri(probe_p)}> {object_nt(probe_o, cfg, m)}"
 
     # Subjects of the p1 scan, and of the filter-range rows: the outer sides
     # of the OPTIONAL and MINUS shapes, paired with a predicate half of them carry.
@@ -411,6 +451,17 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                   OPTIONAL {{
                     ?s {star_p3} ?x
                   }}
+                }}
+            """),
+        ),
+        Query(
+            "filter-probe",
+            "joins",
+            _sparql(f"""
+                SELECT ?s ?v WHERE {{
+                  ?s {probe_anchor} .
+                  ?s {p_probe} ?v
+                  FILTER(langMatches(lang(?v), "fr"))
                 }}
             """),
         ),
