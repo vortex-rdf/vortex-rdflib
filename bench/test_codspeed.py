@@ -137,8 +137,12 @@ FILES: dict[str, dict] = {
     "default": dict(layout="default"),
 }
 
-#: Queries whose cost is dominated by the BGP join strategy.
-JOIN_QUERIES = ("star-2", "star-3", "chain-2", "optional")
+#: Queries whose cost is dominated by the BGP join strategy: the anchored
+#: stars and the chain (count-first seeding, probes against wide legs), the
+#: anchored OPTIONAL (the right pattern counted, then probed, never matched
+#: whole) and the anchored join under a language FILTER (the filter
+#: evaluated over the probed rows only).
+JOIN_QUERIES = ("star-2", "star-3", "chain-2", "optional", "filter-probe")
 
 #: Queries whose cost is dominated by evaluating a numeric FILTER: a typed
 #: range over one variable, and an integer arithmetic band over two (BSBM
