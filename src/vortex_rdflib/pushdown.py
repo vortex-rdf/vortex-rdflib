@@ -251,6 +251,7 @@ def _eval_part(ctx, part):
     if token is not None:
         # Generators keep the trace object explicitly through _yield_rows.
         if hasattr(result, "__next__"):
+            assert active is not None  # a token only exists for a trace we created
             result = _trace_generator(result, active, token)
         else:
             _TRACE.reset(token)
@@ -1518,7 +1519,7 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
         shape = _pattern_trace_shape(ctx, triples[0]) if traced else None
         _trace_event("bgp_pattern_start", original_pattern_index=0, **(shape or {}))
         then = time.perf_counter_ns() if traced else 0
-        pat = _match_pattern(ctx, store, *triples[0], scope)
+        pat = _match_pattern(ctx, store, *triples[0], scope=scope)
         native_ns = time.perf_counter_ns() - then if then else 0
         if traced:
             pat["_trace_original_index"] = 0
@@ -1567,7 +1568,7 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
     for index, triple in enumerate(triples):
         shape = _pattern_trace_shape(ctx, triple) if traced else None
         _trace_event("bgp_pattern_start", original_pattern_index=index, **(shape or {}))
-        pat = _pattern_terms(ctx, store, *triple, scope)
+        pat = _pattern_terms(ctx, store, *triple, scope=scope)
         pat["_trace_original_index"] = index
         if var_preds:
             pending = {v: var_preds[v] for v in pat["varpos"] if v in var_preds}

@@ -55,7 +55,7 @@ code — no decode needed.
 **Blocks and heads.** The hook solves a *block* — a subtree of the grammar
 `BGP` | `Filter(block)` | `Join(block, block)` | `LeftJoin(block, block,
 expr)` | `Minus(block, block)` | `ToMultiSet(values)` | `Graph(block)` —
-into a [`Relation`](../src/vortex_rdflib/pushdown.py#L220): a schema of
+into a [`Relation`](../src/vortex_rdflib/pushdown.py#L337): a schema of
 variables and a body of `u32` columns (a matched pattern's zero-copy views,
 or a join's gathered columns) or of materialized code-tuple rows (an
 unbound variable is `None`). Above a block it recognizes the *heads* rdflib
@@ -98,9 +98,9 @@ SelectQuery                    ← offered to the hook, declined
 rdflib evaluates it itself and offers `Slice`, which the hook takes — and
 with it everything below, which rdflib never sees again. In that one call:
 
-1. [`_plan_head`](../src/vortex_rdflib/pushdown.py#L256) splits
+1. [`_plan_head`](../src/vortex_rdflib/pushdown.py#L373) splits
    `Slice -> Distinct -> Project` and hands the `Filter` below it to
-   [`_solve_block`](../src/vortex_rdflib/pushdown.py#L759).
+   [`_solve_block`](../src/vortex_rdflib/pushdown.py#L945).
 2. `isIRI(?o)` references a single block variable, so it becomes a
    *per-variable predicate*
    [pushed into the scans](../src/vortex_rdflib/pushdown.py#L872-L879) rather
@@ -150,7 +150,7 @@ a variable is `None` in a resolved pattern, so the hops of a self-join
 keeps its own reading of the shared columns. Patterns join smallest first,
 greedily preferring one that shares a variable with the relation so far. Each
 join gathers the matching rows into fresh `u32` columns — an index-gather,
-[`_join_columns`](../src/vortex_rdflib/pushdown.py#L1425) — so the running
+[`_join_columns`](../src/vortex_rdflib/pushdown.py#L1997) — so the running
 relation stays columnar and row tuples exist only where a consumer
 materializes them; a restricted or repeated-variable pattern, several
 shared variables, or a cross product drop to the row hash join. Either way,
