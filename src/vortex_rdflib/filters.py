@@ -1019,6 +1019,8 @@ def tuple_fast_reject_predicate(
     views = {} if shared_views is None else shared_views
     memo: dict = {}
     fast = conjunct.fast
+    if fast is None:
+        raise ValueError("tuple_fast_reject_predicate requires a fast conjunct")
 
     def view_of(code):
         view = views.get(code)
