@@ -182,6 +182,35 @@ def _trace_event(event: str, **fields) -> None:
         trace.emit(event, **fields)
 
 
+def _native_count(store, pattern) -> int:
+    """Count a native pattern and record its boundary cost when tracing."""
+    started = time.perf_counter_ns() if _TRACE.get() is not None else 0
+    result = store._store().count_quads(*pattern)
+    _trace_event(
+        "native_call_complete",
+        operation="count_quads",
+        pattern=list(pattern),
+        returned_rows=result,
+        elapsed_ns=time.perf_counter_ns() - started if started else 0,
+    )
+    return result
+
+
+def _native_match(store, pattern):
+    """Match a native pattern and record its boundary cost when tracing."""
+    started = time.perf_counter_ns() if _TRACE.get() is not None else 0
+    result = store._store().match_codes(*pattern)
+    rows = None if result is None else len(result[0])
+    _trace_event(
+        "native_call_complete",
+        operation="match_codes",
+        pattern=list(pattern),
+        returned_rows=rows,
+        elapsed_ns=time.perf_counter_ns() - started if started else 0,
+    )
+    return result
+
+
 def _relation_rows(rel: "Relation") -> int | None:
     if rel.rows is not None:
         return len(rel.rows)
@@ -778,7 +807,7 @@ def _eval_aggregate(ctx, store, part):
             not distinct and (target == "*" or target in pat["varpos"] or ctx[target] is not None)
             for _, target, distinct in counts
         ):
-            n = 0 if pat["unsatisfiable"] else store._store().count_quads(*pat["n3"])
+            n = 0 if pat["unsatisfiable"] else _native_count(store, pat["n3"])
             return iter([FrozenBindings(ctx, {res: Literal(n) for res, _, _ in counts})])
 
     rel = _solve_block(ctx, store, block, scope=scope)
@@ -945,7 +974,7 @@ def _block_nonempty(ctx, store, block) -> bool:
             return False
         if all(len(pos) == 1 for pos in pat["varpos"].values()):
             # Existence needs no rows: count from the row selection.
-            return store._store().count_quads(*pat["n3"]) > 0
+            return _native_count(store, pat["n3"]) > 0
     rel = _solve_block(ctx, store, block, scope=scope)
     return next(_code_rows(rel), None) is not None
 
@@ -1651,7 +1680,7 @@ def _count_pattern(store, pat, counts: dict) -> int:
     key = tuple(pat["n3"])
     n = counts.get(key)
     if n is None:
-        n = counts[key] = store._store().count_quads(*key)
+        n = counts[key] = _native_count(store, key)
     return n
 
 
@@ -1675,7 +1704,7 @@ def _match_resolved_pattern(store, pat, memo=None) -> tuple[int, int]:
     cols = memo.get(key) if memo is not None else None
     calls = 0
     if cols is None:
-        cols = store._store().match_codes(*key)
+        cols = _native_match(store, key)
         if cols is None:
             raise NotImplementedError
         if memo is not None:
