@@ -27,6 +27,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from typing import Any
 
 from rdflib.plugins.sparql.datatypes import XSD_DTs
@@ -136,6 +137,7 @@ def convert(view: TermView):
     return None
 
 
+@lru_cache(maxsize=65536)
 def numeric_value(view: TermView):
     """The value a literal contributes to rdflib's numeric fast path — a
     numeric datatype, a converting lexical form and a well-formed value —
@@ -437,6 +439,48 @@ def _compile_additive(node, slots, consts):
         return TermView(LITERAL, str(total), dt=_XSD_INTEGER)
 
     return fn
+
+
+def _compile_integer_band(expr, slots):
+    """Compile a strict two-sided integer range over two variables."""
+    if not isinstance(expr, CompValue) or expr.name != "ConditionalAndExpression":
+        return None
+    parts = [expr.expr, *(expr.other or ())]
+    if len(parts) != 2:
+        return None
+    bounds = []
+    for part in parts:
+        if not isinstance(part, CompValue) or part.name != "RelationalExpression":
+            return None
+        additive = part.other
+        if part.op not in ("<", ">") or not isinstance(additive, CompValue):
+            return None
+        if additive.name != "AdditiveExpression" or additive.op not in (["+"], ["-"]):
+            return None
+        if not isinstance(part.expr, Variable) or not isinstance(additive.expr, Variable):
+            return None
+        terms = additive.other
+        if not isinstance(terms, list) or len(terms) != 1:
+            return None
+        delta = terms[0]
+        if not isinstance(delta, Literal) or delta.datatype != URIRef(_XSD_INTEGER):
+            return None
+        bounds.append((part.op, part.expr, additive.expr, int(delta)))
+    low, high = sorted(bounds, key=lambda item: item[3])
+    if low[0] != ">" or high[0] != "<" or low[1:] != high[1:]:
+        return None
+    sim_index = slots[low[1]]
+    orig_index = slots[low[2]]
+    width = high[3]
+
+    def band(env):
+        sim = _integer(env[sim_index])
+        orig = _integer(env[orig_index])
+        if sim is UNKNOWN or orig is UNKNOWN:
+            return UNKNOWN
+        return orig - low[3] < sim < orig + width
+
+    return band
 
 
 def _compile_relational(node, slots, consts):
@@ -843,6 +887,11 @@ def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
                 const_views = None
             if const_views is not None:
                 fast = compile_fast(expr, variables, const_views)
+                band = _compile_integer_band(
+                    expr, {variable: index for index, variable in enumerate(variables)}
+                )
+                if band is not None:
+                    fast = band
         conjunct = Conjunct(
             expr, variables, fast, fast is not None and is_kind_only(expr), consts, ctx
         )
@@ -916,11 +965,13 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
     return remaining
 
 
-def tuple_predicate(store, conjunct: Conjunct, positions: list) -> Callable[[tuple], bool]:
+def tuple_predicate(
+    store, conjunct: Conjunct, positions: list, shared_views: dict | None = None
+) -> Callable[[tuple], bool]:
     """A row predicate for a conjunct over several variables, memoized per
     distinct code tuple; ``positions`` are the variables' row indexes."""
     memo: dict = {}
-    views: dict = {}
+    views = {} if shared_views is None else shared_views
     fast = conjunct.fast
     variables = conjunct.vars
 
@@ -955,3 +1006,58 @@ def tuple_predicate(store, conjunct: Conjunct, positions: list) -> Callable[[tup
         return r is True
 
     return predicate
+
+
+def tuple_fast_reject_predicate(
+    store, conjunct: Conjunct, positions: list, shared_views: dict | None = None
+) -> Callable[[tuple], bool]:
+    """Keep rows unless the exact fast route proves a conjunct false.
+
+    UNKNOWN remains visible to the normal final predicate, preserving the
+    generic RDFLib fallback for values outside the fast path's domain.
+    """
+    views = {} if shared_views is None else shared_views
+    memo: dict = {}
+    fast = conjunct.fast
+
+    def view_of(code):
+        view = views.get(code)
+        if view is None:
+            if code < 0:
+                view = views[code] = view_of_node(store._foreign[code])
+            else:
+                spelling = store._dict.decode(code)
+                if spelling is None:
+                    raise ValueError(f"term code {code} is not in the store dictionary")
+                view = views[code] = parse_spelling(spelling)
+        return view
+
+    def predicate(row) -> bool:
+        key = tuple(row[index] for index in positions)
+        result = memo.get(key)
+        if result is None:
+            result = fast(tuple(view_of(code) for code in key))
+            memo[key] = result
+        return result is not False
+
+    return predicate
+
+
+def prepare_tuple_views(store, conjuncts, positions, rows) -> dict:
+    """Decode the distinct dictionary codes used by tuple predicates in one batch."""
+    codes = {
+        row[position]
+        for indexes in positions
+        for row in rows
+        for position in indexes
+        if row[position] is not None and row[position] >= 0
+    }
+    if not codes:
+        return {}
+    values = store._dict.decode_many(list(codes))
+    views = {}
+    for code, spelling in zip(codes, values, strict=True):
+        if spelling is None:
+            raise ValueError(f"term code {code} is not in the store dictionary")
+        views[code] = parse_spelling(spelling)
+    return views
