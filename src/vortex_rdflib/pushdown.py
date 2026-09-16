@@ -182,6 +182,35 @@ def _trace_event(event: str, **fields) -> None:
         trace.emit(event, **fields)
 
 
+def _native_count(store, pattern) -> int:
+    """Count a native pattern and record its boundary cost when tracing."""
+    started = time.perf_counter_ns() if _TRACE.get() is not None else 0
+    result = store._store().count_quads(*pattern)
+    _trace_event(
+        "native_call_complete",
+        operation="count_quads",
+        pattern=list(pattern),
+        returned_rows=result,
+        elapsed_ns=time.perf_counter_ns() - started if started else 0,
+    )
+    return result
+
+
+def _native_match(store, pattern):
+    """Match a native pattern and record its boundary cost when tracing."""
+    started = time.perf_counter_ns() if _TRACE.get() is not None else 0
+    result = store._store().match_codes(*pattern)
+    rows = None if result is None else len(result[0])
+    _trace_event(
+        "native_call_complete",
+        operation="match_codes",
+        pattern=list(pattern),
+        returned_rows=rows,
+        elapsed_ns=time.perf_counter_ns() - started if started else 0,
+    )
+    return result
+
+
 def _relation_rows(rel: "Relation") -> int | None:
     if rel.rows is not None:
         return len(rel.rows)
@@ -778,7 +807,7 @@ def _eval_aggregate(ctx, store, part):
             not distinct and (target == "*" or target in pat["varpos"] or ctx[target] is not None)
             for _, target, distinct in counts
         ):
-            n = 0 if pat["unsatisfiable"] else store._store().count_quads(*pat["n3"])
+            n = 0 if pat["unsatisfiable"] else _native_count(store, pat["n3"])
             return iter([FrozenBindings(ctx, {res: Literal(n) for res, _, _ in counts})])
 
     rel = _solve_block(ctx, store, block, scope=scope)
@@ -945,12 +974,20 @@ def _block_nonempty(ctx, store, block) -> bool:
             return False
         if all(len(pos) == 1 for pos in pat["varpos"].values()):
             # Existence needs no rows: count from the row selection.
-            return store._store().count_quads(*pat["n3"]) > 0
+            return _native_count(store, pat["n3"]) > 0
     rel = _solve_block(ctx, store, block, scope=scope)
     return next(_code_rows(rel), None) is not None
 
 
-def _solve_block(ctx, store, node, env=frozenset(), var_preds=None, scope=None) -> Relation:
+def _solve_block(
+    ctx,
+    store,
+    node,
+    env=frozenset(),
+    var_preds=None,
+    scope=None,
+    early_tuple_conjuncts=(),
+) -> Relation:
     """Solve a block into a relation.
 
     ``env`` is the set of variables an enclosing lazy join or OPTIONAL binds
@@ -971,7 +1008,7 @@ def _solve_block(ctx, store, node, env=frozenset(), var_preds=None, scope=None) 
         trace.depth += 1
     try:
         if name == "BGP":
-            rel = _solve_bgp(ctx, store, node.triples, scope, var_preds)
+            rel = _solve_bgp(ctx, store, node.triples, scope, var_preds, early_tuple_conjuncts)
         elif name == "Filter":
             rel = _solve_filter(ctx, store, node, env, var_preds, scope)
         elif name == "Join":
@@ -1090,11 +1127,27 @@ def _solve_filter(ctx, store, node, env, var_preds, scope) -> Relation:
             residual.extend(conjuncts)
         else:
             pushed[var] = pushed.get(var, []) + conjuncts
-    rel = _solve_block(ctx, store, inner, env, pushed or None, scope)
+    rel = _solve_block(
+        ctx,
+        store,
+        inner,
+        env,
+        pushed or None,
+        scope,
+        residual if inner.name == "BGP" else (),
+    )
     if residual:
+        positions = [
+            [rel.schema.index(variable) for variable in conjunct.vars] for conjunct in residual
+        ]
+        shared_views = (
+            filters.prepare_tuple_views(store, residual, positions, rel.rows)
+            if rel.rows is not None
+            else None
+        )
         preds = tuple(
-            filters.tuple_predicate(store, conjunct, [rel.schema.index(v) for v in conjunct.vars])
-            for conjunct in residual
+            filters.tuple_predicate(store, conjunct, indexes, shared_views)
+            for conjunct, indexes in zip(residual, positions, strict=True)
         )
         rel = _filter_relation(rel, preds)
     for exists in plan.exists:
@@ -1472,7 +1525,7 @@ def _pattern_trace_shape(ctx, triple) -> dict:
     }
 
 
-def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
+def _solve_bgp(ctx, store, triples, scope, var_preds=None, early_tuple_conjuncts=()) -> Relation:
     """Evaluate a BGP by matching one seed and probing connected patterns."""
     trace = _TRACE.get()
     traced = trace is not None
@@ -1574,7 +1627,7 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
 
     then = time.perf_counter_ns() if traced else 0
     stats = {}
-    rel = _join_patterns(store, patterns, stats)
+    rel = _join_patterns(store, patterns, stats, early_tuple_conjuncts)
     total_join_ns = time.perf_counter_ns() - then if then else 0
     native_ns = stats["native_ns"]
     restriction_ns = stats["restriction_ns"]
@@ -1622,7 +1675,7 @@ def _count_pattern(store, pat, counts: dict) -> int:
     key = tuple(pat["n3"])
     n = counts.get(key)
     if n is None:
-        n = counts[key] = store._store().count_quads(*key)
+        n = counts[key] = _native_count(store, key)
     return n
 
 
@@ -1646,7 +1699,7 @@ def _match_resolved_pattern(store, pat, memo=None) -> tuple[int, int]:
     cols = memo.get(key) if memo is not None else None
     calls = 0
     if cols is None:
-        cols = store._store().match_codes(*key)
+        cols = _native_match(store, key)
         if cols is None:
             raise NotImplementedError
         if memo is not None:
@@ -1660,7 +1713,7 @@ def _match_resolved_pattern(store, pat, memo=None) -> tuple[int, int]:
     return calls, time.perf_counter_ns() - then if then else 0
 
 
-def _join_incremental_bgp(store, patterns) -> tuple[Relation, dict]:
+def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Relation, dict]:
     """Seed with the smallest pattern, then extend one connected pattern at
     a time.
 
@@ -1686,6 +1739,30 @@ def _join_incremental_bgp(store, patterns) -> tuple[Relation, dict]:
         "native_ns": 0,
         "restriction_ns": 0,
     }
+
+    def apply_early_filters(schema, cols, rows, pending):
+        ready = tuple(
+            conjunct
+            for conjunct in pending
+            if conjunct.fast is not None and all(variable in schema for variable in conjunct.vars)
+        )
+        if not ready:
+            return schema, cols, rows, pending
+        if cols is not None:
+            rows = _cols_to_rows(cols)
+            cols = None
+        positions = [[schema.index(variable) for variable in conjunct.vars] for conjunct in ready]
+        views = filters.prepare_tuple_views(store, ready, positions, rows)
+        predicates = tuple(
+            filters.tuple_fast_reject_predicate(store, conjunct, indexes, views)
+            for conjunct, indexes in zip(ready, positions, strict=True)
+        )
+        rows = [row for row in rows if all(predicate(row) for predicate in predicates)]
+        pending = tuple(conjunct for conjunct in pending if conjunct not in ready)
+        return schema, cols, rows, pending
+
+    early_tuple_conjuncts = tuple(early_tuple_conjuncts)
+
     traced = _TRACE.get() is not None
     then = time.perf_counter_ns() if traced else 0
     for pat in sorted(patterns, key=_pattern_static_rank):
@@ -1724,6 +1801,9 @@ def _join_incremental_bgp(store, patterns) -> tuple[Relation, dict]:
     _materialize_eager_restrictions(store, seed, ())
     stats["restriction_ns"] += time.perf_counter_ns() - then if then else 0
     schema, cols, rows = _pattern_body(seed)
+    schema, cols, rows, early_tuple_conjuncts = apply_early_filters(
+        schema, cols, rows, early_tuple_conjuncts
+    )
     order = [seed.get("index")]
     _trace_event(
         "bgp_seed_complete",
@@ -1786,6 +1866,10 @@ def _join_incremental_bgp(store, patterns) -> tuple[Relation, dict]:
                 schema, rows = _join(schema, rows, schema_b, rows_b)
                 strategy = "hash_rows"
             source = "matched"
+
+        schema, cols, rows, early_tuple_conjuncts = apply_early_filters(
+            schema, cols, rows, early_tuple_conjuncts
+        )
 
         _trace_event(
             "bgp_join_step_complete",
@@ -2067,17 +2151,26 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
     keep_b = [i for i, v in enumerate(schema_b) if v not in schema_a]
     schema = schema_a + tuple(schema_b[i] for i in keep_b)
     table: dict = {}
-    setdefault = table.setdefault
     for j, key in enumerate(cols_b[ib]):
-        setdefault(key, []).append(j)
+        previous = table.get(key)
+        if previous is None:
+            table[key] = j
+        elif isinstance(previous, list):
+            previous.append(j)
+        else:
+            table[key] = [previous, j]
     a_idx = []
     b_idx = []
     get = table.get
     for i, key in enumerate(cols_a[ia]):
         hits = get(key)
-        if hits:
-            a_idx += [i] * len(hits)
-            b_idx += hits
+        if hits is not None:
+            if isinstance(hits, list):
+                a_idx += [i] * len(hits)
+                b_idx += hits
+            else:
+                a_idx.append(i)
+                b_idx.append(hits)
     out = [array("I", map(col.__getitem__, a_idx)) for col in cols_a]
     out += [array("I", map(cols_b[i].__getitem__, b_idx)) for i in keep_b]
     return schema, tuple(out)
@@ -2101,7 +2194,7 @@ def _materialize_eager_restrictions(store, pat, bound) -> None:
         pat["_trace_match_rows"] = input_rows
 
 
-def _join_patterns(store, patterns, stats=None) -> Relation:
+def _join_patterns(store, patterns, stats=None, early_tuple_conjuncts=()) -> Relation:
     """Join a BGP through the incremental planner.
 
     Keep this function as the observable BGP join boundary. Existing tests,
@@ -2109,7 +2202,7 @@ def _join_patterns(store, patterns, stats=None) -> Relation:
     two-argument signature. _solve_bgp passes an optional dictionary to
     receive physical native-call and timing counters.
     """
-    rel, measured = _join_incremental_bgp(store, patterns)
+    rel, measured = _join_incremental_bgp(store, patterns, early_tuple_conjuncts)
     if stats is not None:
         stats.update(measured)
     return rel
@@ -2162,7 +2255,7 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
                 ):
                     satisfiable = False
                 n3[idx] = term
-        matched = False
+            matched = False
         if not satisfiable:
             pass
         elif not free:
@@ -2253,25 +2346,50 @@ def _join(schema_a, rows_a, schema_b, rows_b):
     key_a = itemgetter(*(schema_a.index(v) for v in shared))
     key_b = itemgetter(*(schema_b.index(v) for v in shared))
     table: dict = {}
-    setdefault = table.setdefault
     if not keep_b:
         for rb in rows_b:
-            setdefault(key_b(rb), []).append(())
+            key = key_b(rb)
+            previous = table.get(key)
+            if previous is None:
+                table[key] = ()
+            elif isinstance(previous, list):
+                previous.append(())
+            else:
+                table[key] = [previous, ()]
     elif len(keep_b) == 1:
         tail_of = itemgetter(keep_b[0])
         for rb in rows_b:
-            setdefault(key_b(rb), []).append((tail_of(rb),))
+            key = key_b(rb)
+            tail = (tail_of(rb),)
+            previous = table.get(key)
+            if previous is None:
+                table[key] = tail
+            elif isinstance(previous, list):
+                previous.append(tail)
+            else:
+                table[key] = [previous, tail]
     else:
         tail_of = itemgetter(*keep_b)
         for rb in rows_b:
-            setdefault(key_b(rb), []).append(tail_of(rb))
+            key = key_b(rb)
+            tail = tail_of(rb)
+            previous = table.get(key)
+            if previous is None:
+                table[key] = tail
+            elif isinstance(previous, list):
+                previous.append(tail)
+            else:
+                table[key] = [previous, tail]
     out: list = []
     extend = out.extend
     get = table.get
     for ra in rows_a:
         tails = get(key_a(ra))
-        if tails:
-            extend(ra + tail for tail in tails)
+        if tails is not None:
+            if isinstance(tails, list):
+                extend(ra + tail for tail in tails)
+            else:
+                out.append(ra + tails)
     return schema, out
 
 

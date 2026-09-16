@@ -234,6 +234,7 @@ def test_add_graph_is_a_no_op(quad_store):
 def test_dictionary_graph_uses_code_path(vortex_files, monkeypatch):
     store = VortexRdflibStore(str(vortex_files["dictionary"]))
     assert store._dict is not None  # code path active
+    assert store.max_resident_bytes == 1 << 30
 
     monkeypatch.setenv("VORTEX_RDF_DISABLE_CODE_PATH", "1")
     disabled = VortexRdflibStore(str(vortex_files["dictionary"]))
