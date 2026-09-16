@@ -1008,9 +1008,7 @@ def _solve_block(
         trace.depth += 1
     try:
         if name == "BGP":
-            rel = _solve_bgp(
-                ctx, store, node.triples, scope, var_preds, early_tuple_conjuncts
-            )
+            rel = _solve_bgp(ctx, store, node.triples, scope, var_preds, early_tuple_conjuncts)
         elif name == "Filter":
             rel = _solve_filter(ctx, store, node, env, var_preds, scope)
         elif name == "Join":
@@ -1140,8 +1138,7 @@ def _solve_filter(ctx, store, node, env, var_preds, scope) -> Relation:
     )
     if residual:
         positions = [
-            [rel.schema.index(variable) for variable in conjunct.vars]
-            for conjunct in residual
+            [rel.schema.index(variable) for variable in conjunct.vars] for conjunct in residual
         ]
         shared_views = (
             filters.prepare_tuple_views(store, residual, positions, rel.rows)
@@ -1528,9 +1525,7 @@ def _pattern_trace_shape(ctx, triple) -> dict:
     }
 
 
-def _solve_bgp(
-    ctx, store, triples, scope, var_preds=None, early_tuple_conjuncts=()
-) -> Relation:
+def _solve_bgp(ctx, store, triples, scope, var_preds=None, early_tuple_conjuncts=()) -> Relation:
     """Evaluate a BGP by matching one seed and probing connected patterns."""
     trace = _TRACE.get()
     traced = trace is not None
@@ -1718,9 +1713,7 @@ def _match_resolved_pattern(store, pat, memo=None) -> tuple[int, int]:
     return calls, time.perf_counter_ns() - then if then else 0
 
 
-def _join_incremental_bgp(
-    store, patterns, early_tuple_conjuncts=()
-) -> tuple[Relation, dict]:
+def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Relation, dict]:
     """Seed with the smallest pattern, then extend one connected pattern at
     a time.
 
@@ -1751,18 +1744,14 @@ def _join_incremental_bgp(
         ready = tuple(
             conjunct
             for conjunct in pending
-            if conjunct.fast is not None
-            and all(variable in schema for variable in conjunct.vars)
+            if conjunct.fast is not None and all(variable in schema for variable in conjunct.vars)
         )
         if not ready:
             return schema, cols, rows, pending
         if cols is not None:
             rows = _cols_to_rows(cols)
             cols = None
-        positions = [
-            [schema.index(variable) for variable in conjunct.vars]
-            for conjunct in ready
-        ]
+        positions = [[schema.index(variable) for variable in conjunct.vars] for conjunct in ready]
         views = filters.prepare_tuple_views(store, ready, positions, rows)
         predicates = tuple(
             filters.tuple_fast_reject_predicate(store, conjunct, indexes, views)
@@ -1881,7 +1870,6 @@ def _join_incremental_bgp(
         schema, cols, rows, early_tuple_conjuncts = apply_early_filters(
             schema, cols, rows, early_tuple_conjuncts
         )
-
 
         _trace_event(
             "bgp_join_step_complete",
