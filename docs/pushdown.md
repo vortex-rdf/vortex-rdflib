@@ -30,7 +30,7 @@ functions registered in `rdflib.plugins.sparql.CUSTOM_EVALS` before running
 its own evaluator. Constructing a
 [`VortexRdflibStore`](../src/vortex_rdflib/store.py#L49) registers one such
 hook
-([`pushdown.register_sparql_pushdown`](../src/vortex_rdflib/pushdown.py#L193)).
+([`pushdown.register_sparql_pushdown`](../src/vortex_rdflib/pushdown.py#L222)).
 The hook looks at the node's name and for:
 
 - a node it handles, over a graph whose store is a `VortexRdflibStore` with the
@@ -106,7 +106,7 @@ with it everything below, which rdflib never sees again. In that one call:
    [`_solve_block`](../src/vortex_rdflib/pushdown.py#L982).
 2. `isIRI(?o)` references a single block variable, so it becomes a
    *per-variable predicate*
-   [pushed into the scans](../src/vortex_rdflib/pushdown.py#L1088-L1092) rather
+   [pushed into the scans](../src/vortex_rdflib/pushdown.py#L1125-L1129) rather
    than a test applied to returned solutions.
 3. Both triple patterns resolve to the same quad pattern, scoped to the
    active graph — a variable is `None` in a resolved pattern, so only the
@@ -537,7 +537,7 @@ described above.
 graph the query is active in.
 [`_pattern_terms`](../src/vortex_rdflib/pushdown.py#L1962) builds a **quad**
 pattern, whose fourth position is
-[`VortexRdflibStore._graph_n3(ctx.graph)`](../src/vortex_rdflib/store.py#L174)
+[`VortexRdflibStore._graph_n3(ctx.graph)`](../src/vortex_rdflib/store.py#L185)
 — `None` (the wildcard over every graph) for a union default graph, `""` for
 the default graph of a `Dataset` without union, the graph's own name inside
 a `GRAPH` block. Every `match_codes` and `count_quads` in this document

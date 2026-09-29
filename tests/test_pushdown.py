@@ -3,7 +3,7 @@ evaluator — every query shape is run both ways and compared exactly, on a
 file-backed and on an in-memory store."""
 
 import pytest
-from rdflib import Dataset, Graph, Literal, URIRef
+from rdflib import Dataset, Graph, Literal, URIRef, Variable
 from rdflib.plugins.sparql.sparql import QueryContext
 from vortex_rdf import serialize_rdf
 
@@ -889,6 +889,22 @@ def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
     )
     assert rows == [(URIRef("http://ex.org/s0"), URIRef("http://ex.org/o0"))]
     assert probes, "the skewed join did not take the probe path"
+
+
+def test_probe_join_pads_rows_when_the_pattern_shares_no_variable(graph):
+    """A left-join probe keeps each relation row that finds no continuation,
+    padded with None — also when the pattern shares no variable with the
+    relation, so nothing is substituted per row. No caller probes such a
+    pattern today, but `_probe_join` must not rely on that."""
+    pattern = {
+        "n3": [None, "<http://ex.org/nothing>", None, None],
+        "varpos": {Variable("x"): [0], Variable("a"): [2]},
+    }
+    schema, rows = pd._probe_join(
+        graph.store, (Variable("z"),), [(0,), (1,)], pattern, keep_unmatched=True
+    )
+    assert schema == (Variable("z"), Variable("x"), Variable("a"))
+    assert rows == [(0, None, None), (1, None, None)]
 
 
 def test_hash_joined_bgp_keeps_a_columnar_body(graph, monkeypatch):

@@ -357,6 +357,28 @@ def test_ctx_bound_constants_are_substituted():
     assert fast_answer(unbound, typed("5", "integer")) is False  # unbound ?w is an error
 
 
+def test_fast_reject_predicate_keeps_a_row_the_filter_keeps_over_an_unbound_variable(tmp_path):
+    """The mid-join pre-filter may drop only rows the FILTER drops. With `?w`
+    unbound, `!bound(?w) || ?v < ?w` holds, so the row is kept — the
+    missing code is not looked up as a term."""
+    from vortex_rdf import serialize_rdf
+
+    from vortex_rdflib import VortexRdflibStore
+
+    five = typed("5", "integer")
+    nt = tmp_path / "five.nt"
+    nt.write_text(f"<http://ex.org/s> <http://ex.org/p> {five} .\n", encoding="utf-8")
+    out = tmp_path / "five.vortex"
+    serialize_rdf(str(nt), str(out), layout="dictionary")
+    store = VortexRdflibStore(str(out))
+    dictionary = store._dict
+    assert dictionary is not None  # the code path is active
+    expr = filter_expr("!bound(?w) || ?v < ?w")
+    conjunct = filters.Conjunct(expr, (V, W), filters.compile_fast(expr, (V, W), {}), False)
+    keep = filters.tuple_fast_reject_predicate(store, conjunct, [0, 1])
+    assert keep((dictionary.encode(five), None)) is True
+
+
 def test_parse_spelling_round_trips_escapes():
     assert parse_spelling('"a\\"b\\n\\u0041"') == TermView(LITERAL, 'a"b\nA')
     assert parse_spelling('"x"@en-us') == TermView(LITERAL, "x", lang="en-us")

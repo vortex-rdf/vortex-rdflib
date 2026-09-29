@@ -4,6 +4,7 @@ from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, ConjunctiveGraph
 
 from conftest import GRAPH_1, GRAPH_2, LAYOUTS
 from vortex_rdflib import VortexRdflibStore
+from vortex_rdflib.store import _FILE_DICT_RESIDENCY
 
 FOAF_NAME = URIRef("http://xmlns.com/foaf/0.1/name")
 FOAF_KNOWS = URIRef("http://xmlns.com/foaf/0.1/knows")
@@ -232,9 +233,12 @@ def test_add_graph_is_a_no_op(quad_store):
 
 
 def test_dictionary_graph_uses_code_path(vortex_files, monkeypatch):
+    # The file-backed residency default applies only when nothing overrides it.
+    monkeypatch.delenv("VORTEX_RDF_IN_MEMORY", raising=False)
+    monkeypatch.delenv("VORTEX_RDF_DICT_MAX_RESIDENT_BYTES", raising=False)
     store = VortexRdflibStore(str(vortex_files["dictionary"]))
     assert store._dict is not None  # code path active
-    assert store.max_resident_bytes == 1 << 30
+    assert store.max_resident_bytes == _FILE_DICT_RESIDENCY
 
     monkeypatch.setenv("VORTEX_RDF_DISABLE_CODE_PATH", "1")
     disabled = VortexRdflibStore(str(vortex_files["dictionary"]))

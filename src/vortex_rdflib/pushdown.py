@@ -2217,10 +2217,10 @@ def _materialize_eager_restrictions(store, pat, bound) -> None:
 def _join_patterns(store, patterns, stats=None, early_tuple_conjuncts=()) -> Relation:
     """Join a BGP through the incremental planner.
 
-    Keep this function as the observable BGP join boundary. Existing tests,
-    diagnostics, and callers can continue to wrap it with the historical
-    two-argument signature. _solve_bgp passes an optional dictionary to
-    receive physical native-call and timing counters.
+    Keep this function as the observable BGP join boundary: tests and
+    diagnostics wrap it. _solve_bgp also passes an optional dictionary to
+    receive physical native-call and timing counters, and the FILTER
+    conjuncts over several variables that may prune the relation mid-join.
     """
     rel, measured = _join_incremental_bgp(store, patterns, early_tuple_conjuncts)
     if stats is not None:
@@ -2275,7 +2275,7 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
                 ):
                     satisfiable = False
                 n3[idx] = term
-            matched = False
+        matched = False
         if not satisfiable:
             pass
         elif not free:
