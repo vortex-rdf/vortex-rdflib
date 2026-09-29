@@ -18,7 +18,10 @@ _UNRESOLVED = object()
 
 # Keep the dictionary resident for file-backed RDFLib stores so the code-space
 # evaluator remains available. The native default is 512 MiB, which leaves the
-# BSBM 100k dictionary file-backed and disables pushdown entirely.
+# BSBM 100k dictionary file-backed and disables pushdown entirely. Applied only
+# when nothing else decides the budget: an explicit `max_resident_bytes` is
+# passed through, and `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES`, an in-memory open
+# (resident regardless) or a disabled code path leave the native policy.
 _FILE_DICT_RESIDENCY = 1 << 30
 
 #: How the native layer spells the default graph: the fourth column of a quad
@@ -88,9 +91,11 @@ class VortexRdflibStore(Store):
         if in_memory is None:
             in_memory = os.environ.get("VORTEX_RDF_IN_MEMORY") == "1"
         self.in_memory = in_memory
+        self._use_codes = os.environ.get("VORTEX_RDF_DISABLE_CODE_PATH") != "1"
         if (
             max_resident_bytes is None
             and not in_memory
+            and self._use_codes
             and "VORTEX_RDF_DICT_MAX_RESIDENT_BYTES" not in os.environ
         ):
             max_resident_bytes = _FILE_DICT_RESIDENCY
@@ -112,7 +117,6 @@ class VortexRdflibStore(Store):
         self._all_contexts: list | None = None
         # Whether a blank node names a graph of this file (see _blank_graph_n3).
         self._blank_graphs: dict[str, bool] = {}
-        self._use_codes = os.environ.get("VORTEX_RDF_DISABLE_CODE_PATH") != "1"
 
         # Whole-BGP pushdown into code space (no-op for non-Vortex graphs;
         # VORTEX_RDF_DISABLE_PUSHDOWN=1 keeps rdflib's default evaluator).

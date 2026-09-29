@@ -250,6 +250,35 @@ def test_dictionary_graph_uses_code_path(vortex_files, monkeypatch):
     assert got_codes == got_strings and len(got_codes) == 5
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "env", "expected"),
+    [
+        ({"max_resident_bytes": 4096}, {}, 4096),
+        ({}, {"VORTEX_RDF_DICT_MAX_RESIDENT_BYTES": "4096"}, None),
+        ({"in_memory": True}, {}, None),
+        ({}, {"VORTEX_RDF_DISABLE_CODE_PATH": "1"}, None),
+    ],
+    ids=["explicit-budget", "native-env-budget", "in-memory", "code-path-disabled"],
+)
+def test_file_residency_default_yields_to_every_override(
+    vortex_files, monkeypatch, kwargs, env, expected
+):
+    """The file-backed residency default applies only when nothing else
+    decides the budget: an explicit budget is passed through, and the native
+    env budget, an in-memory open (resident regardless) or a disabled code
+    path (which never reads the dictionary) leave the native policy (None)."""
+    for name in (
+        "VORTEX_RDF_IN_MEMORY",
+        "VORTEX_RDF_DICT_MAX_RESIDENT_BYTES",
+        "VORTEX_RDF_DISABLE_CODE_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    store = VortexRdflibStore(str(vortex_files["dictionary"]), **kwargs)
+    assert store.max_resident_bytes == expected
+
+
 def test_in_memory_graph_equality(vortex_files):
     on_file = Graph(store=VortexRdflibStore(str(vortex_files["dictionary"])))
     in_mem = Graph(store=VortexRdflibStore(str(vortex_files["dictionary"]), in_memory=True))

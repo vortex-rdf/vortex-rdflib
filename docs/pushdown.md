@@ -1,7 +1,7 @@
 # SPARQL pushdown
 
 `vortex-rdflib` answers SPARQL with rdflib's engine, but a
-[`VortexRdflibStore`](../src/vortex_rdflib/store.py#L49) can do more than
+[`VortexRdflibStore`](../src/vortex_rdflib/store.py#L52) can do more than
 serve quad patterns: it hooks into rdflib's algebra evaluation and answers
 the operators it understands in **code space**, i.e., over the `u32` term
 codes of a Dictionary-layout store, handing everything else back to rdflib
@@ -28,13 +28,14 @@ rdflib evaluates a query as a tree of algebra operators (`Project`,
 `Filter`, `LeftJoin`, `BGP`, ...) and, for **every** node, offers it to the
 functions registered in `rdflib.plugins.sparql.CUSTOM_EVALS` before running
 its own evaluator. Constructing a
-[`VortexRdflibStore`](../src/vortex_rdflib/store.py#L49) registers one such
+[`VortexRdflibStore`](../src/vortex_rdflib/store.py#L52) registers one such
 hook
 ([`pushdown.register_sparql_pushdown`](../src/vortex_rdflib/pushdown.py#L222)).
 The hook looks at the node's name and for:
 
 - a node it handles, over a graph whose store is a `VortexRdflibStore` with the
-  code path available (Dictionary layout, resident term dictionary), is
+  code path available (Dictionary layout, resident term dictionary — a
+  file-backed store keeps one of up to 1 GiB resident, see the README), is
   answered in code space;
 - anything else raises `NotImplementedError`, which rdflib takes as
   "fallback to default behavior": it evaluates that node itself and,
@@ -537,7 +538,7 @@ described above.
 graph the query is active in.
 [`_pattern_terms`](../src/vortex_rdflib/pushdown.py#L1962) builds a **quad**
 pattern, whose fourth position is
-[`VortexRdflibStore._graph_n3(ctx.graph)`](../src/vortex_rdflib/store.py#L185)
+[`VortexRdflibStore._graph_n3(ctx.graph)`](../src/vortex_rdflib/store.py#L189)
 — `None` (the wildcard over every graph) for a union default graph, `""` for
 the default graph of a `Dataset` without union, the graph's own name inside
 a `GRAPH` block. Every `match_codes` and `count_quads` in this document
@@ -603,7 +604,7 @@ to the wrong graph.
 | `VORTEX_RDF_TRACE_QUERY=1` | Print the plan of every intercepted query as JSON lines on stderr, one per step — each prefixed `VORTEX_RDF_QUERY_TRACE ` and carrying `schema: vortex-rdf-query-trace-v1`, the event name and a sequence number: the head planned, each pattern counted/matched/probed/restricted, each join step and its strategy, the ORDER BY ranking, the rows decoded. `VORTEX_RDF_TRACE_QUERY_ID` labels the lines of one query. Read at query time, not at construction. |
 
 The switches are read when a
-[`VortexRdflibStore`](../src/vortex_rdflib/store.py#L49) is constructed. The
+[`VortexRdflibStore`](../src/vortex_rdflib/store.py#L52) is constructed. The
 default evaluator is the oracle of the test suite:
 [`tests/test_pushdown.py`](../tests/test_pushdown.py) runs every query shape
 (≈280) with the pushdown and without, on a file-backed and an in-memory

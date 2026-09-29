@@ -123,10 +123,14 @@ in-memory store they change nothing measurable, since the rows are resident
 already, and on multi-pattern joins the run-to-run spread is wider than any
 effect they have. Enable them for lookup-heavy file-backed workloads.
 
-For Dictionary-layout files, the term dictionary is held in memory when it
-fits the residency budget; pass `VortexRdflibStore(path, max_resident_bytes=...)`
-(the dictionary's compressed size in bytes) to raise the budget
-(recommended for large stores).
+For Dictionary-layout files, the term dictionary is held in memory when its
+compressed size fits the residency budget, and the pushdown and the `u32`
+code path need it resident. A file-backed `VortexRdflibStore` raises the
+native 512 MiB budget to 1 GiB; pass `max_resident_bytes=...` (the
+dictionary's compressed size in bytes) to set it yourself, or set
+`VORTEX_RDF_DICT_MAX_RESIDENT_BYTES` to give the native layer a process-wide
+budget instead. In-memory stores keep the dictionary resident regardless, and
+with the code path disabled the native budget is left alone.
 
 ## Environment variables
 
@@ -134,6 +138,7 @@ fits the residency budget; pass `VortexRdflibStore(path, max_resident_bytes=...)
 | --- | --- |
 | `VORTEX_RDF_IN_MEMORY=1` | Load stores into memory instead of file-backed lazy open |
 | `VORTEX_RDF_DISABLE_CODE_PATH=1` | Force the N-Triples string path instead of `u32` codes |
+| `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES=<bytes>` | Process-wide term-dictionary residency budget, read by the native layer; file-backed stores then stop defaulting to 1 GiB |
 | `VORTEX_RDF_DISABLE_PUSHDOWN=1` | Keep rdflib's default evaluator for every operator (see [docs/pushdown.md](docs/pushdown.md)) |
 | `VORTEX_RDF_PUSHDOWN_OPS=<list>` | Only push down the listed algebra nodes (`bgp` = basic graph patterns only) |
 | `VORTEX_RDF_FILTER_FAST=0` | Evaluate every FILTER value through rdflib's expression evaluator (still once per distinct value) |
