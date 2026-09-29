@@ -144,6 +144,10 @@ class _QueryTrace:
     query_id: str | None
     sequence: int = 0
     depth: int = 0
+    # Lines wait here until flush(), which runs once the planning (or the
+    # iteration) they describe is over, so a slow stderr never lands in the
+    # timed windows the events report.
+    pending: list = field(default_factory=list)
 
     def emit(self, event: str, **fields) -> None:
         self.sequence += 1
@@ -155,12 +159,19 @@ class _QueryTrace:
             **fields,
         }
         try:
-            print(
-                _TRACE_PREFIX + json.dumps(payload, separators=(",", ":"), allow_nan=False),
-                file=sys.stderr,
-                flush=True,
-            )
-        except (OSError, TypeError, ValueError):
+            line = json.dumps(payload, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError):
+            _TRACE.set(None)
+            return
+        self.pending.append(_TRACE_PREFIX + line)
+
+    def flush(self) -> None:
+        if not self.pending:
+            return
+        lines, self.pending = self.pending, []
+        try:
+            print("\n".join(lines), file=sys.stderr, flush=True)
+        except OSError:
             _TRACE.set(None)
 
 
@@ -182,33 +193,51 @@ def _trace_event(event: str, **fields) -> None:
         trace.emit(event, **fields)
 
 
-def _native_count(store, pattern) -> int:
-    """Count a native pattern and record its boundary cost when tracing."""
-    started = time.perf_counter_ns() if _TRACE.get() is not None else 0
-    result = store._store().count_quads(*pattern)
-    _trace_event(
-        "native_call_complete",
-        operation="count_quads",
-        pattern=list(pattern),
-        returned_rows=result,
-        elapsed_ns=time.perf_counter_ns() - started if started else 0,
-    )
-    return result
+class _TracedNative:
+    """The native store with every call recorded as a ``native_call_complete``
+    event: its operation, pattern, rows returned and elapsed time. Handed out
+    by :func:`_native` while a query is traced, so each native call the
+    pushdown makes is an event, the per-row probes included."""
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def count_quads(self, *pattern):
+        started = time.perf_counter_ns()
+        result = self._inner.count_quads(*pattern)
+        elapsed = time.perf_counter_ns() - started
+        _trace_event(
+            "native_call_complete",
+            operation="count_quads",
+            pattern=list(pattern),
+            returned_rows=result,
+            elapsed_ns=elapsed,
+        )
+        return result
+
+    def match_codes(self, *pattern):
+        started = time.perf_counter_ns()
+        result = self._inner.match_codes(*pattern)
+        elapsed = time.perf_counter_ns() - started
+        _trace_event(
+            "native_call_complete",
+            operation="match_codes",
+            pattern=list(pattern),
+            returned_rows=None if result is None else len(result[0]),
+            elapsed_ns=elapsed,
+        )
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
-def _native_match(store, pattern):
-    """Match a native pattern and record its boundary cost when tracing."""
-    started = time.perf_counter_ns() if _TRACE.get() is not None else 0
-    result = store._store().match_codes(*pattern)
-    rows = None if result is None else len(result[0])
-    _trace_event(
-        "native_call_complete",
-        operation="match_codes",
-        pattern=list(pattern),
-        returned_rows=rows,
-        elapsed_ns=time.perf_counter_ns() - started if started else 0,
-    )
-    return result
+def _native(store):
+    """The store's native handle, traced while the query is."""
+    native = store._store()
+    return native if _TRACE.get() is None else _TracedNative(native)
 
 
 def _relation_rows(rel: "Relation") -> int | None:
@@ -271,11 +300,15 @@ def _eval_part(ctx, part):
         result = globals()[handler](ctx, store, part)
     except NotImplementedError:
         _trace_event("eval_part_fallback", algebra_node=part.name)
+        if active is not None:
+            active.flush()
         if token is not None:
             _TRACE.reset(token)
         raise
     except Exception as error:
         _trace_event("eval_part_failed", algebra_node=part.name, error_type=type(error).__name__)
+        if active is not None:
+            active.flush()
         if token is not None:
             _TRACE.reset(token)
         raise
@@ -285,6 +318,8 @@ def _eval_part(ctx, part):
         handled=True,
         elapsed_ns=time.perf_counter_ns() - started if active is not None else 0,
     )
+    if active is not None:
+        active.flush()  # the planning is over: nothing below is timed any more
     if token is not None:
         # Generators keep the trace object explicitly through _yield_rows.
         if hasattr(result, "__next__"):
@@ -318,6 +353,7 @@ def _trace_generator(iterator, trace: _QueryTrace, token):
                 rows_yielded=rows,
                 elapsed_ns=time.perf_counter_ns() - started,
             )
+            trace.flush()
         finally:
             _TRACE.reset(inner_token)
 
@@ -807,7 +843,7 @@ def _eval_aggregate(ctx, store, part):
             not distinct and (target == "*" or target in pat["varpos"] or ctx[target] is not None)
             for _, target, distinct in counts
         ):
-            n = 0 if pat["unsatisfiable"] else _native_count(store, pat["n3"])
+            n = 0 if pat["unsatisfiable"] else _native(store).count_quads(*pat["n3"])
             return iter([FrozenBindings(ctx, {res: Literal(n) for res, _, _ in counts})])
 
     rel = _solve_block(ctx, store, block, scope=scope)
@@ -974,30 +1010,43 @@ def _block_nonempty(ctx, store, block) -> bool:
             return False
         if all(len(pos) == 1 for pos in pat["varpos"].values()):
             # Existence needs no rows: count from the row selection.
-            return _native_count(store, pat["n3"]) > 0
+            return _native(store).count_quads(*pat["n3"]) > 0
     rel = _solve_block(ctx, store, block, scope=scope)
     return next(_code_rows(rel), None) is not None
 
 
-def _solve_block(
-    ctx,
-    store,
-    node,
-    env=frozenset(),
-    var_preds=None,
-    scope=None,
-    early_tuple_conjuncts=(),
-) -> Relation:
+class _Pushed(dict):
+    """The filter conjuncts a FILTER hands down into its block. As a dict,
+    each variable's single-variable conjuncts, for the scans that bind it;
+    ``tuples``, the fast conjuncts over several variables, which a BGP that
+    binds all of theirs may prune with mid-join (a pre-filter: the FILTER
+    still applies them); ``views``, the terms parsed for those, shared with
+    the FILTER so none is decoded twice. They travel together wherever the
+    block solvers pass them — a group join's sides, an OPTIONAL's or a
+    MINUS's left side, a GRAPH block — and never an OPTIONAL's or a MINUS's
+    right side, where dropping a row would change the answer. Empty, it is
+    falsy like ``None``."""
+
+    __slots__ = ("tuples", "views")
+
+    def __init__(self, per_var=(), tuples=(), views=None):
+        super().__init__(per_var)
+        self.tuples = tuple(tuples)
+        self.views = {} if views is None else views
+
+
+def _solve_block(ctx, store, node, env=frozenset(), var_preds=None, scope=None) -> Relation:
     """Solve a block into a relation.
 
     ``env`` is the set of variables an enclosing lazy join or OPTIONAL binds
     row by row in rdflib's evaluation — here the sides are solved
     independently and joined, which is only exact while nothing inside
     depends on those values (a FILTER that could see them falls back).
-    ``var_preds`` are single-variable filter conjuncts pushed down to the
-    pattern scans binding the variable. ``scope`` is the graph every pattern
-    below is matched in (:class:`_GraphScope`); ``None`` means the graph the
-    context has made active.
+    ``var_preds`` (a :class:`_Pushed`) are the filter conjuncts a FILTER
+    above pushed down: single-variable ones to the pattern scans binding the
+    variable, tuple ones to the BGPs binding all of theirs. ``scope`` is the
+    graph every pattern below is matched in (:class:`_GraphScope`); ``None``
+    means the graph the context has made active.
     """
     if scope is None:
         scope = _active_scope(ctx, store)
@@ -1008,7 +1057,7 @@ def _solve_block(
         trace.depth += 1
     try:
         if name == "BGP":
-            rel = _solve_bgp(ctx, store, node.triples, scope, var_preds, early_tuple_conjuncts)
+            rel = _solve_bgp(ctx, store, node.triples, scope, var_preds)
         elif name == "Filter":
             rel = _solve_filter(ctx, store, node, env, var_preds, scope)
         elif name == "Join":
@@ -1089,7 +1138,7 @@ def _constant_code(store, term, graph_n3) -> int:
             raise NotImplementedError
         return code
     n3 = term.n3()
-    count = store._store().count_quads
+    count = _native(store).count_quads
     positions = [(None, None, n3, graph_n3)]
     if not isinstance(term, Literal):
         positions.append((n3, None, None, graph_n3))
@@ -1120,33 +1169,33 @@ def _solve_filter(ctx, store, node, env, var_preds, scope) -> Relation:
         if not filters.evaluate_constant(conjunct):
             return Relation.from_rows(tuple(block_vars), [])
     nullable = _block_nullable(inner)
-    pushed = dict(var_preds or {})
+    outer = var_preds if var_preds is not None else _Pushed()
+    fast_tuples = tuple(conjunct for conjunct in plan.tuples if conjunct.fast is not None)
+    pushed = _Pushed(outer, outer.tuples + fast_tuples, outer.views)
     residual = list(plan.tuples)
     for var, conjuncts in plan.per_var.items():
         if var in nullable:
             residual.extend(conjuncts)
         else:
             pushed[var] = pushed.get(var, []) + conjuncts
-    rel = _solve_block(
-        ctx,
-        store,
-        inner,
-        env,
-        pushed or None,
-        scope,
-        residual if inner.name == "BGP" else (),
-    )
+    rel = _solve_block(ctx, store, inner, env, pushed, scope)
     if residual:
         positions = [
             [rel.schema.index(variable) for variable in conjunct.vars] for conjunct in residual
         ]
-        shared_views = (
-            filters.prepare_tuple_views(store, residual, positions, rel.rows)
-            if rel.rows is not None
-            else None
-        )
+        views = pushed.views
+        if rel.rows is not None:
+            # Only the fast route reads parsed terms; a generic-only conjunct
+            # decodes through the store's own term cache.
+            columns = {
+                index
+                for conjunct, indexes in zip(residual, positions, strict=True)
+                if conjunct.fast is not None
+                for index in indexes
+            }
+            filters.prime_tuple_views(store, rel.rows, columns, views)
         preds = tuple(
-            filters.tuple_predicate(store, conjunct, indexes, shared_views)
+            filters.tuple_predicate(store, conjunct, indexes, views)
             for conjunct, indexes in zip(residual, positions, strict=True)
         )
         rel = _filter_relation(rel, preds)
@@ -1228,7 +1277,7 @@ def _unwrap_empty_joins(node):
 def _probe_exists(store, schema, rows, pat) -> list:
     """Whether the pattern, with each row's codes substituted, matches at
     least one quad — one ``count_quads`` per row, no row materialized."""
-    count = store._store().count_quads
+    count = _native(store).count_quads
     bound = [(schema.index(v), pos) for v, pos in pat["varpos"].items() if v in schema]
     n3_cache = _probe_spellings(store, rows, bound)
     out = []
@@ -1525,7 +1574,7 @@ def _pattern_trace_shape(ctx, triple) -> dict:
     }
 
 
-def _solve_bgp(ctx, store, triples, scope, var_preds=None, early_tuple_conjuncts=()) -> Relation:
+def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
     """Evaluate a BGP by matching one seed and probing connected patterns."""
     trace = _TRACE.get()
     traced = trace is not None
@@ -1627,7 +1676,7 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None, early_tuple_conjuncts
 
     then = time.perf_counter_ns() if traced else 0
     stats = {}
-    rel = _join_patterns(store, patterns, stats, early_tuple_conjuncts)
+    rel = _join_patterns(store, patterns, stats, var_preds)
     total_join_ns = time.perf_counter_ns() - then if then else 0
     native_ns = stats["native_ns"]
     restriction_ns = stats["restriction_ns"]
@@ -1675,7 +1724,7 @@ def _count_pattern(store, pat, counts: dict) -> int:
     key = tuple(pat["n3"])
     n = counts.get(key)
     if n is None:
-        n = counts[key] = _native_count(store, key)
+        n = counts[key] = _native(store).count_quads(*key)
     return n
 
 
@@ -1699,7 +1748,7 @@ def _match_resolved_pattern(store, pat, memo=None) -> tuple[int, int]:
     cols = memo.get(key) if memo is not None else None
     calls = 0
     if cols is None:
-        cols = _native_match(store, key)
+        cols = _native(store).match_codes(*key)
         if cols is None:
             raise NotImplementedError
         if memo is not None:
@@ -1713,7 +1762,7 @@ def _match_resolved_pattern(store, pat, memo=None) -> tuple[int, int]:
     return calls, time.perf_counter_ns() - then if then else 0
 
 
-def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Relation, dict]:
+def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]:
     """Seed with the smallest pattern, then extend one connected pattern at
     a time.
 
@@ -1740,44 +1789,8 @@ def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Re
         "restriction_ns": 0,
     }
 
-    def apply_early_filters(schema, cols, rows, pending, remaining):
-        """Prune the running relation with the fast conjuncts its schema now
-        covers, when that pays. A conjunct costs a few µs a row to evaluate,
-        far more than a join step spends on the row, so pruning pays only by
-        letting a remaining pattern be probed instead of matched whole — the
-        planner's own test, `survivors * _PROBE_FANOUT < estimate`. The rows
-        stream, evaluation stops once too many survive for that, and the
-        conjunct is left to the FILTER above the BGP, which streams it over a
-        columnar body, so a LIMIT stops it early."""
-        ready = tuple(
-            conjunct
-            for conjunct in pending
-            if conjunct.fast is not None and all(variable in schema for variable in conjunct.vars)
-        )
-        if not ready:
-            return schema, cols, rows, pending
-        probeable = max(
-            (pat["estimate"] for pat in remaining if any(v in schema for v in pat["varpos"])),
-            default=0,
-        )
-        if _PROBE_FANOUT >= probeable:  # not even one survivor would be probed
-            return schema, cols, rows, pending
-        pending = tuple(conjunct for conjunct in pending if conjunct not in ready)
-        predicates = tuple(
-            filters.tuple_fast_reject_predicate(
-                store, conjunct, [schema.index(variable) for variable in conjunct.vars]
-            )
-            for conjunct in ready
-        )
-        kept = []
-        for row in rows if cols is None else _column_rows(cols, len(cols[0])):
-            if all(predicate(row) for predicate in predicates):
-                kept.append(row)
-                if len(kept) * _PROBE_FANOUT >= probeable:
-                    return schema, cols, rows, pending
-        return schema, None, kept, pending
-
-    early_tuple_conjuncts = tuple(early_tuple_conjuncts)
+    tuples = pushed.tuples if pushed is not None else ()
+    views = pushed.views if pushed is not None else {}
 
     traced = _TRACE.get() is not None
     then = time.perf_counter_ns() if traced else 0
@@ -1817,9 +1830,6 @@ def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Re
     _materialize_eager_restrictions(store, seed, ())
     stats["restriction_ns"] += time.perf_counter_ns() - then if then else 0
     schema, cols, rows = _pattern_body(seed)
-    schema, cols, rows, early_tuple_conjuncts = apply_early_filters(
-        schema, cols, rows, early_tuple_conjuncts, remaining
-    )
     order = [seed.get("index")]
     _trace_event(
         "bgp_seed_complete",
@@ -1830,6 +1840,7 @@ def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Re
         native_call_count=calls,
         native_match_ns=native_ns,
     )
+    cols, rows, tuples = _prune_early(store, schema, cols, rows, tuples, remaining, views)
 
     execution_index = 1
     while remaining and (len(cols[0]) if cols is not None else len(rows)):
@@ -1883,10 +1894,6 @@ def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Re
                 strategy = "hash_rows"
             source = "matched"
 
-        schema, cols, rows, early_tuple_conjuncts = apply_early_filters(
-            schema, cols, rows, early_tuple_conjuncts, remaining
-        )
-
         _trace_event(
             "bgp_join_step_complete",
             execution_index=execution_index,
@@ -1905,6 +1912,7 @@ def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Re
             shared_variable_count=len(shared),
             elapsed_ns=time.perf_counter_ns() - step_then if step_then else 0,
         )
+        cols, rows, tuples = _prune_early(store, schema, cols, rows, tuples, remaining, views)
         execution_index += 1
 
     for pat in remaining:
@@ -1926,6 +1934,64 @@ def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Re
     if cols is not None:
         return Relation(schema, cols, None, len(cols[0])), stats
     return Relation.from_rows(schema, rows), stats
+
+
+def _prune_early(store, schema, cols, rows, pending, remaining, views):
+    """Prune a BGP's running relation with the pending tuple conjuncts its
+    schema now covers, when that pays. A conjunct costs a few µs a row to
+    evaluate, far more than a join step spends on the row, so pruning pays
+    only by letting a remaining pattern be probed instead of matched whole —
+    the planner's own test, `survivors * _PROBE_FANOUT < estimate`. The rows
+    stream, evaluation stops once too many survive for that, and the
+    conjunct is left to the FILTER above the BGP, which streams it over a
+    columnar body, so a LIMIT stops it early.
+
+    ``views`` is the parsed-term cache it shares with that FILTER. Returns
+    ``(cols, rows, pending)``: the body, pruned or as it was, and the
+    conjuncts not yet evaluated.
+    """
+    ready, waiting = [], []
+    for conjunct in pending:
+        (ready if all(v in schema for v in conjunct.vars) else waiting).append(conjunct)
+    if not ready:
+        return cols, rows, pending
+    probeable = max(
+        (pat["estimate"] for pat in remaining if any(v in schema for v in pat["varpos"])),
+        default=0,
+    )
+    if _PROBE_FANOUT >= probeable:  # not even one survivor would be probed
+        return cols, rows, pending
+    started = time.perf_counter_ns() if _TRACE.get() is not None else 0
+    predicates = tuple(
+        filters.tuple_fast_reject_predicate(
+            store, conjunct, [schema.index(variable) for variable in conjunct.vars], views
+        )
+        for conjunct in ready
+    )
+    input_rows = len(rows) if cols is None else len(cols[0])
+    kept = []
+    evaluated = 0
+    deferred = False
+    for row in rows if cols is None else _column_rows(cols, input_rows):
+        evaluated += 1
+        if all(predicate(row) for predicate in predicates):
+            kept.append(row)
+            if len(kept) * _PROBE_FANOUT >= probeable:
+                deferred = True
+                break
+    _trace_event(
+        "bgp_prune_complete",
+        conjunct_count=len(ready),
+        probe_estimate=probeable,
+        input_rows=input_rows,
+        evaluated_rows=evaluated,
+        output_rows=input_rows if deferred else len(kept),
+        pruned=not deferred,
+        elapsed_ns=time.perf_counter_ns() - started if started else 0,
+    )
+    if deferred:
+        return cols, rows, tuple(waiting)
+    return None, kept, tuple(waiting)
 
 
 def _plan_pattern_side(ctx, store, triple, scope, left: Relation, left_rows, var_preds):
@@ -2170,6 +2236,10 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
     ib = schema_b.index(shared[0])
     keep_b = [i for i, v in enumerate(schema_b) if v not in schema_a]
     schema = schema_a + tuple(schema_b[i] for i in keep_b)
+    # Build side: a key seen once maps to its bare value, a key seen again to
+    # a list, so the unique keys that dominate allocate none. Inlined here and
+    # per tail shape in _join, since a shared helper costs this loop up to 19%;
+    # test_hash_join_kernels_join_like_a_nested_loop pins every copy.
     table: dict = {}
     for j, key in enumerate(cols_b[ib]):
         previous = table.get(key)
@@ -2214,15 +2284,16 @@ def _materialize_eager_restrictions(store, pat, bound) -> None:
         pat["_trace_match_rows"] = input_rows
 
 
-def _join_patterns(store, patterns, stats=None, early_tuple_conjuncts=()) -> Relation:
+def _join_patterns(store, patterns, stats=None, pushed=None) -> Relation:
     """Join a BGP through the incremental planner.
 
     Keep this function as the observable BGP join boundary: tests and
     diagnostics wrap it. _solve_bgp also passes an optional dictionary to
-    receive physical native-call and timing counters, and the FILTER
-    conjuncts over several variables that may prune the relation mid-join.
+    receive physical native-call and timing counters, and the filters a
+    FILTER above pushed down (:class:`_Pushed`), whose tuple conjuncts may
+    prune the relation mid-join.
     """
-    rel, measured = _join_incremental_bgp(store, patterns, early_tuple_conjuncts)
+    rel, measured = _join_incremental_bgp(store, patterns, pushed)
     if stats is not None:
         stats.update(measured)
     return rel
@@ -2242,7 +2313,7 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
     row; with ``keep_unmatched`` a row without a continuation is kept,
     padded with None (a left join).
     """
-    native = store._store()
+    native = _native(store)
     match = native.match_codes
     count = native.count_quads
     bound = [(schema.index(v), pos) for v, pos in pat["varpos"].items() if v in schema]
@@ -2365,6 +2436,7 @@ def _join(schema_a, rows_a, schema_b, rows_b):
 
     key_a = itemgetter(*(schema_a.index(v) for v in shared))
     key_b = itemgetter(*(schema_b.index(v) for v in shared))
+    # The build-side encoding of _join_columns, inlined once per tail shape.
     table: dict = {}
     if not keep_b:
         for rb in rows_b:

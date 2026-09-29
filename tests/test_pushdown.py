@@ -2,6 +2,11 @@
 evaluator — every query shape is run both ways and compared exactly, on a
 file-backed and on an in-memory store."""
 
+import io
+import json
+import sys
+import time
+
 import pytest
 from rdflib import Dataset, Graph, Literal, URIRef, Variable
 from rdflib.plugins.sparql.sparql import QueryContext
@@ -537,6 +542,30 @@ ORDER_QUERIES += [
         ORDER BY ?x ?y""",
 ]
 
+#: Two-variable FILTERs over composite blocks. Their fast conjuncts reach
+#: every BGP the single-variable ones do, as a mid-join pre-filter (always
+#: applied under the probe-forcing runs, `_PROBE_FANOUT = 0`): a group
+#: join's sides and an OPTIONAL's or a MINUS's left side, never their right
+#: side, where dropping a row would change the answer.
+QUERIES += [
+    """SELECT ?x ?a ?s WHERE {
+        { ?x <http://ex.org/score> ?s . ?x <http://ex.org/age> ?a . ?x <http://ex.org/name> ?n }
+        { ?x <http://ex.org/name> ?m }
+        FILTER(?a < ?s) }""",
+    """SELECT ?x ?a ?w WHERE {
+        ?x <http://ex.org/score> ?s . ?x <http://ex.org/age> ?a . ?x <http://ex.org/name> ?n
+        OPTIONAL { ?x <http://ex.org/weight> ?w }
+        FILTER(?a < ?s) }""",
+    """SELECT ?x ?a ?s WHERE {
+        ?x <http://ex.org/age> ?a . ?x <http://ex.org/name> ?n
+        OPTIONAL { ?x <http://ex.org/score> ?s }
+        FILTER(!bound(?s) || ?a < ?s) }""",
+    """SELECT ?x ?a WHERE {
+        ?x <http://ex.org/score> ?s . ?x <http://ex.org/age> ?a . ?x <http://ex.org/name> ?n
+        MINUS { ?x <http://ex.org/weight> ?w }
+        FILTER(?a < ?s) }""",
+]
+
 #: Shapes that name a graph. rdflib evaluates the `Graph` node itself — a
 #: bound name scopes the block below, an unbound one fans out over the
 #: store's graphs — so what is under test here is that every pushed-down
@@ -638,6 +667,12 @@ GRAPH_QUERIES = [
         ?s <http://ex.org/name> ?n
         OPTIONAL { ?s <http://ex.org/knows> ?k
                    FILTER EXISTS { ?s <http://ex.org/age> ?a } } }""",
+    # a two-variable FILTER over a graph block: its fast conjunct reaches the
+    # BGP inside, as the single-variable ones do
+    """SELECT ?x ?y WHERE {
+        GRAPH ?g { ?x <http://ex.org/knows> ?y . ?x <http://ex.org/name> ?n .
+                   ?y <http://ex.org/name> ?m }
+        FILTER(?n != ?m) }""",
 ]
 
 
@@ -928,25 +963,29 @@ _XSD_INTEGER = "http://www.w3.org/2001/XMLSchema#integer"
 
 
 def _three_predicate_graph(
-    tmp_path, q_subject: str, q_value, n: int = 50, r_per_subject: int = 2
+    tmp_path, q_subject: str, q_value, n: int = 50, r_per_subject: int = 2, graph_name=None
 ) -> Graph:
     """`n` subjects `s{i}` with an integer `p` of `i` and `r_per_subject`
     `r` values each (`r{j}` for every `j` congruent to `i` mod `n`), plus `n`
     integer `q` values `q_value(i)` on subjects `{q_subject}{i}`. `r` is
-    counted above `p` and `q`, so the planner joins it last."""
+    counted above `p` and `q`, so the planner joins it last. With
+    `graph_name` every statement is in that named graph, over a Dataset."""
+    end = " .\n" if graph_name is None else f" <{graph_name}> .\n"
     lines = []
     for i in range(n):
-        lines.append(f'<http://ex.org/s{i}> <http://ex.org/p> "{i}"^^<{_XSD_INTEGER}> .\n')
-        lines.append(
-            f'<http://ex.org/{q_subject}{i}> <http://ex.org/q> "{q_value(i)}"^^<{_XSD_INTEGER}> .\n'
-        )
+        q = f'"{q_value(i)}"^^<{_XSD_INTEGER}>'
+        lines.append(f'<http://ex.org/s{i}> <http://ex.org/p> "{i}"^^<{_XSD_INTEGER}>{end}')
+        lines.append(f"<http://ex.org/{q_subject}{i}> <http://ex.org/q> {q}{end}")
     for j in range(r_per_subject * n):
-        lines.append(f'<http://ex.org/s{j % n}> <http://ex.org/r> "r{j}" .\n')
-    nt = tmp_path / "data.nt"
-    nt.write_text("".join(lines), encoding="utf-8")
+        lines.append(f'<http://ex.org/s{j % n}> <http://ex.org/r> "r{j}"{end}')
+    source = tmp_path / ("data.nt" if graph_name is None else "data.nq")
+    source.write_text("".join(lines), encoding="utf-8")
     out = tmp_path / "data.vortex"
-    serialize_rdf(str(nt), str(out), layout="dictionary")
-    return Graph(store=VortexRdflibStore(str(out)))
+    if graph_name is None:
+        serialize_rdf(str(source), str(out), layout="dictionary")
+        return Graph(store=VortexRdflibStore(str(out)))
+    serialize_rdf(str(source), str(out), layout="dictionary", format="nquads")
+    return Dataset(store=VortexRdflibStore(str(out)), default_union=True)
 
 
 @pytest.mark.parametrize(
@@ -1035,27 +1074,148 @@ def test_limit_streams_a_tuple_filter_over_a_hash_join(tmp_path, extra_pattern):
     assert counting.decoded < 1000, f"decoded {counting.decoded} codes for a LIMIT 5"
 
 
-def test_tuple_filter_prunes_a_bgp_so_a_remaining_pattern_is_probed(tmp_path, monkeypatch):
-    """When pruning lets a remaining pattern be probed instead of matched
-    whole, the FILTER prunes mid-join — BSBM Explore Q5's win. `?a < ?b`
-    holds for `s0` only, so one row survives the `p`/`q` join, and `r`'s 400
-    rows are probed from it (1 × 100 < 400) rather than matched and
-    hash-joined, as the unpruned 50 rows would be (50 × 100 ≥ 400)."""
-    graph = _three_predicate_graph(
-        tmp_path, "s", lambda i: 1000 if i == 0 else i - 1000, r_per_subject=8
-    )
-    probes = []
-    original = pd._probe_join
-    monkeypatch.setattr(pd, "_probe_join", lambda *a: probes.append(1) or original(*a))
+def test_filter_decodes_a_generic_only_conjunct_once(tmp_path):
+    """A FILTER conjunct with no fast route is answered by rdflib's evaluator
+    over the store's decoded terms, so the batch decode that readies the fast
+    route's parsed terms must skip it: each of the 20 `?a` and 20 `?b` codes
+    of this 400-row cross product is decoded once."""
+    graph = _three_predicate_graph(tmp_path, "t", lambda i: i + 1000, n=20)
     register_sparql_pushdown()
+    counting = _counting_term_dict(graph)
     rows = run(
         graph,
-        """SELECT ?c WHERE {
+        """SELECT ?a WHERE {
+            ?s <http://ex.org/p> ?a .
+            ?t <http://ex.org/q> ?b
+            FILTER(CONCAT(STR(?a), STR(?b)) = "x") }""",
+    )
+    assert rows == []
+    assert counting.decoded == 40
+
+
+def test_filter_reuses_the_terms_its_early_pass_decoded(tmp_path):
+    """Terms a mid-join FILTER attempt decoded before deferring are not
+    decoded again by the FILTER above. Pruning stops once 20 of the 1,000
+    `p`/`q` rows pass; the FILTER then reads all 2,000 joined rows, so each
+    of the 1,000 `?a` and 1,000 `?b` codes is decoded once, plus the 1,000
+    subjects the answer names."""
+    graph = _three_predicate_graph(tmp_path, "s", lambda i: i + 1000, n=1000)
+    register_sparql_pushdown()
+    counting = _counting_term_dict(graph)
+    rows = run(
+        graph,
+        """SELECT ?s WHERE {
             ?s <http://ex.org/p> ?a .
             ?s <http://ex.org/q> ?b .
             ?s <http://ex.org/r> ?c
             FILTER(?a < ?b) }""",
     )
+    assert len(rows) == 2000
+    assert counting.decoded == 3000
+
+
+def _trace_events(text: str) -> list[dict]:
+    """The query-trace events printed to ``text`` (captured stderr)."""
+    prefix = pd._TRACE_PREFIX
+    return [
+        json.loads(line[len(prefix) :]) for line in text.splitlines() if line.startswith(prefix)
+    ]
+
+
+_PRUNED_SQL = """SELECT ?c WHERE {
+    ?s <http://ex.org/p> ?a .
+    ?s <http://ex.org/q> ?b .
+    ?s <http://ex.org/r> ?c
+    FILTER(?a < ?b) }"""
+
+
+def _pruned_graph(tmp_path) -> Graph:
+    """`?a < ?b` holds for `s0` only, and `r` (400 rows) is large enough for
+    the one surviving row to be probed into: `_PRUNED_SQL` prunes mid-join."""
+    return _three_predicate_graph(
+        tmp_path, "s", lambda i: 1000 if i == 0 else i - 1000, r_per_subject=8
+    )
+
+
+def test_trace_records_every_native_call(tmp_path, monkeypatch, capsys):
+    """Every native call a traced query makes is a `native_call_complete`
+    event, the per-row probes included, so the events add up to the calls
+    the store served: 3 counts, the `p` and `q` matches and 1 probe of `r`."""
+    graph = _pruned_graph(tmp_path)
+    register_sparql_pushdown()
+    native = _counting_native(graph)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    run(graph, _PRUNED_SQL)
+    trace = _trace_events(capsys.readouterr().err)
+    calls = [e for e in trace if e["event"] == "native_call_complete"]
+    assert (native.counts, native.matches) == (3, 3)
+    assert len(calls) == native.counts + native.matches
+
+
+def test_trace_reports_a_mid_join_prune_between_the_steps_it_links(tmp_path, monkeypatch, capsys):
+    """A mid-join prune is its own trace event, so row counts reconcile step
+    to step: the `p`/`q` join's 50 rows are the prune's input, and its one
+    surviving row is the input of the `r` probe that follows."""
+    graph = _pruned_graph(tmp_path)
+    register_sparql_pushdown()
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    run(graph, _PRUNED_SQL)
+    trace = _trace_events(capsys.readouterr().err)
+    steps = [e for e in trace if e["event"] == "bgp_join_step_complete"]
+    prunes = [e for e in trace if e["event"] == "bgp_prune_complete"]
+    assert len(prunes) == 1 and prunes[0]["pruned"] is True
+    prune = prunes[0]
+    assert (steps[0]["output_rows"], prune["input_rows"]) == (50, 50)
+    assert (prune["output_rows"], steps[1]["input_rows"]) == (1, 1)
+
+
+def test_trace_output_is_not_timed_as_native_work(tmp_path, monkeypatch):
+    """Trace lines are written after the planning they describe, so however
+    slowly stderr takes them, the native time the events report is the
+    native calls' own: a 20 ms write must not show up in it."""
+    graph = _three_predicate_graph(tmp_path, "s", lambda i: i + 1000, n=5)
+    register_sparql_pushdown()
+
+    class _SlowStderr(io.StringIO):
+        def write(self, text):
+            time.sleep(0.02)
+            return super().write(text)
+
+    slow = _SlowStderr()
+    monkeypatch.setattr(sys, "stderr", slow)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    run(graph, "SELECT ?s WHERE { ?s <http://ex.org/p> ?a . ?s <http://ex.org/q> ?b }")
+    done = next(e for e in _trace_events(slow.getvalue()) if e["event"] == "bgp_complete")
+    assert done["native_match_ns"] < 20_000_000
+
+
+@pytest.mark.parametrize("in_graph", [False, True], ids=["bgp", "graph-block"])
+def test_tuple_filter_prunes_a_bgp_so_a_remaining_pattern_is_probed(
+    tmp_path, monkeypatch, in_graph
+):
+    """When pruning lets a remaining pattern be probed instead of matched
+    whole, the FILTER prunes mid-join — BSBM Explore Q5's win. `?a < ?b`
+    holds for `s0` only, so one row survives the `p`/`q` join, and `r`'s 400
+    rows are probed from it (1 × 100 < 400) rather than matched and
+    hash-joined, as the unpruned 50 rows would be (50 × 100 ≥ 400). A GRAPH
+    block is no barrier: the conjunct reaches every BGP the FILTER's
+    single-variable conjuncts do."""
+    graph = _three_predicate_graph(
+        tmp_path,
+        "s",
+        lambda i: 1000 if i == 0 else i - 1000,
+        r_per_subject=8,
+        graph_name="http://ex.org/g" if in_graph else None,
+    )
+    probes = []
+    original = pd._probe_join
+    monkeypatch.setattr(pd, "_probe_join", lambda *a: probes.append(1) or original(*a))
+    register_sparql_pushdown()
+    patterns = "?s <http://ex.org/p> ?a . ?s <http://ex.org/q> ?b . ?s <http://ex.org/r> ?c"
+    body = f"GRAPH <http://ex.org/g> {{ {patterns} }}" if in_graph else patterns
+    rows = run(graph, f"SELECT ?c WHERE {{ {body} FILTER(?a < ?b) }}")
     assert sorted(str(row[0]) for row in rows) == sorted(f"r{j}" for j in range(0, 400, 50))
     assert probes, "the FILTER did not prune the relation down to a probe of r"
 
@@ -1112,6 +1272,32 @@ def test_columnar_join_matches_row_join():
     assert pd._cols_to_rows(cols) == expected
     # Several shared variables decline: the row join handles them.
     assert pd._join_columns(("k", "x"), cols_a, ("k", "x"), cols_a) is None
+
+
+@pytest.mark.parametrize("tail_width", [0, 1, 2], ids=["no-tail", "one-tail", "two-tails"])
+def test_hash_join_kernels_join_like_a_nested_loop(tail_width):
+    """Both kernels bucket the build side alike — a key seen once holds its
+    bare value, a key seen again a list — and so join exactly as a nested
+    loop does, in its order. The encoding is inlined per kernel and per tail
+    shape for speed; these keys hit every case of every copy: key 5 twice,
+    first at row index 0 with an empty tail (both falsy, which must not read
+    as absent), 7 twice, 9 three times, 3 once, 11 only on the build side,
+    and 5 probed twice."""
+    from array import array
+
+    keys_a = [5, 7, 9, 3, 5]
+    keys_b = [5, 7, 7, 9, 9, 9, 3, 11, 5]
+    rows_a = [(k, 100 + i) for i, k in enumerate(keys_a)]
+    rows_b = [(k, 200 + j, 300 + j)[: 1 + tail_width] for j, k in enumerate(keys_b)]
+    schema_a, schema_b = ("k", "x"), ("k", "y", "z")[: 1 + tail_width]
+    expected = [ra + rb[1:] for ra in rows_a for rb in rows_b if ra[0] == rb[0]]
+
+    assert pd._join(schema_a, rows_a, schema_b, rows_b) == (schema_a + schema_b[1:], expected)
+    cols_a = tuple(array("I", column) for column in zip(*rows_a, strict=True))
+    cols_b = tuple(array("I", column) for column in zip(*rows_b, strict=True))
+    joined = pd._join_columns(schema_a, cols_a, schema_b, cols_b)
+    assert joined is not None
+    assert pd._cols_to_rows(joined[1]) == expected
 
 
 def test_repeated_pattern_is_matched_once(graph):
