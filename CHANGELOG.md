@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.1.2...v0.1.3) - 2026-09-29
+
+### Changed
+
+- Optimize BSBM Q05 joins and filters ([`bf1dfac`](https://github.com/vortex-rdf/vortex-rdflib/commit/bf1dfac0fd0579bdff95f14909251d530cafbc51) by @fothot2)
+- Keep file-backed dictionaries resident for pushdown (store) ([`c80b557`](https://github.com/vortex-rdf/vortex-rdflib/commit/c80b55724d71694dd9267d38a37cf1e58694bc98) by @fothot2)
+- Prune mid-join only when a later pattern can be probed (pushdown) ([`0a7aa8c`](https://github.com/vortex-rdf/vortex-rdflib/commit/0a7aa8cbe04605237a672f415fdd1f601acda9f8) by @julianrojas87)
+
+### Fixed
+
+- Explicit validation of callable conjuct.fast ([`80b80a5`](https://github.com/vortex-rdf/vortex-rdflib/commit/80b80a5acbe5a9ea7367609e23d3030d11c49863) by @fothot2)
+- Documentation links ([`291542a`](https://github.com/vortex-rdf/vortex-rdflib/commit/291542a9330e444a96f6e36794b5ec316db69ee1) by @fothot2)
+- Remove dead code and fix latent review findings ([`00e077f`](https://github.com/vortex-rdf/vortex-rdflib/commit/00e077ff4d81fc9af012f9b551e6b4eebda90f22) by @julianrojas87)
+- Scope the residency default and add filter-band-probe (store,bench) ([`4b96350`](https://github.com/vortex-rdf/vortex-rdflib/commit/4b963502cbb98c07a2594f91c0a1fa75401170cd) by @julianrojas87)
+- Unify pushed filters, share decodes, reconcile the trace (pushdown) ([`12ecac1`](https://github.com/vortex-rdf/vortex-rdflib/commit/12ecac1f2f982c61d3c2c6cef59a6511ebd9da71) by @julianrojas87)
+
 ## [0.1.2](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.1.1...v0.1.2) - 2026-09-08
 
 ### Added
