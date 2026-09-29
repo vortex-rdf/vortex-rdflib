@@ -17,7 +17,9 @@ Four groups, mirroring how the dashboard panels are organized:
 - ``joins``    — anchored star-2/star-3, an unanchored 2-hop chain, an
   anchored OPTIONAL, an anchored join to a predicate scan under a language
   FILTER (BSBM Explore Q8's core: the filter must be evaluated over the
-  rows the anchor reaches, not the whole scan), a VALUES of 64 subjects
+  rows the anchor reaches, not the whole scan), a two-variable FILTER over
+  a hash join under a ``LIMIT 10`` (the filter must stream with the rows
+  the LIMIT pulls, not run over the whole join), a VALUES of 64 subjects
   joined to a predicate scan, a
   wide OPTIONAL (a whole predicate scan as the outer side), a NOT EXISTS
   over the same scan, and a MINUS of the filtered range
@@ -463,6 +465,18 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                   ?s {p_probe} ?v
                   FILTER(langMatches(lang(?v), "fr"))
                 }}
+            """),
+        ),
+        Query(
+            "filter-join-limit",
+            "joins",
+            _sparql(f"""
+                SELECT ?s ?a ?b WHERE {{
+                  ?s {p1} ?a .
+                  ?s {q_opt} ?b
+                  FILTER(?a != ?b)
+                }}
+                LIMIT 10
             """),
         ),
         Query(

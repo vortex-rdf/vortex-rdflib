@@ -908,6 +908,170 @@ def test_hash_joined_bgp_keeps_a_columnar_body(graph, monkeypatch):
     assert rels and rels[-1].cols is not None
 
 
+_XSD_INTEGER = "http://www.w3.org/2001/XMLSchema#integer"
+
+
+def _three_predicate_graph(
+    tmp_path, q_subject: str, q_value, n: int = 50, r_per_subject: int = 2
+) -> Graph:
+    """`n` subjects `s{i}` with an integer `p` of `i` and `r_per_subject`
+    `r` values each (`r{j}` for every `j` congruent to `i` mod `n`), plus `n`
+    integer `q` values `q_value(i)` on subjects `{q_subject}{i}`. `r` is
+    counted above `p` and `q`, so the planner joins it last."""
+    lines = []
+    for i in range(n):
+        lines.append(f'<http://ex.org/s{i}> <http://ex.org/p> "{i}"^^<{_XSD_INTEGER}> .\n')
+        lines.append(
+            f'<http://ex.org/{q_subject}{i}> <http://ex.org/q> "{q_value(i)}"^^<{_XSD_INTEGER}> .\n'
+        )
+    for j in range(r_per_subject * n):
+        lines.append(f'<http://ex.org/s{j % n}> <http://ex.org/r> "r{j}" .\n')
+    nt = tmp_path / "data.nt"
+    nt.write_text("".join(lines), encoding="utf-8")
+    out = tmp_path / "data.vortex"
+    serialize_rdf(str(nt), str(out), layout="dictionary")
+    return Graph(store=VortexRdflibStore(str(out)))
+
+
+@pytest.mark.parametrize(
+    ("extra_pattern", "expected_rows"),
+    [("", 25), ("?s <http://ex.org/r> ?c .", 50)],
+    ids=["ready-at-last-step", "ready-mid-join"],
+)
+def test_tuple_filtered_bgp_keeps_a_columnar_body(
+    tmp_path, monkeypatch, extra_pattern, expected_rows
+):
+    """A FILTER over two variables of a hash-joined BGP leaves its body
+    columnar when pruning cannot pay: at the last join step there is nothing
+    left to prune for, and mid-join `r`'s 100 rows are too few for any
+    pruned relation to be probed into (that takes fewer than 100 / 100).
+
+    `?a < ?b` holds for the even subjects only, and each subject has two `r`
+    values, so 25 rows over two patterns and 50 over three."""
+    graph = _three_predicate_graph(tmp_path, "s", lambda i: i + 1000 if i % 2 == 0 else i - 1000)
+    rels = []
+    original = pd._join_patterns
+    monkeypatch.setattr(pd, "_join_patterns", lambda *a: rels.append(original(*a)) or rels[-1])
+    register_sparql_pushdown()
+    rows = run(
+        graph,
+        f"""SELECT ?s WHERE {{
+            ?s <http://ex.org/p> ?a .
+            ?s <http://ex.org/q> ?b .
+            {extra_pattern}
+            FILTER(?a < ?b) }}""",
+    )
+    assert len(rows) == expected_rows
+    assert {str(row[0]) for row in rows} == {f"http://ex.org/s{i}" for i in range(0, 50, 2)}
+    assert rels and rels[-1].cols is not None, "the tuple FILTER materialized the BGP as rows"
+
+
+class _CountingTermDict:
+    """A TermDict stand-in that counts the codes the pushdown decodes."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.decoded = 0
+
+    def decode(self, code):
+        self.decoded += 1
+        return self._inner.decode(code)
+
+    def decode_many(self, codes):
+        codes = list(codes)
+        self.decoded += len(codes)
+        return self._inner.decode_many(codes)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _counting_term_dict(graph) -> _CountingTermDict:
+    """Install the counter over the store's resident term dictionary."""
+    counting = _CountingTermDict(graph.store._dict)
+    graph.store._dict = counting
+    return counting
+
+
+@pytest.mark.parametrize(
+    "extra_pattern", ["", "?s <http://ex.org/r> ?c ."], ids=["two-patterns", "three-patterns"]
+)
+def test_limit_streams_a_tuple_filter_over_a_hash_join(tmp_path, extra_pattern):
+    """Under a LIMIT, a FILTER over two variables of a hash-joined BGP runs
+    as the LIMIT pulls rows, not over the whole join first. All 1,000 `p`/`q`
+    rows pass and 5 are asked for: streaming decodes the few terms those rows
+    need, where evaluating the join first decodes its 2,000 distinct `?a` and
+    `?b` codes. With `r` still to join, the FILTER is evaluable mid-join, but
+    `r`'s 2,000 rows could only be probed from fewer than 20 survivors, so
+    pruning stops as soon as 20 pass and leaves the rest to stream."""
+    graph = _three_predicate_graph(tmp_path, "s", lambda i: i + 1000, n=1000)
+    register_sparql_pushdown()
+    counting = _counting_term_dict(graph)
+    rows = run(
+        graph,
+        f"""SELECT ?s WHERE {{
+            ?s <http://ex.org/p> ?a .
+            ?s <http://ex.org/q> ?b .
+            {extra_pattern}
+            FILTER(?a < ?b) }} LIMIT 5""",
+    )
+    assert len(rows) == 5
+    assert counting.decoded < 1000, f"decoded {counting.decoded} codes for a LIMIT 5"
+
+
+def test_tuple_filter_prunes_a_bgp_so_a_remaining_pattern_is_probed(tmp_path, monkeypatch):
+    """When pruning lets a remaining pattern be probed instead of matched
+    whole, the FILTER prunes mid-join — BSBM Explore Q5's win. `?a < ?b`
+    holds for `s0` only, so one row survives the `p`/`q` join, and `r`'s 400
+    rows are probed from it (1 × 100 < 400) rather than matched and
+    hash-joined, as the unpruned 50 rows would be (50 × 100 ≥ 400)."""
+    graph = _three_predicate_graph(
+        tmp_path, "s", lambda i: 1000 if i == 0 else i - 1000, r_per_subject=8
+    )
+    probes = []
+    original = pd._probe_join
+    monkeypatch.setattr(pd, "_probe_join", lambda *a: probes.append(1) or original(*a))
+    register_sparql_pushdown()
+    rows = run(
+        graph,
+        """SELECT ?c WHERE {
+            ?s <http://ex.org/p> ?a .
+            ?s <http://ex.org/q> ?b .
+            ?s <http://ex.org/r> ?c
+            FILTER(?a < ?b) }""",
+    )
+    assert sorted(str(row[0]) for row in rows) == sorted(f"r{j}" for j in range(0, 400, 50))
+    assert probes, "the FILTER did not prune the relation down to a probe of r"
+
+
+@pytest.mark.parametrize(
+    ("q_subject", "q_value", "condition", "r_per_subject"),
+    [("t", lambda i: i, "", 2), ("s", lambda i: i + 1000, "FILTER(?a > ?b)", 8)],
+    ids=["hash-join-runs-empty", "tuple-filter-rejects-all"],
+)
+def test_bgp_that_runs_empty_before_its_last_pattern(
+    tmp_path, q_subject, q_value, condition, r_per_subject
+):
+    """When the relation runs empty with a pattern still to join, the BGP
+    still answers over every variable its patterns name: a DISTINCT over the
+    variable only the unjoined `r` binds is empty, as rdflib says, rather
+    than an IndexError from a schema with more variables than columns.
+
+    In the first case `p` and `q` share no subject; in the second `?a > ?b`
+    holds for none of them, and `r`'s 400 rows make pruning worth trying, so
+    the FILTER empties the relation mid-join."""
+    graph = _three_predicate_graph(tmp_path, q_subject, q_value, r_per_subject=r_per_subject)
+    with_pushdown, without_pushdown = both_ways(
+        graph,
+        f"""SELECT DISTINCT ?c WHERE {{
+            ?s <http://ex.org/p> ?a .
+            ?s <http://ex.org/q> ?b .
+            ?s <http://ex.org/r> ?c
+            {condition} }}""",
+    )
+    assert with_pushdown == without_pushdown == []
+
+
 def test_columnar_join_matches_row_join():
     """The columnar kernel produces the row join's exact rows, in its exact
     order, and declines the shapes the row join handles."""

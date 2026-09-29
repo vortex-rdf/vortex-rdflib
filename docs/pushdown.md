@@ -162,12 +162,12 @@ so far (the smallest of all for a cross product) and decides by the counts:
 when the relation is at least
 [`_PROBE_FANOUT`](../src/vortex_rdflib/pushdown.py#L1511) (100) times
 smaller than the pattern's count, the pattern is re-matched natively per row
-of the relation ([`_probe_join`](../src/vortex_rdflib/pushdown.py#L2211))
+of the relation ([`_probe_join`](../src/vortex_rdflib/pushdown.py#L2231))
 and is never matched whole — an anchored star, a subject fixed by one
 selective pattern joined to two unselective legs, costs one match and one
 probe per leg; otherwise the pattern is matched once and hash-joined,
 gathering the matching rows into fresh `u32` columns — an index-gather,
-[`_join_columns`](../src/vortex_rdflib/pushdown.py#L2140) — so the running
+[`_join_columns`](../src/vortex_rdflib/pushdown.py#L2160) — so the running
 relation stays columnar and row tuples exist only where a consumer
 materializes them (a restricted or repeated-variable pattern, several shared
 variables, or a cross product drop to the row hash join). A block that is a
@@ -224,7 +224,15 @@ conjunct is classified by the block variables it references:
   "EN")` runs over one product's reviews, not over every review text in
   the store. A variable the relation already binds is not restricted
   again: the pattern that bound it did;
-- **several** — applied to the joined rows, memoized per distinct code tuple.
+- **several** — applied to the joined rows, memoized per distinct code
+  tuple, and streamed over a columnar body, so a `LIMIT` above stops it
+  early. A fast conjunct is also tried mid-join, once the relation binds
+  its variables, when pruning could let a remaining pattern be probed
+  rather than matched whole — the `_PROBE_FANOUT` test again. BSBM Explore
+  Q5 is the case: its similarity band prunes the candidate products, and
+  the next numeric property is then probed per survivor instead of matched
+  over every product. Evaluation stops as soon as too many rows pass for
+  that, leaving the conjunct to the joined rows.
 
 Every conjunct is evaluated **per distinct value, never per row**, through
 two routes:
@@ -400,7 +408,7 @@ with unbound variables (the hoisted condition is applied to candidate pairs
 before a row counts as matched), an anti-join, or a hash join (the right
 side deduplicated for a non-lazy join, as rdflib's `set(b)` does). When the
 inner side is one pattern, it is counted before it is matched
-([`_plan_pattern_side`](../src/vortex_rdflib/pushdown.py#L1911)): an outer
+([`_plan_pattern_side`](../src/vortex_rdflib/pushdown.py#L1931)): an outer
 relation at least [`_PROBE_FANOUT`](../src/vortex_rdflib/pushdown.py#L1511)
 times smaller than the count re-probes the pattern per outer row — unmatched
 rows padded, the hoisted condition applied per candidate — and the inner
@@ -527,7 +535,7 @@ described above.
 
 **Shape.** Not an algebra node of its own: every pattern above carries the
 graph the query is active in.
-[`_pattern_terms`](../src/vortex_rdflib/pushdown.py#L1942) builds a **quad**
+[`_pattern_terms`](../src/vortex_rdflib/pushdown.py#L1962) builds a **quad**
 pattern, whose fourth position is
 [`VortexRdflibStore._graph_n3(ctx.graph)`](../src/vortex_rdflib/store.py#L174)
 — `None` (the wildcard over every graph) for a union default graph, `""` for
@@ -556,7 +564,7 @@ they come from the same graph.
 `GRAPH` ranges over the *named* graphs, so the default graph's rows are
 dropped from a variable-scoped match. There is no "any named graph" native
 pattern, so
-[`_exclude_default_graph`](../src/vortex_rdflib/pushdown.py#L1991) restricts
+[`_exclude_default_graph`](../src/vortex_rdflib/pushdown.py#L2011) restricts
 the wildcard match afterwards: the graph column's distinct codes minus the
 default graph's, as a `keep` set, which every row path already applies (and
 which then narrows the values a `FILTER` on `?g` is evaluated over, so the
@@ -581,7 +589,7 @@ rdflib does evaluate a `Graph` node — in `bgp` mode, or above a block it
 declined — it writes `solution.ctx.graph` back as it yields, so the
 solutions of a block below it each carry their own context rather than
 sharing the caller's
-([`_pushed_graph`](../src/vortex_rdflib/pushdown.py#L2427)); otherwise that
+([`_pushed_graph`](../src/vortex_rdflib/pushdown.py#L2447)); otherwise that
 write would reach the rows still to come and send an OPTIONAL's right side
 to the wrong graph.
 
@@ -663,7 +671,7 @@ some pushdowns cheaper at scale; the Python side would detect them with
    in one call: all patterns parsed first (any malformed one → `ValueError`,
    nothing evaluated), one GIL release, results in input order, file-backed
    scans free to run concurrently. Used by every probe
-   ([`_probe_join`](../src/vortex_rdflib/pushdown.py#L2211),
+   ([`_probe_join`](../src/vortex_rdflib/pushdown.py#L2231),
    [`_probe_exists`](../src/vortex_rdflib/pushdown.py#L1228), the OPTIONAL
    probe): today 1,516 probes cost 1,516 × 45 µs in memory and 1,516 × ≈1 ms
    file-backed.
@@ -701,7 +709,7 @@ some pushdowns cheaper at scale; the Python side would detect them with
 8. **Native equi-join over code columns** — the matching row pairs of two
    matches' key columns, gathered into result columns in one GIL-released
    call: it would replace
-   [`_join_columns`](../src/vortex_rdflib/pushdown.py#L2140)' Python kernel.
+   [`_join_columns`](../src/vortex_rdflib/pushdown.py#L2160)' Python kernel.
    numpy was prototyped for that kernel and deliberately not shipped — the
    stdlib index-gather already captures most of the win (1M-row wide star:
    130 ms against numpy's 118 ms) and this primitive obsoletes both.

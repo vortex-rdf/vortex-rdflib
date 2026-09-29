@@ -1009,14 +1009,14 @@ def tuple_predicate(
 
 
 def tuple_fast_reject_predicate(
-    store, conjunct: Conjunct, positions: list, shared_views: dict | None = None
+    store, conjunct: Conjunct, positions: list
 ) -> Callable[[tuple], bool]:
     """Keep rows unless the exact fast route proves a conjunct false.
 
     UNKNOWN remains visible to the normal final predicate, preserving the
     generic RDFLib fallback for values outside the fast path's domain.
     """
-    views = {} if shared_views is None else shared_views
+    views: dict = {}
     memo: dict = {}
     fast = conjunct.fast
     if fast is None:

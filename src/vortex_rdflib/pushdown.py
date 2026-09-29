@@ -18,15 +18,15 @@ What runs in code space:
   relation is far smaller than the pattern's count (``_probe_join``) or
   matched once and hash-joined on ``u32`` code columns; a pattern that
   counts to nothing empties the block before anything is matched, and
-  intermediate results never decode a term;
+  the join itself never decodes a term;
 - a ``Filter`` over a block is split into conjuncts (:mod:`.filters`):
   those over one variable are evaluated once per distinct code of the
   variable, on the pattern that binds it — over the pattern's whole column
   when it is matched, over the codes the probes reach when it is probed —
-  the others once per distinct code tuple after the join; a whitelist of
-  expression shapes runs as predicates over the stored spellings, anything
-  else (and every value outside the fast path's exact domain) is answered
-  by rdflib's own evaluator, per distinct value instead of per row;
+  the others per distinct code tuple, after the join (mid-join when that
+  lets a later pattern be probed); a whitelist of expression shapes runs
+  over the stored spellings, anything else (and any value outside its exact
+  domain) goes to rdflib's own evaluator, per distinct value, not per row;
 - group joins (``Join``), ``OPTIONAL`` (``LeftJoin``), ``MINUS`` and
   ``FILTER (NOT) EXISTS`` over blocks run as hash joins, left joins, anti-
   and semi-joins over code tuples, with a one-pattern inner side counted
@@ -1740,7 +1740,15 @@ def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Re
         "restriction_ns": 0,
     }
 
-    def apply_early_filters(schema, cols, rows, pending):
+    def apply_early_filters(schema, cols, rows, pending, remaining):
+        """Prune the running relation with the fast conjuncts its schema now
+        covers, when that pays. A conjunct costs a few µs a row to evaluate,
+        far more than a join step spends on the row, so pruning pays only by
+        letting a remaining pattern be probed instead of matched whole — the
+        planner's own test, `survivors * _PROBE_FANOUT < estimate`. The rows
+        stream, evaluation stops once too many survive for that, and the
+        conjunct is left to the FILTER above the BGP, which streams it over a
+        columnar body, so a LIMIT stops it early."""
         ready = tuple(
             conjunct
             for conjunct in pending
@@ -1748,18 +1756,26 @@ def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Re
         )
         if not ready:
             return schema, cols, rows, pending
-        if cols is not None:
-            rows = _cols_to_rows(cols)
-            cols = None
-        positions = [[schema.index(variable) for variable in conjunct.vars] for conjunct in ready]
-        views = filters.prepare_tuple_views(store, ready, positions, rows)
-        predicates = tuple(
-            filters.tuple_fast_reject_predicate(store, conjunct, indexes, views)
-            for conjunct, indexes in zip(ready, positions, strict=True)
+        probeable = max(
+            (pat["estimate"] for pat in remaining if any(v in schema for v in pat["varpos"])),
+            default=0,
         )
-        rows = [row for row in rows if all(predicate(row) for predicate in predicates)]
+        if _PROBE_FANOUT >= probeable:  # not even one survivor would be probed
+            return schema, cols, rows, pending
         pending = tuple(conjunct for conjunct in pending if conjunct not in ready)
-        return schema, cols, rows, pending
+        predicates = tuple(
+            filters.tuple_fast_reject_predicate(
+                store, conjunct, [schema.index(variable) for variable in conjunct.vars]
+            )
+            for conjunct in ready
+        )
+        kept = []
+        for row in rows if cols is None else _column_rows(cols, len(cols[0])):
+            if all(predicate(row) for predicate in predicates):
+                kept.append(row)
+                if len(kept) * _PROBE_FANOUT >= probeable:
+                    return schema, cols, rows, pending
+        return schema, None, kept, pending
 
     early_tuple_conjuncts = tuple(early_tuple_conjuncts)
 
@@ -1802,7 +1818,7 @@ def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Re
     stats["restriction_ns"] += time.perf_counter_ns() - then if then else 0
     schema, cols, rows = _pattern_body(seed)
     schema, cols, rows, early_tuple_conjuncts = apply_early_filters(
-        schema, cols, rows, early_tuple_conjuncts
+        schema, cols, rows, early_tuple_conjuncts, remaining
     )
     order = [seed.get("index")]
     _trace_event(
@@ -1868,7 +1884,7 @@ def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Re
             source = "matched"
 
         schema, cols, rows, early_tuple_conjuncts = apply_early_filters(
-            schema, cols, rows, early_tuple_conjuncts
+            schema, cols, rows, early_tuple_conjuncts, remaining
         )
 
         _trace_event(
@@ -1903,6 +1919,10 @@ def _join_incremental_bgp(store, patterns, early_tuple_conjuncts=()) -> tuple[Re
         native_initial_match_count=stats["initial_calls"],
         native_probe_call_count=stats["probe_calls"],
     )
+    if remaining:
+        # The relation ran empty before these patterns were joined: the
+        # schema names their variables, which no column carries.
+        return Relation.from_rows(schema, []), stats
     if cols is not None:
         return Relation(schema, cols, None, len(cols[0])), stats
     return Relation.from_rows(schema, rows), stats
