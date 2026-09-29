@@ -16,6 +16,14 @@ from .terms import canonical_spelling, kind_bounds
 #: Sentinel for a cached lookup whose answer may legitimately be ``None``.
 _UNRESOLVED = object()
 
+# Keep the dictionary resident for file-backed RDFLib stores so the code-space
+# evaluator remains available. The native default is 512 MiB, which leaves the
+# BSBM 100k dictionary file-backed and disables pushdown entirely. Applied only
+# when nothing else decides the budget: an explicit `max_resident_bytes` is
+# passed through, and `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES`, an in-memory open
+# (resident regardless) or a disabled code path leave the native policy.
+_FILE_DICT_RESIDENCY = 1 << 30
+
 #: How the native layer spells the default graph: the fourth column of a quad
 #: no ``GRAPH`` names is the empty string, and ``""`` is also how a pattern
 #: selects those rows — ``None`` being the wildcard over every graph.
@@ -77,13 +85,21 @@ class VortexRdflibStore(Store):
         self.path = str(Path(path)) if path is not None else None
         self.layout = _LAYOUT_ALIASES.get(layout, layout) if layout else None
         self.backend = backend
-        self.max_resident_bytes = max_resident_bytes
         # File-backed lazy open by default; in-memory drops the ~1 ms per-call
         # file-scan floor (decisive for rdflib joins) at the cost of loading
         # the store up front. Env override for benchmark sweeps.
         if in_memory is None:
             in_memory = os.environ.get("VORTEX_RDF_IN_MEMORY") == "1"
         self.in_memory = in_memory
+        self._use_codes = os.environ.get("VORTEX_RDF_DISABLE_CODE_PATH") != "1"
+        if (
+            max_resident_bytes is None
+            and not in_memory
+            and self._use_codes
+            and "VORTEX_RDF_DICT_MAX_RESIDENT_BYTES" not in os.environ
+        ):
+            max_resident_bytes = _FILE_DICT_RESIDENCY
+        self.max_resident_bytes = max_resident_bytes
         self._native: VortexRdfStore | None = None
         self._dict = None
         self._decode_cache: dict = {}
@@ -101,7 +117,6 @@ class VortexRdflibStore(Store):
         self._all_contexts: list | None = None
         # Whether a blank node names a graph of this file (see _blank_graph_n3).
         self._blank_graphs: dict[str, bool] = {}
-        self._use_codes = os.environ.get("VORTEX_RDF_DISABLE_CODE_PATH") != "1"
 
         # Whole-BGP pushdown into code space (no-op for non-Vortex graphs;
         # VORTEX_RDF_DISABLE_PUSHDOWN=1 keeps rdflib's default evaluator).

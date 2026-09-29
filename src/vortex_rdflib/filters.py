@@ -895,12 +895,7 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
                 elif r is UNKNOWN:
                     unknown.append(code)
         else:
-            missing = [code for code in remaining if code not in views]
-            if missing:
-                for code, spelling in zip(missing, store._dict.decode_many(missing), strict=True):
-                    if spelling is None:
-                        raise ValueError(f"term code {code} is not in the store dictionary")
-                    views[code] = parse_spelling(spelling)
+            decode_views(store, remaining, views)
             for code in remaining:
                 r = fast((views[code],))
                 if r is True:
@@ -916,33 +911,46 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
     return remaining
 
 
-def tuple_predicate(store, conjunct: Conjunct, positions: list) -> Callable[[tuple], bool]:
-    """A row predicate for a conjunct over several variables, memoized per
-    distinct code tuple; ``positions`` are the variables' row indexes."""
-    memo: dict = {}
-    views: dict = {}
-    fast = conjunct.fast
-    variables = conjunct.vars
+def _fast_route(store, fast, views: dict) -> Callable[[tuple], Any]:
+    """``fast`` over a code tuple: each code parsed into a view once, through
+    ``views``, a dictionary code decoded and a negative (query-constant) one
+    taken from the store's foreign terms; an unbound ``None`` stays unbound."""
 
     def view_of(code):
         view = views.get(code)
         if view is None:
             if code < 0:
                 view = views[code] = view_of_node(store._foreign[code])
-                return view
-            spelling = store._dict.decode(code)
-            if spelling is None:
-                raise ValueError(f"term code {code} is not in the store dictionary")
-            view = views[code] = parse_spelling(spelling)
+            else:
+                spelling = store._dict.decode(code)
+                if spelling is None:
+                    raise ValueError(f"term code {code} is not in the store dictionary")
+                view = views[code] = parse_spelling(spelling)
         return view
+
+    def answer(key: tuple):
+        return fast(tuple(None if code is None else view_of(code) for code in key))
+
+    return answer
+
+
+def tuple_predicate(
+    store, conjunct: Conjunct, positions: list, shared_views: dict | None = None
+) -> Callable[[tuple], bool]:
+    """A row predicate for a conjunct over several variables, memoized per
+    distinct code tuple; ``positions`` are the variables' row indexes and
+    ``shared_views`` a parsed-term cache shared with the caller."""
+    memo: dict = {}
+    fast = conjunct.fast
+    views = {} if shared_views is None else shared_views
+    answer = None if fast is None else _fast_route(store, fast, views)
+    variables = conjunct.vars
 
     def predicate(row) -> bool:
         key = tuple(row[i] for i in positions)
         r = memo.get(key)
         if r is None:
-            r = UNKNOWN
-            if fast is not None:
-                r = fast(tuple(None if c is None else view_of(c) for c in key))
+            r = UNKNOWN if answer is None else answer(key)
             if r is UNKNOWN:
                 r = conjunct.generic(
                     {
@@ -955,3 +963,48 @@ def tuple_predicate(store, conjunct: Conjunct, positions: list) -> Callable[[tup
         return r is True
 
     return predicate
+
+
+def tuple_fast_reject_predicate(
+    store, conjunct: Conjunct, positions: list, shared_views: dict | None = None
+) -> Callable[[tuple], bool]:
+    """Keep rows unless the exact fast route proves a conjunct false.
+
+    UNKNOWN remains visible to the normal final predicate, preserving the
+    generic RDFLib fallback for values outside the fast path's domain.
+    """
+    fast = conjunct.fast
+    if fast is None:
+        raise ValueError("tuple_fast_reject_predicate requires a fast conjunct")
+    memo: dict = {}
+    answer = _fast_route(store, fast, {} if shared_views is None else shared_views)
+
+    def predicate(row) -> bool:
+        key = tuple(row[index] for index in positions)
+        result = memo.get(key)
+        if result is None:
+            result = memo[key] = answer(key)
+        return result is not False
+
+    return predicate
+
+
+def decode_views(store, codes, views: dict) -> None:
+    """Parse into ``views`` every dictionary code of ``codes`` it lacks,
+    decoding them in one batch."""
+    missing = [code for code in codes if code not in views]
+    if not missing:
+        return
+    for code, spelling in zip(missing, store._dict.decode_many(missing), strict=True):
+        if spelling is None:
+            raise ValueError(f"term code {code} is not in the store dictionary")
+        views[code] = parse_spelling(spelling)
+
+
+def prime_tuple_views(store, rows, positions, views: dict) -> None:
+    """Decode, in one batch, the dictionary codes ``rows`` hold at
+    ``positions`` that ``views`` lacks — for tuple predicates about to read
+    every row, which would otherwise decode them one call at a time."""
+    codes = {row[position] for row in rows for position in positions}
+    codes.discard(None)
+    decode_views(store, [code for code in codes if code >= 0], views)

@@ -17,7 +17,13 @@ Four groups, mirroring how the dashboard panels are organized:
 - ``joins``    — anchored star-2/star-3, an unanchored 2-hop chain, an
   anchored OPTIONAL, an anchored join to a predicate scan under a language
   FILTER (BSBM Explore Q8's core: the filter must be evaluated over the
-  rows the anchor reaches, not the whole scan), a VALUES of 64 subjects
+  rows the anchor reaches, not the whole scan), a two-variable FILTER over
+  a hash join under a ``LIMIT 10`` (the filter must stream with the rows
+  the LIMIT pulls, not run over the whole join), an integer band around an
+  anchor's value ahead of a wide ``?s ?p ?o`` leg (BSBM Explore Q5's join
+  shape: the band prunes the candidates so the leg is probed per survivor,
+  never matched whole; heavy: rdflib's nested loop reads the leg for every
+  candidate), a VALUES of 64 subjects
   joined to a predicate scan, a
   wide OPTIONAL (a whole predicate scan as the outer side), a NOT EXISTS
   over the same scan, and a MINUS of the filtered range
@@ -26,8 +32,8 @@ Four groups, mirroring how the dashboard panels are organized:
   strategy (vortex-rdflib's code-space joins vs rdflib's per-binding
   nested loop) dominates.
 - ``features`` — FILTER on a typed range, an integer arithmetic band around
-  a reference binding (BSBM Explore Q5's shape: two variables in one
-  conjunct), a term-kind FILTER (``isIRI``), DISTINCT over a predicate scan
+  a reference binding (BSBM Explore Q5's band expression: two variables in
+  one conjunct), a term-kind FILTER (``isIRI``), DISTINCT over a predicate scan
   and over the whole store, ORDER BY + LIMIT, a full ORDER BY of a predicate
   scan, and full-scan aggregates (a GROUP BY count, a COUNT(*), a COUNT
   DISTINCT per group): rdflib operators layered over the BGP.
@@ -464,6 +470,31 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                   FILTER(langMatches(lang(?v), "fr"))
                 }}
             """),
+        ),
+        Query(
+            "filter-join-limit",
+            "joins",
+            _sparql(f"""
+                SELECT ?s ?a ?b WHERE {{
+                  ?s {p1} ?a .
+                  ?s {q_opt} ?b
+                  FILTER(?a != ?b)
+                }}
+                LIMIT 10
+            """),
+        ),
+        Query(
+            "filter-band-probe",
+            "joins",
+            _sparql(f"""
+                SELECT ?s ?p ?o WHERE {{
+                  {band_anchor} {pf} ?ref .
+                  ?s {pf} ?v .
+                  ?s ?p ?o
+                  FILTER(?v < ?ref + {band} && ?v > ?ref - {band})
+                }}
+            """),
+            heavy=True,
         ),
         Query(
             "values-64",

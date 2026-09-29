@@ -141,12 +141,13 @@ FILES: dict[str, dict] = {
 #: stars and the chain (count-first seeding, probes against wide legs), the
 #: anchored OPTIONAL (the right pattern counted, then probed, never matched
 #: whole) and the anchored join under a language FILTER (the filter
-#: evaluated over the probed rows only).
+#: evaluated over the probed rows only). `filter-band-probe` is left out:
+#: rdflib's own evaluator takes ~0.9 s on it here, 30x any query above.
 JOIN_QUERIES = ("star-2", "star-3", "chain-2", "optional", "filter-probe")
 
 #: Queries whose cost is dominated by evaluating a numeric FILTER: a typed
 #: range over one variable, and an integer arithmetic band over two (BSBM
-#: Explore Q5's shape, memoized per distinct code pair rather than per row).
+#: Explore Q5's band expression, memoized per distinct code pair, not per row).
 #: Run against the fast route and against rdflib's evaluator.
 FILTER_QUERIES = ("filter-range", "filter-arith")
 

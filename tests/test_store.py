@@ -4,6 +4,7 @@ from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, ConjunctiveGraph
 
 from conftest import GRAPH_1, GRAPH_2, LAYOUTS
 from vortex_rdflib import VortexRdflibStore
+from vortex_rdflib.store import _FILE_DICT_RESIDENCY
 
 FOAF_NAME = URIRef("http://xmlns.com/foaf/0.1/name")
 FOAF_KNOWS = URIRef("http://xmlns.com/foaf/0.1/knows")
@@ -232,8 +233,12 @@ def test_add_graph_is_a_no_op(quad_store):
 
 
 def test_dictionary_graph_uses_code_path(vortex_files, monkeypatch):
+    # The file-backed residency default applies only when nothing overrides it.
+    monkeypatch.delenv("VORTEX_RDF_IN_MEMORY", raising=False)
+    monkeypatch.delenv("VORTEX_RDF_DICT_MAX_RESIDENT_BYTES", raising=False)
     store = VortexRdflibStore(str(vortex_files["dictionary"]))
     assert store._dict is not None  # code path active
+    assert store.max_resident_bytes == _FILE_DICT_RESIDENCY
 
     monkeypatch.setenv("VORTEX_RDF_DISABLE_CODE_PATH", "1")
     disabled = VortexRdflibStore(str(vortex_files["dictionary"]))
@@ -243,6 +248,35 @@ def test_dictionary_graph_uses_code_path(vortex_files, monkeypatch):
     got_codes = sorted(Graph(store=store).triples((None, None, None)))
     got_strings = sorted(Graph(store=disabled).triples((None, None, None)))
     assert got_codes == got_strings and len(got_codes) == 5
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "env", "expected"),
+    [
+        ({"max_resident_bytes": 4096}, {}, 4096),
+        ({}, {"VORTEX_RDF_DICT_MAX_RESIDENT_BYTES": "4096"}, None),
+        ({"in_memory": True}, {}, None),
+        ({}, {"VORTEX_RDF_DISABLE_CODE_PATH": "1"}, None),
+    ],
+    ids=["explicit-budget", "native-env-budget", "in-memory", "code-path-disabled"],
+)
+def test_file_residency_default_yields_to_every_override(
+    vortex_files, monkeypatch, kwargs, env, expected
+):
+    """The file-backed residency default applies only when nothing else
+    decides the budget: an explicit budget is passed through, and the native
+    env budget, an in-memory open (resident regardless) or a disabled code
+    path (which never reads the dictionary) leave the native policy (None)."""
+    for name in (
+        "VORTEX_RDF_IN_MEMORY",
+        "VORTEX_RDF_DICT_MAX_RESIDENT_BYTES",
+        "VORTEX_RDF_DISABLE_CODE_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    store = VortexRdflibStore(str(vortex_files["dictionary"]), **kwargs)
+    assert store.max_resident_bytes == expected
 
 
 def test_in_memory_graph_equality(vortex_files):
