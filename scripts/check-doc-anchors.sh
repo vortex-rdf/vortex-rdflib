@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Verifies the relative markdown links in the hand-written docs: every linked
 # file exists, every `#Lnn` / `#Lnn-Lmm` anchor is within the file's line
-# count, and a link whose text is a single backticked identifier
-# ([`foo`](path#Lnn)) names something that appears on the anchored line.
-# Plain-file labels (`open.rs`, `store/mod.rs`) and `file.rs:A-B` range labels
-# are only checked for existence and range.
+# count, and a link whose text is a single backticked name — `foo`,
+# `module.foo`, `Type::foo`, or a call such as `Type.foo(arg)` — has that
+# name's last segment on the anchored line. Plain-file labels (`open.rs`,
+# `store/mod.rs`) and `file.rs:A-B` range labels are only checked for
+# existence and range.
 #
 # Prints one `doc:line: message` per failure and exits 1 if there is any.
 # Run directly (`scripts/check-doc-anchors.sh`) or through scripts/ci-check.sh.
@@ -27,7 +28,10 @@ import sys
 
 LINK = re.compile(r"\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 ANCHOR = re.compile(r"^L(\d+)(?:-L(\d+))?$")
-IDENT = re.compile(r"^`([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)`$")
+IDENT = re.compile(
+    r"^`([A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)*)(?:\([^`]*\))?`$"
+)
+FILE_LABEL = re.compile(r"\.(?:rs|py|md|toml|ts|js|json|sh|ya?ml|html)$")
 
 failures = 0
 line_counts = {}
@@ -83,9 +87,9 @@ for doc in sys.argv[1:]:
                     fail(doc, lineno, f"[{label}]({target}): #{frag} outside 1-{total}")
                     continue
                 ident = IDENT.match(label.strip())
-                if not ident:
+                if not ident or FILE_LABEL.search(ident.group(1)):
                     continue  # file label, range label, prose label
-                name = ident.group(1).rsplit("::", 1)[-1]
+                name = re.split(r"::|\.", ident.group(1))[-1]
                 found = any(
                     name in line_text(resolved, n) for n in range(start, end + 1)
                 )

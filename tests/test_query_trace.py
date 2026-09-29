@@ -78,3 +78,18 @@ def test_trace_rejects_invalid_switch(monkeypatch):
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "yes")
     with pytest.raises(ValueError, match="must be 0 or 1"):
         pd._trace_enabled()
+
+
+def test_trace_reports_native_call_shape_and_rows(traced_graph, capsys, monkeypatch):
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY_ID", "native-test")
+    register_sparql_pushdown()
+    list(traced_graph.query("SELECT ?s WHERE { ?s <http://ex.org/name> ?n } LIMIT 1"))
+
+    native_calls = [
+        event for event in events(capsys.readouterr()) if event["event"] == "native_call_complete"
+    ]
+    assert native_calls
+    assert "match_codes" in {event["operation"] for event in native_calls}
+    assert all(len(event["pattern"]) == 4 for event in native_calls)
+    assert all(event["returned_rows"] is not None for event in native_calls)
