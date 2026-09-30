@@ -18,7 +18,7 @@ dataset from the benchmark generator ([`bench/dataset.py`](../bench/dataset.py):
 predicates, 27,034 distinct terms) in a Dictionary-layout store loaded in memory
 (`VortexRdflibStore(path, in_memory=True)`). "rdflib" is the same store under
 rdflib's default evaluator (`VORTEX_RDF_DISABLE_PUSHDOWN=1`), which is what
-the dashboard's *pushdown off* row runs; the [benchmark
+the dashboard's *pushdown off* rows run; the [benchmark
 dashboard](https://vortex-rdf.github.io/vortex-rdflib/) is the live
 reference, at 250,000 quads over 8 graphs and across the other stores.
 
@@ -620,9 +620,10 @@ matrix for the fast FILTER route.
 
 ## Measuring
 
-The dashboard's *pushdown off* row (`vortex-rdflib (dict · in-mem · pushdown
-off)`) is the same store with `VORTEX_RDF_DISABLE_PUSHDOWN=1`, so the
-pushdown's own contribution is the difference between two rows. In-process,
+The dashboard's *pushdown off* rows (`vortex-rdflib (dict · in-mem · pushdown
+off)` and `vortex-rdflib (dict · file · pushdown off)`) are the in-memory and
+file-backed stores with `VORTEX_RDF_DISABLE_PUSHDOWN=1`, so the pushdown's own
+contribution is the difference between two rows of the same residency. In-process,
 the pattern used for the numbers above toggles the hook on one graph with a
 prepared query:
 
@@ -703,7 +704,8 @@ some pushdowns cheaper at scale; the Python side would detect them with
 5. **`match_codes(..., limit, offset)` and `count_quads(..., limit)`** — the
    first rows of a match in base order, an existence test that stops at the
    first hit: `LIMIT` over a single pattern and `ASK` on file-backed stores,
-   where a match gathers every row today.
+   where today the match gathers every row and the `ASK` counts every one
+   (`count_quads(...) > 0`).
 6. **`TermDict.prefix_range(prefix) -> (lo, hi)`** — the code range of a
    spelling prefix: kind bounds without the bisection, IRI namespaces as
    ranges for `strstarts(str(?s), ...)`.
@@ -717,3 +719,19 @@ some pushdowns cheaper at scale; the Python side would detect them with
    numpy was prototyped for that kernel and deliberately not shipped — the
    stdlib index-gather already captures most of the win (1M-row wide star:
    130 ms against numpy's 118 ms) and this primitive obsoletes both.
+9. **`VortexRdfStore.term_dict()` and `match_codes` over a file-backed
+   dictionary** — a `TermDict` whose `encode`, `decode` and `decode_many`
+   (all the Python side calls) run the same wire-chunk point reads a match
+   already does for such a dictionary, blocking with the GIL released, and
+   `match_codes` answering in codes: the file's quad columns are codes
+   either way. It means letting a file-backed dictionary do I/O outside a
+   match's async prelude, the one place vortex-rdf confines it to today.
+   Both return `None` once the compressed dictionary outgrows the residency
+   budget (1 GiB for a file-backed store), and the store then loses the pushdown and the
+   `u32` code path together: over 50,000 file-backed quads (best of 7
+   prepared runs), `chain-2` goes from 1.3 ms to 230 ms, `filter-range` from
+   2.4 ms to 59 ms and `p-scan` from 5.1 ms to 20 ms. Nothing to detect on
+   the Python side —
+   [`VortexRdflibStore.open`](../src/vortex_rdflib/store.py#L133) already
+   takes whatever `term_dict()` returns — and the budget would become a
+   memory-for-speed dial instead of the switch that turns the pushdown off.

@@ -42,7 +42,7 @@ stage() { echo; echo "══ $1 · $(date +%H:%M:%S) ══"; }
 
 if has deps; then
   stage "Dependencies (project + bench contenders)"
-  # oxrdflib lives here; pycottas and rdflib-hdt pin versions that cannot share
+  # oxrdflib and pyoxigraph live here; pycottas and rdflib-hdt pin versions that cannot share
   # this environment, so run_bench builds each of them a venv of its own.
   uv sync --locked --group bench
 fi

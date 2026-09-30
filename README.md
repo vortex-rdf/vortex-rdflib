@@ -91,8 +91,7 @@ from Python — it enables the SPARQL pushdowns described below.
 
 ## How it works
 
-**Term codes instead of strings.** For Dictionary-layout stores, matched rows
-cross the native boundary as zero-copy `u32` term-code columns
+**Dictionary-encoded terms.** For vortex-rdf Dictionary-layout stores, matched rows cross the native boundary as zero-copy `u32` term-code columns
 (`vortex_rdf.VortexRdfStore.match_codes`), and each distinct code is decoded
 to an rdflib term once — in one GIL-released `TermDict.decode_many` call per
 batch — and cached for the store's lifetime. Other layouts fall back to
@@ -101,8 +100,7 @@ N-Triples string columns, parsing each distinct term once.
 **SPARQL pushdown.** Constructing a `VortexRdflibStore` registers an rdflib
 `CUSTOM_EVALS` hook that answers the algebra operators it understands over
 vortex term codes instead of leaving them to rdflib's per-row evaluation: basic
-graph patterns, `FILTER`, `OPTIONAL`, `MINUS`, `FILTER (NOT) EXISTS`, nested groups
-and `VALUES`, projection, `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`,
+graph patterns, `FILTER`, `OPTIONAL`, `MINUS`, `FILTER (NOT) EXISTS`, nested groups and `VALUES`, projection, `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`,
 `ASK` and `COUNT` aggregates above them. Anything else is evaluated by
 rdflib. Each pushdown is described, with an example and numbers, in
 [docs/pushdown.md](docs/pushdown.md); the switches to disable or narrow it
@@ -123,14 +121,9 @@ in-memory store they change nothing measurable, since the rows are resident
 already, and on multi-pattern joins the run-to-run spread is wider than any
 effect they have. Enable them for lookup-heavy file-backed workloads.
 
-For Dictionary-layout files, the term dictionary is held in memory when its
-compressed size fits the residency budget, and the pushdown and the `u32`
-code path need it resident. A file-backed `VortexRdflibStore` raises the
-native 512 MiB budget to 1 GiB; pass `max_resident_bytes=...` (the
-dictionary's compressed size in bytes) to set it yourself, or set
+For Dictionary-layout files, the term dictionary is loaded into memory at open when its compressed size fits a given residency budget (1 GiB by default). Otherwise it stays in the file and is read on demand. The pushdown and the u32 code path need an in-memory dictionary, though the quads can stay file-backed. Vortex-rdf only exposes the term dictionary (`term_dict()`) when it is in memory. Pass `max_resident_bytes=...` (the dictionary's compressed size in bytes) to set it yourself, or set
 `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES` to give the native layer a process-wide
-budget instead. In-memory stores keep the dictionary resident regardless, and
-with the code path disabled the native budget is left alone.
+budget instead. In-memory stores keep the dictionary resident regardless.
 
 ## Environment variables
 
@@ -150,57 +143,16 @@ with the code path disabled the native budget is left alone.
 A comparative benchmark — `VortexRdflibStore` against rdflib's in-memory `Memory`
 store, [oxrdflib](https://github.com/oxigraph/oxrdflib) (Oxigraph),
 [pycottas](https://github.com/cottas-rdf/pycottas) (COTTAS) and
-[rdflib-hdt](https://pypi.org/project/rdflib-hdt/) (HDT) — runs on every
-push to `main` and publishes the current numbers to GitHub Pages:
-**<https://vortex-rdf.github.io/vortex-rdflib/>**. That dashboard is the
-reference for how these variants actually compare; timings vary with machine
-and dataset.
+[rdflib-hdt](https://pypi.org/project/rdflib-hdt/) (HDT), with
+[pyoxigraph](https://pypi.org/project/pyoxigraph/) as a reference point — runs
+on every push to `main` and publishes the current numbers to GitHub Pages:
+**<https://vortex-rdf.github.io/vortex-rdflib/>**.
 
-It executes a synthetic representative SPARQL set (lookups/scans, star and
-chain joins, FILTER/DISTINCT/ORDER BY/GROUP BY, and the shapes that name a
-graph) and records per-store peak RSS; each store's full lifecycle runs in its
-own process. SPARQL evaluation is rdflib's engine for every store but one, so
-the store serving quad patterns is the only variable among the rows ranked
-against each other. The exception is a final, ruled-off row: the same Oxigraph
-store answering through pyoxigraph's own engine instead of rdflib's. It is the
-reference point the rdflib rows are all working against rather than a
-like-for-like row — and it reports no `exec only` figure, because rdflib's prepared
-algebra cannot reach a store that parses the query itself. It is not a
-measurement of pyoxigraph either: the solutions still cross into Python as
-rdflib terms through oxrdflib, which is most of that row on any query that
-returns rows.
+It executes a synthetic representative SPARQL set with each store's full lifecycle running in its own process. SPARQL evaluation is rdflib's engine for every store but `pyoxigraph`.
 
-Row counts are cross-checked across stores after every run: same data, same
+Results are cross-checked across stores after every run: same data, same
 query, so a store that returns a different number is reported as a failure on
-the dashboard, measured against what the majority found rather than against
-whichever store ran first.
-
-The dashboard reports two figures per query, both from one run split where
-rdflib's own string path splits: **exec only** is the evaluation of an
-already-translated algebra — what a store's speed can move — and **full**
-adds the parse and algebra translation in front of it, which rdflib repeats
-on every string query. `full` is what an application passing a string waits
-for; on a selective query it is mostly rdflib's parser, which no store can
-undercut. `tests/test_bench_worker.py` pins the two rdflib properties that
-make the split faithful.
-
-The dataset is a set of quads — every statement about a subject goes into
-one graph, so the union of the graphs is exactly the triple set — and each
-store loads it as an rdflib `Dataset` whose default graph is that union. HDT and COTTAS cannot
-serve named graphs through rdflib — HDT's format has none, and pycottas'
-`COTTASStore` does not expose the ones COTTAS files can hold — so those two
-rows load the flattened N-Triples, the same statements, and are not asked the
-`graphs` group, whose cells stay empty for them.
-
-The Vortex rows are all Dictionary layout — the layout that enables the term codes
-path — crossed over the two axes that change how a store answers: residency
-(file-backed vs in-memory) and secondary index (none, by-copy, by-reference).
-
-`pycottas` and `rdflib-hdt` pin dependencies that cannot share the project
-environment — pycottas an exact `pyoxigraph`, rdflib-hdt an exact `rdflib` —
-so `run_bench` builds each a throwaway virtualenv and runs that worker with
-its interpreter. rdflib-hdt reads HDT but cannot write it, so the HDT file is
-built by the Rust crate's CLI, which the refresh script installs on demand.
+the dashboard.
 
 Run it locally with `scripts/refresh.sh` — it syncs the contenders, ensures
 the HDT builder, measures, and re-renders the dashboard:
@@ -209,39 +161,6 @@ the HDT builder, measures, and re-renders the dashboard:
 scripts/refresh.sh                      # every stage, at the 250k CI scale
 BENCH_TRIPLES=20000 scripts/refresh.sh  # scale down
 scripts/refresh.sh --only render        # template-only edits: no re-measurement
-```
-
-### Regression tracking (CodSpeed)
-
-The dashboard answers "how does this compare?"; it cannot answer "did this
-commit make things slower?", because wall-clock numbers from a shared CI
-runner move on their own. `bench/test_codspeed.py` covers that: the **same**
-dataset generator and the **same** query set, measured per commit under
-CodSpeed's CPU simulation so every task gets a deterministic instruction
-count. Every pull request gets a report at
-<https://app.codspeed.io/vortex-rdf/vortex-rdflib>, so a change that costs
-instructions is visible before it lands.
-
-Only the vortex variants are measured: another library's instruction count
-moves when *it* releases, which is not a signal this repo can act on. And
-since instruction counts are deterministic, the suite does not run the full
-configurations × queries cross product; the whole query set runs on the
-primary configuration (Dictionary layout, in-memory, pushdown on) and
-each other axis is isolated on the queries where it can move the number —
-the pushdown A/B on the join queries, file-backed opens and secondary
-indexes on the lookups they target, the `Store.triples()` service per pattern
-selectivity, the u32 term codes path against the N-Triples string fallback, and
-each residency's open cost.
-
-The suite is not part of `uv run pytest` (which runs `tests/` only); run it
-explicitly. 32,768 triples by default — small enough for Valgrind, and the
-size the vortex-rdf Rust and JS suites share, so a shared-core regression
-lands in every tab at comparable magnitude — override with
-`CODSPEED_BENCH_TRIPLES`:
-
-```bash
-uv run pytest bench/test_codspeed.py --codspeed   # wall-clock, no instrumentation
-CODSPEED_BENCH_TRIPLES=5000 uv run pytest bench/test_codspeed.py --codspeed
 ```
 
 ## Development
@@ -269,26 +188,6 @@ same checks as CI first (and commit messages follow
 Run the checks manually with `./scripts/ci-check.sh`; skip a hook once with
 `git commit --no-verify` / `git push --no-verify`.
 
-## Releasing
-
-`.github/workflows/release.yml` builds the sdist and wheel and uploads them
-to PyPI via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) —
-no API token is stored in the repository. To cut a release:
-
-1. Bump `version` in `pyproject.toml` (and run `uv lock` to sync the lockfile).
-2. Update the changelog: `scripts/update-changelog.sh v<version>` stamps the
-   `[Unreleased]` section (regenerated from Conventional Commits via
-   [git-cliff](https://git-cliff.org/); refresh anytime with
-   `scripts/update-changelog.sh`).
-3. Commit, then push a matching `vX.Y.Z` tag.
-
-The full CI matrix runs on the tagged commit and must pass before anything is
-built; the workflow refuses to publish if the tag, `pyproject.toml` and
-`uv.lock` disagree on the version; and the wheel is smoke-tested against the
-test suite before upload. Running the workflow by hand (Actions → Release →
-Run workflow) is a dry run — build, validate, smoke-test, publish nothing —
-unless the "Publish to PyPI" toggle is on, which is how to retry a release
-whose publish step failed.
 
 ## License
 

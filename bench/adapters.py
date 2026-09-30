@@ -3,13 +3,16 @@
 Each adapter runs its full lifecycle (build/parse, queries, memory readings)
 in its own worker process (see ``worker.py``), so heavy imports live inside
 the factory functions: the rdflib-Memory worker never imports vortex_rdflib
-(whose pushdown hook registers into rdflib's ``CUSTOM_EVALS``), and only the
-oxrdflib workers import pyoxigraph.
+(whose pushdown hook registers into rdflib's ``CUSTOM_EVALS``), only the
+oxrdflib and pyoxigraph workers import pyoxigraph, and the pyoxigraph worker
+never imports rdflib.
 
 Quads: the dataset is N-Quads, and every store whose format has named graphs
 loads it into an rdflib ``Dataset`` whose default graph is the **union** of
-its graphs — so the queries that name no graph see exactly the triples they
-saw before the dataset had graphs, and the ``graphs`` group can name one.
+its graphs — or, for pyoxigraph, into its own store, queried with that same
+union as the default graph — so the queries that name no graph see exactly
+the triples they saw before the dataset had graphs, and the ``graphs`` group
+can name one.
 Two contenders cannot serve named graphs *through rdflib*, for different
 reasons, and both load the flattened N-Triples instead (``quads=False``) —
 the same statements in one graph, by construction of the generator. They
@@ -33,41 +36,35 @@ before Python starts, so process-wide switches like
 
 Engines: SPARQL evaluation is rdflib's engine for every adapter but one, so
 the store serving triple patterns is the only variable across the comparable
-rows. For vortex adapters with a resident dictionary, rdflib's engine hands
-the algebra nodes this package understands to its code-space pushdown. The
-``pushdown off`` row runs the primary configuration with
-``VORTEX_RDF_DISABLE_PUSHDOWN=1``, so the pushdown's own contribution is the
-difference between two rows of the same store.
+rows. oxrdflib is among them: it is asked with ``use_store_provided=False``,
+which stops ``OxigraphStore.query`` from handing the query text to
+pyoxigraph. For vortex adapters with a resident dictionary, rdflib's engine
+hands the algebra nodes this package understands to its code-space pushdown.
+The two ``pushdown off`` rows run the primary configuration of each
+residency with ``VORTEX_RDF_DISABLE_PUSHDOWN=1``, so the pushdown's own
+contribution is the difference between two rows of the same store.
 
-The exception is ``oxrdflib (pyoxigraph engine)``: the same Oxigraph store,
-asked without ``use_store_provided=False``, so ``OxigraphStore.query`` answers
-from pyoxigraph's own Rust engine and rdflib evaluates nothing. It is here as
-the reference point the rdflib rows are all working against, rather than a
-like-for-like row — it parses its own SPARQL, plans its own joins and never
-builds an rdflib solution per intermediate binding, so it takes the
+The exception is ``pyoxigraph``: Oxigraph's own Python bindings, used
+directly. The store bulk-loads the N-Quads and ``Store.query`` takes the
+query text, so pyoxigraph parses it, plans its own joins and returns its own
+terms; that worker never imports rdflib, so both its timings and its peak RSS
+are pyoxigraph's alone. It is here as the reference point the rdflib rows are
+all working against, rather than a like-for-like row, and it takes the
 dashboard's "fastest" marker on most end-to-end columns by not doing the same
-work.
+work. What keeps it comparable at all:
 
-It is emphatically **not** a measurement of pyoxigraph. Every solution still
-crosses into Python through ``oxrdflib``'s ``from_ox``, one value at a time,
-because the row has to produce the rdflib terms every other row produces. For
-a query that returns rows that conversion, not the engine, is most of the
-number: measured at 20k against the same query text run straight on the
-underlying ``pyoxigraph.Store``, the predicate scan is 2.66 ms here against
-0.23 ms there, the ``DISTINCT`` 2.16 against 0.25, ``GRAPH ?g`` 2.77 against
-0.25 — 88-91% of this row is oxrdflib. Only where the answer is a scalar does
-the engine dominate (``COUNT(*)``: 2.91 against 2.47).
-
-Two more consequences worth knowing:
-
-- It reports no ``exec only`` figure (``prepared=False``). rdflib's prepared
-  algebra cannot cross that boundary: ``OxigraphStore.query`` raises
-  ``NotImplementedError`` for a parsed ``Query``, and ``Graph.query``
-  *catches* it and quietly falls back to its own evaluator — so a timing
-  taken that way would be rdflib's engine wearing this row's label.
-- Its ``full`` figure includes Oxigraph's own parse, which is the honest
-  end-to-end comparison: both columns' ``full`` is "here is a query string,
-  here are the rows".
+- Same answers. Its default graph is the union of the graphs
+  (``use_default_graph_as_union``), as the rdflib rows' ``Dataset`` has it,
+  and ``GRAPH ?g`` ranges over the named graphs alone, so it returns the
+  same row count on every query.
+- Same finish line. A pyoxigraph solution builds each Python term only when
+  it is read, where an rdflib row arrives holding its terms, so the worker
+  reads every value (``worker.consume_native``): the row ends, like every
+  other, with the answer's terms in Python.
+- No ``exec only`` figure. pyoxigraph exposes no parsed-query object, so its
+  parse cannot be timed apart from its evaluation. Its ``full`` figure is the
+  honest comparison: every ``full`` cell is "here is a query string, here are
+  the rows".
 
 The Vortex rows are all Dictionary layout — the layout that enables the term
 code path and so the only one worth tuning — crossed over the two axes that
@@ -80,28 +77,31 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from rdflib import Dataset, Graph
+if TYPE_CHECKING:
+    from pyoxigraph import Store
+    from rdflib import Graph
 
 
 @dataclass(frozen=True)
 class Adapter:
     slug: str
     label: str
-    engine: str  # "rdflib" | "native"
-    # (nq_path, nt_path, work_dir) -> queryable Graph or Dataset. A quad
-    # adapter builds from the N-Quads; a triple-only one from the N-Triples.
-    make: Callable[[str, str, str], Graph]
+    # "rdflib": rdflib's engine evaluates, over the store `make` wraps in a
+    # Graph or Dataset. "native": the store answers the query text itself and
+    # rdflib has no part in it; with no algebra to prepare, the row reports
+    # only the end-to-end mode (see the module docstring).
+    engine: str
+    # (nq_path, nt_path, work_dir) -> what queries are asked of: an rdflib
+    # Graph or Dataset, or the native store itself. A quad adapter builds from
+    # the N-Quads; a triple-only one from the N-Triples.
+    make: Callable[[str, str, str], "Graph | Store"]
     env: dict[str, str] = field(default_factory=dict)
     query_kwargs: dict = field(default_factory=dict)
     # Whether the store's format has named graphs. False means the `graphs`
     # query group is not asked of it (see the module docstring).
     quads: bool = True
-    # Whether a prepared algebra reaches this adapter's evaluator, so the run
-    # can be split into "prepare" and "evaluate". False for a store that
-    # answers the query string itself, below rdflib: there is no algebra to
-    # prepare, so only the end-to-end figure exists (see the module docstring).
-    prepared: bool = True
     # Import name of the third-party package this adapter needs from the
     # project environment, so the orchestrator can fail fast with the fix
     # instead of losing a worker.
@@ -117,7 +117,7 @@ class Adapter:
 
 def _make_vortex(
     tag: str, in_memory: bool, indexes: tuple[str, ...] = ()
-) -> Callable[[str, str, str], Graph]:
+) -> Callable[[str, str, str], "Graph"]:
     """A Dictionary-layout store built with `indexes`, opened per `in_memory`.
 
     `tag` names the built file, so adapters sharing an index configuration
@@ -125,7 +125,8 @@ def _make_vortex(
     deterministic, so the residency variants rewrite identical bytes.
     """
 
-    def make(nq_path: str, nt_path: str, work_dir: str) -> Graph:
+    def make(nq_path: str, nt_path: str, work_dir: str) -> "Graph":
+        from rdflib import Dataset
         from vortex_rdf import serialize_rdf
 
         from vortex_rdflib import VortexRdflibStore
@@ -137,19 +138,39 @@ def _make_vortex(
     return make
 
 
-def _make_rdflib_memory(nq_path: str, nt_path: str, work_dir: str) -> Graph:
+def _make_rdflib_memory(nq_path: str, nt_path: str, work_dir: str) -> "Graph":
+    from rdflib import Dataset
+
     ds = Dataset(default_union=True)
     ds.parse(nq_path, format="nquads")
     return ds
 
 
-def _make_oxrdflib(nq_path: str, nt_path: str, work_dir: str) -> Graph:
+def _make_oxrdflib(nq_path: str, nt_path: str, work_dir: str) -> "Graph":
+    from rdflib import Dataset
+
     ds = Dataset(store="Oxigraph", default_union=True)
     ds.parse(nq_path, format="nquads")
     return ds
 
 
-def _make_rdflib_hdt(nq_path: str, nt_path: str, work_dir: str) -> Graph:
+def _make_pyoxigraph(nq_path: str, nt_path: str, work_dir: str) -> "Store":
+    """Oxigraph's own store, loaded and queried with no rdflib in between.
+
+    `bulk_load` is pyoxigraph's documented path for a file this size: its own
+    parser straight into the store, twice as fast as the transactional `load`
+    here (15 ms against 32 ms at 20k quads). It is this row's counterpart of
+    the other stores' own fastest way in — `serialize_rdf`, `rdf2cottas`,
+    `hdt convert`.
+    """
+    import pyoxigraph
+
+    store = pyoxigraph.Store()
+    store.bulk_load(path=nq_path, format=pyoxigraph.RdfFormat.N_QUADS)
+    return store
+
+
+def _make_rdflib_hdt(nq_path: str, nt_path: str, work_dir: str) -> "Graph":
     """An HDT file built from the shared N-Triples, served through its store.
 
     `rdflib-hdt` reads HDT but cannot write it, and hdt-cpp's `rdf2hdt` is not
@@ -172,6 +193,7 @@ def _make_rdflib_hdt(nq_path: str, nt_path: str, work_dir: str) -> Graph:
     file-backed rows (`vortex-rdflib (dict . file)`, `pycottas-rdflib`) do
     read per query, tens of MB across the same scans.
     """
+    from rdflib import Graph
     from rdflib_hdt import HDTStore  # ty: ignore[unresolved-import]
 
     out = Path(work_dir) / "data.hdt"
@@ -179,7 +201,7 @@ def _make_rdflib_hdt(nq_path: str, nt_path: str, work_dir: str) -> Graph:
     return Graph(store=HDTStore(str(out)))
 
 
-def _make_pycottas(nq_path: str, nt_path: str, work_dir: str) -> Graph:
+def _make_pycottas(nq_path: str, nt_path: str, work_dir: str) -> "Graph":
     """A COTTAS file built from the shared N-Triples, served through its store.
 
     `rdf2cottas` is the build step the load row measures, mirroring
@@ -187,6 +209,7 @@ def _make_pycottas(nq_path: str, nt_path: str, work_dir: str) -> Graph:
     own columnar file before any query runs.
     """
     from pycottas import COTTASStore, rdf2cottas  # ty: ignore[unresolved-import]
+    from rdflib import Graph
 
     out = str(Path(work_dir) / "data.cottas")
     rdf2cottas(nt_path, out)
@@ -240,6 +263,13 @@ ADAPTERS: list[Adapter] = [
         "rdflib",
         _make_vortex("ref", in_memory=False, indexes=BY_REFERENCE),
     ),
+    Adapter(
+        "vortex_dict_file_nopushdown",
+        "vortex-rdflib (dict · file · pushdown off)",
+        "rdflib",
+        _make_vortex("noidx", in_memory=False),
+        env={"VORTEX_RDF_DISABLE_PUSHDOWN": "1"},
+    ),
     Adapter("rdflib_memory", "rdflib (in-mem)", "rdflib", _make_rdflib_memory),
     Adapter(
         "oxrdflib",
@@ -266,15 +296,16 @@ ADAPTERS: list[Adapter] = [
         requires_cli="hdt",
         quads=False,
     ),
-    # Last, and ruled off in the dashboard: a different engine, not a
-    # different store. See the module docstring on how to read it.
+    # Last, and ruled off in the dashboard: no rdflib at all, so a different
+    # engine rather than a different store. See the module docstring on how
+    # to read it.
     Adapter(
-        "oxrdflib_native",
-        "oxrdflib (in-mem · pyoxigraph engine)",
+        "pyoxigraph",
+        "pyoxigraph (in-mem)",
         "native",
-        _make_oxrdflib,
-        requires="oxrdflib",
-        prepared=False,
+        _make_pyoxigraph,
+        query_kwargs={"use_default_graph_as_union": True},
+        requires="pyoxigraph",
     ),
 ]
 

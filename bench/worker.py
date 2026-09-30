@@ -29,6 +29,13 @@ exactly the ``translateQuery(parseQuery(...))`` that ``prepareQuery`` wraps.
 ``tests/test_bench_worker.py`` pins that, including the part the timing
 depends on: that rdflib caches nothing between calls.
 
+The native adapter (pyoxigraph) has neither half to split: its store takes
+the query text and returns its own results, which ``consume_native`` reads to
+the last value, so it reports ``full`` alone. rdflib is imported only for the
+rdflib rows — before their baseline RSS is read, as it always was, so it
+counts toward no store's footprint — and the native worker's process never
+loads it: its peak RSS would otherwise carry a library it does not use.
+
 Normal queries get one warmup — a real string query, so the row count the
 prepared path reports is checked against the path it stands in for — then up
 to ``BENCH_QUERY_ITERS`` samples capped by ``BENCH_QUERY_BUDGET_S``; ``heavy``
@@ -46,13 +53,12 @@ it.
 """
 
 import gc
+import importlib
 import json
 import os
 import statistics
 import sys
 from time import perf_counter_ns
-
-from rdflib.plugins.sparql import prepareQuery
 
 from .adapters import BY_SLUG
 from .dataset import config_from_env, moduli
@@ -129,10 +135,34 @@ def consume(result, query: Query) -> int:
     return (1 if result.askAnswer else 0) if query.is_ask else sum(1 for _ in result)
 
 
-def run_string_once(graph, query: Query, query_kwargs: dict) -> tuple[int, float]:
-    """`graph.query(<text>)`, end to end; returns (result rows, ns)."""
+def consume_native(result, query: Query) -> int:
+    """`consume` for a pyoxigraph result, which rdflib never touches.
+
+    An rdflib row arrives holding its terms; a pyoxigraph solution keeps its
+    values on the Rust side and builds each Python term only when it is read.
+    So every value is read: the row ends where the rdflib rows end, with the
+    answer's terms in Python, instead of timing solutions nobody looked at.
+    """
+    if query.is_ask:
+        return 1 if result else 0
+    rows = 0
+    for solution in result:
+        tuple(solution)
+        rows += 1
+    return rows
+
+
+def run_string_once(
+    graph, query: Query, query_kwargs: dict, native: bool = False
+) -> tuple[int, float]:
+    """`graph.query(<text>)`, end to end; returns (result rows, ns).
+
+    `native` is a pyoxigraph store in place of an rdflib graph: it takes the
+    query text the same way, and returns results of its own.
+    """
+    count = consume_native if native else consume
     t0 = perf_counter_ns()
-    n = consume(graph.query(query.sparql, **query_kwargs), query)
+    n = count(graph.query(query.sparql, **query_kwargs), query)
     return n, float(perf_counter_ns() - t0)
 
 
@@ -145,6 +175,9 @@ def run_once(graph, query: Query, query_kwargs: dict, init_ns: dict) -> tuple[in
     evaluation. `init_ns` is hoisted out because `Graph.query` builds it once
     per call and already does so inside the second span.
     """
+    # Here rather than at the top, so the native worker never loads rdflib.
+    from rdflib.plugins.sparql import prepareQuery
+
     t0 = perf_counter_ns()
     prepared = prepareQuery(query.sparql, initNs=init_ns)
     t1 = perf_counter_ns()
@@ -154,21 +187,21 @@ def run_once(graph, query: Query, query_kwargs: dict, init_ns: dict) -> tuple[in
 
 
 def measure_query(
-    graph, query: Query, query_kwargs: dict, split: bool = True
+    graph, query: Query, query_kwargs: dict, native: bool = False
 ) -> tuple[int, int | None, dict[str, list[float]]]:
     """Sample one query; returns (rows, rows the warmup string query saw, ns per mode).
 
-    `split` off is a store that answers the query string itself, below
-    rdflib's evaluator: there is no algebra for rdflib to prepare, so the run
-    cannot be split and only `full` — the end-to-end figure both kinds of row
-    report — is measured.
+    `native` is a store that answers the query text itself, with no rdflib
+    involved: there is no algebra for rdflib to prepare, so the run cannot be
+    split and only `full` — the end-to-end figure both kinds of row report —
+    is measured.
     """
-    init_ns = dict(graph.namespaces())
-    samples: dict[str, list[float]] = {mode: [] for mode in (MODES if split else ("full",))}
+    init_ns = {} if native else dict(graph.namespaces())
+    samples: dict[str, list[float]] = {mode: [] for mode in (("full",) if native else MODES)}
 
     def sample() -> int:
-        if not split:
-            rows, elapsed_ns = run_string_once(graph, query, query_kwargs)
+        if native:
+            rows, elapsed_ns = run_string_once(graph, query, query_kwargs, native=True)
             samples["full"].append(elapsed_ns)
             return rows
         rows, prepare_ns, evaluate_ns = run_once(graph, query, query_kwargs, init_ns)
@@ -184,7 +217,7 @@ def measure_query(
     # The warmup is the string path itself, so where the run is split it also
     # checks that the prepared path answers the same query. Discarded as a
     # sample either way.
-    warmed, _ns = run_string_once(graph, query, query_kwargs)
+    warmed, _ns = run_string_once(graph, query, query_kwargs, native)
     spent = 0.0
     while len(samples["full"]) < QUERY_ITERS:
         matched = sample()
@@ -192,6 +225,17 @@ def measure_query(
         if len(samples["full"]) >= QUERY_MIN_ITERS and spent > QUERY_BUDGET_NS:
             break
     return matched, warmed, samples
+
+
+def import_engine(engine: str) -> None:
+    """Load what an adapter's engine needs before the baseline RSS is read.
+
+    rdflib is the engine every rdflib row shares, so it belongs in the
+    baseline rather than in any one store's footprint — where it sat while
+    this module imported it at the top. The native row never loads it.
+    """
+    if engine == "rdflib":
+        importlib.import_module("rdflib.plugins.sparql")
 
 
 def main() -> int:
@@ -215,6 +259,7 @@ def main() -> int:
     # and the delta collapses to near zero. Each later build still releases
     # its predecessor first, so only one store is ever live and the peak-RSS
     # figure stays a single store's lifecycle.
+    import_engine(adapter.engine)
     gc.collect()
     baseline_mb = rss_mb()
     loaded_mb = None
@@ -244,7 +289,7 @@ def main() -> int:
             continue
         try:
             rows_matched, warmed, samples = measure_query(
-                graph, query, adapter.query_kwargs, adapter.prepared
+                graph, query, adapter.query_kwargs, native=adapter.engine == "native"
             )
         except Exception as error:  # noqa: BLE001 — one query must not sink the rest
             failures.append({"phase": query.name, "error": f"{type(error).__name__}: {error}"})

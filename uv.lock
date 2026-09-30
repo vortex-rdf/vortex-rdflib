@@ -277,6 +277,7 @@ dependencies = [
 [package.dev-dependencies]
 bench = [
     { name = "oxrdflib" },
+    { name = "pyoxigraph" },
 ]
 dev = [
     { name = "pytest" },
@@ -292,7 +293,10 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-bench = [{ name = "oxrdflib", specifier = ">=0.5" }]
+bench = [
+    { name = "oxrdflib", specifier = ">=0.5" },
+    { name = "pyoxigraph", specifier = ">=0.5" },
+]
 dev = [
     { name = "pytest", specifier = ">=9.1" },
     { name = "pytest-codspeed", specifier = ">=5" },

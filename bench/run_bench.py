@@ -6,7 +6,9 @@ the dashboard-shaped JSON consumed by ``scripts/render_bench_dashboard.py``,
 and cross-checks that every store returned the same result count for every
 query. Each worker emits two rows per query — the evaluation alone, and that
 same run including the parse and algebra translation in front of it — which
-the dashboard shows as a pair of columns (see ``worker.py``'s modes).
+the dashboard shows as a pair of columns (see ``worker.py``'s modes); the
+native store, which has no separate parse to split off, emits the second
+alone.
 
 The dataset is generated twice, from one deterministic generator: as
 N-Quads for the stores that serve named graphs, and as the N-Triples
@@ -294,7 +296,7 @@ def main() -> int:
                 "quads": a.quads,
                 # Which measurement modes this row has: a store that answers
                 # the query string itself reports only the end-to-end one.
-                "modes": ["exec", "full"] if a.prepared else ["full"],
+                "modes": ["full"] if a.engine == "native" else ["exec", "full"],
             }
             for a in adapters
         ],
