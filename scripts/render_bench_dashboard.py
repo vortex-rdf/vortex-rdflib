@@ -62,9 +62,10 @@ def main() -> int:
         .replace("__CONFIG_DATA__", json.dumps(data.get("config", {})))
         .replace("__FAILURES_DATA__", json.dumps(data.get("failures", [])))
         .replace("__PROVENANCE__", json.dumps(data.get("provenance", "")))
-        # Commit subjects are free text: "</script>" in one must not end the
-        # page's script. "<\/" is the same string to JSON and to JavaScript.
-        .replace("__HISTORY_DATA__", json.dumps(history).replace("</", "<\\/"))
+        # Commit subjects are free text, and "</script>" or "<!--" in one must
+        # not end or swallow the page's script: every "<" goes in as \u003c,
+        # the same character to JSON and to JavaScript.
+        .replace("__HISTORY_DATA__", json.dumps(history).replace("<", "\\u003c"))
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(html, encoding="utf-8")

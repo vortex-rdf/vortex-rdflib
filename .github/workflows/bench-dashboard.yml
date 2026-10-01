@@ -12,9 +12,11 @@ on:
       - '.gitignore'
   workflow_dispatch:
 
+# The build job installs third-party code (the contenders, the hdt crate), so
+# its token can only read the repository. The record job below is the one
+# place that writes, and it runs nothing but git.
 permissions:
-  # write: the history chart's records are pushed to the bench-history branch.
-  contents: write
+  contents: read
   pages: write
   id-token: write
 
@@ -49,28 +51,33 @@ jobs:
       - name: Run comparative benchmark
         run: uv run python -m bench.run_bench --out bench/results.json
 
-      # The history chart's data: one record per commit on the bench-history
-      # branch, kept across deploys. A failed push costs later dashboards this
-      # point, not this deploy, which renders it from disk.
-      - name: Record the history point
+      # The history chart's data: one record per main commit on the
+      # bench-history branch, kept across deploys. Read here, pushed by the
+      # record job.
+      - name: Fetch the history
         run: |
           if git ls-remote --exit-code --heads origin bench-history >/dev/null; then
             git fetch --quiet origin bench-history
             git worktree add --detach history FETCH_HEAD
-          else
-            git worktree add --orphan -b bench-history history
           fi
-          uv run python -m bench.history record bench/results.json \
-            --source ci --commit "$GITHUB_SHA" --ref main --out history/records
-          cd history
-          git add records
-          git -c user.name="github-actions[bot]" \
-            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit --quiet -m "bench: record ${GITHUB_SHA::7}"
-          git push --quiet origin HEAD:bench-history \
-            || { git fetch --quiet origin bench-history && git rebase --quiet FETCH_HEAD \
-                 && git push --quiet origin HEAD:bench-history; } \
-            || echo "::warning::could not push the history record for ${GITHUB_SHA::7}"
+
+      # This commit's point, on main only: a manual run on another branch must
+      # not land on main's line. A failure costs the point, never the deploy.
+      - name: Record this commit's point
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: >-
+          uv run python -m bench.history record bench/results.json
+          --source ci --commit "$GITHUB_SHA" --ref main --out history/records
+
+      - name: Hand the record to the record job
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-record
+          path: history/records/${{ github.sha }}.json
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Render dashboard
         run: >-
@@ -81,6 +88,44 @@ jobs:
         uses: actions/upload-pages-artifact@v5
         with:
           path: public
+
+  # Pushes the build job's record to bench-history. The only job with write
+  # access, and it runs nothing but git. A push that loses a race rebases once.
+  record:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GIT_AUTHOR_NAME: github-actions[bot]
+      GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+      GIT_COMMITTER_NAME: github-actions[bot]
+      GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: history-record
+          path: incoming
+
+      - name: Push the record to bench-history
+        run: |
+          if git ls-remote --exit-code --heads origin bench-history >/dev/null; then
+            git fetch --quiet origin bench-history
+            git worktree add --detach history FETCH_HEAD
+          else
+            git worktree add --orphan -b bench-history history
+          fi
+          mkdir -p history/records
+          cp incoming/*.json history/records/
+          cd history
+          git add records
+          git commit --quiet -m "bench: record ${GITHUB_SHA::7}"
+          git push --quiet origin HEAD:bench-history \
+            || { git fetch --quiet origin bench-history && git rebase --quiet FETCH_HEAD \
+                 && git push --quiet origin HEAD:bench-history; }
 
   deploy:
     needs: build

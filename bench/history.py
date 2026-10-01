@@ -60,31 +60,45 @@ def make_record(results: dict, commit: dict, source: str) -> dict:
             "python": platform.python_version(),
             "versions": {package: version_of(package) for package in ("vortex-rdf", "rdflib")},
         },
-        "dataset": {"triples": config["triples"], "graphs": config["graphs"]},
+        # Everything the generator was told, not only its size: a run with any
+        # other knob set is another dataset, skipped beside main's line.
+        "dataset": {
+            "triples": config["triples"],
+            "graphs": config["graphs"],
+            "cardinality": config.get("cardinality"),
+        },
         "reference": REFERENCE,
         "labels": {
             a["slug"]: a["label"] for a in config["adapters"] if a["slug"] in CONFIGURATIONS
         },
         "medians": medians,
-        "dropped": dropped_queries(config.get("rowCounts", {})),
+        "dropped": dropped_queries(config.get("rowCounts", {}), results.get("failures", [])),
     }
 
 
-def dropped_queries(row_counts: dict[str, dict[str, int]]) -> dict[str, list[str]]:
-    """Per configuration, the queries whose row count is not rdflib's.
+def dropped_queries(
+    row_counts: dict[str, dict[str, int]], failures: list[dict]
+) -> dict[str, list[str]]:
+    """Per configuration, the queries that failed or whose row count is not rdflib's.
 
     rdflib is the oracle rather than the majority: every configuration runs
     the same commit's library code, so a bug they share would outvote it. A
-    query rdflib has no count for is skipped; it is never plotted.
+    query rdflib has no count for is skipped; it is never plotted. A failure
+    names its query as its phase, and counts even when the worker kept its
+    medians (a prepared run answering differently from the query text).
     """
-    dropped: dict[str, list[str]] = {}
+    dropped: dict[str, set[str]] = {}
     for query, per_store in row_counts.items():
         expected = per_store.get(REFERENCE)
         if expected is None:
             continue
         for slug in CONFIGURATIONS:
             if slug in per_store and per_store[slug] != expected:
-                dropped.setdefault(slug, []).append(query)
+                dropped.setdefault(slug, set()).add(query)
+    for failure in failures:
+        slug, query = failure.get("slug"), failure.get("phase")
+        if slug in CONFIGURATIONS and query in row_counts:
+            dropped.setdefault(slug, set()).add(query)
     return {slug: sorted(queries) for slug, queries in dropped.items()}
 
 
