@@ -4,11 +4,13 @@
 #   scripts/refresh.sh                       # every stage
 #   scripts/refresh.sh --only render         # template-only edits: no re-measurement
 #   scripts/refresh.sh --only bench,render   # re-measure, skip the dependency sync
+#   scripts/refresh.sh --history             # plot the working tree on the history chart
 #   scripts/refresh.sh --adapters a,b        # measure a subset (see the warning below)
 #   scripts/refresh.sh --force-build         # reinstall the HDT builder even if present
 #   BENCH_TRIPLES=20000 scripts/refresh.sh   # scale down (default: the code's 250k)
 #
-# Stages, in the order they run: deps, hdt, bench, render.
+# Stages, in the order they run: deps, hdt, bench, history, render. `history`
+# is not in the default set; --history is shorthand for --only history,render.
 #
 # The measurement runs one process per store, sequentially, so the timings do
 # not contend with each other — the same reason bench/worker.py exists.
@@ -25,14 +27,15 @@ while [ $# -gt 0 ]; do
     --adapters) ADAPTERS="$2"; shift 2 ;;
     --adapters=*) ADAPTERS="${1#*=}"; shift ;;
     --force-build) FORCE_BUILD=1; shift ;;
-    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --history) ONLY="history,render"; shift ;;
+    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
 
 for s in ${ONLY//,/ }; do
-  case "$s" in deps|hdt|bench|render) ;; *)
-    echo "unknown stage: $s (stages: deps, hdt, bench, render)" >&2; exit 2 ;;
+  case "$s" in deps|hdt|bench|history|render) ;; *)
+    echo "unknown stage: $s (stages: deps, hdt, bench, history, render)" >&2; exit 2 ;;
   esac
 done
 
@@ -74,13 +77,38 @@ if has bench; then
   uv run python -m bench.run_bench "${args[@]}"
 fi
 
+if has history; then
+  stage "History point for the working tree (BENCH_TRIPLES=${BENCH_TRIPLES:-250000})"
+  # The 8 vortex configurations plus rdflib, the reference the chart divides
+  # by. Written apart from bench/results.json, which keeps the full run the
+  # rest of the dashboard shows. Measure at the default scale: a point at
+  # another one is skipped next to main's.
+  history_run="$(mktemp -d)/results.json"
+  uv run python -m bench.run_bench --adapters "$(uv run python -m bench.history adapters)" \
+    --out "$history_run"
+  uv run python -m bench.history record "$history_run" --source local --commit HEAD \
+    --out bench/history-local
+fi
+
 if has render; then
   stage "Render (public/index.html)"
   if [ ! -f bench/results.json ]; then
     echo "bench/results.json is missing — run the bench stage at least once first" >&2
     exit 1
   fi
-  uv run python scripts/render_bench_dashboard.py bench/results.json public/index.html
+  render_args=(bench/results.json public/index.html)
+  # The history chart: main's records from the bench-history branch, plus this
+  # machine's local points. Either may be missing; the chart shows what there
+  # is, or stays hidden.
+  history_dir="$(mktemp -d)"
+  if git fetch --quiet origin bench-history 2>/dev/null \
+    && git archive FETCH_HEAD records | tar -x -C "$history_dir" 2>/dev/null; then
+    render_args+=(--history "$history_dir/records")
+  else
+    echo "note: origin has no bench-history branch yet; the history chart shows local points only"
+  fi
+  if [ -d bench/history-local ]; then render_args+=(--local bench/history-local); fi
+  uv run python scripts/render_bench_dashboard.py "${render_args[@]}"
 fi
 
 echo
