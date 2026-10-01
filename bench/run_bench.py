@@ -287,6 +287,10 @@ def main() -> int:
             "terms": m.terms,
         },
         "matchedRows": matched,
+        # Each store's own row count per query, not only the agreed one: the
+        # history records check every configuration against rdflib's count,
+        # since all of them run the same library code (bench.history).
+        "rowCounts": counted,
         "skipped": skipped,
         "adapters": [
             {
