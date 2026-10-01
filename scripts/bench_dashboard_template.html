@@ -17,6 +17,8 @@
     --good:        #0ca30c;
     --bad:         #c93030;
     --focus:       #2a78d6;
+    --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100;
+    --s5:#e87ba4; --s6:#008300; --s7:#4a3aa7; --s8:#e34948;
   }
   @media (prefers-color-scheme: dark) {
     :root:where(:not([data-theme="light"])) {
@@ -35,6 +37,8 @@
       --good:        #0ca30c;
       --bad:         #e05252;
       --focus:       #3987e5;
+      --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+      --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
     }
   }
   :root[data-theme="dark"] {
@@ -45,6 +49,8 @@
     --border-strong: rgba(255,255,255,0.18);
     --accent:#3987e5; --good:#0ca30c; --bad:#e05252;
     --focus:#3987e5;
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+    --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
   }
   :root[data-theme="light"] {
     color-scheme: light;
@@ -54,6 +60,8 @@
     --border-strong: rgba(11,11,11,0.18);
     --accent:#2a78d6; --good:#0ca30c; --bad:#c93030;
     --focus:#2a78d6;
+    --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100;
+    --s5:#e87ba4; --s6:#008300; --s7:#4a3aa7; --s8:#e34948;
   }
 
   * { box-sizing: border-box; }
@@ -192,6 +200,39 @@
   table.data td.name { font-family: ui-monospace, monospace; text-align:left; }
   table.data td.num { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
 
+  /* ---- history chart ---- */
+  .history-controls { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:0 0 12px; }
+  .history-controls button {
+    font:inherit; font-size:12.5px; color:var(--ink-2); background:var(--surface);
+    border:1px solid var(--border-strong); border-radius:6px; padding:5px 10px; cursor:pointer;
+    display:inline-flex; align-items:center; gap:6px;
+  }
+  .history-controls button:hover { color:var(--ink); }
+  .history-controls button[aria-pressed="true"] { color:var(--ink); background:var(--surface-2); }
+  .history-controls .chip[aria-pressed="false"] { opacity:0.5; }
+  .history-controls .seg { display:inline-flex; }
+  .history-controls .seg button { border-radius:0; }
+  .history-controls .seg button:first-child { border-radius:6px 0 0 6px; }
+  .history-controls .seg button:last-child { border-radius:0 6px 6px 0; border-left:0; }
+  .history-controls .sep { width:1px; align-self:stretch; background:var(--border); margin:0 4px; }
+  .hkey { display:inline-block; width:14px; height:2px; border-radius:1px; flex:none; }
+  .history-panel { position:relative; }
+  .history-chart svg { display:block; width:100%; height:auto; }
+  .history-chart svg:focus-visible { outline:2px solid var(--focus); outline-offset:4px; }
+  .history-tip {
+    position:absolute; z-index:5; pointer-events:none; min-width:220px; max-width:340px;
+    background:var(--surface); border:1px solid var(--border-strong); border-radius:8px;
+    padding:10px 12px; font-size:12.5px; box-shadow:0 4px 16px rgba(0,0,0,0.12);
+  }
+  .history-tip .head { color:var(--ink-2); margin-bottom:6px; }
+  .history-tip .subject { color:var(--ink); }
+  .history-tip .row { display:flex; align-items:center; gap:8px; }
+  .history-tip .row strong { min-width:5ch; font-variant-numeric:tabular-nums; }
+  .history-tip .lbl { color:var(--ink-2); }
+  .history-tip .drop { color:var(--ink-muted); font-size:11.5px; margin:0 0 2px 22px; }
+  #history-table { margin-top:12px; }
+  #history-sub { max-width:none; }
+
   footer.prov {
     margin-top:36px; padding-top:16px; border-top:1px solid var(--border);
     color:var(--ink-muted); font-size:11.5px;
@@ -209,6 +250,7 @@
       <span class="sub">SPARQL over rdflib stores — comparative benchmark</span>
     </div>
     <nav class="seclinks">
+      <a href="#history" id="nav-history" hidden>History</a>
       <a href="#overview">Overview</a>
       <a href="#load">Load</a>
       <a href="#queries">Queries</a>
@@ -220,6 +262,29 @@
 </header>
 
 <main>
+  <section id="history" class="group" hidden>
+    <div class="group-head">
+      <span class="chan-tag mono">HISTORY</span>
+      <h2>Speedup over rdflib, per commit</h2>
+    </div>
+    <p class="group-desc">
+      How many times faster each vortex-rdflib configuration answers the query set than
+      rdflib's in-memory store, measured in the same run: rdflib's time divided by the
+      configuration's, as a geometric mean over the queries every point shares. Above 1× is
+      faster. Older commits were measured with today's benchmark against their own library
+      code. A hollow dot leaves out queries that configuration answered with a different row
+      count than rdflib. Local points, measured on another machine, follow
+      <span class="mono">main</span>'s.
+    </p>
+    <div class="history-controls" id="history-controls"></div>
+    <div class="panel wide history-panel">
+      <p class="note mono" id="history-sub"></p>
+      <div class="history-chart" id="history-chart"></div>
+      <div class="history-tip" id="history-tip" aria-live="polite" hidden></div>
+      <div class="table-wrap" id="history-table" hidden></div>
+    </div>
+  </section>
+
   <section id="overview" class="group">
     <p class="lede">
       A run of <code>bench/run_bench.py</code>: <a href="https://github.com/vortex-rdf/vortex-rdflib">vortex-rdflib</a>'s
@@ -652,6 +717,263 @@ for (const q of QUERIES){
   });
   filterEl.addEventListener("input", () => { filterText = filterEl.value.trim().toLowerCase(); draw(); });
   draw();
+})();
+
+// ---- history: speedup over rdflib, per commit ----
+// HISTORY is bench.history.build_series output, or null when the render had no
+// records; the section then stays hidden.
+(function renderHistory(){
+  if (!HISTORY || !HISTORY.points.length || !HISTORY.configurations.length) return;
+  document.getElementById("history").hidden = false;
+  document.getElementById("nav-history").hidden = false;
+
+  const POINTS = HISTORY.points;
+  const SERIES = HISTORY.configurations;
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const HEIGHT = 320, M = { top: 28, right: 44, bottom: 46, left: 52 };
+  const MODE_LABEL = { exec: "exec only", full: "full" };
+  const TICKS = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500,
+                 1000, 2000, 5000, 10000];
+  // A configuration's slot is its place in bench.history.CONFIGURATIONS, so its
+  // color never depends on which configurations this render contains.
+  const colorOf = s => s.slot <= 8 ? `var(--s${s.slot})` : "var(--ink-muted)";
+  const short = s => s.label.replace(/^vortex-rdflib \((.*)\)$/, "$1");
+  const visible = new Set(SERIES.map(s => s.slug));
+  let mode = "exec", active = null, lastWidth = 0, cross = null, geo = null;
+
+  const chartEl = document.getElementById("history-chart");
+  const tipEl = document.getElementById("history-tip");
+  const tableEl = document.getElementById("history-table");
+
+  function svg(tag, attrs, parent){
+    const node = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+    if (parent) parent.appendChild(node);
+    return node;
+  }
+  function html(tag, cls, text, parent){
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text != null) node.textContent = text;
+    if (parent) parent.appendChild(node);
+    return node;
+  }
+  const fmt = v => (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)) + "×";
+  // {speedup, dropped} at this point in the current mode, or null: not measured.
+  const cell = (p, s) => p.values[s.slug]?.[mode] ?? null;
+  const commitLabel = p => p.local && p.commit.dirty ? "working tree" : p.commit.short;
+  const dayOf = p => (p.local ? p.measured : p.commit.date).slice(0, 10);
+
+  // ---- controls: timing switch, one chip per configuration (the legend), table ----
+  const controls = document.getElementById("history-controls");
+  const seg = html("div", "seg", null, controls);
+  seg.setAttribute("role", "group");
+  seg.setAttribute("aria-label", "Timing");
+  const modeButtons = Object.entries(MODE_LABEL).map(([key, label]) => {
+    const b = html("button", null, label, seg);
+    b.type = "button";
+    b.addEventListener("click", () => { mode = key; draw(); });
+    return [key, b];
+  });
+  html("span", "sep", null, controls);
+  const chips = SERIES.map(s => {
+    const b = html("button", "chip", null, controls);
+    b.type = "button";
+    b.title = s.label;
+    html("span", "hkey", null, b).style.background = colorOf(s);
+    html("span", null, short(s), b);
+    b.addEventListener("click", () => {
+      if (visible.has(s.slug)) visible.delete(s.slug); else visible.add(s.slug);
+      draw();
+    });
+    return [s.slug, b];
+  });
+  html("span", "sep", null, controls);
+  const tableButton = html("button", null, "Table", controls);
+  tableButton.type = "button";
+  tableButton.addEventListener("click", () => { tableEl.hidden = !tableEl.hidden; draw(); });
+
+  function draw(){
+    for (const [key, b] of modeButtons) b.setAttribute("aria-pressed", String(key === mode));
+    for (const [slug, b] of chips) b.setAttribute("aria-pressed", String(visible.has(slug)));
+    tableButton.setAttribute("aria-pressed", String(!tableEl.hidden));
+    document.getElementById("history-sub").textContent =
+      `geometric mean over ${HISTORY.queries} queries · ${MODE_LABEL[mode]}` +
+      " · higher is faster · 1× = rdflib (in-mem)";
+    drawChart();
+    drawTable();
+  }
+
+  function drawChart(){
+    hide();
+    chartEl.replaceChildren();
+    lastWidth = chartEl.clientWidth;
+    const width = Math.max(lastWidth, 320);
+    const plotW = width - M.left - M.right, plotH = HEIGHT - M.top - M.bottom;
+    const last = POINTS.length - 1;
+    const shown = SERIES.filter(s => visible.has(s.slug));
+    const values = shown.flatMap(s => POINTS.map(p => cell(p, s)?.speedup))
+      .filter(v => v != null);
+    const lo = Math.min(0.5, ...values.map(v => v / 1.2));
+    const hi = Math.max(10, ...values.map(v => v * 1.2));
+    const y = v => M.top + plotH * Math.log(hi / v) / Math.log(hi / lo);
+    const step = last > 0 ? plotW / last : 0;
+    const x = i => last > 0 ? M.left + i * step : M.left + plotW / 2;
+
+    const root = svg("svg", {
+      viewBox: `0 0 ${width} ${HEIGHT}`, width, height: HEIGHT, tabindex: "0", role: "img",
+      "aria-label": `Speedup over rdflib per commit, ${MODE_LABEL[mode]}. ` +
+        "Arrow keys step through the commits.",
+    }, chartEl);
+    geo = { x, root, width };
+
+    // Gridlines on 1-2-5 steps; the 1× line is rdflib itself.
+    for (const t of TICKS.filter(t => t >= lo && t <= hi)){
+      svg("line", { x1: M.left, x2: width - M.right, y1: y(t), y2: y(t),
+        stroke: t === 1 ? "var(--baseline)" : "var(--grid)", "stroke-width": 1 }, root);
+      svg("text", { x: M.left - 8, y: y(t), "text-anchor": "end", "dominant-baseline": "middle",
+        fill: "var(--ink-muted)", "font-size": 11 }, root).textContent = `${t}×`;
+    }
+    svg("text", { x: width - M.right, y: y(1) - 6, "text-anchor": "end",
+      fill: "var(--ink-muted)", "font-size": 11 }, root).textContent = "rdflib (in-mem) = 1×";
+
+    // Commit labels, thinned to fit; the newest always shows.
+    const every = Math.max(1, Math.ceil(POINTS.length * 72 / plotW));
+    const labelled = POINTS.map((_, i) => i).filter(i => i % every === 0);
+    if (labelled.at(-1) !== last){
+      if (last - labelled.at(-1) < every / 2) labelled.pop();
+      labelled.push(last);
+    }
+    for (const i of labelled){
+      svg("text", { x: x(i), y: HEIGHT - M.bottom + 18, "text-anchor": "middle",
+        fill: "var(--ink-2)", "font-size": 11, class: "mono" }, root)
+        .textContent = commitLabel(POINTS[i]);
+      svg("text", { x: x(i), y: HEIGHT - M.bottom + 33, "text-anchor": "middle",
+        fill: "var(--ink-muted)", "font-size": 10.5 }, root).textContent = dayOf(POINTS[i]);
+    }
+
+    // Local points sit after main's, past a divider naming their branch.
+    const firstLocal = POINTS.findIndex(p => p.local);
+    if (firstLocal >= 0){
+      const dx = firstLocal > 0 ? (x(firstLocal - 1) + x(firstLocal)) / 2 : M.left;
+      if (firstLocal > 0) svg("line", { x1: dx, x2: dx, y1: M.top - 18, y2: HEIGHT - M.bottom,
+        stroke: "var(--baseline)", "stroke-width": 1 }, root);
+      svg("text", { x: dx + 6, y: M.top - 8, fill: "var(--ink-2)", "font-size": 11 }, root)
+        .textContent = `local · ${POINTS[firstLocal].commit.ref}`;
+    }
+
+    // One 2px line per configuration, broken where a point was not measured.
+    for (const s of shown){
+      let d = "", pen = false;
+      POINTS.forEach((p, i) => {
+        const v = cell(p, s)?.speedup;
+        if (v == null){ pen = false; return; }
+        d += `${pen ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`;
+        pen = true;
+      });
+      if (d) svg("path", { d, fill: "none", stroke: colorOf(s), "stroke-width": 2,
+        "stroke-linejoin": "round", "stroke-linecap": "round" }, root);
+    }
+    // Dots above every line: filled with a 2px surface ring where they overlap,
+    // hollow where the point leaves queries out, drawn last so no dot hides one.
+    for (const hollow of [false, true]){
+      for (const s of shown){
+        POINTS.forEach((p, i) => {
+          const c = cell(p, s);
+          if (c?.speedup == null || (c.dropped.length > 0) !== hollow) return;
+          svg("circle", { cx: x(i), cy: y(c.speedup), r: hollow ? 4 : 5,
+            fill: hollow ? "var(--surface)" : colorOf(s),
+            stroke: hollow ? colorOf(s) : "var(--surface)", "stroke-width": 2 }, root);
+        });
+      }
+    }
+
+    // The crosshair finds the commit: the pointer only has to be nearest.
+    cross = svg("line", { y1: M.top, y2: HEIGHT - M.bottom, stroke: "var(--ink-muted)",
+      "stroke-width": 1, visibility: "hidden" }, root);
+    const nearest = px => Math.min(last, Math.max(0, step ? Math.round((px - M.left) / step) : 0));
+    root.addEventListener("pointermove", e => {
+      const rect = root.getBoundingClientRect();
+      show(nearest((e.clientX - rect.left) * width / rect.width));
+    });
+    root.addEventListener("pointerleave", hide);
+    root.addEventListener("focus", () => show(active ?? last));
+    root.addEventListener("blur", hide);
+    root.addEventListener("keydown", e => {
+      if (e.key === "Escape") return hide();
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      e.preventDefault();
+      show(Math.min(last, Math.max(0, (active ?? last) + (e.key === "ArrowRight" ? 1 : -1))));
+    });
+  }
+
+  function show(i){
+    active = i;
+    cross.setAttribute("x1", geo.x(i));
+    cross.setAttribute("x2", geo.x(i));
+    cross.setAttribute("visibility", "visible");
+    fillTip(POINTS[i]);
+    tipEl.hidden = false;
+    // Beside the crosshair, flipped to its left near the panel's right edge.
+    const scale = geo.root.getBoundingClientRect().width / geo.width;
+    const cx = chartEl.offsetLeft + geo.x(i) * scale;
+    let left = cx + 14;
+    if (left + tipEl.offsetWidth > chartEl.parentElement.clientWidth - 8){
+      left = cx - 14 - tipEl.offsetWidth;
+    }
+    tipEl.style.left = `${Math.max(8, left)}px`;
+    tipEl.style.top = `${chartEl.offsetTop + M.top}px`;
+  }
+  function hide(){
+    active = null;
+    cross?.setAttribute("visibility", "hidden");
+    tipEl.hidden = true;
+  }
+
+  // One readout for every visible configuration: the value leads, keyed by a
+  // short line in the series color; the commit and its rdflib version head it.
+  function fillTip(p){
+    tipEl.replaceChildren();
+    const head = html("div", "head", null, tipEl);
+    html("span", "mono", commitLabel(p), head);
+    head.append(` · ${dayOf(p)} · ${p.source} · rdflib ${p.rdflib ?? "?"}`);
+    html("div", "subject", p.commit.subject, head);
+    for (const s of SERIES.filter(s => visible.has(s.slug))){
+      const c = cell(p, s);
+      const row = html("div", "row", null, tipEl);
+      html("span", "hkey", null, row).style.background = colorOf(s);
+      html("strong", null, c?.speedup == null ? "—" : fmt(c.speedup), row);
+      html("span", "lbl", c?.speedup == null ? `${short(s)} · not measured` : short(s), row);
+      if (c?.dropped.length) html("div", "drop", `leaves out ${c.dropped.join(", ")}`, tipEl);
+    }
+  }
+
+  // The table view: the same values, every point a row.
+  function drawTable(){
+    tableEl.replaceChildren();
+    if (tableEl.hidden) return;
+    const shown = SERIES.filter(s => visible.has(s.slug));
+    const table = html("table", "matrix-table", null, tableEl);
+    const head = html("tr", null, null, html("thead", null, null, table));
+    for (const h of ["Commit", "Date", "Source", "rdflib"]) html("th", "rowh", h, head);
+    for (const s of shown) html("th", null, short(s), head);
+    const body = html("tbody", null, null, table);
+    for (const p of POINTS){
+      const tr = html("tr", null, null, body);
+      html("td", "rowh mono", commitLabel(p), tr);
+      for (const text of [dayOf(p), p.source, p.rdflib ?? "?"]) html("td", "rowh sub", text, tr);
+      for (const s of shown){
+        const c = cell(p, s);
+        const text = c?.speedup == null ? "—" : fmt(c.speedup) + (c.dropped.length ? " *" : "");
+        const td = html("td", "num", text, tr);
+        if (c?.dropped.length) td.title = `leaves out ${c.dropped.join(", ")}`;
+      }
+    }
+  }
+
+  draw();
+  new ResizeObserver(() => { if (chartEl.clientWidth !== lastWidth) drawChart(); })
+    .observe(chartEl);
 })();
 
 document.getElementById("provenance").textContent = PROVENANCE;
