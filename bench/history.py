@@ -20,6 +20,7 @@ on different machines stay roughly comparable.
 
 import argparse
 import json
+import math
 import platform
 import subprocess
 import sys
@@ -85,6 +86,117 @@ def dropped_queries(row_counts: dict[str, dict[str, int]]) -> dict[str, list[str
             if slug in per_store and per_store[slug] != expected:
                 dropped.setdefault(slug, []).append(query)
     return {slug: sorted(queries) for slug, queries in dropped.items()}
+
+
+def load_records(folder: Path) -> tuple[list[dict], list[str]]:
+    """Every record in ``folder``, and a warning per file that can't be read."""
+    if not folder.is_dir():
+        return [], [f"no history folder at {folder}"]
+    records: list[dict] = []
+    warnings: list[str] = []
+    for path in sorted(folder.glob("*.json")):
+        try:
+            records.append(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError) as error:
+            warnings.append(f"skipped {path.name}: {error}")
+    return records, warnings
+
+
+def build_series(main: list[dict], local: list[dict]) -> dict | None:
+    """The history chart's data: one point per record, one line per configuration.
+
+    Records with an unknown schema, without reference medians, or on another
+    dataset scale than the newest ``main`` one are skipped with a warning.
+    Every point is a geometric mean over the same queries (those every kept
+    record has reference medians for), so the lines stay comparable; a query
+    a configuration lacks or answered wrongly is dropped from that point
+    alone. ``None`` when there is nothing to plot.
+    """
+    warnings: list[str] = []
+    main = sorted(
+        (r for r in main if _usable(r, warnings)),
+        key=lambda r: datetime.fromisoformat(r["commit"]["date"]),
+    )
+    local = sorted(
+        (r for r in local if _usable(r, warnings)),
+        key=lambda r: datetime.fromisoformat(r["run"]["measured"]),
+    )
+    if not main and not local:
+        return None
+    scale = (main or local)[-1]["dataset"]
+    kept: list[dict] = []
+    for record in [*main, *local]:
+        if record["dataset"] == scale:
+            kept.append(record)
+        else:
+            warnings.append(
+                f"skipped {_name(record)}: dataset {record['dataset']}, plotting {scale}"
+            )
+    queries = sorted(
+        set.intersection(*(set(r["medians"][r["reference"]][mode]) for r in kept for mode in MODES))
+    )
+    present = [s for s in CONFIGURATIONS if any(s in r["medians"] for r in kept)]
+    labels: dict[str, str] = {}
+    for record in kept:  # oldest first, so the newest label wins
+        labels.update(record.get("labels", {}))
+    return {
+        "queries": len(queries),
+        "configurations": [
+            {"slug": s, "label": labels.get(s, s), "slot": CONFIGURATIONS.index(s) + 1}
+            for s in present
+        ],
+        "points": [_point(record, present, queries) for record in kept],
+        "warnings": warnings,
+    }
+
+
+def _point(record: dict, present: list[str], queries: list[str]) -> dict:
+    reference = record["medians"][record["reference"]]
+    values: dict[str, dict | None] = {}
+    for slug in present:
+        mine = record["medians"].get(slug)
+        if mine is None:
+            values[slug] = None
+            continue
+        wrong = set(record.get("dropped", {}).get(slug, ()))
+        per_mode: dict[str, dict] = {}
+        for mode in MODES:
+            times = mine.get(mode, {})
+            dropped = [q for q in queries if q in wrong or q not in times]
+            used = [q for q in queries if q not in dropped]
+            speedup = (
+                math.exp(sum(math.log(reference[mode][q] / times[q]) for q in used) / len(used))
+                if used
+                else None
+            )
+            per_mode[mode] = {"speedup": speedup, "dropped": dropped}
+        values[slug] = per_mode
+    commit = record["commit"]
+    return {
+        "commit": {k: commit.get(k) for k in ("sha", "short", "date", "subject", "ref", "dirty")},
+        "source": record["run"]["source"],
+        "local": record["run"]["source"] == "local",
+        "measured": record["run"]["measured"],
+        "rdflib": record["run"].get("versions", {}).get("rdflib"),
+        "values": values,
+    }
+
+
+def _usable(record: dict, warnings: list[str]) -> bool:
+    if record.get("schema") != SCHEMA:
+        warnings.append(f"skipped {_name(record)}: schema {record.get('schema')!r}, not {SCHEMA}")
+        return False
+    reference = record.get("medians", {}).get(record.get("reference"), {})
+    if not all(reference.get(mode) for mode in MODES):
+        warnings.append(f"skipped {_name(record)}: no {record.get('reference')} medians")
+        return False
+    return True
+
+
+def _name(record: dict) -> str:
+    commit = record.get("commit") or {}
+    run = record.get("run") or {}
+    return f"{commit.get('short', '?')} ({run.get('source', '?')})"
 
 
 def git(*args: str) -> str:
