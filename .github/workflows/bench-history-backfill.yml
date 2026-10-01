@@ -1,0 +1,74 @@
+name: Benchmark History Backfill
+
+# Measures older commits of main with today's benchmark and writes their
+# records to the bench-history branch, so the history chart has points from
+# before CI recorded them. Each commit's own library code runs under today's
+# harness, dataset and queries: the worktree's src/ goes first on PYTHONPATH,
+# ahead of the editable install. Started by hand; re-running a commit
+# replaces its record.
+on:
+  workflow_dispatch:
+    inputs:
+      commits:
+        description: Commits of main to measure, space-separated
+        default: 36caede 2e04fb1 8813a97 0007bb6
+
+permissions:
+  contents: write
+
+# Shared with the dashboard workflow, so one job writes bench-history at a time.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Measure and record each commit
+        env:
+          COMMITS: ${{ inputs.commits }}
+        run: |
+          if git ls-remote --exit-code --heads origin bench-history >/dev/null; then
+            git fetch --quiet origin bench-history
+            git worktree add --detach history FETCH_HEAD
+          else
+            git worktree add --orphan -b bench-history history
+          fi
+          adapters="$(uv run python -m bench.history adapters)"
+          for commit in $COMMITS; do
+            lib="$RUNNER_TEMP/lib-$commit"
+            git worktree add --detach "$lib" "$commit"
+            found="$(PYTHONPATH="$lib/src" uv run python -c 'import vortex_rdflib; print(vortex_rdflib.__file__)')"
+            case "$found" in
+              "$lib"/*) ;;
+              *) echo "::error::$commit: vortex_rdflib resolved to $found, not $lib; skipped"; continue ;;
+            esac
+            if PYTHONPATH="$lib/src" uv run python -m bench.run_bench \
+                 --adapters "$adapters" --out "$RUNNER_TEMP/results-$commit.json"; then
+              uv run python -m bench.history record "$RUNNER_TEMP/results-$commit.json" \
+                --source backfill --commit "$commit" --ref main --out history/records
+            else
+              echo "::error::$commit: the benchmark did not complete; skipped"
+            fi
+          done
+          cd history
+          git add records
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet -m "bench: backfill $COMMITS"
+          git push --quiet origin HEAD:bench-history \
+            || { git fetch --quiet origin bench-history && git rebase --quiet FETCH_HEAD \
+                 && git push --quiet origin HEAD:bench-history; }

@@ -13,7 +13,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # write: the history chart's records are pushed to the bench-history branch.
+  contents: write
   pages: write
   id-token: write
 
@@ -48,8 +49,33 @@ jobs:
       - name: Run comparative benchmark
         run: uv run python -m bench.run_bench --out bench/results.json
 
+      # The history chart's data: one record per commit on the bench-history
+      # branch, kept across deploys. A failed push costs later dashboards this
+      # point, not this deploy, which renders it from disk.
+      - name: Record the history point
+        run: |
+          if git ls-remote --exit-code --heads origin bench-history >/dev/null; then
+            git fetch --quiet origin bench-history
+            git worktree add --detach history FETCH_HEAD
+          else
+            git worktree add --orphan -b bench-history history
+          fi
+          uv run python -m bench.history record bench/results.json \
+            --source ci --commit "$GITHUB_SHA" --ref main --out history/records
+          cd history
+          git add records
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet -m "bench: record ${GITHUB_SHA::7}"
+          git push --quiet origin HEAD:bench-history \
+            || { git fetch --quiet origin bench-history && git rebase --quiet FETCH_HEAD \
+                 && git push --quiet origin HEAD:bench-history; } \
+            || echo "::warning::could not push the history record for ${GITHUB_SHA::7}"
+
       - name: Render dashboard
-        run: uv run python scripts/render_bench_dashboard.py bench/results.json public/index.html
+        run: >-
+          uv run python scripts/render_bench_dashboard.py bench/results.json public/index.html
+          --history history/records
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
