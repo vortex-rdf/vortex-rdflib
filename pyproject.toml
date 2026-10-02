@@ -46,8 +46,9 @@ dev = [
     "ruff>=0.16.9",
     "ty>=0.0.84",
 ]
-# Comparative benchmark contenders (bench/): oxrdflib pulls pyoxigraph.
-bench = ["oxrdflib>=0.5"]
+# Comparative benchmark contenders (bench/): oxrdflib serves Oxigraph through
+# rdflib, and pyoxigraph is measured directly as well.
+bench = ["oxrdflib>=0.5", "pyoxigraph>=0.5"]
 
 [project.urls]
 Homepage = "https://github.com/vortex-rdf/vortex-rdflib"

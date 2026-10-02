@@ -26,7 +26,8 @@ jobs:
         with:
           enable-cache: true
       - name: Install
-        # bench/ imports oxrdflib, so `ty` needs the bench group to resolve it.
+        # bench/ imports oxrdflib and pyoxigraph, so `ty` needs the bench group
+        # to resolve them.
         run: uv sync --locked --group bench
       - name: Ruff format
         run: uv run ruff format --check

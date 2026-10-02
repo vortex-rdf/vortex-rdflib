@@ -80,6 +80,11 @@ class Query:
     is_ask: bool = False
     #: Names a graph, so only a store that serves named graphs can answer it.
     quads: bool = False
+    #: One pattern, and an answer that is a cardinality rather than the rows:
+    #: a store able to count a selection without materializing it answers
+    #: these without decoding a term, so their columns compare an approach
+    #: rather than an implementation's speed. See ``docs/pushdown.md``.
+    countable: bool = False
 
 
 def _sparql(text: str) -> str:
@@ -367,6 +372,7 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                 }}
             """),
             is_ask=True,
+            countable=True,
         ),
         Query(
             "po-lookup",
@@ -404,6 +410,7 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                 }}
             """),
             is_ask=True,
+            countable=True,
         ),
         Query(
             "limit-scan",
@@ -642,6 +649,7 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
                 }
             """),
             heavy=True,
+            countable=True,
         ),
         Query(
             "count-distinct",
