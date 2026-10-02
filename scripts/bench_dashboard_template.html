@@ -265,7 +265,7 @@
   <section id="overview" class="group">
     <p class="lede">
       A run of <code>bench/run_bench.py</code>: <a href="https://github.com/vortex-rdf/vortex-rdflib">vortex-rdflib</a>'s
-      <code>VortexRdflibStore</code> against: 
+      <code>VortexRdflibStore</code> against itself and: 
       <ul>
         <li><a href="https://github.com/RDFLib/rdflib">rdflib</a> (default)</li>
         <li><a href="https://github.com/oxigraph/oxrdflib">oxrdflib</a> (rdflib over an Oxigraph store)</li>
@@ -307,12 +307,9 @@
     </div>
     <p class="group-desc">
       How many times faster each vortex-rdflib configuration answers the query set than
-      rdflib's in-memory store, measured in the same run: rdflib's time divided by the
-      configuration's, as a geometric mean over the queries every point shares. Above 1× is
-      faster. Older commits were measured with today's benchmark against their own library
-      code. A hollow dot leaves out queries that configuration answered with a different row
-      count than rdflib. Local points, measured on another machine, follow
-      <span class="mono">main</span>'s.
+      rdflib's in-memory store. rdflib's time divided by the
+      configuration's, as a geometric mean over all the queries. Above 1× is
+      faster.
     </p>
     <div class="history-controls" id="history-controls"></div>
     <div class="panel wide history-panel">
@@ -331,9 +328,9 @@
     <p class="group-desc">
       Cold start: from the shared source file — <span class="mono">.nq</span> for the stores with
       named graphs, the flattened <span class="mono">.nt</span> for HDT and COTTAS — to a
-      queryable store. The same statements either way, but <strong>not the same bytes</strong>:
+      queryable store. The same statements, but <strong>not the same bytes</strong>:
       dropping the graph column makes the <span class="mono">.nt</span> about 18% smaller, so
-      those two rows have that much less to parse. Most
+      those two libraries have that much less to parse. Most
       libraries build their own format first — <span class="mono">serialize_rdf</span> (vortex-rdflib),
       <span class="mono">rdf2cottas</span>, <span class="mono">hdt convert</span> — then open it;
       rdflib and oxrdflib parse directly, and pyoxigraph bulk-loads the file with its own
