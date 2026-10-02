@@ -250,8 +250,8 @@
       <span class="sub">SPARQL over rdflib stores — comparative benchmark</span>
     </div>
     <nav class="seclinks">
-      <a href="#history" id="nav-history" hidden>History</a>
       <a href="#overview">Overview</a>
+      <a href="#history" id="nav-history" hidden>History</a>
       <a href="#load">Load</a>
       <a href="#queries">Queries</a>
       <a href="#memory">Memory</a>
@@ -262,29 +262,6 @@
 </header>
 
 <main>
-  <section id="history" class="group" hidden>
-    <div class="group-head">
-      <span class="chan-tag mono">HISTORY</span>
-      <h2>Speedup over rdflib, per commit</h2>
-    </div>
-    <p class="group-desc">
-      How many times faster each vortex-rdflib configuration answers the query set than
-      rdflib's in-memory store, measured in the same run: rdflib's time divided by the
-      configuration's, as a geometric mean over the queries every point shares. Above 1× is
-      faster. Older commits were measured with today's benchmark against their own library
-      code. A hollow dot leaves out queries that configuration answered with a different row
-      count than rdflib. Local points, measured on another machine, follow
-      <span class="mono">main</span>'s.
-    </p>
-    <div class="history-controls" id="history-controls"></div>
-    <div class="panel wide history-panel">
-      <p class="note mono" id="history-sub"></p>
-      <div class="history-chart" id="history-chart"></div>
-      <div class="history-tip" id="history-tip" aria-live="polite" hidden></div>
-      <div class="table-wrap" id="history-table" hidden></div>
-    </div>
-  </section>
-
   <section id="overview" class="group">
     <p class="lede">
       A run of <code>bench/run_bench.py</code>: <a href="https://github.com/vortex-rdf/vortex-rdflib">vortex-rdflib</a>'s
@@ -321,6 +298,29 @@
     </p>
     <div class="kpi-row" id="kpi-row"></div>
     <div id="failures-host"></div>
+  </section>
+
+  <section id="history" class="group" hidden>
+    <div class="group-head">
+      <span class="chan-tag mono">HISTORY</span>
+      <h2>Speedup over rdflib, per commit</h2>
+    </div>
+    <p class="group-desc">
+      How many times faster each vortex-rdflib configuration answers the query set than
+      rdflib's in-memory store, measured in the same run: rdflib's time divided by the
+      configuration's, as a geometric mean over the queries every point shares. Above 1× is
+      faster. Older commits were measured with today's benchmark against their own library
+      code. A hollow dot leaves out queries that configuration answered with a different row
+      count than rdflib. Local points, measured on another machine, follow
+      <span class="mono">main</span>'s.
+    </p>
+    <div class="history-controls" id="history-controls"></div>
+    <div class="panel wide history-panel">
+      <p class="note mono" id="history-sub"></p>
+      <div class="history-chart" id="history-chart"></div>
+      <div class="history-tip" id="history-tip" aria-live="polite" hidden></div>
+      <div class="table-wrap" id="history-table" hidden></div>
+    </div>
   </section>
 
   <section id="load" class="group">

@@ -164,11 +164,11 @@ scripts/refresh.sh --only render        # template-only edits: no re-measurement
 scripts/refresh.sh --history            # plot the working tree on the history chart
 ```
 
-The dashboard opens with a history chart: for each commit on `main`, how many
-times faster each vortex-rdflib configuration answers the query set than
-rdflib's in-memory store, as a geometric mean (exec only, or full). CI records
-one point per benchmark run on the `bench-history` branch. To plot a change on
-your branch against that line before merging it, run
+Below the overview, the dashboard has a history chart: for each commit on
+`main`, how many times faster each vortex-rdflib configuration answers the
+query set than rdflib's in-memory store, as a geometric mean (exec only, or
+full). CI records one point per benchmark run on the `bench-history` branch.
+To plot a change on your branch against that line before merging it, run
 `scripts/refresh.sh --history` (about 6 minutes at the default scale): it
 measures the working tree and renders `public/index.html` with your point after
 `main`'s.
