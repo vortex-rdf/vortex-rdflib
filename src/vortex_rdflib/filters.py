@@ -21,9 +21,20 @@ evaluated **per distinct value**, never per row, through two routes:
 
 ``UNKNOWN`` is sticky through ``&&``/``||``/``!`` except where rdflib itself
 short-circuits first (``false && ?`` is false, ``true || ?`` is true).
+
+A single-variable conjunct of one of the shapes the native layer evaluates
+over the dictionary itself (``TermDict.filter_codes``: the kind tests,
+``datatype``, ``lang``, ``langMatches``, a numeric comparison with a
+constant, ``strstarts(str(?v), ...)``) also carries that predicate
+(``Conjunct.native``). Its definite answers are a one-time scan of the
+dictionary, memoized; the pushdown turns them into a ``keep`` on the native
+match, so the rows that fail never cross into Python, and
+:func:`evaluate_column` reads them instead of decoding a value. The codes
+the native layer leaves undecided go down the two routes above.
 """
 
 import re
+from bisect import bisect_left
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -35,12 +46,17 @@ from rdflib.plugins.sparql.operators import _lang_range_check
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.plugins.sparql.sparql import FrozenBindings, SPARQLError
 from rdflib.term import BNode, Literal, URIRef, Variable
+from vortex_rdf import U32Column
 
-from .terms import BLANK, IRI, LITERAL, TermView, kind_of, parse_spelling
+from .terms import BLANK, IRI, LITERAL, TermView, canonical_spelling, kind_of, parse_spelling
 
 # Force the generic route everywhere (VORTEX_RDF_FILTER_FAST=0): the
 # equivalence tests run the matrix both ways.
 _FAST_ENABLED: bool = True
+# Answer the conjuncts the native layer can evaluate from its dictionary
+# scan (VORTEX_RDF_NATIVE_FILTERS=0 keeps them on the Python fast route,
+# for A/B measurements; the generic route above disables them too).
+_NATIVE_ENABLED: bool = True
 
 
 class _Sentinel:
@@ -730,6 +746,295 @@ def is_kind_only(expr) -> bool:
     return False
 
 
+# --- native predicates ------------------------------------------------------
+
+#: The relational operators as native numeric predicates, and the operator
+#: that reads the same comparison with its operands swapped.
+_NUM_KINDS = {
+    "<": "num_lt",
+    "<=": "num_le",
+    ">": "num_gt",
+    ">=": "num_ge",
+    "=": "num_eq",
+    "!=": "num_ne",
+}
+_SWAPPED = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "=": "=", "!=": "!="}
+#: The native predicates whose definite answers are all literals: a
+#: non-literal code is in neither of their sets and fails them, except `!=`.
+_LITERAL_DOMAIN = frozenset({"datatype", "lang", "lang_matches", *_NUM_KINDS.values()})
+#: Language ranges on which the native basic filtering (RFC 4647 §3.3.1) and
+#: rdflib's `_lang_range_check` agree: `*`, or ASCII alphanumeric subtags.
+_LANG_RANGE = re.compile(r"\*|[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
+
+
+def _call_on(node, name: str, var) -> bool:
+    """Whether ``node`` is the builtin ``name`` applied to ``var`` itself."""
+    return isinstance(node, CompValue) and node.name == name and node.arg == var
+
+
+def _string_constant(term) -> bool:
+    """A plain or ``xsd:string`` literal: what the native string predicates
+    take as their argument."""
+    return (
+        isinstance(term, Literal)
+        and term.language is None
+        and (term.datatype is None or str(term.datatype) == _XSD_STRING)
+    )
+
+
+def _constant_term(node, consts: dict):
+    """The rdflib term an operand without block variables evaluates to: a
+    constant, a visible ctx-bound variable, or an expression over those,
+    which rdflib's own evaluator computes. ``None`` for an error or a value
+    that is not a term."""
+    if isinstance(node, (Literal, URIRef)):
+        return node
+    if isinstance(node, _VAR_LIKE):
+        term = consts.get(node)
+        return term if isinstance(term, (Literal, URIRef)) else None
+    if not isinstance(node, CompValue) or any(v not in consts for v in expr_vars(node)):
+        return None
+    try:
+        result = node.eval(dict(consts))
+    except Exception:  # noqa: BLE001 - not a value this route can rely on
+        return None
+    return result if isinstance(result, (Literal, URIRef)) else None
+
+
+def native_shape(expr, var, consts: dict) -> tuple[str, str] | None:
+    """The native term predicate ``(kind, arg)`` that ``expr`` is as a test of
+    ``var`` alone — any other variable seen only through ``consts`` — or
+    ``None``.
+
+    The shapes: ``isIRI``/``isURI``/``isBlank``/``isLiteral`` of ``var``;
+    ``datatype(var) = <iri>`` and ``lang(var) = "tag"`` (either way round);
+    ``langMatches(lang(var), "range")``; ``strstarts(str(var), "prefix")``;
+    and ``var`` compared with a well-formed numeric literal by any of
+    ``< <= > >= = !=`` (either way round). The native layer answers each
+    over the stored spellings with rdflib's own rules wherever it gives a
+    definite answer (``tests/test_native_filters.py`` pins that against
+    rdflib's evaluator) and leaves every other value undecided.
+    """
+    if not isinstance(expr, CompValue):
+        return None
+    name = expr.name
+    if name in ("Builtin_isIRI", "Builtin_isURI", "Builtin_isBLANK", "Builtin_isLITERAL"):
+        if expr.arg != var:
+            return None
+        return {"Builtin_isBLANK": ("is_blank", ""), "Builtin_isLITERAL": ("is_literal", "")}.get(
+            name, ("is_iri", "")
+        )
+    if name == "Builtin_LANGMATCHES":
+        if not _call_on(expr.arg1, "Builtin_LANG", var):
+            return None
+        # rdflib's `string()` admits a language-tagged range: its lexical
+        # form is the range either way.
+        rng = _constant_term(expr.arg2, consts)
+        if not isinstance(rng, Literal) or (
+            rng.datatype is not None and str(rng.datatype) != _XSD_STRING
+        ):
+            return None
+        return ("lang_matches", str(rng)) if _LANG_RANGE.fullmatch(str(rng)) else None
+    if name == "Builtin_STRSTARTS":
+        if not _call_on(expr.arg1, "Builtin_STR", var):
+            return None
+        prefix = _constant_term(expr.arg2, consts)
+        return ("str_prefix", str(prefix)) if _string_constant(prefix) else None
+    if name != "RelationalExpression" or expr.other is None or isinstance(expr.other, list):
+        return None
+    op, left, right = expr.op, expr.expr, expr.other
+    if op == "=":
+        for call, other in ((left, right), (right, left)):
+            if _call_on(call, "Builtin_DATATYPE", var):
+                datatype = _constant_term(other, consts)
+                return ("datatype", str(datatype)) if isinstance(datatype, URIRef) else None
+            if _call_on(call, "Builtin_LANG", var):
+                tag = _constant_term(other, consts)
+                return ("lang", str(tag)) if _string_constant(tag) else None
+    kind = _NUM_KINDS.get(op)
+    if kind is None:
+        return None
+    if isinstance(left, _VAR_LIKE) and left == var:
+        constant = _constant_term(right, consts)
+    elif isinstance(right, _VAR_LIKE) and right == var:
+        constant = _constant_term(left, consts)
+        kind = _NUM_KINDS[_SWAPPED[op]]
+    else:
+        return None
+    # A constant inside the value model both sides share — rdflib compares a
+    # typed query constant by its value even out of its type's bounds (see
+    # `_constant_view`), which the native layer refuses to.
+    if (
+        not isinstance(constant, Literal)
+        or str(constant.datatype) not in NUMERIC_TYPES
+        or numeric_value(view_of_node(constant)) is None
+    ):
+        return None
+    return (kind, canonical_spelling(constant))
+
+
+class NativeVerdicts:
+    """A native term predicate's partition of the dictionary
+    (``TermDict.filter_codes``): the ascending codes it definitely holds for,
+    and those it leaves undecided. A literal-domain predicate decides every
+    code outside the literal range by ``nonliteral``; any other code in
+    neither set fails."""
+
+    __slots__ = ("true", "undecided", "_true", "_undecided", "literal_domain", "nonliteral")
+
+    def __init__(self, true, undecided, literal_domain: bool, nonliteral: bool):
+        self.true = true
+        self.undecided = undecided
+        self._true = memoryview(true).cast("I")
+        self._undecided = memoryview(undecided).cast("I")
+        self.literal_domain = literal_domain
+        self.nonliteral = nonliteral
+
+    def undecided_in(self, lo: int, hi: int) -> bool:
+        """Whether any undecided code lies in ``[lo, hi)``."""
+        return bisect_left(self._undecided, hi) > bisect_left(self._undecided, lo)
+
+    def split(self, codes, literals: tuple[int, int]) -> tuple[set, list]:
+        """Of ``codes``: the set that passes, and the codes left undecided.
+
+        The undecided set is read first: it holds the codes whose native
+        verdict is not rdflib's (see :func:`native_verdicts`), whichever set
+        they would otherwise be found in.
+        """
+        passed: set = set()
+        undecided: list = []
+        lo, hi = literals
+        for code in codes:
+            if _sorted_contains(self._undecided, code):
+                undecided.append(code)
+            elif _sorted_contains(self._true, code):
+                passed.add(code)
+            elif self.literal_domain and self.nonliteral and not lo <= code < hi:
+                passed.add(code)
+        return passed, undecided
+
+
+def _sorted_contains(view, code: int) -> bool:
+    index = bisect_left(view, code)
+    return index < len(view) and view[index] == code
+
+
+def native_verdicts(store, kind: str, arg: str) -> NativeVerdicts | None:
+    """The store dictionary's partition by a native predicate, or ``None``
+    when the native layer refuses the argument (a numeric constant outside
+    its value model, say).
+
+    For the numeric comparisons the ``xsd:long`` and ``xsd:unsignedLong``
+    literals beyond 64 bits join the undecided set: the native layer holds
+    them to XSD's bounds and orders them by their datatype IRI, where rdflib
+    — which checks no upper bound for either — compares them by value.
+    """
+    try:
+        true, undecided = store._dict.filter_codes(kind, arg)
+    except ValueError:
+        return None
+    if kind in _NUM_KINDS.values():
+        suspects = store._wide_integer_codes()
+        if suspects:
+            merged = set(memoryview(undecided).cast("I"))
+            merged.update(suspects)
+            undecided = U32Column(sorted(merged))
+    return NativeVerdicts(true, undecided, kind in _LITERAL_DOMAIN, kind == "num_ne")
+
+
+def wide_integer_codes(store) -> list:
+    """The codes of the ``xsd:long`` and ``xsd:unsignedLong`` literals the
+    native value model leaves without a value: one is out of 64-bit range
+    (or malformed) exactly when a ``num_eq`` against a zero of its own
+    datatype is undecided. Two dictionary scans, once per store; empty for
+    most stores, which use ``xsd:integer``."""
+    codes: set = set()
+    for local in ("long", "unsignedLong"):
+        datatype = _XSD + local
+        typed, _ = store._dict.filter_codes("datatype", datatype)
+        if not len(typed):
+            continue
+        _, undecided = store._dict.filter_codes("num_eq", f'"0"^^<{datatype}>')
+        left, _ = typed.join_indices(undecided)
+        codes.update(memoryview(typed.take(left)).cast("I").tolist())
+    return sorted(codes)
+
+
+#: The term kinds that can occupy each quad position (s, p, o, g) — an
+#: undecided native verdict matters only for a code the position can hold.
+_POSITION_KINDS = ((IRI, BLANK), (IRI,), (LITERAL, IRI, BLANK), (IRI, BLANK))
+
+
+def native_restriction(store, conjuncts: list, positions) -> tuple:
+    """``(keep, residual)`` for one variable's conjuncts at ``positions``.
+
+    ``keep`` admits exactly the codes that pass every conjunct the native
+    layer decides for each code those positions can hold — a ``(lo, hi)``
+    code range for the kind tests, an ascending code column otherwise, or
+    ``None`` when no conjunct qualifies — and ``residual`` are the conjuncts
+    left to the Python routes. A conjunct qualifies when its native
+    predicate leaves no code of those kinds undecided; ``!=`` never does,
+    since every non-literal passes it and no single keep says so.
+    """
+    if not (_FAST_ENABLED and _NATIVE_ENABLED):
+        return None, conjuncts
+    kinds = {kind for position in positions for kind in _POSITION_KINDS[position]}
+    ranges = store._kind_ranges()
+    keeps, residual = [], []
+    for conjunct in conjuncts:
+        keep = None
+        if conjunct.native is not None:
+            kind, arg = conjunct.native
+            if kind in ("is_literal", "is_iri", "is_blank"):
+                keep = ranges[{"is_literal": LITERAL, "is_iri": IRI, "is_blank": BLANK}[kind]]
+            elif kind != "num_ne":
+                verdicts = store._native_verdicts(kind, arg)
+                if verdicts is not None and not any(
+                    verdicts.undecided_in(*ranges[k]) for k in kinds
+                ):
+                    keep = verdicts.true
+        if keep is None:
+            residual.append(conjunct)
+        else:
+            keeps.append(keep)
+    return (intersect_keeps(keeps) if keeps else None), residual
+
+
+def intersect_keeps(keeps: list):
+    """The intersection of native keeps: ranges intersect as ranges, code
+    columns (ascending, unique) through the native merge join, and a range
+    over a column slices it."""
+    ranges = [keep for keep in keeps if isinstance(keep, tuple)]
+    columns = sorted((keep for keep in keeps if not isinstance(keep, tuple)), key=len)
+    if ranges:
+        lo = max(lo for lo, _ in ranges)
+        hi = max(lo, min(hi for _, hi in ranges))
+    if not columns:
+        return (lo, hi)
+    result = columns[0]
+    for other in columns[1:]:
+        if not len(result):
+            break
+        left, _ = result.join_indices(other)
+        result = result.take(left)
+    if ranges:
+        view = memoryview(result).cast("I")
+        start, stop = bisect_left(view, lo), bisect_left(view, hi)
+        if (start, stop) != (0, len(view)):
+            result = U32Column(view[start:stop])
+    return result
+
+
+def keep_member(keep) -> Callable[[int], bool]:
+    """A native keep as a test of one code, for rows that did not come
+    through a keep-narrowed native match."""
+    if isinstance(keep, tuple):
+        lo, hi = keep
+        return lambda code: lo <= code < hi
+    view = memoryview(keep).cast("I")
+    return lambda code: _sorted_contains(view, code)
+
+
 # --- analysis ----------------------------------------------------------------
 
 
@@ -785,6 +1090,9 @@ class Conjunct:
     kind_only: bool
     consts: dict = field(default_factory=dict)  # visible ctx-bound vars -> rdflib terms
     ctx: Any = None
+    # The native term predicate `(kind, arg)` a single-variable conjunct is
+    # (see `native_shape`), or None.
+    native: tuple[str, str] | None = None
 
     def generic(self, bound: dict) -> bool:
         """rdflib's own answer for one value assignment (``bound`` maps the
@@ -866,8 +1174,11 @@ def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
                 const_views = None
             if const_views is not None:
                 fast = compile_fast(expr, variables, const_views)
+        native = None
+        if len(variables) == 1 and _FAST_ENABLED and _NATIVE_ENABLED:
+            native = native_shape(expr, variables[0], consts)
         conjunct = Conjunct(
-            expr, variables, fast, fast is not None and is_kind_only(expr), consts, ctx
+            expr, variables, fast, fast is not None and is_kind_only(expr), consts, ctx, native
         )
         shape = exists_shape(expr)
         if shape is not None:
@@ -895,7 +1206,9 @@ def evaluate_constant(conjunct: Conjunct) -> bool:
 
 def evaluate_column(store, conjuncts: list, codes) -> set:
     """The subset of ``codes`` (distinct codes of one variable) passing every
-    conjunct. Kind-only predicates never decode; the others decode the
+    conjunct. Kind-only predicates never decode; a conjunct with a native
+    predicate reads its memoized partition of the dictionary, and only the
+    codes the native layer leaves undecided go on; the others decode the
     surviving codes once, in one batch, and parse their spellings."""
     remaining = set(codes)
     views: dict = {}
@@ -906,20 +1219,27 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
         fast = conjunct.fast
         passed: set = set()
         unknown: list = []
-        if fast is None:
-            unknown = list(remaining)
+        candidates = remaining
+        if conjunct.native is not None and not conjunct.kind_only and _NATIVE_ENABLED:
+            verdicts = store._native_verdicts(*conjunct.native)
+            if verdicts is not None:
+                passed, candidates = verdicts.split(remaining, store._kind_ranges()[LITERAL])
+        if not candidates:
+            pass
+        elif fast is None:
+            unknown = list(candidates)
         elif conjunct.kind_only:
             if bounds is None:
                 bounds = store._term_kind_bounds()
-            for code in remaining:
+            for code in candidates:
                 r = fast((TermView(kind_of(code, bounds), None),))
                 if r is True:
                     passed.add(code)
                 elif r is UNKNOWN:
                     unknown.append(code)
         else:
-            decode_views(store, remaining, views)
-            for code in remaining:
+            decode_views(store, candidates, views)
+            for code in candidates:
                 r = fast((views[code],))
                 if r is True:
                     passed.add(code)

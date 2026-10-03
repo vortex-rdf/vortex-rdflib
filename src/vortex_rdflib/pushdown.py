@@ -11,43 +11,54 @@ subtree of a query still runs here.
 What runs in code space:
 
 - a basic graph pattern is solved in one pass: every triple pattern is
-  *counted* natively first (a count is a fraction of a match's cost and
-  moves no columns), the smallest is matched and seeds the relation, and
-  each further pattern — smallest first among those sharing a variable with
-  the relation — is either re-probed per row of the relation when the
-  relation is far smaller than the pattern's count (``_probe_join``) or
-  matched once and hash-joined on ``u32`` code columns; a pattern that
-  counts to nothing empties the block before anything is matched, and
-  the join itself never decodes a term;
+  *counted* natively first, in one concurrent batch (a count is a fraction
+  of a match's cost and moves no columns), the smallest is matched and
+  seeds the relation, and each further pattern — smallest first among those
+  sharing a variable with the relation — is either re-probed per row of the
+  relation when the relation is far smaller than the pattern's count
+  (``_probe_join``, the probes batched into one native call) or matched
+  once and hash-joined by the native ``join_indices``/``take`` kernels; a
+  pattern that counts to nothing empties the block before anything is
+  matched, and the join itself never decodes a term;
 - a ``Filter`` over a block is split into conjuncts (:mod:`.filters`):
-  those over one variable are evaluated once per distinct code of the
+  those over one variable that the native layer decides from its dictionary
+  (kind tests, ``datatype``, ``lang``, ``langMatches``, numeric comparisons,
+  ``strstarts(str(?v), ...)``) become a ``keep`` on the match of every
+  pattern binding the variable, so the rows that fail never leave it; the
+  others over one variable are evaluated once per distinct code of the
   variable, on the pattern that binds it — over the pattern's whole column
   when it is matched, over the codes the probes reach when it is probed —
-  the others per distinct code tuple, after the join (mid-join when that
-  lets a later pattern be probed); a whitelist of expression shapes runs
-  over the stored spellings, anything else (and any value outside its exact
-  domain) goes to rdflib's own evaluator, per distinct value, not per row;
+  the rest per distinct code tuple, after the join (mid-join when that lets
+  a later pattern be probed, and as a keep when the relation binds all but
+  one of its variables to single values); a whitelist of expression shapes
+  runs over the stored spellings, anything else (and any value outside its
+  exact domain) goes to rdflib's own evaluator, per distinct value, not per
+  row;
 - group joins (``Join``), ``OPTIONAL`` (``LeftJoin``), ``MINUS`` and
   ``FILTER (NOT) EXISTS`` over blocks run as hash joins, left joins, anti-
   and semi-joins over code tuples, with a one-pattern inner side counted
   first and re-probed per outer row when the outer relation is small —
   instead of rdflib re-entering the store once per outer solution, and
   without the inner side's complete match; an inline ``VALUES`` table
-  is a code-space relation too (a constant the dictionary does not hold
-  gets a private negative code and joins nothing);
+  is a code-space relation too, its constants encoded in one batch (a
+  constant the dictionary does not hold gets a private negative code and
+  joins nothing);
 - ``Project``, ``Distinct``, ``OrderBy`` (on variables) and ``Slice``
-  (LIMIT/OFFSET) heads are applied to the code-space relation, and an
-  ``AskQuery`` over one pattern is answered from the row selection alone, so
-  only the projected variables of the rows that are actually consumed are
-  ever decoded — a ``LIMIT 10`` decodes a few dozen codes, an ASK none, a
-  ``DISTINCT ?p`` over the whole store only its distinct predicates; an
+  (LIMIT/OFFSET) heads are applied to the code-space relation — a LIMIT over
+  one pattern stops the native match itself — and an ``AskQuery`` over one
+  pattern is a count capped at one row, so only the projected variables of
+  the rows that are actually consumed are ever decoded — a ``LIMIT 10``
+  decodes a few dozen codes, an ASK none, a ``DISTINCT ?p`` over the whole
+  store only its distinct predicates (found by the native ``distinct``); an
   ORDER BY ranks each distinct code once (blank nodes and IRIs by code
   order, literals through rdflib's own comparator) and sorts the code rows,
   a top-k when a LIMIT follows;
 - ``COUNT`` aggregates (``COUNT(*)``, ``COUNT(?v)``, ``COUNT(DISTINCT ?v)``,
   with or without ``GROUP BY`` variables) are computed over the code
-  columns, decoding only the group keys — and a ``COUNT(*)`` over one
-  pattern is answered by ``count_quads`` without matching a row;
+  columns — a column at a time by the native ``value_counts`` and
+  ``distinct`` where the body is columnar — decoding only the group keys,
+  and a ``COUNT(*)`` over one pattern (under a FILTER the native match
+  decides, too) is answered by ``count_quads`` without matching a row;
 - solutions are decoded lazily in growing chunks, each distinct code once
   through the store's decode cache, and built directly as
   ``FrozenBindings``, the row shape every rdflib operator above expects.
@@ -65,16 +76,18 @@ rdflib only catches ``NotImplementedError`` at hook-call time, so every
 capability check and every native call happens before a generator is handed
 back; the generators only decode. The hook applies when the active graph's
 store is a VortexRdflibStore with the code path available (Dictionary layout,
-resident dictionary); behaviour is identical to rdflib's default evaluation,
-only faster, and the equivalence tests compare both paths on every query
-shape.
+its dictionary resident or read from the file on demand); behaviour is
+identical to rdflib's default evaluation, only faster, and the equivalence
+tests compare both paths on every query shape.
 
 Registration happens automatically when the first ``VortexRdflibStore`` is
 constructed. ``VORTEX_RDF_DISABLE_PUSHDOWN=1`` keeps rdflib's evaluator
 entirely (the equivalence tests' oracle); ``VORTEX_RDF_PUSHDOWN_OPS`` narrows
 the intercepted algebra nodes to a comma-separated list (``bgp`` = basic
-graph patterns only) and ``VORTEX_RDF_FILTER_FAST=0`` routes every FILTER
-value through rdflib's evaluator, for bisecting and A/B measurements.
+graph patterns only), ``VORTEX_RDF_NATIVE_FILTERS=0`` keeps the conjuncts
+the native layer decides on the Python fast route and
+``VORTEX_RDF_FILTER_FAST=0`` routes every FILTER value through rdflib's
+evaluator, for bisecting and A/B measurements.
 ``VORTEX_RDF_TRACE_QUERY=1`` prints one JSON line per planning step to
 stderr (prefixed ``VORTEX_RDF_QUERY_TRACE``): what was counted, matched,
 probed, restricted and joined, with row counts and timings.
@@ -85,8 +98,6 @@ import json
 import os
 import sys
 import time
-from array import array
-from collections import Counter
 from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -98,6 +109,7 @@ from rdflib.plugins.sparql import CUSTOM_EVALS
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
+from vortex_rdf import U32Column
 
 from . import filters
 from .terms import canonical_spelling
@@ -193,10 +205,29 @@ def _trace_event(event: str, **fields) -> None:
         trace.emit(event, **fields)
 
 
+def _keep_summary(keep) -> dict | None:
+    """A native keep as JSON: per position, a code range or a set's size."""
+    if not keep:
+        return None
+    return {
+        str(position): ({"range": list(spec)} if isinstance(spec, tuple) else {"codes": len(spec)})
+        for position, spec in keep.items()
+    }
+
+
+def _probe_pattern(probe) -> list:
+    """The ``(s, p, o, g)`` of a batch probe, tuple or dict."""
+    if isinstance(probe, dict):
+        return [probe.get(key) for key in ("s", "p", "o", "g")]
+    return list(probe)
+
+
 class _TracedNative:
-    """The native store with every call recorded as a ``native_call_complete``
-    event: its operation, pattern, rows returned and elapsed time. Handed out
-    by :func:`_native` while a query is traced, so each native call the
+    """The native store with every call recorded as an event: a single call
+    as ``native_call_complete`` (its operation, pattern, narrowing, rows
+    returned and elapsed time), a batch as ``native_batch_complete`` (its
+    operation, probe count, total rows and elapsed time). Handed out by
+    :func:`_native` while a query is traced, so each native call the
     pushdown makes is an event, the per-row probes included."""
 
     __slots__ = ("_inner",)
@@ -204,28 +235,60 @@ class _TracedNative:
     def __init__(self, inner):
         self._inner = inner
 
-    def count_quads(self, *pattern):
+    def count_quads(self, *pattern, **narrowing):
         started = time.perf_counter_ns()
-        result = self._inner.count_quads(*pattern)
+        result = self._inner.count_quads(*pattern, **narrowing)
         elapsed = time.perf_counter_ns() - started
         _trace_event(
             "native_call_complete",
             operation="count_quads",
             pattern=list(pattern),
+            keep=_keep_summary(narrowing.get("keep")),
+            limit=narrowing.get("limit"),
             returned_rows=result,
             elapsed_ns=elapsed,
         )
         return result
 
-    def match_codes(self, *pattern):
+    def match_codes(self, *pattern, **narrowing):
         started = time.perf_counter_ns()
-        result = self._inner.match_codes(*pattern)
+        result = self._inner.match_codes(*pattern, **narrowing)
         elapsed = time.perf_counter_ns() - started
         _trace_event(
             "native_call_complete",
             operation="match_codes",
             pattern=list(pattern),
+            keep=_keep_summary(narrowing.get("keep")),
+            limit=narrowing.get("limit"),
             returned_rows=None if result is None else len(result[0]),
+            elapsed_ns=elapsed,
+        )
+        return result
+
+    def count_quads_many(self, probes):
+        started = time.perf_counter_ns()
+        result = self._inner.count_quads_many(probes)
+        elapsed = time.perf_counter_ns() - started
+        _trace_event(
+            "native_batch_complete",
+            operation="count_quads_many",
+            probe_count=len(probes),
+            first_pattern=_probe_pattern(probes[0]) if probes else None,
+            returned_rows=sum(result),
+            elapsed_ns=elapsed,
+        )
+        return result
+
+    def match_codes_many(self, probes):
+        started = time.perf_counter_ns()
+        result = self._inner.match_codes_many(probes)
+        elapsed = time.perf_counter_ns() - started
+        _trace_event(
+            "native_batch_complete",
+            operation="match_codes_many",
+            probe_count=len(probes),
+            first_pattern=_probe_pattern(probes[0]) if probes else None,
+            returned_rows=sum(len(cols[0]) for cols in result if cols is not None),
             elapsed_ns=elapsed,
         )
         return result
@@ -238,6 +301,33 @@ def _native(store):
     """The store's native handle, traced while the query is."""
     native = store._store()
     return native if _TRACE.get() is None else _TracedNative(native)
+
+
+class _Solution(FrozenBindings):
+    """The ``FrozenBindings`` the pushdown yields, with a direct ``get``.
+
+    rdflib's ``ResultRow`` reads every projected variable of every solution
+    through ``get``, which ``Mapping`` routes through ``__getitem__`` and its
+    type checks. A solution here only ever binds variable-like keys to
+    terms, never to ``None``, so a hit in its own bindings is the answer
+    ``__getitem__`` would give; anything else takes rdflib's own path.
+    """
+
+    def get(self, key, default=None):
+        value = self._d.get(key)
+        if value is not None:
+            return value
+        return FrozenBindings.get(self, key, default)
+
+
+def _solution(ctx, bindings: dict) -> _Solution:
+    """A solution over ``bindings``, which it takes as its own — what
+    ``FrozenBindings.__init__`` sets up, without copying the dict."""
+    solution = object.__new__(_Solution)
+    solution._d = bindings
+    solution._hash = None
+    solution.ctx = ctx
+    return solution
 
 
 def _relation_rows(rel: "Relation") -> int | None:
@@ -258,6 +348,8 @@ def register_sparql_pushdown():
         _ENABLED_OPS = _parse_ops(spec)
     if os.environ.get("VORTEX_RDF_FILTER_FAST") == "0":
         filters._FAST_ENABLED = False
+    if os.environ.get("VORTEX_RDF_NATIVE_FILTERS") == "0":
+        filters._NATIVE_ENABLED = False
     CUSTOM_EVALS.setdefault(_EVAL_KEY, _eval_part)
 
 
@@ -411,9 +503,10 @@ class Relation:
     """A code-space relation.
 
     ``schema`` names the variable-like terms. The body is either ``u32``
-    columns (``cols``, one per schema entry: the zero-copy views of a single
-    matched pattern, or the gathered ``array('I')`` columns of a hash join)
-    or materialized ``rows`` of ``int`` codes. ``None`` in a row is an unbound variable and
+    columns (``cols``, one per schema entry: zero-copy views over native
+    ``U32Column`` buffers — a single matched pattern's, or a hash join's
+    gathered columns) or materialized ``rows`` of ``int`` codes. ``None`` in
+    a row is an unbound variable and
     ``nullable`` lists the variables that may hold it; ``foreign`` maps
     negative codes to terms outside the dictionary; ``preds`` are row
     predicates still to be applied while a columnar body streams (``nrows``
@@ -421,7 +514,7 @@ class Relation:
     """
 
     schema: tuple
-    cols: tuple | None  # memoryview or array('I') per entry; both slice + tolist
+    cols: tuple | None  # a u32 memoryview per entry (slice, tolist, iterate)
     rows: list[tuple] | None
     nrows: int
     nullable: frozenset = frozenset()
@@ -587,7 +680,10 @@ def _eval_head(ctx, store, part):
         offset=head.start,
         limit=None if head.stop is None else head.stop - head.start,
     )
-    rel = _solve_block(ctx, store, head.block)
+    # Without an ORDER BY or a DISTINCT between them, a LIMIT bounds the
+    # block's rows themselves; a block that is one native match takes it.
+    limit = head.stop if not head.order and not head.distinct else None
+    rel = _solve_block(ctx, store, head.block, limit=limit)
     _trace_event(
         "block_solve_complete",
         rows=_relation_rows(rel),
@@ -739,7 +835,8 @@ def _code_distinct(rel: Relation, idx: list) -> Iterator[tuple]:
     tuple, in first-seen order."""
     if rel.cols is not None and not rel.preds:
         if len(idx) == 1:
-            return ((code,) for code in dict.fromkeys(rel.cols[idx[0]]))
+            # The native kernel keeps first-seen order, as dict.fromkeys did.
+            return ((code,) for code in _distinct_codes(rel.cols[idx[0]]))
         columns = [rel.cols[i].tolist() for i in idx]
         return iter(dict.fromkeys(zip(*columns, strict=True)))
 
@@ -757,51 +854,74 @@ def _code_distinct(rel: Relation, idx: list) -> Iterator[tuple]:
 def _term_distinct(store, tuples: Iterator[tuple], foreign: dict) -> Iterator[tuple]:
     """Drop the code tuples whose decoded terms equal an earlier tuple's."""
     seen: set = set()
+    aliases: dict = {}
     size = _CHUNK_START
     while True:
         chunk = list(islice(tuples, size))
         if not chunk:
             return
-        keys = _equivalence_keys(
-            store, {c for row in chunk for c in row if c is not None and c >= 0}
-        )
+        _alias_codes(store, {c for row in chunk for c in row}, foreign, aliases)
         for row in chunk:
-            key = tuple(None if c is None else (keys[c] if c >= 0 else foreign[c]) for c in row)
+            key = tuple(aliases.get(c, c) for c in row) if aliases else row
             if key not in seen:
                 seen.add(key)
                 yield row
         size = min(size * 4, _CHUNK_MAX)
 
 
-def _equivalence_keys(store, codes) -> dict:
-    """Keys equal iff rdflib finds the decoded terms equal.
+def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
+    """Record in ``aliases`` each code of ``codes`` whose decoded term equals
+    another code's, mapped to the code that term was first seen under —
+    rdflib compares decoded terms, and two spellings of a typed literal can
+    be one term (``"042"^^xsd:integer`` and ``"42"^^xsd:integer`` are both
+    ``42``).
 
-    IRIs, blank nodes and untyped literals are one term per spelling, so the
-    code itself is the key; a typed literal's lexical form may be normalized
-    by rdflib (``"042"^^xsd:integer`` is ``42``), so it is keyed by the
-    decoded term. Only typed literals are decoded here.
+    IRIs, blank nodes and untyped literals are one term per spelling, so
+    only typed literals can alias, and whether one does is a property of the
+    store, not of the query: each literal code is classified once for the
+    store's lifetime — its spelling decoded, a typed literal's term
+    registered under the first code that carried it — and later queries only
+    look their codes up. A query constant outside the dictionary (a negative
+    code, stable for the store too) takes part through its own term. For
+    most stores no code aliases another and ``aliases`` stays empty.
     """
     literal_lo, iri_lo, _ = store._term_kind_bounds()
-    keys: dict = {}
-    literals = []
-    for code in codes:
-        if literal_lo <= code < iri_lo:
-            literals.append(code)
-        else:
-            keys[code] = code
-    if literals:
-        cache = store._decode_cache
-        for code, spelling in zip(literals, store._dict.decode_many(literals), strict=True):
-            if spelling is None:
-                raise ValueError(f"term code {code} is not in the store dictionary")
-            if spelling.endswith(">"):
-                term = cache.get(code)
-                if term is None:
-                    term = cache[code] = store._from_n3_safe(spelling)
-                keys[code] = term
-            else:
-                keys[code] = code
-    return keys
+    classified = store._alias_classified
+    pending = [
+        c
+        for c in codes
+        if c is not None and (c < 0 or literal_lo <= c < iri_lo) and c not in classified
+    ]
+    if pending:
+        typed = []
+        local = [c for c in pending if c >= 0]
+        if local:
+            cache = store._decode_cache
+            for code, spelling in zip(local, store._dict.decode_many(local), strict=True):
+                if spelling is None:
+                    raise ValueError(f"term code {code} is not in the store dictionary")
+                if spelling.endswith(">"):
+                    term = cache.get(code)
+                    if term is None:
+                        term = cache[code] = store._from_n3_safe(spelling)
+                    typed.append((code, term))
+        for code in pending:
+            if code < 0:
+                term = foreign[code]
+                if isinstance(term, Literal) and term.datatype is not None:
+                    typed.append((code, term))
+        firsts, reps = store._alias_firsts, store._alias_reps
+        for code, term in typed:
+            representative = firsts.setdefault(term, code)
+            if representative != code:
+                reps[code] = representative
+        classified.update(pending)
+    reps = store._alias_reps
+    if reps:
+        for code in codes:
+            representative = reps.get(code)
+            if representative is not None:
+                aliases[code] = representative
 
 
 def _eval_aggregate(ctx, store, part):
@@ -836,15 +956,19 @@ def _eval_aggregate(ctx, store, part):
         else:
             raise NotImplementedError
 
-    # One pattern, no grouping, plain counts: the row selection's size.
-    if group_vars is None and block.name == "BGP" and len(block.triples) == 1:
-        pat = _pattern_terms(ctx, store, *block.triples[0], scope=scope)
-        if all(len(pos) == 1 for pos in pat["varpos"].values()) and all(
+    # One pattern — under a FILTER the native match decides entirely, or
+    # none — no grouping, plain counts: the row selection's size.
+    pat = _single_pattern(ctx, store, block, scope) if group_vars is None else None
+    if (
+        pat is not None
+        and all(len(pos) == 1 for pos in pat["varpos"].values())
+        and all(
             not distinct and (target == "*" or target in pat["varpos"] or ctx[target] is not None)
             for _, target, distinct in counts
-        ):
-            n = 0 if pat["unsatisfiable"] else _native(store).count_quads(*pat["n3"])
-            return iter([FrozenBindings(ctx, {res: Literal(n) for res, _, _ in counts})])
+        )
+    ):
+        n = _count_pattern(store, pat, {}, exact=True)
+        return iter([FrozenBindings(ctx, {res: Literal(n) for res, _, _ in counts})])
 
     rel = _solve_block(ctx, store, block, scope=scope)
     return _aggregate_rows(ctx, store, rel, group_vars or [], counts, samples, group.expr is None)
@@ -891,14 +1015,8 @@ def _aggregate_rows(ctx, store, rel: Relation, group_vars, counts, samples, impl
         return _Group(rows, [0] * nspecs, [set() for _ in specs])
 
     groups: dict[tuple, _Group] = {}
-    plain = all(spec.kind in ("rows", "const") and not spec.distinct for spec in specs)
-    if rel.cols is not None and not rel.preds and len(key_cols) <= 1 and plain:
-        # COUNT(*) [GROUP BY ?v] over one pattern: count the codes directly.
-        if key_cols:
-            for code, n in Counter(rel.cols[key_cols[0]]).items():
-                groups[(code,)] = new_group(n)
-        elif rel.nrows:
-            groups[()] = new_group(rel.nrows)
+    if rel.cols is not None and not rel.preds and len(key_cols) <= 1:
+        groups = _columnar_groups(rel, key_cols, specs, new_group)
     else:
         for row in _code_rows(rel):
             key = tuple(row[i] for i in key_cols)
@@ -923,7 +1041,7 @@ def _aggregate_rows(ctx, store, rel: Relation, group_vars, counts, samples, impl
         return iter([FrozenBindings(ctx)])
 
     # Merge groups whose decoded keys are equal terms; distinct counts likewise
-    # count equal terms once.
+    # count equal terms once (see `_alias_codes`).
     codes = {c for key in groups for c in key if c is not None}
     for group in groups.values():
         for j, spec in enumerate(specs):
@@ -931,15 +1049,18 @@ def _aggregate_rows(ctx, store, rel: Relation, group_vars, counts, samples, impl
                 codes.update(group.sets[j])
             elif spec.distinct and spec.kind == "rows":
                 codes.update(c for row in group.sets[j] for c in row if c is not None)
-    equivalence = _equivalence_keys(store, {c for c in codes if c >= 0})
     foreign = rel.foreign
+    aliases: dict = {}
+    _alias_codes(store, codes, foreign, aliases)
 
-    def term_key(code):
-        return None if code is None else (equivalence[code] if code >= 0 else foreign[code])
+    def distinct_count(values) -> int:
+        if not aliases:
+            return len(values)
+        return len({aliases.get(c, c) for c in values})
 
     merged: dict[tuple, tuple[tuple, _Group]] = {}
     for key, group in groups.items():
-        tkey = tuple(term_key(c) for c in key)
+        tkey = tuple(aliases.get(c, c) for c in key)
         first = merged.get(tkey)
         if first is None:
             merged[tkey] = (key, group)
@@ -961,16 +1082,14 @@ def _aggregate_rows(ctx, store, rel: Relation, group_vars, counts, samples, impl
             row: dict = {}
             for j, spec in enumerate(specs):
                 if spec.kind == "rows":
-                    if spec.distinct:
-                        n = len({tuple(term_key(c) for c in r) for r in group.sets[j]})
-                    else:
+                    if not spec.distinct:
                         n = group.rows
+                    elif aliases:
+                        n = len({tuple(aliases.get(c, c) for c in r) for r in group.sets[j]})
+                    else:
+                        n = len(group.sets[j])
                 elif spec.kind == "col":
-                    n = (
-                        len({term_key(c) for c in group.sets[j]})
-                        if spec.distinct
-                        else group.counts[j]
-                    )
+                    n = distinct_count(group.sets[j]) if spec.distinct else group.counts[j]
                 elif spec.kind == "const":
                     n = 1 if spec.distinct else group.rows
                 else:
@@ -989,6 +1108,69 @@ def _aggregate_rows(ctx, store, rel: Relation, group_vars, counts, samples, impl
     return solutions()
 
 
+#: Groups up to which COUNT(DISTINCT) gathers each group's rows natively
+#: (one ``join_indices`` over the key column per group); past it, one pass
+#: over the distinct (key, value) pairs.
+_NATIVE_GROUPS_MAX = 64
+
+
+def _columnar_groups(rel: Relation, key_cols, specs, new_group) -> dict:
+    """The groups of a columnar body by at most one key column, counted a
+    column at a time.
+
+    A columnar body holds no unbound value, so a group's ``COUNT(?v)`` is
+    its row count, which the key column's native ``value_counts`` gives. A
+    ``COUNT(DISTINCT ?v)`` takes each group's distinct codes of ``?v`` — for
+    a handful of groups natively, gathering a group's rows by its key
+    (``join_indices``, ``take``, ``distinct``), otherwise from the distinct
+    (key, value) pairs.
+    """
+    cols = rel.cols
+    assert cols is not None  # the caller's columnar case
+    groups: dict = {}
+    key_col = None
+    if key_cols:
+        key_col = _native_column(cols[key_cols[0]])
+        values, tallies = key_col.value_counts()
+        for code, n in zip(
+            memoryview(values).cast("I").tolist(),
+            memoryview(tallies).cast("I").tolist(),
+            strict=True,
+        ):
+            groups[(code,)] = new_group(n)
+    elif rel.nrows:
+        groups[()] = new_group(rel.nrows)
+    if not groups:
+        return groups
+    members = keys = None
+    for j, spec in enumerate(specs):
+        if spec.kind == "col" and not spec.distinct:
+            for group in groups.values():
+                group.counts[j] = group.rows
+        elif spec.kind == "const" and spec.distinct:
+            for group in groups.values():
+                group.sets[j].add(())
+        elif spec.kind == "col":
+            column = _native_column(cols[spec.col])
+            if key_col is None:
+                groups[()].sets[j] = set(_distinct_codes(column))
+            elif len(groups) <= _NATIVE_GROUPS_MAX:
+                if members is None:
+                    members = {key: key_col.join_indices(U32Column([key[0]]))[0] for key in groups}
+                for key, rows in members.items():
+                    groups[key].sets[j] = set(_distinct_codes(column.take(rows)))
+            else:
+                if keys is None:
+                    keys = memoryview(key_col).cast("I").tolist()
+                for key, code in set(zip(keys, memoryview(column).cast("I").tolist(), strict=True)):
+                    groups[(key,)].sets[j].add(code)
+        elif spec.kind == "rows" and spec.distinct:
+            rows = set(zip(*(col.tolist() for col in cols), strict=True))
+            for row in rows:
+                groups[tuple(row[i] for i in key_cols)].sets[j].add(row)
+    return groups
+
+
 def _eval_block_node(ctx, store, part):
     _check_block(part)
     return _yield_solutions(ctx, store, _solve_block(ctx, store, part))
@@ -1004,15 +1186,41 @@ def _eval_ask(ctx, store, part):
 
 def _block_nonempty(ctx, store, block) -> bool:
     block, scope = _peel_graph(ctx, block, _active_scope(ctx, store))
-    if block.name == "BGP" and len(block.triples) == 1:
-        pat = _pattern_terms(ctx, store, *block.triples[0], scope=scope)
+    pat = _single_pattern(ctx, store, block, scope)
+    if pat is not None:
         if pat["unsatisfiable"]:
             return False
         if all(len(pos) == 1 for pos in pat["varpos"].values()):
-            # Existence needs no rows: count from the row selection.
-            return _native(store).count_quads(*pat["n3"]) > 0
-    rel = _solve_block(ctx, store, block, scope=scope)
+            # Existence needs no rows: a count capped at one, which stops a
+            # file-backed scan at its first match.
+            narrowing = _narrowing(pat.get("nkeep"), limit=1)
+            return _native(store).count_quads(*pat["n3"], **narrowing) > 0
+    rel = _solve_block(ctx, store, block, scope=scope, limit=1)
     return next(_code_rows(rel), None) is not None
+
+
+def _single_pattern(ctx, store, block, scope) -> dict | None:
+    """``block`` as one triple pattern the native layer answers whole: a
+    ``BGP`` of one pattern, or a ``FILTER`` over one whose conjuncts all push
+    into the native match as keeps. The resolved pattern, ready to count, or
+    ``None``."""
+    var_preds = None
+    if block.name == "Filter":
+        inner = block.p
+        if inner.name != "BGP" or len(inner.triples) != 1:
+            return None
+        plan = filters.analyze_filter(block, _block_vars(ctx, inner, scope), ctx)
+        if plan.constant or plan.tuples or plan.exists:
+            return None
+        var_preds, block = plan.per_var, inner
+    elif block.name != "BGP" or len(block.triples) != 1:
+        return None
+    pat = _pattern_terms(ctx, store, *block.triples[0], scope=scope)
+    if var_preds and _push_native_restrictions(store, pat, var_preds):
+        return None  # a conjunct the native match cannot decide
+    if _split_keeps(store, pat.get("nkeep"))[1]:
+        return None  # a set the native layer would not count exactly
+    return pat
 
 
 class _Pushed(dict):
@@ -1021,21 +1229,27 @@ class _Pushed(dict):
     ``tuples``, the fast conjuncts over several variables, which a BGP that
     binds all of theirs may prune with mid-join (a pre-filter: the FILTER
     still applies them); ``views``, the terms parsed for those, shared with
-    the FILTER so none is decoded twice. They travel together wherever the
-    block solvers pass them — a group join's sides, an OPTIONAL's or a
-    MINUS's left side, a GRAPH block — and never an OPTIONAL's or a MINUS's
-    right side, where dropping a row would change the answer. Empty, it is
-    falsy like ``None``."""
+    the FILTER so none is decoded twice; ``applied``, the ids of the tuple
+    conjuncts a BGP decided entirely inside a native match (see
+    :func:`_specialize_tuple_conjuncts`), which every row the block yields
+    therefore passes. They travel together wherever the block solvers pass
+    them — a group join's sides, an OPTIONAL's or a MINUS's left side, a
+    GRAPH block — and never an OPTIONAL's or a MINUS's right side, where
+    dropping a row would change the answer. Empty, it is falsy like
+    ``None``."""
 
-    __slots__ = ("tuples", "views")
+    __slots__ = ("tuples", "views", "applied")
 
-    def __init__(self, per_var=(), tuples=(), views=None):
+    def __init__(self, per_var=(), tuples=(), views=None, applied=None):
         super().__init__(per_var)
         self.tuples = tuple(tuples)
         self.views = {} if views is None else views
+        self.applied = set() if applied is None else applied
 
 
-def _solve_block(ctx, store, node, env=frozenset(), var_preds=None, scope=None) -> Relation:
+def _solve_block(
+    ctx, store, node, env=frozenset(), var_preds=None, scope=None, limit=None
+) -> Relation:
     """Solve a block into a relation.
 
     ``env`` is the set of variables an enclosing lazy join or OPTIONAL binds
@@ -1046,7 +1260,9 @@ def _solve_block(ctx, store, node, env=frozenset(), var_preds=None, scope=None) 
     above pushed down: single-variable ones to the pattern scans binding the
     variable, tuple ones to the BGPs binding all of theirs. ``scope`` is the
     graph every pattern below is matched in (:class:`_GraphScope`); ``None``
-    means the graph the context has made active.
+    means the graph the context has made active. ``limit`` says only that
+    many rows will be read: a block that is one native match fetches no
+    more (see :func:`_solve_bgp`); any other ignores it.
     """
     if scope is None:
         scope = _active_scope(ctx, store)
@@ -1057,9 +1273,9 @@ def _solve_block(ctx, store, node, env=frozenset(), var_preds=None, scope=None) 
         trace.depth += 1
     try:
         if name == "BGP":
-            rel = _solve_bgp(ctx, store, node.triples, scope, var_preds)
+            rel = _solve_bgp(ctx, store, node.triples, scope, var_preds, limit)
         elif name == "Filter":
-            rel = _solve_filter(ctx, store, node, env, var_preds, scope)
+            rel = _solve_filter(ctx, store, node, env, var_preds, scope, limit)
         elif name == "Join":
             rel = _solve_join(ctx, store, node, env, var_preds, scope)
         elif name == "LeftJoin":
@@ -1067,9 +1283,9 @@ def _solve_block(ctx, store, node, env=frozenset(), var_preds=None, scope=None) 
         elif name == "Minus":
             rel = _solve_minus(ctx, store, node, env, var_preds, scope)
         elif name == "ToMultiSet":
-            rel = _solve_values(ctx, store, node, scope)
+            rel = _solve_values(ctx, store, node)
         elif name == "Graph":
-            rel = _solve_block(ctx, store, node.p, env, var_preds, _graph_scope(ctx, node))
+            rel = _solve_block(ctx, store, node.p, env, var_preds, _graph_scope(ctx, node), limit)
         else:
             raise NotImplementedError
     finally:
@@ -1088,72 +1304,69 @@ def _solve_block(ctx, store, node, env=frozenset(), var_preds=None, scope=None) 
     return rel
 
 
-def _solve_values(ctx, store, node, scope) -> Relation:
-    """An inline VALUES table as a relation: each constant looked up by its
-    canonical spelling (a term the dictionary does not hold gets a negative
-    code, so it joins nothing but is still yielded verbatim), UNDEF unbound.
-    A row that contradicts a context binding is dropped, as rdflib's
-    ``evalValues`` skips it on AlreadyBound."""
-    rows_in = node.p.res
-    graph_n3 = scope.n3
+def _solve_values(ctx, store, node) -> Relation:
+    """An inline VALUES table as a relation: its constants looked up in one
+    batch (:func:`_constant_codes`; a term the dictionary does not hold gets
+    a negative code, so it joins nothing but is still yielded verbatim),
+    UNDEF unbound. A row that contradicts a context binding is dropped, as
+    rdflib's ``evalValues`` skips it on AlreadyBound."""
     variables = _node_vars(node)
     schema = tuple(v for v in variables if ctx[v] is None)
     bound = {v: ctx[v] for v in variables if ctx[v] is not None}
-    codes: dict = {}
-    rows = []
-    for row in rows_in:
-        if any(row.get(v, "UNDEF") != "UNDEF" and row[v] != term for v, term in bound.items()):
-            continue
-        out = []
-        for v in schema:
-            term = row.get(v, "UNDEF")
-            if term == "UNDEF":
-                out.append(None)
-                continue
-            code = codes.get(term)
-            if code is None:
-                code = codes[term] = _constant_code(store, term, graph_n3)
-            out.append(code)
-        rows.append(tuple(out))
+    rows_in = [
+        row
+        for row in node.p.res
+        if not any(row.get(v, "UNDEF") != "UNDEF" and row[v] != term for v, term in bound.items())
+    ]
+    terms = list(
+        dict.fromkeys(row[v] for row in rows_in for v in schema if row.get(v, "UNDEF") != "UNDEF")
+    )
+    codes = dict(zip(terms, _constant_codes(store, terms), strict=True))
+    rows = [
+        tuple(None if row.get(v, "UNDEF") == "UNDEF" else codes[row[v]] for v in schema)
+        for row in rows_in
+    ]
     nullable = frozenset(v for i, v in enumerate(schema) if any(row[i] is None for row in rows))
     return Relation(schema, None, rows, len(rows), nullable, store._foreign)
 
 
-def _constant_code(store, term, graph_n3) -> int:
-    """The dictionary code of a query constant, or a private negative one.
+def _constant_codes(store, terms: list) -> list:
+    """The dictionary codes of query constants, private negative ones for the
+    terms it does not hold.
 
-    ``encode`` is an exact lookup of the canonical spelling; if it misses but
-    the store does hold the term under a spelling the pattern parser accepts
-    (``count_quads`` is spelling-tolerant), the canonicalization disagreed
-    with the store's and the query is left to rdflib rather than guessed.
-    The probes are scoped to ``graph_n3``, the graph the rows would join in.
+    One ``encode_many`` looks every spelling up, tolerant of spelling: the
+    native layer canonicalizes a term the way its pattern parser does, so a
+    miss means no match of any pattern could reach the term either. A term
+    the native parser rejects leaves the table to rdflib.
     """
-    code = store._dict.encode(canonical_spelling(term))
-    if code is not None:
+    if not terms:
+        return []
+    try:
+        found = store._dict.encode_many([canonical_spelling(term) for term in terms])
+    except ValueError:
+        raise NotImplementedError from None
+    store._prime_decode_cache([code for code in found if code is not None])
+    codes = []
+    for term, code in zip(terms, found, strict=True):
+        if code is None:
+            codes.append(store._foreign_code(term))
+            continue
         # rdflib would carry the query's own object into the solutions; when
         # that object is not the decoded dictionary term (a query literal
         # rdflib's parser left unnormalized, "042"^^xsd:integer), the two are
         # observably different rows, so the query is left to rdflib.
         if store._decode_term(code) != term:
             raise NotImplementedError
-        return code
-    n3 = term.n3()
-    count = _native(store).count_quads
-    positions = [(None, None, n3, graph_n3)]
-    if not isinstance(term, Literal):
-        positions.append((n3, None, None, graph_n3))
-        if isinstance(term, URIRef):
-            positions.append((None, n3, None, graph_n3))
-    if any(count(*pattern) for pattern in positions):
-        raise NotImplementedError
-    return store._foreign_code(term)
+        codes.append(code)
+    return codes
 
 
-def _solve_filter(ctx, store, node, env, var_preds, scope) -> Relation:
+def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None) -> Relation:
     """A ``Filter`` over a block: constant conjuncts decide the whole block
     before anything is matched, single-variable conjuncts over variables the
     block always binds restrict the pattern scans, the rest filters the
-    solved rows."""
+    solved rows. A ``limit`` reaches the block only when nothing is left to
+    filter above it."""
     inner = node.p
     block_vars = _block_vars(ctx, inner, scope)
     plan = filters.analyze_filter(node, block_vars, ctx)
@@ -1171,14 +1384,16 @@ def _solve_filter(ctx, store, node, env, var_preds, scope) -> Relation:
     nullable = _block_nullable(inner)
     outer = var_preds if var_preds is not None else _Pushed()
     fast_tuples = tuple(conjunct for conjunct in plan.tuples if conjunct.fast is not None)
-    pushed = _Pushed(outer, outer.tuples + fast_tuples, outer.views)
+    pushed = _Pushed(outer, outer.tuples + fast_tuples, outer.views, outer.applied)
     residual = list(plan.tuples)
     for var, conjuncts in plan.per_var.items():
         if var in nullable:
             residual.extend(conjuncts)
         else:
             pushed[var] = pushed.get(var, []) + conjuncts
-    rel = _solve_block(ctx, store, inner, env, pushed, scope)
+    limit = None if residual or plan.exists else limit
+    rel = _solve_block(ctx, store, inner, env, pushed, scope, limit)
+    residual = [conjunct for conjunct in residual if id(conjunct) not in pushed.applied]
     if residual:
         positions = [
             [rel.schema.index(variable) for variable in conjunct.vars] for conjunct in residual
@@ -1207,8 +1422,8 @@ def _solve_filter(ctx, store, node, env, var_preds, scope) -> Relation:
 def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
     """``FILTER (NOT) EXISTS { body }`` as a semi- or anti-join on the
     variables the body shares with the block: the body is solved once (or,
-    for a small block and a one-pattern body, probed per row with
-    ``count_quads``) instead of once per row. Shapes rdflib would evaluate
+    for a small block and a one-pattern body, probed per row with counts
+    capped at one row, in native batches) instead of once per row. Shapes rdflib would evaluate
     differently on an independently solved body — a nullable shared
     variable, a body the solver cannot take, a body FILTER that sees the
     block's bindings — take the generic route, rdflib's own evaluator per
@@ -1234,20 +1449,28 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
     try:
         if not shared:
             found = (
-                next(_code_rows(_solve_block(ctx, store, body, env, None, scope)), None) is not None
+                next(_code_rows(_solve_block(ctx, store, body, env, None, scope, 1)), None)
+                is not None
             )
             if found != negate:
                 return rel
             return Relation(rel.schema, None, [], 0, rel.nullable, rel.foreign)
         if body.name == "BGP" and len(body.triples) == 1:
-            pat = _match_pattern(ctx, store, *body.triples[0], scope=scope)
+            # Counted before it is matched: probing needs no match at all.
+            pat = _pattern_terms(ctx, store, *body.triples[0], scope=scope)
             repeated_free = any(
                 len(pos) > 1 for v, pos in pat["varpos"].items() if v not in rel.schema
             )
-            if not repeated_free and len(rows) * _PROBE_FANOUT < pat["nrows"]:
+            exact = not _split_keeps(store, pat.get("nkeep"))[1]
+            if (
+                exact
+                and not repeated_free
+                and len(rows) * _PROBE_FANOUT < _count_pattern(store, pat, {})
+            ):
                 flags = _probe_exists(store, rel.schema, rows, pat)
                 kept = [row for row, found in zip(rows, flags, strict=True) if found != negate]
                 return Relation(rel.schema, None, kept, len(kept), rel.nullable, rel.foreign)
+            _match_resolved_pattern(store, pat)
             inner = _rel_from_pattern(pat)
         else:
             inner = _solve_block(ctx, store, body, env, None, scope)
@@ -1276,17 +1499,38 @@ def _unwrap_empty_joins(node):
 
 def _probe_exists(store, schema, rows, pat) -> list:
     """Whether the pattern, with each row's codes substituted, matches at
-    least one quad — one ``count_quads`` per row, no row materialized."""
-    count = _native(store).count_quads
+    least one quad — counts capped at one row (``count_quads_many``, in
+    batches), no row materialized."""
     bound = [(schema.index(v), pos) for v, pos in pat["varpos"].items() if v in schema]
-    n3_cache = _probe_spellings(store, rows, bound)
+    free_positions = {idx for v, pos in pat["varpos"].items() if v not in schema for idx in pos}
+    keep = {p: spec for p, spec in (pat.get("nkeep") or {}).items() if p in free_positions}
+    narrowing = _narrowing(keep, limit=1)
+    patterns = _substituted_patterns(store, rows, pat, bound)
     out = []
+    for start in range(0, len(rows), _PROBE_BATCH):
+        batch = patterns[start : start + _PROBE_BATCH]
+        probes = [(n3, narrowing) for n3 in batch if n3 is not None]
+        answers = iter(_run_probes(store, probes, count=True))
+        out.extend(n3 is not None and next(answers) > 0 for n3 in batch)
+    return out
+
+
+def _substituted_patterns(store, rows, pat, bound) -> list:
+    """Per row, the pattern's quad with the row's codes substituted at the
+    ``bound`` positions — or ``None`` when no quad can match it."""
+    # One GIL-released batch decode covers every code the probes will bind.
+    n3_cache = _probe_spellings(store, rows, bound)
+    patterns = []
     for row in rows:
         n3 = list(pat["n3"])
         satisfiable = True
         for row_idx, positions in bound:
             term = n3_cache[row[row_idx]]
             for idx in positions:
+                # The dictionary stores canonical N-Triples forms: a literal
+                # ('"') cannot occupy subject or predicate position or name a
+                # graph, and only an IRI ('<') can be a predicate — such a
+                # binding simply has no continuation.
                 if (
                     (idx == 0 and term[:1] == '"')
                     or (idx == 1 and term[:1] != "<")
@@ -1294,8 +1538,8 @@ def _probe_exists(store, schema, rows, pat) -> list:
                 ):
                     satisfiable = False
                 n3[idx] = term
-        out.append(satisfiable and count(*n3) > 0)
-    return out
+        patterns.append(n3 if satisfiable else None)
+    return patterns
 
 
 def _reject_env_references(node, plan, env, ctx) -> None:
@@ -1574,8 +1818,15 @@ def _pattern_trace_shape(ctx, triple) -> dict:
     }
 
 
-def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
-    """Evaluate a BGP by matching one seed and probing connected patterns."""
+def _solve_bgp(ctx, store, triples, scope, var_preds=None, limit=None) -> Relation:
+    """Evaluate a BGP by matching one seed and probing connected patterns.
+
+    The filter conjuncts the native layer decides become keeps on each
+    pattern's native match before anything is counted (see
+    :func:`_push_native_restrictions`); the others stay on the Python routes.
+    A single pattern with nothing left to restrict in Python takes
+    ``limit`` into its match as well (see :func:`_limit_reaches_match`).
+    """
     trace = _TRACE.get()
     traced = trace is not None
     started = time.perf_counter_ns() if traced else 0
@@ -1599,14 +1850,17 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
         )
         return rel
 
-    # Keep the established single-pattern path unchanged in behavior.
     if len(triples) == 1:
         shape = _pattern_trace_shape(ctx, triples[0]) if traced else None
         _trace_event("bgp_pattern_start", original_pattern_index=0, **(shape or {}))
-        then = time.perf_counter_ns() if traced else 0
-        pat = _match_pattern(ctx, store, *triples[0], scope=scope)
-        native_ns = time.perf_counter_ns() - then if then else 0
+        pat = _pattern_terms(ctx, store, *triples[0], scope=scope)
         pat["index"] = 0
+        residual = _push_native_restrictions(store, pat, var_preds) if var_preds else {}
+        if not _limit_reaches_match(store, pat, residual):
+            limit = None
+        then = time.perf_counter_ns() if traced else 0
+        _match_resolved_pattern(store, pat, limit=limit)
+        native_ns = time.perf_counter_ns() - then if then else 0
         _trace_event(
             "bgp_pattern_complete",
             original_pattern_index=0,
@@ -1622,8 +1876,8 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
             **(shape or {}),
         )
         then = time.perf_counter_ns() if traced else 0
-        if var_preds:
-            _restrict_pattern(store, pat, var_preds)
+        if residual:
+            _restrict_pattern(store, pat, residual)
         restriction_ns = time.perf_counter_ns() - then if then else 0
         then = time.perf_counter_ns() if traced else 0
         rel = _rel_from_pattern(pat)
@@ -1656,6 +1910,8 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
         pat["index"] = index
         if var_preds:
             pending = {v: var_preds[v] for v in pat["varpos"] if v in var_preds}
+            if pending:
+                pending = _push_native_restrictions(store, pat, pending)
             if pending:
                 pat["deferred_var_preds"] = pending
         patterns.append(pat)
@@ -1705,79 +1961,297 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None) -> Relation:
 
 def _pattern_static_rank(pat) -> tuple:
     """A pattern's likely selectivity from its shape alone — more bound
-    positions first, then repeated variables, then query order. It decides
-    the order patterns are *counted* in (so an anchor that matches nothing
-    is found before a scan is counted) and breaks ties between equal
-    counts; the counts themselves decide the plan."""
+    positions first, then repeated variables, then query order. It breaks
+    ties between equal counts; the counts themselves decide the plan."""
     n3 = pat["n3"]
     repeated = sum(len(pos) - 1 for pos in pat["varpos"].values())
     return (-sum(value is not None for value in n3), -repeated, pat.get("index", 0))
 
 
-def _count_pattern(store, pat, counts: dict) -> int:
+def _pattern_key(pat) -> tuple:
+    """What a pattern's native count and match are memoized by: the resolved
+    quad pattern and its native keep (two triples resolving to the same quad
+    share both only when they are narrowed alike)."""
+    nkeep = pat.get("nkeep")
+    if not nkeep:
+        return tuple(pat["n3"])
+    narrowing = tuple(
+        sorted(
+            (position, ("range", *keep) if isinstance(keep, tuple) else ("codes", id(keep)))
+            for position, keep in nkeep.items()
+        )
+    )
+    return (*pat["n3"], narrowing)
+
+
+def _count_pattern(store, pat, counts: dict, exact: bool = False) -> int:
     """The number of quads a resolved pattern selects, from ``count_quads``
     — the row selection's size, a fraction of a match's cost, and no
-    columns. Memoized across the patterns of one block by the resolved
-    quad, like the matches. Zero for an unsatisfiable pattern."""
+    columns. Memoized across the patterns of one block, like the matches.
+    Zero for an unsatisfiable pattern.
+
+    A planning count (the default) reads the quad pattern alone: narrowing
+    it by the pattern's native keep costs the native layer a pass over the
+    selected rows, more than an estimate is worth, and it decides nothing a
+    narrowed match would not repair. An ``exact`` count — an answer, or a
+    size a join decision hinges on — narrows by the keep.
+    """
     if pat["unsatisfiable"]:
         return 0
-    key = tuple(pat["n3"])
+    nkeep = pat.get("nkeep") if exact else None
+    key = _pattern_key(pat) if nkeep else tuple(pat["n3"])
     n = counts.get(key)
     if n is None:
-        n = counts[key] = _native(store).count_quads(*key)
+        native = _native(store)
+        if nkeep:
+            n = native.count_quads(*pat["n3"], **_narrowing(_split_keeps(store, nkeep)[0]))
+        else:
+            n = native.count_quads(*pat["n3"])
+        counts[key] = n
     return n
 
 
-def _match_resolved_pattern(store, pat, memo=None) -> tuple[int, int]:
-    """One native match for a resolved pattern: adds ``"cols"`` (the raw
-    code columns) and ``"nrows"``. Returns the native calls made (0 when
-    ``memo`` — keyed by the resolved quad — already held the columns, or
-    the pattern is unsatisfiable) and the time they took when tracing.
+def _count_patterns(store, patterns, counts: dict) -> int:
+    """Set the patterns' ``"estimate"`` — their planning counts (see
+    :func:`_count_pattern`) — counting the quad patterns ``counts`` does not
+    hold yet, in static rank order, and stop at the first zero, which
+    empties the block: the patterns left uncounted get no ``"estimate"``.
+
+    Enough patterns that scan (``_SCAN_BATCH_MIN``,
+    ``_MEMORY_SCAN_BATCH_MIN``) are counted last, in one ``count_quads_many``
+    batch that runs them concurrently, one GIL release for all — after the
+    point counts, any of which may still end the block first. Returns the
+    counts made."""
+    before = len(counts)
+    ordered = sorted(patterns, key=_pattern_static_rank)
+    minimum = _MEMORY_SCAN_BATCH_MIN if store.in_memory else _SCAN_BATCH_MIN
+    scans: list = []
+    if len(patterns) >= minimum:
+        scans = [
+            pat
+            for pat in ordered
+            if not pat["unsatisfiable"]
+            and tuple(pat["n3"]) not in counts
+            and not _cheap_probe(store, pat["n3"])
+        ]
+        if len({tuple(pat["n3"]) for pat in scans}) < minimum:
+            scans = []
+    batched = {id(pat) for pat in scans}
+    for pat in ordered:
+        if id(pat) not in batched:
+            pat["estimate"] = _count_pattern(store, pat, counts)
+            if pat["estimate"] == 0:
+                return len(counts) - before
+    if scans:
+        keys = list(dict.fromkeys(tuple(pat["n3"]) for pat in scans))
+        counts.update(zip(keys, _native(store).count_quads_many(keys), strict=True))
+        for pat in scans:
+            pat["estimate"] = counts[tuple(pat["n3"])]
+    return len(counts) - before
+
+
+#: vortex-rdf 0.11 pushes a keep set of 33 to 4,096 codes into a file scan
+#: as one ``list_contains`` expression, which evaluates far slower than the
+#: scan it narrows (2,000 codes: ~25x an unnarrowed match); a smaller set
+#: becomes OR'd equalities and a larger one an in-memory test, both cheap.
+_FILE_LIST_CONTAINS = range(33, 4097)
+
+
+def _split_keeps(store, nkeep) -> tuple[dict, dict]:
+    """A pattern's native keep, split into what goes to the native layer and
+    the code sets Python tests on the rows it returns.
+
+    Everything goes natively, except on a file-backed store a code set the
+    scan would evaluate as ``list_contains`` (``_FILE_LIST_CONTAINS``): that
+    one goes as its bounding code range, a cheap superset the scan prunes by
+    zone maps, and its codes are tested over the rows that range admits.
+    """
+    if not nkeep or store.in_memory:
+        return nkeep or {}, {}
+    native, tested = {}, {}
+    for position, keep in nkeep.items():
+        if isinstance(keep, tuple) or len(keep) not in _FILE_LIST_CONTAINS:
+            native[position] = keep
+        else:
+            view = memoryview(keep).cast("I")
+            native[position] = (view[0], view[-1] + 1)
+            tested[position] = keep
+    return native, tested
+
+
+def _narrowing(keep=None, limit=None) -> dict:
+    """The keyword narrowing of a native count or match: a non-empty keep,
+    a limit — only what is set."""
+    narrowing: dict = {}
+    if keep:
+        narrowing["keep"] = keep
+    if limit is not None:
+        narrowing["limit"] = limit
+    return narrowing
+
+
+#: A batch call (``count_quads_many``/``match_codes_many``) costs a fixed
+#: ~60–150 µs of native task scheduling before its probes run concurrently —
+#: the upper end once the runtime's worker threads have parked, as they do
+#: between the steps of a query. That pays off for probes that scan the
+#: store — several times over — but not for a handful of cheap point probes,
+#: which the calls in a loop answer in a few µs each. A probe is cheap when
+#: its subject is bound (a binary search in the subject-ordered base) or a
+#: secondary index serves its predicate or object. Cheap probes are batched
+#: only on a file-backed store and from this many on, where overlapping
+#: their reads wins.
+_CHEAP_BATCH_MIN = 256
+
+#: Scanning probes batch from two on a file-backed store, whose scans
+#: overlap their reads (two predicate scans: ~1.3x). An in-memory scan is
+#: pure CPU, and two of them overlap by no more than the batch costs.
+_SCAN_BATCH_MIN = 2
+_MEMORY_SCAN_BATCH_MIN = 3
+
+
+def _cheap_probe(store, n3) -> bool:
+    """Whether the native layer answers a probe without a scan."""
+    return n3[0] is not None or bool(store._indexes) and (n3[1] is not None or n3[2] is not None)
+
+
+def _batched_probes(store, patterns) -> list[int]:
+    """The indexes of the quad patterns :func:`_run_probes` answers through
+    one batch call: those that scan, when there are enough of them
+    (``_SCAN_BATCH_MIN``, ``_MEMORY_SCAN_BATCH_MIN``), or all of them when
+    enough cheap ones are probing a file-backed store
+    (``_CHEAP_BATCH_MIN``)."""
+    minimum = _MEMORY_SCAN_BATCH_MIN if store.in_memory else _SCAN_BATCH_MIN
+    if len(patterns) < minimum:
+        return []
+    batched = [i for i, n3 in enumerate(patterns) if not _cheap_probe(store, n3)]
+    if not store.in_memory and len(patterns) - len(batched) >= _CHEAP_BATCH_MIN:
+        return list(range(len(patterns)))
+    return batched if len(batched) >= minimum else []
+
+
+def _run_probes(store, probes, count: bool) -> list:
+    """Native answers to ``(n3, narrowing)`` probes (see :func:`_narrowing`),
+    in order: counts or code columns.
+
+    The probes :func:`_batched_probes` picks go through one
+    ``count_quads_many`` or ``match_codes_many`` call — every probe parsed
+    before any runs, all of them concurrently on the native runtime, a
+    file-backed store overlapping their reads — and the rest through plain
+    calls.
+    """
+    if not probes:
+        return []
+    native = _native(store)
+    call = native.count_quads if count else native.match_codes
+    minimum = _MEMORY_SCAN_BATCH_MIN if store.in_memory else _SCAN_BATCH_MIN
+    batched = _batched_probes(store, [n3 for n3, _ in probes]) if len(probes) >= minimum else []
+    if not batched:
+        return [call(*n3, **narrowing) for n3, narrowing in probes]
+    answers: list = [None] * len(probes)
+    batch = []
+    for i in batched:
+        n3, narrowing = probes[i]
+        batch.append(
+            {"s": n3[0], "p": n3[1], "o": n3[2], "g": n3[3], **narrowing}
+            if narrowing
+            else tuple(n3)
+        )
+    many = native.count_quads_many if count else native.match_codes_many
+    for i, answer in zip(batched, many(batch), strict=True):
+        answers[i] = answer
+    done = set(batched)
+    for i, (n3, narrowing) in enumerate(probes):
+        if i not in done:
+            answers[i] = call(*n3, **narrowing)
+    return answers
+
+
+def _match_resolved_pattern(store, pat, memo=None, limit=None) -> tuple[int, int]:
+    """One native match for a resolved pattern, narrowed by its native keep:
+    adds ``"cols"`` (the raw code columns) and ``"nrows"``. Returns the
+    native calls made (0 when ``memo`` — keyed by :func:`_pattern_key` —
+    already held the columns, or the pattern is unsatisfiable) and the time
+    they took when tracing. ``limit`` takes only the first rows of the
+    match, in the order an unlimited match returns them (see
+    :func:`_limit_reaches_match`).
 
     Only the columns are shared through the memo, and they are read-only
     views; ``varpos`` and the ``keep`` sets built from it stay per pattern,
     since two triples matching the same rows still bind different variables.
-    A graph variable bound from the fourth column drops the default graph's
-    rows, as a ``GRAPH`` clause ranges over the named graphs only.
     """
     then = time.perf_counter_ns() if _TRACE.get() is not None else 0
     if pat["unsatisfiable"]:
         pat["cols"], pat["nrows"] = None, 0
         return 0, 0
-    key = tuple(pat["n3"])
-    cols = memo.get(key) if memo is not None else None
+    nkeep = pat.get("nkeep")
+    key = _pattern_key(pat) if nkeep else tuple(pat["n3"])
+    cols = memo.get(key) if memo is not None and limit is None else None
     calls = 0
+    keep, tested = _split_keeps(store, nkeep) if nkeep else (None, None)
     if cols is None:
-        cols = _native(store).match_codes(*key)
+        native = _native(store)
+        if keep or limit is not None:
+            cols = native.match_codes(*pat["n3"], **_narrowing(keep, limit))
+        else:
+            cols = native.match_codes(*pat["n3"])
         if cols is None:
             raise NotImplementedError
-        if memo is not None:
+        if memo is not None and limit is None:
             memo[key] = cols
         calls = 1
     pat["cols"], pat["nrows"] = cols, len(cols[0])
-    for var, positions in pat["varpos"].items():
-        if 3 in positions:
-            _exclude_default_graph(store, pat, var)
-            break
+    if tested:
+        # The sets the scan took as ranges: tested on the rows, as the
+        # per-variable ``keep`` the row paths apply.
+        allowed_by_var = pat.setdefault("keep", {})
+        for var, positions in pat["varpos"].items():
+            for position in positions:
+                if position in tested:
+                    allowed = set(memoryview(tested[position]).cast("I"))
+                    previous = allowed_by_var.get(var)
+                    allowed_by_var[var] = allowed if previous is None else previous & allowed
     return calls, time.perf_counter_ns() - then if then else 0
+
+
+def _limit_reaches_match(store, pat, residual) -> bool:
+    """Whether a single pattern's rows are its native match's rows one for
+    one, in the match's own order — so a LIMIT may stop the match itself.
+
+    Nothing may be left to drop in Python (a residual conjunct, a repeated
+    variable's equality), and the store must hold no secondary index: the
+    native layer windows a match in base order, which is the order an
+    unlimited match returns only when no index serves it — and rdflib, which
+    reads the pattern through ``triples()``, sees that order.
+    """
+    return (
+        not residual
+        and not store._indexes
+        and not (pat.get("nkeep") and _split_keeps(store, pat["nkeep"])[1])
+        and all(len(positions) == 1 for positions in pat["varpos"].values())
+    )
 
 
 def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]:
     """Seed with the smallest pattern, then extend one connected pattern at
     a time.
 
-    Every pattern is counted before anything is matched — in static
-    selectivity order, so a pattern that selects nothing ends the block
-    before a scan is even counted. The smallest is matched and is the seed.
-    Each further step takes the smallest pattern sharing a variable with the
-    relation so far (the smallest of all for a cross product) and either
-    re-probes it natively per row of the relation, when the relation is at
-    least ``_PROBE_FANOUT`` times smaller than the pattern's count
+    Every pattern is counted before anything is matched, in static rank
+    order up to the first zero — the scans together, in one concurrent
+    native batch, when there are enough of them (:func:`_count_patterns`) —
+    so a pattern that selects nothing ends the block before any match. The
+    smallest is matched and is the seed. Each further step
+    takes the smallest pattern sharing a variable with the relation so far
+    (the smallest of all for a cross product) and either re-probes it
+    natively per row of the relation, when the relation is at least
+    ``_PROBE_FANOUT`` times smaller than the pattern's count
     (``_probe_join``), or matches it once and hash-joins it — columnar while
-    the shapes allow, as rows otherwise. A pattern's deferred per-variable
-    restrictions apply on whichever path it takes, to the variables the
-    relation does not bind yet: a variable already bound was restricted by
-    the pattern that bound it, and the join keeps its rows to those codes.
+    the shapes allow, as rows otherwise. A pattern's native keep narrows it
+    on whichever path it takes; its deferred per-variable restrictions apply
+    to the variables the relation does not bind yet: a variable already
+    bound was restricted by the pattern that bound it, and the join keeps
+    its rows to those codes. Before a step, a tuple conjunct the relation
+    binds all but one variable of may become a keep on the pattern binding
+    that one (:func:`_specialize_tuple_conjuncts`).
     """
     counts: dict[tuple, int] = {}
     memo: dict[tuple, tuple] = {}
@@ -1794,12 +2268,13 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
 
     traced = _TRACE.get() is not None
     then = time.perf_counter_ns() if traced else 0
-    for pat in sorted(patterns, key=_pattern_static_rank):
-        before = len(counts)
-        pat["estimate"] = _count_pattern(store, pat, counts)
-        stats["estimate_calls"] += len(counts) - before
-        if pat["estimate"] == 0:
-            break
+    if any(pat["unsatisfiable"] for pat in patterns):
+        # A literal bound into subject or predicate position: the block is
+        # empty whatever the other patterns count.
+        for pat in patterns:
+            pat["estimate"] = 0
+    else:
+        stats["estimate_calls"] += _count_patterns(store, patterns, counts)
     stats["native_ns"] += time.perf_counter_ns() - then if then else 0
     remaining = sorted(
         (pat for pat in patterns if "estimate" in pat),
@@ -1853,6 +2328,14 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
         running = len(cols[0]) if cols is not None else len(rows)
         step_then = time.perf_counter_ns() if traced else 0
         probe_calls = probe_ns = 0
+        if tuples and pushed is not None:
+            narrowed = _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed)
+            tuples = tuple(c for c in tuples if id(c) not in pushed.applied)
+            if narrowed and shared:
+                # Narrower than it counted: count it again, narrowed, since
+                # its size decides how it joins.
+                pat["estimate"] = _count_pattern(store, pat, counts, exact=True)
+                stats["estimate_calls"] += 1
         estimate = pat["estimate"]
 
         if shared and running * _PROBE_FANOUT < estimate:
@@ -1936,6 +2419,73 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
     return Relation.from_rows(schema, rows), stats
 
 
+def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) -> bool:
+    """Push the tuple conjuncts the relation all but decides into ``pat``'s
+    native match. Returns whether ``pat`` was narrowed.
+
+    A pending conjunct whose variables the relation binds — all but one,
+    which ``pat`` binds — is a test of that one variable once each of the
+    others holds a single value in every row: BSBM Explore Q5's band
+    ``?v < ?ref + N && ?v > ?ref - N`` after the anchor has bound ``?ref``.
+    With those values substituted (rdflib's own evaluator computes the
+    constant side, ``?ref + N``), a shape the native layer decides becomes a
+    keep on ``pat``'s match, so the rows outside the band never leave it.
+    Every row the BGP then yields passes the conjunct, which is marked
+    applied: neither the mid-join prune nor the FILTER above evaluates it
+    again.
+    """
+    narrowed = False
+    single: dict = {}
+    for conjunct in tuples:
+        if id(conjunct) in pushed.applied:
+            continue
+        free = [v for v in conjunct.vars if v not in schema]
+        if len(free) != 1 or free[0] not in pat["varpos"]:
+            continue
+        var = free[0]
+        consts = dict(conjunct.consts)
+        for other in conjunct.vars:
+            if other == var:
+                continue
+            if other not in single:
+                single[other] = _single_code(cols, rows, schema.index(other))
+            if single[other] is None:
+                break
+            consts[other] = store._decode_term(single[other])
+        else:
+            shape = filters.native_shape(conjunct.expr, var, consts)
+            if shape is None:
+                continue
+            proxy = filters.Conjunct(conjunct.expr, (var,), None, False, consts, None, shape)
+            positions = pat["varpos"][var]
+            keep, _ = filters.native_restriction(store, [proxy], positions)
+            if keep is None:
+                continue
+            for position in positions:
+                _set_native_keep(pat, position, keep)
+            pushed.applied.add(id(conjunct))
+            narrowed = True
+            if _TRACE.get() is not None:
+                _trace_event(
+                    "bgp_tuple_specialized",
+                    original_pattern_index=pat.get("index"),
+                    variable=str(var),
+                    native_predicate=shape[0],
+                    keep=_keep_summary({positions[0]: keep}),
+                )
+    return narrowed
+
+
+def _single_code(cols, rows, index: int) -> int | None:
+    """The one code a non-empty relation holds in column ``index`` in every
+    row, or ``None`` when it holds several."""
+    if cols is not None:
+        distinct = _native_column(cols[index]).distinct()
+        return memoryview(distinct).cast("I")[0] if len(distinct) == 1 else None
+    first = rows[0][index]
+    return first if all(row[index] == first for row in rows) else None
+
+
 def _prune_early(store, schema, cols, rows, pending, remaining, views):
     """Prune a BGP's running relation with the pending tuple conjuncts its
     schema now covers, when that pays. A conjunct costs a few µs a row to
@@ -2007,13 +2557,15 @@ def _plan_pattern_side(ctx, store, triple, scope, left: Relation, left_rows, var
     for a hash join. A variable the left side binds was restricted there.
     """
     pat = _pattern_terms(ctx, store, *triple, scope=scope)
-    estimate = _count_pattern(store, pat, {})
     shared = [v for v in pat["varpos"] if v in left.schema]
     free_preds = (
         {v: var_preds[v] for v in pat["varpos"] if v in var_preds and v not in left.schema}
         if var_preds
         else None
     )
+    if free_preds:
+        free_preds = _push_native_restrictions(store, pat, free_preds)
+    estimate = _count_pattern(store, pat, {})
     if shared and len(left_rows) * _PROBE_FANOUT < estimate:
         _shared_key_ok(left, Relation((), None, [], 0), shared)
         if free_preds:
@@ -2062,36 +2614,87 @@ def _pattern_terms(ctx, store, s, p, o, scope) -> dict:
 
     n3 = [store._node_to_n3(v) for v in (rs, rp, ro)]
     n3.append(scope.n3)
-    return {"n3": n3, "varpos": varpos, "unsatisfiable": unsatisfiable}
-
-
-def _match_pattern(ctx, store, s, p, o, scope) -> dict:
-    """One triple pattern resolved and matched natively (see
-    :func:`_pattern_terms` and :func:`_match_resolved_pattern`);
-    materialization is deferred."""
-    pat = _pattern_terms(ctx, store, s, p, o, scope)
-    _match_resolved_pattern(store, pat)
+    pat = {"n3": n3, "varpos": varpos, "unsatisfiable": unsatisfiable}
+    if scope.var is not None:
+        _exclude_default_graph(store, pat)
     return pat
 
 
-def _exclude_default_graph(store, pat, var) -> None:
-    """Drop the default graph's rows from a pattern a ``GRAPH ?g`` scopes.
+def _exclude_default_graph(store, pat) -> None:
+    """Drop the default graph's rows from a pattern a ``GRAPH ?g`` scopes,
+    inside its native match.
 
-    A ``GRAPH`` clause ranges over the *named* graphs, and the native match
-    has no "any named graph" pattern, so the wildcard match is restricted
-    afterwards — as a ``keep`` set over the graph column's distinct codes,
-    which every row path already applies. A file with no default-graph rows
-    has no such code, and needs no restriction at all.
+    A ``GRAPH`` clause ranges over the *named* graphs, and there is no "any
+    named graph" pattern — but the default graph's empty name sorts before
+    every term, so its code is 0 and the named graphs are the code range
+    above it: a keep on the graph column, which matches, probes and exact
+    counts apply. A file with no default-graph rows has no such code and
+    needs no restriction at all.
     """
     default = store._default_graph_code()
-    if default is None or pat["nrows"] == 0:
+    if default is None:
         return
-    allowed = set(memoryview(pat["cols"][3]).cast("I"))
-    if default not in allowed:
-        return
-    allowed.discard(default)
-    keep = pat.setdefault("keep", {})
-    keep[var] = (keep[var] & allowed) if var in keep else allowed
+    if default != 0:
+        raise NotImplementedError  # not a dictionary in byte order
+    _set_native_keep(pat, 3, (1, len(store._dict)))
+
+
+def _set_native_keep(pat, position: int, keep) -> None:
+    """Narrow the pattern's native match at ``position`` by ``keep`` (a code
+    range or an ascending code column), on top of any keep already there."""
+    nkeep = pat.setdefault("nkeep", {})
+    if position in nkeep:
+        keep = filters.intersect_keeps([nkeep[position], keep])
+    nkeep[position] = keep
+
+
+def _push_native_restrictions(store, pat, var_preds) -> dict:
+    """Move the conjuncts the native layer decides (see
+    :func:`filters.native_restriction`) into the pattern's native keep, at
+    every position their variable takes; returns the residual conjuncts per
+    variable, for the Python routes.
+
+    The keep is exact, so it may narrow a variable the relation will already
+    bind when the pattern joins: the rows it drops could not have joined.
+    """
+    residual: dict = {}
+    for var, positions in pat["varpos"].items():
+        conjuncts = var_preds.get(var)
+        if not conjuncts:
+            continue
+        keep, rest = filters.native_restriction(store, conjuncts, positions)
+        if keep is not None:
+            for position in positions:
+                _set_native_keep(pat, position, keep)
+            if _TRACE.get() is not None:
+                _trace_event(
+                    "bgp_native_restriction",
+                    original_pattern_index=pat.get("index"),
+                    variable=str(var),
+                    pushed_predicate_count=len(conjuncts) - len(rest),
+                    residual_predicate_count=len(rest),
+                    keep=_keep_summary({positions[0]: keep}),
+                )
+        if rest:
+            residual[var] = rest
+    return residual
+
+
+def _native_column(col) -> U32Column:
+    """A relation column as the native column behind it: a view over a
+    ``U32Column`` is that column, anything else (an ``array('I')``) is
+    copied into one."""
+    if isinstance(col, U32Column):
+        return col
+    owner = getattr(col, "obj", None)
+    if isinstance(owner, U32Column) and len(owner) == len(col):
+        return owner
+    return U32Column(col)
+
+
+def _distinct_codes(col) -> list:
+    """A column's distinct codes in first-seen order, by the native kernel."""
+    return memoryview(_native_column(col).distinct()).cast("I").tolist()
 
 
 def _restrict_pattern(store, pat, var_preds) -> None:
@@ -2105,7 +2708,7 @@ def _restrict_pattern(store, pat, var_preds) -> None:
         conjuncts = var_preds.get(var)
         if conjuncts:
             started = time.perf_counter_ns() if traced else 0
-            values = set(memoryview(pat["cols"][positions[0]]).cast("I"))
+            values = set(_distinct_codes(pat["cols"][positions[0]]))
             if var in keep:
                 values &= keep[var]
             distinct_binding_count = len(values)
@@ -2228,6 +2831,11 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
     columns out — the rows exist only when a consumer materializes them.
     ``None`` when the shape is not its case (several or no shared
     variables); the row join handles those.
+
+    Native kernels, GIL released: ``join_indices`` pairs the rows of the two
+    key columns in nested-loop order (the left rows in order, each with its
+    right matches in theirs) and ``take`` gathers every output column by
+    those indices.
     """
     shared = [v for v in schema_b if v in schema_a]
     if len(shared) != 1:
@@ -2236,34 +2844,11 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
     ib = schema_b.index(shared[0])
     keep_b = [i for i, v in enumerate(schema_b) if v not in schema_a]
     schema = schema_a + tuple(schema_b[i] for i in keep_b)
-    # Build side: a key seen once maps to its bare value, a key seen again to
-    # a list, so the unique keys that dominate allocate none. Inlined here and
-    # per tail shape in _join, since a shared helper costs this loop up to 19%;
-    # test_hash_join_kernels_join_like_a_nested_loop pins every copy.
-    table: dict = {}
-    for j, key in enumerate(cols_b[ib]):
-        previous = table.get(key)
-        if previous is None:
-            table[key] = j
-        elif isinstance(previous, list):
-            previous.append(j)
-        else:
-            table[key] = [previous, j]
-    a_idx = []
-    b_idx = []
-    get = table.get
-    for i, key in enumerate(cols_a[ia]):
-        hits = get(key)
-        if hits is not None:
-            if isinstance(hits, list):
-                a_idx += [i] * len(hits)
-                b_idx += hits
-            else:
-                a_idx.append(i)
-                b_idx.append(hits)
-    out = [array("I", map(col.__getitem__, a_idx)) for col in cols_a]
-    out += [array("I", map(cols_b[i].__getitem__, b_idx)) for i in keep_b]
-    return schema, tuple(out)
+    left = [_native_column(col) for col in cols_a]
+    a_idx, b_idx = left[ia].join_indices(_native_column(cols_b[ib]))
+    out = [col.take(a_idx) for col in left]
+    out += [_native_column(cols_b[i]).take(b_idx) for i in keep_b]
+    return schema, tuple(memoryview(col).cast("I") for col in out)
 
 
 def _materialize_eager_restrictions(store, pat, bound) -> None:
@@ -2299,6 +2884,10 @@ def _join_patterns(store, patterns, stats=None, pushed=None) -> Relation:
     return rel
 
 
+#: Probes per native batch call: bounds the columns one batch holds at once.
+_PROBE_BATCH = 4096
+
+
 def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
     """Join the relation against a pattern by re-matching it per binding.
 
@@ -2308,14 +2897,16 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
     trade. Substituting each relation row's codes into the pattern and
     re-matching natively keeps the work proportional to the small side —
     it is what lets an anchored star beat rdflib's own nested loop instead
-    of losing to it. A ``keep`` restriction on the pattern's free variables
-    is applied to the probed rows, as are ``row_preds`` over the extended
-    row; with ``keep_unmatched`` a row without a continuation is kept,
-    padded with None (a left join).
+    of losing to it. The probes go to the native layer in batches
+    (``match_codes_many``, or ``count_quads_many`` capped at one row for an
+    existence probe): one call each, every probe of a batch running
+    concurrently — a file-backed store overlaps their reads. The pattern's
+    native keep narrows each probe on the positions it leaves free (a code
+    range inside the native match, a code column over the rows it returns),
+    as do a ``keep`` restriction and ``row_preds`` over the extended row;
+    with ``keep_unmatched`` a row without a continuation is kept, padded
+    with None (a left join).
     """
-    native = _native(store)
-    match = native.match_codes
-    count = native.count_quads
     bound = [(schema.index(v), pos) for v, pos in pat["varpos"].items() if v in schema]
     free = {v: pos for v, pos in pat["varpos"].items() if v not in schema}
     eq_checks = [(pos[0], later) for pos in free.values() for later in pos[1:]]
@@ -2323,53 +2914,51 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
     members = [(pos[0], keep[v]) for v, pos in free.items() if v in keep]
     out_positions = [pos[0] for pos in free.values()]
     needed = sorted({idx for pos in free.values() for idx in pos})
-
-    # One GIL-released batch decode covers every code the probes will bind.
-    n3_cache = _probe_spellings(store, rows, bound)
+    # A code range rides every probe; a code column is tested on the rows a
+    # probe returns, since the native layer would re-read it per probe.
+    probe_keep, tests = {}, []
+    for position, spec in (pat.get("nkeep") or {}).items():
+        if position in needed:
+            if isinstance(spec, tuple):
+                probe_keep[position] = spec
+            else:
+                tests.append((position, filters.keep_member(spec)))
+    narrowing = _narrowing(probe_keep, limit=None if free else 1)
+    patterns = _substituted_patterns(store, rows, pat, bound)
 
     pad = (None,) * len(free)
     out = []
-    for row in rows:
-        n3 = list(pat["n3"])
-        satisfiable = True
-        for row_idx, positions in bound:
-            term = n3_cache[row[row_idx]]
-            for idx in positions:
-                # The dictionary stores canonical N-Triples forms: a literal
-                # ('"') cannot occupy subject or predicate position or name a
-                # graph, and only an IRI ('<') can be a predicate — such a
-                # binding simply has no continuation.
-                if (
-                    (idx == 0 and term[:1] == '"')
-                    or (idx == 1 and term[:1] != "<")
-                    or (idx == 3 and term[:1] == '"')
-                ):
-                    satisfiable = False
-                n3[idx] = term
-        matched = False
-        if not satisfiable:
-            pass
-        elif not free:
-            # Existence probe: count from the row selection, materialize
-            # no columns.
-            if count(*n3) and all(pred(row) for pred in row_preds):
-                out.append(row)
-                matched = True
-        else:
-            cols = match(*n3)
-            if cols is None:
-                raise NotImplementedError
-            views = {idx: memoryview(cols[idx]).cast("I").tolist() for idx in needed}
-            for i in range(len(views[needed[0]])):
-                if all(views[a][i] == views[b][i] for a, b in eq_checks) and all(
-                    views[p][i] in allowed for p, allowed in members
-                ):
-                    extended = row + tuple(views[idx][i] for idx in out_positions)
-                    if all(pred(extended) for pred in row_preds):
-                        out.append(extended)
-                        matched = True
-        if keep_unmatched and not matched:
-            out.append(row + pad)
+    for start in range(0, len(rows), _PROBE_BATCH):
+        batch = range(start, min(start + _PROBE_BATCH, len(rows)))
+        probes = [(patterns[i], narrowing) for i in batch if patterns[i] is not None]
+        answers = iter(_run_probes(store, probes, count=not free))
+        for i in batch:
+            row = rows[i]
+            matched = False
+            if patterns[i] is None:
+                pass
+            elif not free:
+                # Existence probe: a count capped at one row, no columns.
+                if next(answers) and all(pred(row) for pred in row_preds):
+                    out.append(row)
+                    matched = True
+            else:
+                cols = next(answers)
+                if cols is None:
+                    raise NotImplementedError
+                views = {idx: memoryview(cols[idx]).cast("I").tolist() for idx in needed}
+                for j in range(len(views[needed[0]])):
+                    if (
+                        all(views[a][j] == views[b][j] for a, b in eq_checks)
+                        and all(views[p][j] in allowed for p, allowed in members)
+                        and all(test(views[p][j]) for p, test in tests)
+                    ):
+                        extended = row + tuple(views[idx][j] for idx in out_positions)
+                        if all(pred(extended) for pred in row_preds):
+                            out.append(extended)
+                            matched = True
+            if keep_unmatched and not matched:
+                out.append(row + pad)
     combined_schema = schema + tuple(free.keys())
     # The deferred per-variable restrictions, over the codes the probes
     # actually reached rather than the pattern's whole column. A variable
@@ -2567,7 +3156,7 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, sta
                     if c is not None:
                         solution[v] = cached[c] if c >= 0 else foreign[c]
                 yielded += 1
-                yield FrozenBindings(ctx.push() if own_context else ctx, solution)
+                yield _solution(ctx.push() if own_context else ctx, solution)
             size = min(size * 4, _CHUNK_MAX)
     finally:
         if traced:

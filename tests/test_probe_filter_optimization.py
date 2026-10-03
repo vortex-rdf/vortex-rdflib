@@ -47,6 +47,8 @@ def test_probe_filter_evaluates_only_reached_codes(tmp_path, capsys, monkeypatch
         return original(store, conjuncts, codes)
 
     monkeypatch.setattr(filters, "evaluate_column", spy)
+    # The Python route: langMatches would otherwise be a native keep.
+    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY_ID", "probe-filter")
     register_sparql_pushdown()
@@ -109,6 +111,8 @@ def test_lazy_join_probe_evaluates_only_reached_codes(tmp_path, monkeypatch):
         return original(store, conjuncts, codes)
 
     monkeypatch.setattr(filters, "evaluate_column", spy)
+    # The Python route: langMatches would otherwise be a native keep.
+    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
     register_sparql_pushdown()
     rows = list(
         graph.query(
@@ -135,6 +139,8 @@ def test_non_probe_filter_keeps_eager_route(tmp_path, monkeypatch):
         return original(store, conjuncts, codes)
 
     monkeypatch.setattr(filters, "evaluate_column", spy)
+    # The Python route: langMatches would otherwise be a native keep.
+    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
     register_sparql_pushdown()
     rows = list(
         graph.query(
@@ -148,3 +154,42 @@ def test_non_probe_filter_keeps_eager_route(tmp_path, monkeypatch):
     assert len(rows) == 1
     assert len(seen) == 1
     assert len(seen[0]) == 300
+
+
+def test_native_probe_filter_never_reaches_python(tmp_path, capsys, monkeypatch):
+    """With the native predicate, the langMatches filter is a keep on the
+    probed pattern: the probe returns only rows that pass, and no value is
+    evaluated in Python — not even the one the probe reaches."""
+    graph = _graph(tmp_path)
+    seen = []
+    original = filters.evaluate_column
+
+    def spy(store, conjuncts, codes):
+        seen.append(set(codes))
+        return original(store, conjuncts, codes)
+
+    monkeypatch.setattr(filters, "evaluate_column", spy)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    register_sparql_pushdown()
+    rows = list(
+        graph.query("""SELECT ?s ?name WHERE {
+        ?s <http://ex/anchor> "yes" .
+        ?s <http://ex/name> ?name
+        FILTER(langMatches(lang(?name), "EN"))
+    }""")
+    )
+    payloads = _events(capsys.readouterr())
+    assert rows == [(URIRef("http://ex/s0"), rows[0][1])]
+    assert seen == []
+    pushed = next(e for e in payloads if e["event"] == "bgp_native_restriction")
+    assert pushed["original_pattern_index"] == 1
+    assert pushed["residual_predicate_count"] == 0
+    step = next(
+        e
+        for e in payloads
+        if e["event"] == "bgp_join_step_complete" and e["original_pattern_index"] == 1
+    )
+    # Planned on the pattern's own count: the keep narrows the probe, not
+    # the estimate a probe of one row is decided by.
+    assert step["strategy"] == "probe"
+    assert step["estimated_rows"] == 300
