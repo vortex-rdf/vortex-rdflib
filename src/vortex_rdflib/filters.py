@@ -297,6 +297,29 @@ def _const(value):
     return lambda env: value
 
 
+def _constant_view(node):
+    """A query constant's view — or ``UNKNOWN`` for a numeric constant rdflib
+    compares by a value the fast route refuses.
+
+    rdflib's SPARQL parser leaves a typed constant's ``ill_typed`` unset, so
+    ``Literal.__gt__``/``eq`` take its numeric fast path whenever its value
+    converts — ``"300"^^xsd:byte`` compares as 300 — where a data literal
+    out of its type's bounds is ill-typed and ordered by its datatype IRI
+    (``numeric_value`` refuses it). Such a constant sends every value to
+    rdflib's own evaluator.
+    """
+    view = view_of_node(node)
+    if (
+        isinstance(node, Literal)
+        and view.dt in NUMERIC_TYPES
+        and node.ill_typed is not True
+        and node.value is not None
+        and numeric_value(view) is None
+    ):
+        return UNKNOWN
+    return view
+
+
 def _fold_constant(node):
     """A variable-free subexpression (``-1``, ``1 + 2``, ``str(5)``) evaluated
     once by rdflib itself; an error value stays an error."""
@@ -322,7 +345,7 @@ def _compile(node, slots: dict, consts: dict):
             return lambda env: env[index]
         return _const(consts.get(node))
     if isinstance(node, (Literal, URIRef)):
-        return _const(view_of_node(node))
+        return _const(_constant_view(node))
     if not isinstance(node, CompValue):
         raise _NotFast
     if not expr_vars(node):
