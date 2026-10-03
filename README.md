@@ -102,9 +102,12 @@ N-Triples string columns, parsing each distinct term once.
 vortex term codes instead of leaving them to rdflib's per-row evaluation: basic
 graph patterns, `FILTER`, `OPTIONAL`, `MINUS`, `FILTER (NOT) EXISTS`, nested groups and `VALUES`, projection, `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`,
 `ASK` and `COUNT` aggregates above them. Anything else is evaluated by
-rdflib. Each pushdown is described, with an example and numbers, in
-[docs/pushdown.md](docs/pushdown.md); the switches to disable or narrow it
-are in the table below.
+rdflib. Much of that work runs inside vortex-rdf itself: batched counts and
+probes, FILTER predicates decided over the term dictionary and applied
+inside the scans, `LIMIT` and `ASK` stopping the scan, native joins,
+distinct and group counts over the code columns. Each pushdown is described,
+with an example and numbers, in [docs/pushdown.md](docs/pushdown.md); the
+switches to disable or narrow it are in the table below.
 
 **File-backed vs in-memory.** The default open is lazy and file-backed.
 `VortexRdflibStore(path, in_memory=True)` (or env `VORTEX_RDF_IN_MEMORY=1`) loads
@@ -121,7 +124,7 @@ in-memory store they change nothing measurable, since the rows are resident
 already, and on multi-pattern joins the run-to-run spread is wider than any
 effect they have. Enable them for lookup-heavy file-backed workloads.
 
-For Dictionary-layout files, the term dictionary is loaded into memory at open when its compressed size fits a given residency budget (1 GiB by default). Otherwise it stays in the file and is read on demand. The pushdown and the u32 code path need an in-memory dictionary, though the quads can stay file-backed. Vortex-rdf only exposes the term dictionary (`term_dict()`) when it is in memory. Pass `max_resident_bytes=...` (the dictionary's compressed size in bytes) to set it yourself, or set
+For Dictionary-layout files, the term dictionary is loaded into memory at open when its compressed size fits a given residency budget (1 GiB by default). Otherwise it stays in the file and is read on demand. Either way the store answers in `u32` codes and the pushdown stays on: a dictionary left in the file only makes decoding (and looking constants up) slower, since every call reads from the file, so the budget trades memory for speed. Pass `max_resident_bytes=...` (the dictionary's compressed size in bytes) to set it yourself, or set
 `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES` to give the native layer a process-wide
 budget instead. In-memory stores keep the dictionary resident regardless.
 
@@ -135,6 +138,7 @@ budget instead. In-memory stores keep the dictionary resident regardless.
 | `VORTEX_RDF_DISABLE_PUSHDOWN=1` | Keep rdflib's default evaluator for every operator (see [docs/pushdown.md](docs/pushdown.md)) |
 | `VORTEX_RDF_PUSHDOWN_OPS=<list>` | Only push down the listed algebra nodes (`bgp` = basic graph patterns only) |
 | `VORTEX_RDF_FILTER_FAST=0` | Evaluate every FILTER value through rdflib's expression evaluator (still once per distinct value) |
+| `VORTEX_RDF_NATIVE_FILTERS=0` | Decide no FILTER conjunct inside vortex-rdf (no `filter_codes` verdicts or scan constraints): every value goes through the Python routes |
 | `VORTEX_RDF_TRACE_TRIPLES=1` | Print every `triples()` pattern (debugging) |
 | `VORTEX_RDF_TRACE_QUERY=1` | Print the pushdown's query plan as JSON lines on stderr — counts, matches, probes, restrictions, joins, mid-join FILTER prunes and every native call, with row counts and timings (debugging; `VORTEX_RDF_TRACE_QUERY_ID` labels the lines) |
 

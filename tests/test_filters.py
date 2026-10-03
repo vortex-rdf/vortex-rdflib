@@ -345,6 +345,30 @@ def test_additive_outside_the_integer_domain_defers(spelling):
     assert fast_answer(predicate, spelling) is filters.UNKNOWN
 
 
+@pytest.mark.parametrize(
+    "sparql_expr",
+    [
+        '?v < "300"^^xsd:byte',
+        '?v = "300"^^xsd:byte',
+        '?v > "-1"^^xsd:nonNegativeInteger',
+        '"256"^^xsd:unsignedByte >= ?v',
+    ],
+)
+def test_out_of_range_typed_constant_defers_every_value(sparql_expr):
+    """rdflib's parser leaves a typed constant's `ill_typed` unset, so it
+    compares `"300"^^xsd:byte` as the number 300 — not by its datatype IRI,
+    as it orders an out-of-range data literal. The fast route reproduces
+    neither from the spelling alone: every value goes to rdflib."""
+    expr = filter_expr(sparql_expr)
+    predicate = filters.compile_fast(expr, (V,), {})
+    assert predicate is not None
+    for spelling in SPELLINGS:
+        assert fast_answer(predicate, spelling) is filters.UNKNOWN, spelling
+    # and rdflib indeed compares by value: 5 < 300
+    if sparql_expr == '?v < "300"^^xsd:byte':
+        assert rdflib_answer(expr, typed("5", "integer")) is True
+
+
 def test_ctx_bound_constants_are_substituted():
     expr = filter_expr("?v = ?w")
     view = parse_spelling(typed("5", "integer"))

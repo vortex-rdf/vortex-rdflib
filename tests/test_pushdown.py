@@ -6,6 +6,7 @@ import io
 import json
 import sys
 import time
+from typing import Any
 
 import pytest
 from rdflib import Dataset, Graph, Literal, URIRef, Variable
@@ -713,6 +714,44 @@ def dataset(dict_vortex_quads, request):
     )
 
 
+@pytest.fixture(scope="module")
+def variant_vortex(tmp_path_factory):
+    """The triple fixture with each secondary index, keyed by index."""
+    d = tmp_path_factory.mktemp("pushdown-variants")
+    nt = d / "fixture.nt"
+    nt.write_text(FIXTURE_NT, encoding="utf-8")
+    files = {}
+    for name, indexes in (
+        ("none", []),
+        ("by-copy", ["secondary-by-copy"]),
+        ("by-reference", ["secondary-by-reference"]),
+    ):
+        out = d / f"fixture-{name}.vortex"
+        serialize_rdf(str(nt), str(out), layout="dictionary", indexes=indexes)
+        files[name] = out
+    return files
+
+
+#: Store configurations the native layer serves differently: a dictionary
+#: left in the file (read on demand, `TermDict.file_backed`), and the
+#: secondary indexes, whose served views order an unlimited match their own
+#: way — which a LIMIT pushed into the match must not change.
+STORE_VARIANTS: dict[str, tuple[str, dict[str, Any]]] = {
+    "file-backed-dictionary": ("none", {"max_resident_bytes": 0}),
+    "secondary-by-copy": ("by-copy", {}),
+    "secondary-by-reference-mem": ("by-reference", {"in_memory": True}),
+}
+
+
+@pytest.fixture(params=sorted(STORE_VARIANTS))
+def variant_graph(variant_vortex, request):
+    index, kwargs = STORE_VARIANTS[request.param]
+    store = VortexRdflibStore(str(variant_vortex[index]), **kwargs)
+    if "max_resident_bytes" in kwargs:
+        assert store._dict is not None and store._dict.file_backed
+    return Graph(store=store)
+
+
 def _row_key(row):
     # rdflib's term ordering is not total (NaN literals), so sort on the
     # N-Triples spellings, which is.
@@ -756,6 +795,23 @@ def test_pushdown_equals_default_evaluator_over_quads(dataset, sparql):
     """The same shapes over the union default graph of a quad store: the
     pushdown must scope every native match to the graph rdflib would have
     asked, duplicates across graphs included."""
+    with_pushdown, without_pushdown = both_ways(dataset, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_store_variants_equal_default_evaluator(variant_graph, sparql):
+    """The same shapes over a file-backed dictionary and over the secondary
+    indexes."""
+    with_pushdown, without_pushdown = both_ways(variant_graph, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
+def test_graph_pattern_over_a_file_backed_dictionary(dict_vortex_quads, sparql):
+    store = VortexRdflibStore(str(dict_vortex_quads), max_resident_bytes=0)
+    assert store._dict is not None and store._dict.file_backed
+    dataset = Dataset(store=store, default_union=True)
     with_pushdown, without_pushdown = both_ways(dataset, sparql)
     assert with_pushdown == without_pushdown
 
@@ -850,8 +906,8 @@ def test_graph_scope_reaches_the_native_match(dataset, monkeypatch):
     patterns = []
     original = pd._pattern_terms
 
-    def spy(*args):
-        pattern = original(*args)
+    def spy(*args, **kwargs):
+        pattern = original(*args, **kwargs)
         patterns.append(pattern["n3"][3])
         return pattern
 
@@ -886,6 +942,37 @@ def test_bgp_only_mode_equals_default_evaluator(graph, monkeypatch, sparql):
     monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
     bgp_only, without_pushdown = both_ways(graph, sparql)
     assert bgp_only == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_python_filter_routes_equal_default_evaluator(graph, monkeypatch, sparql):
+    """With the native term predicates off, every conjunct the native layer
+    would decide runs on the Python fast route instead."""
+    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
+    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_batched_probe_path_equals_default_evaluator(graph, monkeypatch, sparql):
+    """Every probe through the native batch calls, in batches of three —
+    a lone probe included."""
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
+    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
+    monkeypatch.setattr(pd, "_SCAN_BATCH_MIN", 1)
+    monkeypatch.setattr(pd, "_MEMORY_SCAN_BATCH_MIN", 1)
+    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", [q for q in QUERIES + GRAPH_QUERIES if "COUNT" in q])
+def test_grouped_counts_over_pairs_equal_default_evaluator(dataset, monkeypatch, sparql):
+    """COUNT(DISTINCT) groups from the distinct (key, value) pairs rather
+    than one native gather per group."""
+    monkeypatch.setattr(pd, "_NATIVE_GROUPS_MAX", 0)
+    with_pushdown, without_pushdown = both_ways(dataset, sparql)
+    assert with_pushdown == without_pushdown
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
@@ -1138,9 +1225,11 @@ def _pruned_graph(tmp_path) -> Graph:
 
 
 def test_trace_records_every_native_call(tmp_path, monkeypatch, capsys):
-    """Every native call a traced query makes is a `native_call_complete`
-    event, the per-row probes included, so the events add up to the calls
-    the store served: 3 counts, the `p` and `q` matches and 1 probe of `r`."""
+    """Every native call a traced query makes is an event — a single call a
+    `native_call_complete`, a batch a `native_batch_complete` carrying its
+    probe count — the per-row probes included, so the events add up to the
+    calls the store served: 3 counts (one batch), the `p` and `q` matches
+    and 1 probe of `r`."""
     graph = _pruned_graph(tmp_path)
     register_sparql_pushdown()
     native = _counting_native(graph)
@@ -1149,8 +1238,10 @@ def test_trace_records_every_native_call(tmp_path, monkeypatch, capsys):
     run(graph, _PRUNED_SQL)
     trace = _trace_events(capsys.readouterr().err)
     calls = [e for e in trace if e["event"] == "native_call_complete"]
-    assert (native.counts, native.matches) == (3, 3)
-    assert len(calls) == native.counts + native.matches
+    batches = [e for e in trace if e["event"] == "native_batch_complete"]
+    assert (native.counts, native.matches, native.batches) == (3, 3, 1)
+    assert [e["operation"] for e in batches] == ["count_quads_many"]
+    assert len(calls) + sum(e["probe_count"] for e in batches) == native.counts + native.matches
 
 
 def test_trace_reports_a_mid_join_prune_between_the_steps_it_links(tmp_path, monkeypatch, capsys):
@@ -1276,13 +1367,14 @@ def test_columnar_join_matches_row_join():
 
 @pytest.mark.parametrize("tail_width", [0, 1, 2], ids=["no-tail", "one-tail", "two-tails"])
 def test_hash_join_kernels_join_like_a_nested_loop(tail_width):
-    """Both kernels bucket the build side alike — a key seen once holds its
-    bare value, a key seen again a list — and so join exactly as a nested
-    loop does, in its order. The encoding is inlined per kernel and per tail
-    shape for speed; these keys hit every case of every copy: key 5 twice,
-    first at row index 0 with an empty tail (both falsy, which must not read
-    as absent), 7 twice, 9 three times, 3 once, 11 only on the build side,
-    and 5 probed twice."""
+    """Both kernels join exactly as a nested loop does, in its order: the
+    row kernel buckets the build side — a key seen once holds its bare
+    value, a key seen again a list, inlined per tail shape for speed — and
+    the columnar one is the native `join_indices`, which pairs rows in
+    nested-loop order. These keys hit every case of every copy: key 5
+    twice, first at row index 0 with an empty tail (both falsy, which must
+    not read as absent), 7 twice, 9 three times, 3 once, 11 only on the
+    build side, and 5 probed twice."""
     from array import array
 
     keys_a = [5, 7, 9, 3, 5]
@@ -1418,12 +1510,14 @@ def test_limit_decodes_only_the_first_chunk(tmp_path):
 
 
 class _CountingNative:
-    """A VortexRdfStore stand-in that counts the calls the pushdown makes."""
+    """A VortexRdfStore stand-in that counts the counts and matches the
+    pushdown asks for — each probe of a batch call is one."""
 
     def __init__(self, inner):
         self._inner = inner
         self.counts = 0
         self.matches = 0
+        self.batches = 0
 
     def count_quads(self, *args, **kwargs):
         self.counts += 1
@@ -1432,6 +1526,16 @@ class _CountingNative:
     def match_codes(self, *args, **kwargs):
         self.matches += 1
         return self._inner.match_codes(*args, **kwargs)
+
+    def count_quads_many(self, probes):
+        self.counts += len(probes)
+        self.batches += 1
+        return self._inner.count_quads_many(probes)
+
+    def match_codes_many(self, probes):
+        self.matches += len(probes)
+        self.batches += 1
+        return self._inner.match_codes_many(probes)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -1489,6 +1593,19 @@ def test_pushdown_ops_env_switch(dict_vortex, monkeypatch):
     monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "Bogus")
     with pytest.raises(ValueError, match="Bogus"):
         VortexRdflibStore(str(dict_vortex))
+
+
+def test_native_filters_env_switch(dict_vortex, monkeypatch):
+    """`VORTEX_RDF_NATIVE_FILTERS=0` keeps every conjunct on the Python
+    routes: no conjunct carries a native predicate, and the answer stands."""
+    monkeypatch.setattr(filters, "_NATIVE_ENABLED", True)
+    monkeypatch.setenv("VORTEX_RDF_NATIVE_FILTERS", "0")
+    graph = Graph(store=VortexRdflibStore(str(dict_vortex)))
+    assert filters._NATIVE_ENABLED is False
+    with_pushdown, without_pushdown = both_ways(
+        graph, "SELECT ?s WHERE { ?s ?p ?o FILTER(isIRI(?o)) }"
+    )
+    assert with_pushdown == without_pushdown
 
 
 def test_non_vortex_graphs_unaffected(dict_vortex):
@@ -1577,6 +1694,35 @@ def test_distinct_and_count_are_answered_in_code_space(graph, monkeypatch):
     rows = run(graph, "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p")
     assert (URIRef("http://ex.org/name"), Literal(8)) in rows
     assert distincts and aggregates
+
+
+_ALIAS_QUERIES = [
+    "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a }",
+    "SELECT (COUNT(DISTINCT ?a) AS ?n) WHERE { ?x <http://ex.org/age> ?a }",
+    "SELECT ?a (COUNT(*) AS ?n) WHERE { ?x <http://ex.org/age> ?a } GROUP BY ?a",
+    """PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+    SELECT DISTINCT ?a WHERE {
+        { VALUES ?a { "0042"^^xsd:integer "43"^^xsd:integer } }
+        UNION { ?x <http://ex.org/age> ?a } }""",
+    "SELECT DISTINCT ?o WHERE { ?s ?p ?o }",
+]
+
+
+@pytest.mark.parametrize("order", [1, -1], ids=["forward", "reverse"])
+def test_term_aliases_are_classified_once_per_store(graph, order):
+    """Which codes alias ("042" and "42" are one integer, and so is a query's
+    "0042" the dictionary lacks) is the store's to remember: whatever query
+    classifies a code first, every later one — on the same store, in either
+    order — answers as rdflib does, and the classification is not redone."""
+    store = graph.store
+    for sparql in _ALIAS_QUERIES[::order]:
+        with_pushdown, without_pushdown = both_ways(graph, sparql)
+        assert with_pushdown == without_pushdown, sparql
+    assert store._alias_reps, "the fixture's two spellings of 42 alias"
+    classified = len(store._alias_classified)
+    for sparql in _ALIAS_QUERIES:
+        run(graph, sparql)
+    assert len(store._alias_classified) == classified
 
 
 def test_count_over_one_pattern_counts_instead_of_matching(graph):
