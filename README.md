@@ -105,9 +105,9 @@ graph patterns, `FILTER`, `OPTIONAL`, `MINUS`, `FILTER (NOT) EXISTS`, nested gro
 rdflib. Much of that work runs inside vortex-rdf itself: batched counts and
 probes, FILTER predicates decided over the term dictionary and applied
 inside the scans, `LIMIT` and `ASK` stopping the scan, native joins,
-distinct and group counts over the code columns. Each pushdown is described,
-with an example and numbers, in [docs/pushdown.md](docs/pushdown.md); the
-switches to disable or narrow it are in the table below.
+distinct and group counts over the code columns. How each pushdown works, and
+where in the code it runs, is described in [docs/pushdown.md](docs/pushdown.md);
+the switches to disable or narrow it are in the table below.
 
 **File-backed vs in-memory.** The default open is lazy and file-backed.
 `VortexRdflibStore(path, in_memory=True)` (or env `VORTEX_RDF_IN_MEMORY=1`) loads
