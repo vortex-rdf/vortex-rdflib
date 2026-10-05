@@ -146,23 +146,11 @@ def canonical_spelling(node) -> str:
 def kind_bounds(term_dict) -> tuple[int, int, int]:
     """``(literal_lo, iri_lo, blank_lo)``: the first code of each term kind.
 
-    Three binary searches over ``decode`` (about 17 decodes each); the
-    dictionary is immutable, so the store caches the result.
+    Three native binary searches (``TermDict.lower_bound``: the code of the
+    first term not below the needle); the dictionary is immutable, so the
+    store caches the result.
     """
-    size = len(term_dict)
-
-    def lower_bound(first_char: str) -> int:
-        lo, hi = 0, size
-        while lo < hi:
-            mid = (lo + hi) // 2
-            spelling = term_dict.decode(mid)
-            if spelling is None or spelling[:1] < first_char:
-                lo = mid + 1
-            else:
-                hi = mid
-        return lo
-
-    return lower_bound('"'), lower_bound("<"), lower_bound("_")
+    return term_dict.lower_bound('"'), term_dict.lower_bound("<"), term_dict.lower_bound("_")
 
 
 def kind_of(code: int, bounds: tuple[int, int, int]) -> str:

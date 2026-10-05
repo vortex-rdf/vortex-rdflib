@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.1.3...v0.2.0) - 2026-10-05
+
+Requires vortex-rdf 0.11 (`vortex-rdf>=0.11,<0.12`, up from 0.10): most of the
+SPARQL pushdown now runs on its native primitives.
+
+### Added
+
+- Report each query's evaluation apart from rdflib's parse (bench) ([`f7dca63`](https://github.com/vortex-rdf/vortex-rdflib/commit/f7dca630ba4279a9e231706df337ab47ff09c9b2) by @julianrojas87)
+- Measure pyoxigraph directly, add file pushdown-off row (bench) ([`c281aed`](https://github.com/vortex-rdf/vortex-rdflib/commit/c281aed286e200ea010b96096a0e414891603012) by @julianrojas87)
+- Save each store's row counts in results.json (bench) ([`09286ab`](https://github.com/vortex-rdf/vortex-rdflib/commit/09286abee7ed6b0b464198cbb7e21fb517d0c7fa) by @julianrojas87)
+- History records of the vortex configurations against rdflib (bench) ([`af90135`](https://github.com/vortex-rdf/vortex-rdflib/commit/af901351f48751379cf4e18d46e1ad586261eae7) by @julianrojas87)
+- Build the history series and embed them in the dashboard (bench) ([`6ace2a7`](https://github.com/vortex-rdf/vortex-rdflib/commit/6ace2a7abea2023a2a381c04e76d0dbf7917f60b) by @julianrojas87)
+- Per-commit speedup chart over rdflib (dashboard) ([`12d588f`](https://github.com/vortex-rdf/vortex-rdflib/commit/12d588f1820a3a88851b537d110670c5fa849ee7) by @julianrojas87)
+- Plot the working tree on the history chart with refresh.sh --history (bench) ([`16f213a`](https://github.com/vortex-rdf/vortex-rdflib/commit/16f213a186662fc083dd909e2dca4beef88a5194) by @julianrojas87)
+- Adopt vortex-rdf 0.11 primitives (pushdown) ([`f61f84d`](https://github.com/vortex-rdf/vortex-rdflib/commit/f61f84d1d90e27a59fe435c4c78989e386f72e41) by @claude)
+
+### Fixed
+
+- Harden the history chart's page embedding and workflows (bench) ([`c45ff81`](https://github.com/vortex-rdf/vortex-rdflib/commit/c45ff81c9987a5c3adb697b679e2693a7f4509f5) by @julianrojas87)
+- Reorganize dashboard entries (bench) ([`1c60928`](https://github.com/vortex-rdf/vortex-rdflib/commit/1c6092897e204678eb685f0408a1e14c6ce81846) by @julianrojas87)
+- Minor text adjustments in the dashboard (bench) ([`54d6d57`](https://github.com/vortex-rdf/vortex-rdflib/commit/54d6d579d6f1fd684ee21879750c09da7aecafab) by @julianrojas87)
+- Defer out-of-range typed constants to rdflib (filters) ([`367c9c6`](https://github.com/vortex-rdf/vortex-rdflib/commit/367c9c64be12eef7e51d2b15b0b121f8899e0183) by @claude)
+
 ## [0.1.3](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.1.2...v0.1.3) - 2026-09-29
 
 ### Changed

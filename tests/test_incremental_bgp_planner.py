@@ -18,16 +18,17 @@ def events(captured):
     ]
 
 
-def graph_from(tmp_path, name, ntriples):
-    """The N-Triples as an in-memory Dictionary-layout store, behind a Graph."""
+def graph_from(tmp_path, name, ntriples, in_memory=True):
+    """The N-Triples as a Dictionary-layout store (in memory by default),
+    behind a Graph."""
     source = tmp_path / f"{name}.nt"
     source.write_text(ntriples, encoding="utf-8")
     artifact = tmp_path / f"{name}.vortex"
     serialize_rdf(str(source), str(artifact), layout="dictionary")
-    return Graph(store=VortexRdflibStore(str(artifact), in_memory=True))
+    return Graph(store=VortexRdflibStore(str(artifact), in_memory=in_memory))
 
 
-def graph_of(tmp_path, size=300):
+def graph_of(tmp_path, size=300, in_memory=True):
     """One anchor row, plus a name and a tag for each of ``size`` subjects."""
     return graph_from(
         tmp_path,
@@ -35,6 +36,7 @@ def graph_of(tmp_path, size=300):
         '<http://ex/s0> <http://ex/anchor> "yes" .\n'
         + "".join(f'<http://ex/s{i}> <http://ex/name> "name-{i}"@en .\n' for i in range(size))
         + "".join(f"<http://ex/s{i}> <http://ex/tag> <http://ex/t{i}> .\n" for i in range(size)),
+        in_memory=in_memory,
     )
 
 
@@ -136,8 +138,11 @@ def test_seed_is_the_smallest_count_not_the_most_selective_shape(tmp_path, monke
     assert steps[0]["estimated_rows"] == 300
 
 
-def test_pattern_selecting_nothing_ends_the_block_before_any_match(tmp_path, monkeypatch, capsys):
-    graph = graph_of(tmp_path)
+@pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
+def test_pattern_selecting_nothing_ends_the_block_before_any_match(
+    tmp_path, monkeypatch, capsys, in_memory
+):
+    graph = graph_of(tmp_path, in_memory=in_memory)
     native = graph.store._store()
     matches = []
 
@@ -163,17 +168,29 @@ def test_pattern_selecting_nothing_ends_the_block_before_any_match(tmp_path, mon
     assert matches == []
     plan = next(e for e in payloads if e["event"] == "bgp_plan_complete")
     assert plan["seed_selection"] == "empty_count"
-    # The anchor is counted first, by shape, so the scan is never counted.
-    assert plan["estimate_calls"] == 1
+    batches = [e for e in payloads if e["event"] == "native_batch_complete"]
+    if in_memory:
+        # Two in-memory scans overlap by less than a batch costs: plain
+        # calls count the patterns, most bound first, and the anchor's zero
+        # leaves the name pattern uncounted.
+        assert plan["estimate_calls"] == 1
+        assert batches == []
+    else:
+        # Both patterns are counted in one native batch, concurrently; the
+        # anchor's zero then ends the block before anything is matched.
+        assert plan["estimate_calls"] == 2
+        assert [(e["operation"], e["probe_count"]) for e in batches] == [("count_quads_many", 2)]
 
 
 @pytest.mark.parametrize("fanout", [100, 10**9])
 def test_bound_variable_is_not_restricted_again(tmp_path, monkeypatch, fanout):
-    """A per-variable filter on a variable the seed binds is evaluated by
-    the seed alone; the pattern joined next — probed or hash-joined —
-    inherits the codes and does not evaluate it over its own column."""
+    """On the Python route, a per-variable filter on a variable the seed
+    binds is evaluated by the seed alone; the pattern joined next — probed
+    or hash-joined — inherits the codes and does not evaluate it over its
+    own column."""
     graph = graph_of(tmp_path)
     monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
     seen = []
     original = filters.evaluate_column
 
@@ -211,3 +228,36 @@ def test_disconnected_pattern_uses_complete_match(tmp_path, monkeypatch, capsys)
     step = next(e for e in payloads if e["event"] == "bgp_join_step_complete")
     assert step["strategy"] in {"hash_columns", "hash_rows"}
     assert step["cardinality_source"] == "matched"
+
+
+@pytest.mark.parametrize("fanout", [100, 10**9])
+def test_native_filter_narrows_every_pattern_it_reaches(tmp_path, monkeypatch, capsys, fanout):
+    """A filter the native layer decides — a kind test here — is a keep on
+    the native match of every pattern binding its variable, counted and
+    matched (or probed) narrowed: nothing is evaluated in Python."""
+    graph = graph_of(tmp_path)
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+    seen = []
+    original = filters.evaluate_column
+
+    def spy(store, conjuncts, codes):
+        seen.append(set(codes))
+        return original(store, conjuncts, codes)
+
+    monkeypatch.setattr(filters, "evaluate_column", spy)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    register_sparql_pushdown()
+    rows = list(
+        graph.query("""SELECT ?s ?name WHERE {
+        ?s <http://ex/anchor> "yes" .
+        ?s <http://ex/name> ?name
+        FILTER(isIRI(?s))
+    }""")
+    )
+    payloads = events(capsys.readouterr())
+    assert len(rows) == 1
+    assert rows[0][0] == URIRef("http://ex/s0")
+    assert seen == []
+    pushed = [e for e in payloads if e["event"] == "bgp_native_restriction"]
+    assert sorted(e["original_pattern_index"] for e in pushed) == [0, 1]
+    assert all(e["residual_predicate_count"] == 0 for e in pushed)

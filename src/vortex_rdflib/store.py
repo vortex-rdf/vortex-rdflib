@@ -7,8 +7,9 @@ from rdflib.term import BNode, IdentifiedNode, Literal, Node, URIRef
 from rdflib.util import from_n3
 from vortex_rdf import VortexRdfStore
 
+from . import filters
 from .pushdown import register_sparql_pushdown
-from .terms import canonical_spelling, kind_bounds
+from .terms import BLANK, IRI, LITERAL, canonical_spelling, kind_bounds
 
 # The cottas-bench branch's layout names are accepted as aliases so its
 # benchmark scripts keep working. The layout is only a label here: VortexRdfStore
@@ -16,18 +17,26 @@ from .terms import canonical_spelling, kind_bounds
 #: Sentinel for a cached lookup whose answer may legitimately be ``None``.
 _UNRESOLVED = object()
 
-# Keep the dictionary resident for file-backed RDFLib stores so the code-space
-# evaluator remains available. The native default is 512 MiB, which leaves the
-# BSBM 100k dictionary file-backed and disables pushdown entirely. Applied only
-# when nothing else decides the budget: an explicit `max_resident_bytes` is
-# passed through, and `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES`, an in-memory open
-# (resident regardless) or a disabled code path leave the native policy.
+# The term-dictionary residency budget for file-backed rdflib stores. Since
+# vortex-rdf 0.11 a dictionary over the budget stays in the file and is read
+# on demand, the code path and the pushdown with it; a resident one answers
+# a cold query's decodes from memory. The native default (512 MiB) would
+# leave the BSBM 100k dictionary in the file, so file-backed stores keep up
+# to 1 GiB resident, the memory-for-speed trade this package was tuned on.
+# Applied only when nothing else decides the budget: an explicit
+# `max_resident_bytes` is passed through, and
+# `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES`, an in-memory open (resident
+# regardless) or a disabled code path leave the native policy.
 _FILE_DICT_RESIDENCY = 1 << 30
 
 #: How the native layer spells the default graph: the fourth column of a quad
 #: no ``GRAPH`` names is the empty string, and ``""`` is also how a pattern
 #: selects those rows — ``None`` being the wildcard over every graph.
 DEFAULT_GRAPH = ""
+
+#: Native predicate partitions a store keeps (see `_native_verdicts`); the
+#: native layer memoizes its own, this saves the call and the views.
+_VERDICT_MEMO_SIZE = 128
 
 _LAYOUT_ALIASES = {
     "default": "default",
@@ -104,6 +113,16 @@ class VortexRdflibStore(Store):
         self._dict = None
         self._decode_cache: dict = {}
         self._kind_bounds: tuple[int, int, int] | None = None
+        self._ranges: dict | None = None
+        self._verdicts: dict = {}
+        self._wide_integers: list | None = None
+        # Literal codes classified for term aliasing (see pushdown's
+        # _alias_codes): every code looked at, each typed term's first code,
+        # and the codes whose term an earlier code already carries.
+        self._alias_classified: set[int] = set()
+        self._alias_firsts: dict[Node, int] = {}
+        self._alias_reps: dict[int, int] = {}
+        self._indexes: tuple = ()
         self._default_code: int | None | object = _UNRESOLVED
         # Query constants the dictionary does not hold get negative codes, so
         # a VALUES row can be joined in code space and still yield its term.
@@ -150,12 +169,21 @@ class VortexRdflibStore(Store):
         )
         # Record what the file actually is, whatever label the caller passed.
         self.layout = self._native.layout()
-        # Dictionary-layout stores with a resident dictionary serve matches as
-        # u32 code columns; each distinct code is decoded to an rdflib term
-        # once and cached. None on other layouts -> string fallback path.
+        self._indexes = tuple(self._native.indexes())
+        # Dictionary-layout stores serve matches as u32 code columns — with
+        # the dictionary resident, or read from the file on demand when it
+        # is over the residency budget; each distinct code is decoded to an
+        # rdflib term once and cached. None on other layouts -> string
+        # fallback path.
         self._dict = self._native.term_dict() if self._use_codes else None
         self._decode_cache = {}
         self._kind_bounds = None
+        self._ranges = None
+        self._verdicts = {}
+        self._wide_integers = None
+        self._alias_classified = set()
+        self._alias_firsts = {}
+        self._alias_reps = {}
         self._default_code = _UNRESOLVED
         self._foreign = {}
         self._foreign_codes = {}
@@ -170,6 +198,13 @@ class VortexRdflibStore(Store):
         self._dict = None
         self._decode_cache = {}
         self._kind_bounds = None
+        self._ranges = None
+        self._verdicts = {}
+        self._wide_integers = None
+        self._alias_classified = set()
+        self._alias_firsts = {}
+        self._alias_reps = {}
+        self._indexes = ()
         self._default_code = _UNRESOLVED
         self._foreign = {}
         self._foreign_codes = {}
@@ -268,7 +303,7 @@ class VortexRdflibStore(Store):
         contexts = self._contexts_by_code.get(code)
         if contexts is None:
             if self._dict is None:
-                raise ValueError("store has no resident term dictionary (code path inactive)")
+                raise ValueError("store has no term dictionary (code path inactive)")
             spelling = self._dict.decode(code)
             if spelling is None:
                 raise ValueError(f"term code {code} is not in the store dictionary")
@@ -420,7 +455,8 @@ class VortexRdflibStore(Store):
         if self._dict is not None:
             cols = store.match_codes(s_n3, p_n3, o_n3, None)
             if cols is not None:
-                codes = dict.fromkeys(memoryview(cols[3]).cast("I"))
+                # Native distinct, in first-seen order.
+                codes = memoryview(cols[3].distinct()).cast("I").tolist()
                 return [self._context_of_code(code)[0] for code in codes]
         *_spo, graphs = store.match_columns(s_n3, p_n3, o_n3, None)
         return [self._context_tuple(name)[0] for name in dict.fromkeys(graphs)]
@@ -433,7 +469,7 @@ class VortexRdflibStore(Store):
         one FFI round trip each to one bulk call per match.
         """
         if self._dict is None:
-            raise ValueError("store has no resident term dictionary (code path inactive)")
+            raise ValueError("store has no term dictionary (code path inactive)")
         cache = self._decode_cache
         distinct: set[int] = set()
         for column in code_columns:
@@ -452,7 +488,7 @@ class VortexRdflibStore(Store):
         immutable, so this is looked up once)."""
         if self._default_code is _UNRESOLVED:
             if self._dict is None:
-                raise ValueError("store has no resident term dictionary (code path inactive)")
+                raise ValueError("store has no term dictionary (code path inactive)")
             self._default_code = self._dict.encode(DEFAULT_GRAPH)
         return self._default_code  # ty: ignore[invalid-return-type]
 
@@ -461,9 +497,45 @@ class VortexRdflibStore(Store):
         dictionary is immutable, so three binary searches, once."""
         if self._kind_bounds is None:
             if self._dict is None:
-                raise ValueError("store has no resident term dictionary (code path inactive)")
+                raise ValueError("store has no term dictionary (code path inactive)")
             self._kind_bounds = kind_bounds(self._dict)
         return self._kind_bounds
+
+    def _kind_ranges(self) -> dict:
+        """Each term kind's half-open code range (``TermDict.prefix_range``
+        of ``"``, ``<`` and ``_:``): codes rank spellings in byte order, so a
+        kind is one range — the keep a kind test pushes into a match."""
+        if self._ranges is None:
+            if self._dict is None:
+                raise ValueError("store has no term dictionary (code path inactive)")
+            self._ranges = {
+                LITERAL: tuple(self._dict.prefix_range('"')),
+                IRI: tuple(self._dict.prefix_range("<")),
+                BLANK: tuple(self._dict.prefix_range("_:")),
+            }
+        return self._ranges
+
+    def _native_verdicts(self, kind: str, arg: str):
+        """The dictionary's partition by a native term predicate
+        (:func:`filters.native_verdicts`), memoized per ``(kind, arg)``;
+        ``None`` when the native layer refuses the argument."""
+        key = (kind, arg)
+        verdicts = self._verdicts.get(key, _UNRESOLVED)
+        if verdicts is _UNRESOLVED:
+            if self._dict is None:
+                raise ValueError("store has no term dictionary (code path inactive)")
+            verdicts = filters.native_verdicts(self, kind, arg)
+            if len(self._verdicts) >= _VERDICT_MEMO_SIZE:
+                self._verdicts.pop(next(iter(self._verdicts)))
+            self._verdicts[key] = verdicts
+        return verdicts
+
+    def _wide_integer_codes(self) -> list:
+        """The ``xsd:long``/``xsd:unsignedLong`` literals the native value
+        model has no value for (:func:`filters.wide_integer_codes`), once."""
+        if self._wide_integers is None:
+            self._wide_integers = filters.wide_integer_codes(self)
+        return self._wide_integers
 
     def _foreign_code(self, term: Node) -> int:
         """The negative code standing for a term outside the dictionary."""
@@ -479,7 +551,7 @@ class VortexRdflibStore(Store):
         node = self._decode_cache.get(code)
         if node is None:
             if self._dict is None:
-                raise ValueError("store has no resident term dictionary (code path inactive)")
+                raise ValueError("store has no term dictionary (code path inactive)")
             raw = self._dict.decode(code)
             if raw is None:
                 raise ValueError(f"term code {code} is not in the store dictionary")
