@@ -10,6 +10,7 @@ outside the tools directory, so every call runs there (the driver also writes
 """
 
 import hashlib
+import http.client
 import io
 import os
 import re
@@ -74,7 +75,9 @@ def download(url: str) -> bytes:
     try:
         with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_S) as response:
             return response.read()
-    except OSError as error:  # URLError, HTTPError and timeouts are all OSErrors
+    except (OSError, http.client.HTTPException) as error:
+        # URLError, HTTPError and timeouts are OSErrors; a truncated or garbled response
+        # (IncompleteRead, BadStatusLine) is an HTTPException, which is not.
         raise ToolsUnavailable(f"could not download {url}: {error}") from error
 
 
@@ -94,7 +97,12 @@ def fetch_tools(cache: Path | None = None, fetch: Callable[[str], bytes] = downl
     staging = Path(tempfile.mkdtemp(prefix=".unpack-", dir=root))
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-            archive.extractall(staging, filter="data")
+            if hasattr(tarfile, "data_filter"):
+                archive.extractall(staging, filter="data")
+            else:
+                # Python < 3.11.4 has no extraction filters; the checksum above vouches
+                # for the archive.
+                archive.extractall(staging)
         unpacked = staging / f"bsbm-tools-{TOOLS_COMMIT}"
         if not (unpacked / "lib" / "bsbm.jar").is_file():
             raise ToolsError(f"{TOOLS_URL} holds no bsbm-tools-{TOOLS_COMMIT}/lib/bsbm.jar")
@@ -185,11 +193,11 @@ def single_query_usecase(tools_dir: Path, query: int, work_dir: Path) -> tuple[P
         raise ToolsError(f"the official Explore queries have no query{query}.txt")
     work_dir.mkdir(parents=True, exist_ok=True)
     mix_dir = (work_dir / f"explore-q{query}").resolve()
+    if "=" in str(mix_dir):  # the driver splits use-case lines on "="
+        raise ToolsError(f"the test driver cannot name {mix_dir} in a use case")
     shutil.copytree(source, mix_dir, dirs_exist_ok=True)
     (mix_dir / "querymix.txt").write_text(f"{query}\n", encoding="ascii")
     (mix_dir / "ignoreQueries.txt").write_text("", encoding="ascii")
-    if "=" in str(mix_dir):  # the driver splits use-case lines on "="
-        raise ToolsError(f"the test driver cannot name {mix_dir} in a use case")
     usecase = work_dir / f"usecase-q{query}.txt"
     usecase.write_text(f"querymix={mix_dir}\n", encoding="utf-8")
     return usecase, mix_dir

@@ -1,14 +1,17 @@
 """The official BSBM tools' plumbing, without Java: the pinned download and its
 unpacking, the capture endpoint the driver talks to, and the stream split."""
 
+import contextlib
 import hashlib
 import io
 import os
 import socket
 import stat
 import tarfile
+import threading
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -100,6 +103,13 @@ def test_a_template_the_tools_do_not_have_is_refused(tmp_path):
         tools.single_query_usecase(fake_tools(tmp_path / "t"), 13, tmp_path / "w")
 
 
+def test_a_path_the_driver_cannot_name_is_refused_before_anything_is_copied(tmp_path):
+    work_dir = tmp_path / "w=1"  # the driver splits use-case lines on "="
+    with pytest.raises(tools.ToolsError, match="cannot name"):
+        tools.single_query_usecase(fake_tools(tmp_path / "t"), 6, work_dir)
+    assert not (work_dir / "explore-q6").exists()
+
+
 def archive(files: dict[str, bytes]) -> bytes:
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
@@ -134,6 +144,57 @@ def test_an_unreachable_download_makes_the_tools_unavailable():
         port = s.getsockname()[1]
     with pytest.raises(tools.ToolsUnavailable, match="could not download"):
         tools.download(f"http://127.0.0.1:{port}/bsbm-tools.tar.gz")
+
+
+@contextlib.contextmanager
+def loopback_reply(reply: bytes) -> Iterator[str]:
+    """A loopback server that reads one request, answers it with the raw bytes ``reply``
+    and closes: yields its URL. The thread is joined and the socket closed on the way out."""
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(30)  # a download that never arrives must not hang the suite
+
+        def answer() -> None:
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                return
+            with connection:
+                request = b""
+                while b"\r\n\r\n" not in request:  # closing on unread bytes would reset instead
+                    chunk = connection.recv(4096)
+                    if not chunk:
+                        break
+                    request += chunk
+                connection.sendall(reply)
+
+        thread = threading.Thread(target=answer)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{listener.getsockname()[1]}/bsbm-tools.tar.gz"
+        finally:
+            thread.join()
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" + b"x" * 10, id="short-body"
+        ),
+        pytest.param(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+            id="unterminated-chunks",
+        ),
+        pytest.param(b"not an http response\r\n\r\n", id="garbled-status-line"),
+    ],
+)
+def test_a_cut_off_or_garbled_download_makes_the_tools_unavailable(reply, monkeypatch):
+    monkeypatch.setenv("no_proxy", "127.0.0.1")  # reach loopback even where http_proxy is set
+    with loopback_reply(reply) as url:
+        with pytest.raises(tools.ToolsUnavailable, match="could not download"):
+            tools.download(url)
 
 
 def test_without_java_the_error_says_what_to_install(monkeypatch):
