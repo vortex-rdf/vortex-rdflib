@@ -36,6 +36,8 @@ move the number:
                         difference between two tracked numbers rather than
                         an inference — the pushdown is still on, and every
                         value goes through rdflib's evaluator instead
+  fresh constants       the same two FILTER queries with a new constant on
+                        every call: per-constant work is paid every time
   residency + index     file-backed stores, where the per-call native floor
                         dominates and secondary indexes earn their keep:
                         the two lookups they target, per index config, plus
@@ -63,8 +65,10 @@ which keeps the fixtures and query set honest even when nothing is measured.
 
 from __future__ import annotations
 
+import itertools
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -151,6 +155,14 @@ JOIN_QUERIES = ("star-2", "star-3", "chain-2", "optional", "filter-probe")
 #: Run against the fast route and against rdflib's evaluator.
 FILTER_QUERIES = ("filter-range", "filter-arith")
 
+#: The numeric FILTER queries with a constant that changes on every call
+#: (`Query.fresh`): a store that memoizes work per constant pays it in every
+#: measured call, as a BSBM run with fresh parameters pays it on every query.
+FRESH_QUERIES = ("filter-range", "filter-arith")
+#: One counter per query, so the constant a benchmark measures does not
+#: depend on test order or `-k` selection.
+_FRESH_CALLS: dict[str, Iterator[int]] = {name: itertools.count(1) for name in FRESH_QUERIES}
+
 #: Queries whose cost is dominated by how the graph itself is served. With the
 #: hook off, rdflib's `evalGraph` walks the store's graphs and evaluates the
 #: block once per graph, joining the graph name onto every solution; the
@@ -212,6 +224,11 @@ def _consume_query(graph: Graph, query: Query) -> int:
     if query.is_ask:
         return 1 if result.askAnswer else 0
     return sum(1 for _ in result)
+
+
+def _consume_fresh(graph: Graph, query: Query, fresh: Callable[[int], str]) -> int:
+    """`_consume_query` on the query's next fresh-constant variant."""
+    return _consume_query(graph, replace(query, sparql=fresh(next(_FRESH_CALLS[query.name]))))
 
 
 def _consume_triples(store: VortexRdflibStore, pattern: tuple, context=None) -> int:
@@ -333,6 +350,19 @@ def test_query_generic_filter(benchmark, graphs, name):
     graph, query = graphs["mem_noidx"], QUERIES[name]
     assert _consume_query(graph, query) > 0
     benchmark(_consume_query, graph, query)
+
+
+@pytest.mark.parametrize("name", FRESH_QUERIES)
+def test_query_fresh_constant(benchmark, graphs, name):
+    """A FILTER query whose constant is new on every call, on the primary
+    configuration: per-constant work that `test_query` amortizes over repeated
+    calls of one text is measured here, as BSBM's fresh parameters pay it."""
+    graph, query = graphs["mem_noidx"], QUERIES[name]
+    fresh = query.fresh
+    if fresh is None:
+        pytest.fail(f"{name} has no fresh-constant variants (Query.fresh)")
+    assert _consume_fresh(graph, query, fresh) > 0
+    benchmark(_consume_fresh, graph, query, fresh)
 
 
 @pytest.mark.parametrize(("index_tag", "name"), FILE_CASES, ids=[f"{t}-{q}" for t, q in FILE_CASES])
