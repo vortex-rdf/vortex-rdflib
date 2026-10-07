@@ -583,6 +583,13 @@ function rowBreak(slug){ return slug === "rdflib_memory" || slug === "pyoxigraph
 
 function get(map, id){ const r = map.get(id); if(!r) console.warn("missing bench id", id); return r; }
 
+/** `s` as HTML text. Failure messages carry raw exception text (`<http://...>`, `<class 'str'>`) and
+ * query texts their `<` and `&`: none of it may be taken for markup. */
+function esc(s){
+  const entity = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  return String(s).replace(/[&<>"']/g, c => entity[c]);
+}
+
 /** One panel form: a matrix table of store rows × measurement columns. Cells
  * print the median; the column-best cell is green and every other cell
  * carries its multiplier vs that best. A store with no cell at all is
@@ -737,6 +744,8 @@ function renderSyntheticQueries(ctx, host){
 }
 
 // ---- BSBM: one matrix of stores × templates, and query mixes per hour ----
+// A limit of the run, in seconds: null when it ran without one (BSBM_*_S=0), undefined on a bare config.
+function limit(s){ return s == null ? "no limit" : `${s} s`; }
 function bsbmStore(ctx, slug){ return ctx.CONFIG.stores?.[slug] || {}; }
 function sumTimeouts(s){ return Object.values(s.timeouts || {}).reduce((x, y) => x + y, 0); }
 function bsbmLabel(ctx, a){
@@ -765,7 +774,7 @@ function renderBsbmQueries(ctx, host){
   }
   renderMatrixPanel(host, {
     title: "Explore mix, per template",
-    note: `Mean per template over the measured instances (BSBM's AQET; hover for the median). ⏱n: instances aborted after ${C.queryTimeoutS} s, left out of the mean. A store marked partial ran past its ${C.storeBudgetS} s budget and stopped after the mix it was in.`,
+    note: `Mean per template over the measured instances (BSBM's AQET; hover for the median). ⏱n: instances aborted at the per-query timeout (${limit(C.queryTimeoutS)}), left out of the mean. A store marked partial ran past its time budget (${limit(C.storeBudgetS)}) and stopped after the mix it was in.`,
     wide: true, keepEmpty: true, rowHeaders: ["Store"],
     columnGroups: ctx.QUERIES.map(q => ({ label: q.name, title: null, sub: MODES.map(m => m.label) })),
     rows: storeRows(ctx, a => ctx.QUERIES.flatMap(q => MODES.map(m => ctx.idFor(q, a, m.key))), a => bsbmLabel(ctx, a)),
@@ -799,7 +808,6 @@ function bsbmTiles(ctx){
   const C = ctx.CONFIG, stores = Object.values(C.stores || {});
   const timeouts = stores.reduce((n, s) => n + sumTimeouts(s), 0);
   const partial = stores.filter(s => s.partial).length;
-  const limit = s => s == null ? "none" : `${s} s`;
   return [
     { label:"Stores", value:String(ctx.ADAPTERS.length), sub:"the synthetic tab's stores, on BSBM data" },
     { label:"Products", value:(C.products||0).toLocaleString(), sub:`${(C.triples||0).toLocaleString()} triples · official generator` },
@@ -832,7 +840,7 @@ function renderFailures(ctx, host){
   panel.className = "panel failures";
   panel.innerHTML = `<h3>Unmeasured phases</h3>
     <p class="note">A missing cell below is a store that could not complete the work, not a benchmark nobody ran.${ctx.key === "bsbm" ? " A template listed with “answer” or “row count” returned answers other than the other stores' for some instances." : ""}</p>
-    <ul>${ctx.FAILURES.map(f => `<li><span class="mono">${f.label} / ${f.phase}</span> — ${f.error}</li>`).join("")}</ul>`;
+    <ul>${ctx.FAILURES.map(f => `<li><span class="mono">${esc(f.label)} / ${esc(f.phase)}</span> — ${esc(f.error)}</li>`).join("")}</ul>`;
   host.appendChild(panel);
 }
 
@@ -850,7 +858,7 @@ function renderQuerySet(ctx, host){
     const d = document.createElement("details");
     d.className = "query";
     d.innerHTML = `<summary><span class="qname">${q.name}</span><span class="qmeta">${meta}</span></summary>
-      <pre>${q.sparql.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</pre>`;
+      <pre>${esc(q.sparql)}</pre>`;
     host.appendChild(d);
   }
 }
@@ -1205,7 +1213,7 @@ for (const section of document.querySelectorAll("[data-tabbed]")){
     try { RENDERERS[name](CONTEXTS[key], pane); }
     catch (error){
       console.error(error);
-      pane.insertAdjacentHTML("beforeend", `<p class="group-desc">This section failed to render: ${error}</p>`);
+      pane.insertAdjacentHTML("beforeend", `<p class="group-desc">This section failed to render: ${esc(error)}</p>`);
     }
   }
   const tabs = section.querySelector(".ds-tabs");
@@ -1233,7 +1241,9 @@ for (const section of document.querySelectorAll("[data-tabbed]")){
     note.textContent = missing.map(d => `${d.label}: ${SETS.notes?.[d.key] ?? "no results"}`).join(" · ");
     tabs.after(note);
   }
-  select(DATASETS.find(d => CONTEXTS[d.key])?.key ?? DATASETS[0].key);
+  // A section opens on the first dataset with results; the history section, on the first with history points.
+  const withHistory = name === "history" ? DATASETS.find(d => CONTEXTS[d.key]?.HISTORY?.points?.length) : null;
+  select((withHistory ?? DATASETS.find(d => CONTEXTS[d.key]))?.key ?? DATASETS[0].key);
 }
 if (Object.values(CONTEXTS).some(c => c.HISTORY?.points?.length)){
   document.getElementById("history").hidden = false;

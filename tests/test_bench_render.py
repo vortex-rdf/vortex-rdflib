@@ -77,7 +77,7 @@ def test_both_datasets_are_embedded_without_the_answers(tmp_path):
     bsbm = write(tmp_path / "rb.json", results("bsbm"))
     proc, out = render(tmp_path, syn, "--bsbm", bsbm)
     assert proc.returncode == 0, proc.stderr
-    page = out.read_text()
+    page = out.read_text(encoding="utf-8")
     sets = embedded(page)
     assert sets["synthetic"]["provenance"] == "synthetic run"
     assert sets["bsbm"]["config"]["dataset"] == "bsbm" and "answers" not in sets["bsbm"]["config"]
@@ -92,12 +92,15 @@ def test_a_missing_results_file_disables_its_tab_with_a_note(tmp_path):
         str(tmp_path / "absent.json"),
     )
     assert proc.returncode == 0, proc.stderr
-    sets = embedded(out.read_text())
+    sets = embedded(out.read_text(encoding="utf-8"))
     assert sets["bsbm"] is None and "absent.json" in sets["notes"]["bsbm"]
 
 
 def test_no_results_at_all_is_an_error(tmp_path):
-    assert render(tmp_path, str(tmp_path / "none.json"))[0].returncode == 1
+    proc, _ = render(tmp_path, str(tmp_path / "none.json"))
+    assert proc.returncode == 1
+    assert "nothing to render" in proc.stderr
+    assert "Traceback" not in proc.stderr
 
 
 def test_every_section_switches_datasets_on_its_own():
@@ -117,13 +120,25 @@ def test_every_section_switches_datasets_on_its_own():
     )
 
 
+def test_every_fill_placeholder_names_exactly_one_template():
+    template = TEMPLATE.read_text(encoding="utf-8")
+    placeholders = set(re.findall(r'data-fill="([^"]+)"', template))
+    ids = re.findall(r'<template\b[^>]*\bid="([^"]+)"', template)
+    assert placeholders, "the page has no data-fill placeholder"
+    assert not placeholders - set(ids), (
+        f"placeholders without a template: {placeholders - set(ids)}"
+    )
+    for name in sorted(placeholders):
+        assert ids.count(name) == 1, f'<template id="{name}"> must exist exactly once'
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node checks the page script's syntax")
 def test_the_page_script_parses(tmp_path):
     proc, out = render(tmp_path, write(tmp_path / "r.json", results("synthetic")))
     assert proc.returncode == 0, proc.stderr
-    match = re.search(r"<script>(.*)</script>", out.read_text(), re.S)
+    match = re.search(r"<script>(.*)</script>", out.read_text(encoding="utf-8"), re.S)
     assert match
     js = tmp_path / "page.js"
-    js.write_text(match.group(1))
+    js.write_text(match.group(1), encoding="utf-8")
     check = subprocess.run(["node", "--check", str(js)], capture_output=True, text=True)
     assert check.returncode == 0, check.stderr
