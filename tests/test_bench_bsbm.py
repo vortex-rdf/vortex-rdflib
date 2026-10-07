@@ -114,6 +114,29 @@ def test_main_writes_the_run_with_its_limits(tmp_path, tiny_store):
     assert out["query_timeout_s"] == 30.0 and out["store_budget_s"] == 600.0
 
 
+def test_a_zero_limit_on_the_command_line_is_no_limit(tmp_path, tiny_store):
+    warmup, measured = tiny_streams(1, 2)
+    (tmp_path / "w.json").write_text(json.dumps(warmup))
+    (tmp_path / "m.json").write_text(json.dumps(measured))
+    code = run_stream.main(
+        [
+            str(tiny_store),
+            "--file",
+            str(tmp_path / "w.json"),
+            str(tmp_path / "m.json"),
+            str(tmp_path / "run.json"),
+            "--query-timeout",
+            "0",
+            "--store-budget",
+            "0",
+        ]
+    )
+    assert code == 0
+    out = json.loads((tmp_path / "run.json").read_text())
+    assert out["partial"] is False and out["mixes_done"] == out["mixes_planned"] == 2
+    assert out["query_timeout_s"] is None and out["store_budget_s"] is None
+
+
 def test_the_shared_cli_helpers_need_a_residency_and_read_both_streams(tmp_path):
     parser = argparse.ArgumentParser()
     cli.add_residency(parser)
@@ -199,3 +222,43 @@ def test_a_native_stream_never_imports_rdflib():
     proc = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "[]"
+
+
+class AnswerStore:
+    """Native-style stand-in: ``query`` returns what ``make()`` builds, a new answer each time."""
+
+    def __init__(self, make):
+        self.make = make
+
+    def query(self, text, **kwargs):
+        return self.make()
+
+
+class AskAnswer:
+    """A native ASK answer: it has a truth value and cannot be iterated."""
+
+    def __init__(self, answer: bool) -> None:
+        self.answer = answer
+
+    def __bool__(self) -> bool:
+        return self.answer
+
+
+def rows_then_type_error():
+    yield ("x",)
+    raise TypeError("not a row")
+
+
+def test_a_native_type_error_mid_iteration_is_an_error_not_an_ask_answer():
+    store = AnswerStore(rows_then_type_error)
+    with pytest.raises(TypeError, match="not a row"):
+        execute.run_instance(store, "SELECT * {}", native=True)
+    first = execute.execute_stream(store, [], stream([[0]]), native=True)["results"][0]
+    assert first["error"] == "TypeError: not a row" and "rows" not in first
+
+
+@pytest.mark.parametrize("answer", [True, False])
+def test_a_native_ask_answer_is_one_boolean_row(answer):
+    store = AnswerStore(lambda: AskAnswer(answer))
+    rows, prep_ns, _exec_ns = execute.run_instance(store, "ASK {}", native=True)
+    assert len(rows) == 1 and rows[0] is answer and prep_ns is None

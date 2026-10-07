@@ -98,9 +98,11 @@ def run_instance(
         t0 = perf_counter_ns()
         result = graph.query(text, **kwargs)
         try:
-            rows = [tuple(item) for item in result]  # every value read, as rdflib rows hold them
+            items = iter(result)
         except TypeError:  # an ASK answer is a boolean
             rows = [bool(result)]
+        else:
+            rows = [tuple(item) for item in items]  # every value read, as rdflib rows hold them
         return rows, None, perf_counter_ns() - t0
     from rdflib.plugins.sparql import prepareQuery  # here: a native run never loads rdflib
 

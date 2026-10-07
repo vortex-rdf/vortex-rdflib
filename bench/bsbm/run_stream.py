@@ -73,13 +73,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("measured")
     parser.add_argument("out")
     parser.add_argument(
-        "--query-timeout", type=float, metavar="SECONDS", help="abort a query after this long"
+        "--query-timeout",
+        type=float,
+        metavar="SECONDS",
+        help="abort a query after this long; 0 means no limit, as with BSBM_QUERY_TIMEOUT_S",
     )
     parser.add_argument(
         "--store-budget",
         type=float,
         metavar="SECONDS",
-        help="stop after the mix during which the measured mixes pass this",
+        help="stop after the mix during which the measured mixes pass this; "
+        "0 means no limit, as with BSBM_STORE_BUDGET_S",
     )
     args = parser.parse_args(argv)
     warmup, measured = read_streams(args.warmup, args.measured)
@@ -88,8 +92,8 @@ def main(argv: list[str] | None = None) -> int:
         args.in_memory,
         warmup,
         measured,
-        query_timeout_s=args.query_timeout,
-        store_budget_s=args.store_budget,
+        query_timeout_s=args.query_timeout or None,
+        store_budget_s=args.store_budget or None,
     )
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(out, f)
