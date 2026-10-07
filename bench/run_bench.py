@@ -164,6 +164,22 @@ def reconcile(
     return agreed, disputed
 
 
+def memory_entry(adapter: Adapter, out: dict) -> dict:
+    """A worker's memory readings, as the dashboard's memory panel reads them."""
+    loaded, baseline = out.get("loadedMb"), out.get("baselineMb")
+    store_mb = loaded - baseline if isinstance(loaded, int) and isinstance(baseline, int) else None
+    return {
+        "slug": adapter.slug,
+        "label": adapter.label,
+        "engine": adapter.engine,
+        "peakRssMb": out.get("peakRssMb"),
+        "peakAnonMb": out.get("peakAnonMb"),
+        "baselineMb": baseline,
+        "loadedMb": loaded,
+        "storeMb": store_mb,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default="bench/results.json", help="output JSON path")
@@ -247,21 +263,7 @@ def main() -> int:
             )
             continue
         results.extend(out["rows"])
-        loaded, baseline = out.get("loadedMb"), out.get("baselineMb")
-        store_mb = (
-            loaded - baseline if isinstance(loaded, int) and isinstance(baseline, int) else None
-        )
-        memory.append(
-            {
-                "slug": adapter.slug,
-                "label": adapter.label,
-                "engine": adapter.engine,
-                "peakRssMb": out.get("peakRssMb"),
-                "baselineMb": baseline,
-                "loadedMb": loaded,
-                "storeMb": store_mb,
-            }
-        )
+        memory.append(memory_entry(adapter, out))
         for f in out.get("failures", []):
             failures.append({"slug": adapter.slug, "label": adapter.label, **f})
         if out.get("skipped"):

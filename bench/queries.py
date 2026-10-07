@@ -55,7 +55,8 @@ those a lower iteration budget, mirroring FULL_SCAN_OPTS in the JS bench.
 """
 
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from textwrap import dedent
 
 from .dataset import (
@@ -85,6 +86,11 @@ class Query:
     #: these without decoding a term, so their columns compare an approach
     #: rather than an implementation's speed. See ``docs/pushdown.md``.
     countable: bool = False
+    #: For a query with a FILTER constant: its text with its k-th constant
+    #: (k = 0 is ``sparql``). The fresh-constants mode (``BENCH_FRESH_CONSTANTS=1``)
+    #: samples ``fresh(1)``, ``fresh(2)``, …, so a cost memoized per constant is
+    #: paid in every sample, as a BSBM run with fresh parameters pays it.
+    fresh: Callable[[int], str] | None = field(default=None, compare=False)
 
 
 def _sparql(text: str) -> str:
@@ -350,6 +356,50 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
     q_minus = (
         f"<{predicate_iri(_object_split_predicate(cfg, m, filter_subjects, exclude=filter_p))}>"
     )
+
+    def band_probe_text(width: int) -> str:
+        return _sparql(f"""
+            SELECT ?s ?p ?o WHERE {{
+              {band_anchor} {pf} ?ref .
+              ?s {pf} ?v .
+              ?s ?p ?o
+              FILTER(?v < ?ref + {width} && ?v > ?ref - {width})
+            }}
+        """)
+
+    def minus_text(cut: int) -> str:
+        return _sparql(f"""
+            {XSD_PREFIX}
+            SELECT ?s ?v WHERE {{
+              {{
+                ?s {pf} ?v .
+                FILTER(datatype(?v) = xsd:integer && ?v < {cut})
+              }}
+              MINUS {{
+                ?s {q_minus} ?x
+                FILTER(isIRI(?x))
+              }}
+            }}
+        """)
+
+    def range_text(cut: int) -> str:
+        return _sparql(f"""
+            {XSD_PREFIX}
+            SELECT ?s ?v WHERE {{
+              ?s {pf} ?v .
+              FILTER(datatype(?v) = xsd:integer && ?v < {cut})
+            }}
+        """)
+
+    def arith_text(width: int) -> str:
+        return _sparql(f"""
+            SELECT ?s ?v WHERE {{
+              {band_anchor} {pf} ?ref .
+              ?s {pf} ?v
+              FILTER(?v < ?ref + {width} && ?v > ?ref - {width})
+            }}
+        """)
+
     values_64 = " ".join(f"<{subject_iri(j)}>" for j in sorted(p1_subjects)[:64])
 
     # Graph constants. A subject's statements are never split across graphs,
@@ -493,15 +543,9 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
         Query(
             "filter-band-probe",
             "joins",
-            _sparql(f"""
-                SELECT ?s ?p ?o WHERE {{
-                  {band_anchor} {pf} ?ref .
-                  ?s {pf} ?v .
-                  ?s ?p ?o
-                  FILTER(?v < ?ref + {band} && ?v > ?ref - {band})
-                }}
-            """),
+            band_probe_text(band),
             heavy=True,
+            fresh=lambda k: band_probe_text(band + k),
         ),
         Query(
             "values-64",
@@ -540,42 +584,21 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
         Query(
             "minus",
             "joins",
-            _sparql(f"""
-                {XSD_PREFIX}
-                SELECT ?s ?v WHERE {{
-                  {{
-                    ?s {pf} ?v .
-                    FILTER(datatype(?v) = xsd:integer && ?v < {int_cut})
-                  }}
-                  MINUS {{
-                    ?s {q_minus} ?x
-                    FILTER(isIRI(?x))
-                  }}
-                }}
-            """),
+            minus_text(int_cut),
             heavy=True,
+            fresh=lambda k: minus_text(int_cut + k),
         ),
         Query(
             "filter-range",
             "features",
-            _sparql(f"""
-                {XSD_PREFIX}
-                SELECT ?s ?v WHERE {{
-                  ?s {pf} ?v .
-                  FILTER(datatype(?v) = xsd:integer && ?v < {int_cut})
-                }}
-            """),
+            range_text(int_cut),
+            fresh=lambda k: range_text(int_cut + k),
         ),
         Query(
             "filter-arith",
             "features",
-            _sparql(f"""
-                SELECT ?s ?v WHERE {{
-                  {band_anchor} {pf} ?ref .
-                  ?s {pf} ?v
-                  FILTER(?v < ?ref + {band} && ?v > ?ref - {band})
-                }}
-            """),
+            arith_text(band),
+            fresh=lambda k: arith_text(band + k),
         ),
         Query(
             "filter-class",

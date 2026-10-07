@@ -58,9 +58,10 @@ import json
 import os
 import statistics
 import sys
+from dataclasses import replace
 from time import perf_counter_ns
 
-from .adapters import BY_SLUG
+from .adapters import BY_SLUG, Adapter
 from .dataset import config_from_env, moduli
 from .procmem import peak_rss_mb, rss_anon_mb, rss_mb  # noqa: F401 — re-exported
 from .queries import Query, build_queries
@@ -70,6 +71,9 @@ QUERY_MIN_ITERS = 3
 QUERY_BUDGET_NS = float(os.environ.get("BENCH_QUERY_BUDGET_S", 2.0)) * 1e9
 HEAVY_ITERS = int(os.environ.get("BENCH_HEAVY_ITERS", 3))
 LOAD_ITERS = int(os.environ.get("BENCH_LOAD_ITERS", 3))
+#: Sample a query's fresh-constant variants (``Query.fresh``) instead of
+#: repeating its text, so per-constant costs cannot hide behind warm caches.
+FRESH_CONSTANTS = os.environ.get("BENCH_FRESH_CONSTANTS") == "1"
 #: Measurement modes, in the order the dashboard shows them (see the module
 #: docstring). `full` keeps the plain slug, so the ids it has always written
 #: are unchanged and the load row needs no mode at all.
@@ -176,16 +180,27 @@ def measure_query(
     involved: there is no algebra for rdflib to prepare, so the run cannot be
     split and only `full` — the end-to-end figure both kinds of row report —
     is measured.
+
+    With `FRESH_CONSTANTS`, a query that has variants asks a new one in every
+    sample, so no answer repeats to be checked: the second item is None, and
+    the rows are the warmup's (a heavy query has no warmup: its last sample's,
+    the same variant for every store).
     """
     init_ns = {} if native else dict(graph.namespaces())
     samples: dict[str, list[float]] = {mode: [] for mode in (("full",) if native else MODES)}
+    # Fresh-constants mode: sample k asks the query's k-th constant (k = 1, 2, ...).
+    fresh = query.fresh if FRESH_CONSTANTS else None
+
+    def variant(k: int) -> Query:
+        return query if fresh is None else replace(query, sparql=fresh(k))
 
     def sample() -> int:
+        target = variant(len(samples["full"]) + 1)
         if native:
-            rows, elapsed_ns = run_string_once(graph, query, query_kwargs, native=True)
+            rows, elapsed_ns = run_string_once(graph, target, query_kwargs, native=True)
             samples["full"].append(elapsed_ns)
             return rows
-        rows, prepare_ns, evaluate_ns = run_once(graph, query, query_kwargs, init_ns)
+        rows, prepare_ns, evaluate_ns = run_once(graph, target, query_kwargs, init_ns)
         samples["exec"].append(evaluate_ns)
         samples["full"].append(prepare_ns + evaluate_ns)
         return rows
@@ -197,14 +212,19 @@ def measure_query(
 
     # The warmup is the string path itself, so where the run is split it also
     # checks that the prepared path answers the same query. Discarded as a
-    # sample either way.
-    warmed, _ns = run_string_once(graph, query, query_kwargs, native)
+    # sample either way. In fresh mode it asks the original text (k = 0) and
+    # every sample its own variant, with its own answer: nothing to check. The
+    # rows reported are then the warmup's: the time budget ends each store's
+    # samples at a different k, and only k = 0 is asked of every store.
+    warmed, _ns = run_string_once(graph, variant(0), query_kwargs, native)
     spent = 0.0
     while len(samples["full"]) < QUERY_ITERS:
         matched = sample()
         spent += samples["full"][-1]
         if len(samples["full"]) >= QUERY_MIN_ITERS and spent > QUERY_BUDGET_NS:
             break
+    if fresh is not None:
+        return warmed, None, samples
     return matched, warmed, samples
 
 
@@ -219,27 +239,18 @@ def import_engine(engine: str) -> None:
         importlib.import_module("rdflib.plugins.sparql")
 
 
-def main() -> int:
-    slug, nq_path, nt_path, work_dir, out_path = sys.argv[1:6]
-    adapter = BY_SLUG[slug]
-    cfg = config_from_env()
-    queries = build_queries(cfg, moduli(cfg))
+def load_store(
+    adapter: Adapter, nq_path: str, nt_path: str, work_dir: str
+) -> tuple[object, dict, int | None, int | None]:
+    """Build ``adapter``'s store LOAD_ITERS times, keeping the last; returns
+    (store, load row, baseline RSS, RSS after the first build).
 
-    rows: list[dict] = []
-    matched: dict[str, int] = {}
-    failures: list[dict] = []
-    skipped: list[str] = []
-
-    # Build the store LOAD_ITERS times, keeping the last for the queries.
-    # Every sample is a full build from the same source file: the factories
-    # rewrite their own file rather than reusing one.
-    #
-    # The footprint is read off the FIRST build, against the baseline taken
-    # before it. A later build is no good for that: freeing a store returns
-    # its pages to the allocator, not the OS, so the next build reuses them
-    # and the delta collapses to near zero. Each later build still releases
-    # its predecessor first, so only one store is ever live and the peak-RSS
-    # figure stays a single store's lifecycle.
+    Every sample is a full build from the same source file. The footprint is
+    read off the FIRST build: freeing a store returns its pages to the
+    allocator, not the OS, so a later build's delta collapses to near zero.
+    Each later build releases its predecessor first, so only one store is ever
+    live and the peak-RSS figure stays a single store's lifecycle.
+    """
     import_engine(adapter.engine)
     gc.collect()
     baseline_mb = rss_mb()
@@ -256,12 +267,37 @@ def main() -> int:
         if iteration == 0:
             gc.collect()
             loaded_mb = rss_mb()
-    rows.append(make_row("load", slug, load_samples))
+    row = make_row("load", adapter.slug, load_samples)
     print(
-        f"[{slug}] loaded in {rows[-1]['median']} ({len(load_samples)} samples)"
+        f"[{adapter.slug}] loaded in {row['median']} ({len(load_samples)} samples)"
         f" — RSS {baseline_mb} -> {loaded_mb} MB",
         flush=True,
     )
+    return graph, row, baseline_mb, loaded_mb
+
+
+def main() -> int:
+    slug, nq_path, nt_path, work_dir, out_path = sys.argv[1:6]
+    adapter = BY_SLUG[slug]
+    cfg = config_from_env()
+    queries = build_queries(cfg, moduli(cfg))
+
+    rows: list[dict] = []
+    matched: dict[str, int] = {}
+    failures: list[dict] = []
+    skipped: list[str] = []
+    # Linux keeps no high-water mark for RssAnon: sampled after the load and
+    # after every query, its maximum is the store's own peak.
+    anon_samples: list[int] = []
+
+    def sample_anon() -> None:
+        mb = rss_anon_mb()
+        if mb is not None:
+            anon_samples.append(mb)
+
+    graph, load_row, baseline_mb, loaded_mb = load_store(adapter, nq_path, nt_path, work_dir)
+    rows.append(load_row)
+    sample_anon()
 
     for query in queries:
         if query.quads and not adapter.quads:
@@ -294,6 +330,7 @@ def main() -> int:
             f"({len(samples['full'])} samples, {matched[query.name]} rows)",
             flush=True,
         )
+        sample_anon()
 
     out = {
         "rows": rows,
@@ -303,6 +340,7 @@ def main() -> int:
         "baselineMb": baseline_mb,
         "loadedMb": loaded_mb,
         "peakRssMb": peak_rss_mb(),
+        "peakAnonMb": max(anon_samples) if anon_samples else None,
     }
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f)

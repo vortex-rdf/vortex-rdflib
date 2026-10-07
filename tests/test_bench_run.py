@@ -8,7 +8,7 @@ dissenter is this package's own store.
 """
 
 from bench.adapters import Adapter
-from bench.run_bench import reconcile
+from bench.run_bench import memory_entry, reconcile
 from rdflib import Graph
 
 
@@ -84,3 +84,25 @@ def test_a_store_that_was_never_asked_is_not_a_dissenter():
     )
     assert agreed == {"graph-scan": 76}
     assert disputed == [] and failures == []
+
+
+def test_a_memory_entry_carries_peak_anon():
+    entry = memory_entry(
+        adapters("vortex")[0],
+        {"peakRssMb": 300, "peakAnonMb": 120, "baselineMb": 40, "loadedMb": 160},
+    )
+    assert entry == {
+        "slug": "vortex",
+        "label": "label vortex",
+        "engine": "rdflib",
+        "peakRssMb": 300,
+        "peakAnonMb": 120,
+        "baselineMb": 40,
+        "loadedMb": 160,
+        "storeMb": 120,
+    }
+
+
+def test_an_older_worker_without_anon_reads_as_none():
+    entry = memory_entry(adapters("vortex")[0], {"peakRssMb": 300})
+    assert entry["peakAnonMb"] is None and entry["storeMb"] is None

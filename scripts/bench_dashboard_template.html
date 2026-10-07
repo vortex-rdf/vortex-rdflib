@@ -373,12 +373,15 @@
   <section id="memory" class="group">
     <div class="group-head">
       <span class="chan-tag mono">MEMORY</span>
-      <h2>Peak memory (RSS)</h2>
+      <h2>Peak memory</h2>
     </div>
     <p class="group-desc">
       Each store's whole lifecycle runs in its own process: build, every query, result
-      materialization. This is a clean per-store peak memory resident-set size: the kernel
-      high-water mark (<span class="mono">VmHWM</span>). Lower is better.
+      materialization. <b>Peak RSS</b> is the kernel high-water mark
+      (<span class="mono">VmHWM</span>), which counts file pages a store maps and the kernel may
+      drop again; <b>Peak anon</b> is the highest anonymous memory
+      (<span class="mono">RssAnon</span>) sampled after the build and after every query: the
+      memory the process itself holds. Lower is better.
     </p>
     <div class="panel-grid" id="memory-panels"></div>
   </section>
@@ -439,7 +442,10 @@ const HISTORY = __HISTORY_DATA__;
 const byId = new Map(DATA.map(d => [d.id, d]));
 // Memory reshaped to the {median, median_ns} cell shape renderMatrixPanel
 // reads, so the memory panel reuses the same renderer for a different unit.
-const memPeak = new Map(MEMORY.map(m => [m.slug, cellMb(m.peakRssMb)]));
+const memPeak = new Map(MEMORY.flatMap(m => [
+  [m.slug, cellMb(m.peakRssMb)],
+  [m.slug + ":anon", cellMb(m.peakAnonMb)],
+]));
 function cellMb(mb){ return mb == null ? null : { median: mb.toLocaleString() + " MB", median_ns: mb }; }
 
 const ADAPTERS = CONFIG.adapters || [];
@@ -615,10 +621,10 @@ for (const [group, meta] of Object.entries(GROUP_META)){
 // ---- memory ----
 const memHost = document.getElementById("memory-panels");
 renderMatrixPanel(memHost, {
-  title: "Peak RSS — whole lifecycle",
-  note: "Kernel high-water mark (VmHWM) of each store's own process: parse/build + all queries. Smallest first.",
-  rowHeaders: ["Store"], columns: ["Peak RSS"], sortByColumn: 0,
-  rows: storeRows(a => [a.slug]),
+  title: "Peak memory — whole lifecycle",
+  note: "Peak RSS: kernel high-water mark (VmHWM) of each store's own process, parse/build + all queries; it includes file pages a store maps. Peak anon: the highest RssAnon sampled after the load and after every query — the memory the process itself holds. Smallest first.",
+  rowHeaders: ["Store"], columns: ["Peak RSS", "Peak anon"], sortByColumn: 1,
+  rows: storeRows(a => [a.slug, a.slug + ":anon"]),
 }, memPeak);
 
 // ---- KPIs ----

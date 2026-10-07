@@ -20,14 +20,20 @@ is pinned for it is that none creeps in — not in its answers, not in the
 process whose peak RSS it reports.
 """
 
+import json
+import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
+import bench.worker as worker_module
 import pytest
 import rdflib.plugins.sparql.processor as processor
 from bench.adapters import BY_SLUG
+from bench.dataset import DatasetConfig, moduli, write_nquads, write_ntriples
 from bench.queries import Query as BenchQuery
+from bench.queries import build_queries
 from bench.worker import (
     MODES,
     consume_native,
@@ -234,3 +240,144 @@ def test_pyoxigraph_answers_what_the_rdflib_rows_answer(tmp_path):
         query = BenchQuery(name="probe", group="tests", sparql=sparql, is_ask=is_ask)
         assert run_string_once(reference, query, {})[0] == expected, sparql
         assert run_string_once(store, query, adapter.query_kwargs, native=True)[0] == expected
+
+
+_CFG = DatasetConfig(
+    n=4000, subject_ratio=0.1, predicates=32, object_ratio=0.5, literal_frac=0.4, graphs=8
+)
+
+
+def test_constant_bearing_queries_have_fresh_variants():
+    queries = {q.name: q for q in build_queries(_CFG, moduli(_CFG))}
+    for name in ("filter-range", "filter-arith", "filter-band-probe", "minus"):
+        fresh = queries[name].fresh
+        assert fresh is not None
+        assert fresh(0) == queries[name].sparql
+        assert fresh(1) != queries[name].sparql and fresh(2) != fresh(1)
+    assert queries["star-2"].fresh is None
+
+
+class _Namespaces:
+    def namespaces(self):
+        return []
+
+
+def test_fresh_mode_samples_a_new_constant_every_time(monkeypatch):
+    seen: list[str] = []
+    query = replace(
+        BenchQuery("q", "g", "SELECT * WHERE { ?s ?p ?o } LIMIT 1"),
+        fresh=lambda k: f"SELECT * WHERE {{ ?s ?p ?o }} LIMIT {k + 1}",
+    )
+
+    def fake_run_once(graph, q, kwargs, init_ns):
+        seen.append(q.sparql)
+        return 1, 10.0, 20.0
+
+    def fake_string(graph, q, kwargs, native=False):
+        seen.append("warm:" + q.sparql)
+        return 1, 30.0
+
+    monkeypatch.setattr(worker_module, "FRESH_CONSTANTS", True)
+    monkeypatch.setattr(worker_module, "run_once", fake_run_once)
+    monkeypatch.setattr(worker_module, "run_string_once", fake_string)
+    monkeypatch.setattr(worker_module, "QUERY_ITERS", 3)
+    _rows, warmed, _samples = worker_module.measure_query(_Namespaces(), query, {})
+    assert warmed is None  # every variant has its own answer: no warm-up check
+    assert seen == [
+        "warm:SELECT * WHERE { ?s ?p ?o } LIMIT 1",
+        "SELECT * WHERE { ?s ?p ?o } LIMIT 2",
+        "SELECT * WHERE { ?s ?p ?o } LIMIT 3",
+        "SELECT * WHERE { ?s ?p ?o } LIMIT 4",
+    ]
+
+
+def test_fresh_mode_reports_the_rows_of_the_warmup_variant(monkeypatch):
+    # The samples stop at a time budget, so the last one is a different variant
+    # from one store to the next. Only the warm-up (k = 0) is asked of every
+    # store, and the orchestrator compares what the stores report.
+    query = replace(BenchQuery("q", "g", "SELECT * WHERE { ?s ?p ?o }"), fresh=lambda k: f"V{k}")
+    monkeypatch.setattr(worker_module, "FRESH_CONSTANTS", True)
+    monkeypatch.setattr(worker_module, "run_once", lambda *a, **k: (7, 10.0, 20.0))
+    monkeypatch.setattr(worker_module, "run_string_once", lambda *a, **k: (5, 30.0))
+    monkeypatch.setattr(worker_module, "QUERY_ITERS", 3)
+    matched, warmed, samples = worker_module.measure_query(_Namespaces(), query, {})
+    assert (matched, warmed) == (5, None)  # the warm-up's rows, not the last sample's 7
+    assert len(samples["full"]) == 3
+
+
+def test_a_heavy_query_in_fresh_mode_samples_its_variants_without_a_warmup(monkeypatch):
+    seen: list[str] = []
+    query = replace(BenchQuery("q", "g", "SELECT 0", heavy=True), fresh=lambda k: f"SELECT {k}")
+
+    def fake_run_once(graph, q, kwargs, init_ns):
+        seen.append(q.sparql)
+        return 1, 10.0, 20.0
+
+    monkeypatch.setattr(worker_module, "FRESH_CONSTANTS", True)
+    monkeypatch.setattr(worker_module, "run_once", fake_run_once)
+    monkeypatch.setattr(worker_module, "HEAVY_ITERS", 3)
+    # `run_string_once` is left real: the graph below has no `query`, so a
+    # warm-up would raise.
+    _rows, warmed, _samples = worker_module.measure_query(_Namespaces(), query, {})
+    assert warmed is None
+    assert seen == ["SELECT 1", "SELECT 2", "SELECT 3"]
+
+
+def test_without_fresh_mode_the_text_never_changes(monkeypatch):
+    seen: list[str] = []
+    query = replace(BenchQuery("q", "g", "SELECT * WHERE { ?s ?p ?o }"), fresh=lambda k: "X")
+
+    def fake_run_once(graph, q, kwargs, init_ns):
+        seen.append(q.sparql)
+        return 1, 10.0, 20.0
+
+    monkeypatch.setattr(worker_module, "FRESH_CONSTANTS", False)
+    monkeypatch.setattr(worker_module, "run_once", fake_run_once)
+    monkeypatch.setattr(worker_module, "run_string_once", lambda *a, **k: (1, 30.0))
+    monkeypatch.setattr(worker_module, "QUERY_ITERS", 3)
+    worker_module.measure_query(_Namespaces(), query, {})
+    assert seen == [query.sparql] * 3
+
+
+def test_a_query_without_variants_is_still_checked_in_fresh_mode(monkeypatch):
+    # Its text never changes, so the prepared run keeps being held to the
+    # rows the warm-up's string query saw: here they differ, and both are reported.
+    monkeypatch.setattr(worker_module, "FRESH_CONSTANTS", True)
+    monkeypatch.setattr(worker_module, "run_once", lambda *a, **k: (4, 10.0, 20.0))
+    monkeypatch.setattr(worker_module, "run_string_once", lambda *a, **k: (3, 30.0))
+    monkeypatch.setattr(worker_module, "QUERY_ITERS", 3)
+    rows, warmed, _samples = worker_module.measure_query(_Namespaces(), QUERY, {})
+    assert (rows, warmed) == (4, 3)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="RssAnon is Linux-only")
+def test_the_worker_reports_sampled_peak_anon(tmp_path):
+    nq, nt, out = tmp_path / "d.nq", tmp_path / "d.nt", tmp_path / "out.json"
+    write_nquads(str(nq), _CFG)
+    write_ntriples(str(nt), _CFG)
+    env = {
+        **os.environ,
+        "BENCH_TRIPLES": "4000",
+        "BENCH_QUERY_ITERS": "1",
+        "BENCH_HEAVY_ITERS": "1",
+        "BENCH_LOAD_ITERS": "1",
+    }
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "bench.worker",
+            "vortex_dict_mem",
+            str(nq),
+            str(nt),
+            str(tmp_path),
+            str(out),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(out.read_text())
+    assert isinstance(report["peakAnonMb"], int) and report["peakAnonMb"] > 0
