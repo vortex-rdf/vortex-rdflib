@@ -28,7 +28,7 @@ class Side:
     answers: dict[int, set] = field(default_factory=dict)  # id -> {(rows, digest) | ("error", msg)}
     timeouts: set[int] = field(default_factory=set)
     peak_anon_mb: int | None = None
-    rss_per_mix: list[int | None] = field(default_factory=list)
+    rss_rounds: list[list[int | None]] = field(default_factory=list)  # one RssAnon series per round
     mode: str = "full"
 
 
@@ -40,7 +40,7 @@ def load(paths: list[str], mode: str = "full") -> Side:
             run = json.load(f)
         if run.get("peak_anon_mb") is not None:
             peaks.append(run["peak_anon_mb"])
-        side.rss_per_mix = run.get("rss_anon_per_mix_mb", [])
+        side.rss_rounds.append(run.get("rss_anon_per_mix_mb", []))
         side.label = f"{run.get('vortex_rdflib', '?')} / vortex-rdf {run.get('vortex_rdf', '?')}"
         for r in run["results"]:
             i = r["i"]
@@ -62,11 +62,15 @@ def _geo(xs: list[float]) -> float:
     return math.exp(statistics.fmean(math.log(x) for x in xs))
 
 
-def _flat(rss: list[int | None]) -> bool | None:
-    readings = [m for m in rss if m is not None]
-    if len(readings) < 20:
-        return None
-    return max(readings[-10:]) <= max(readings[:10]) * 1.05
+def _flat(rounds: list[list[int | None]]) -> bool | None:
+    """Every round with 20 readings keeps its last 10 mixes within 5% of its first 10.
+    None when no round has 20 readings (too few mixes, or no RssAnon off Linux)."""
+    verdicts = []
+    for rss in rounds:
+        readings = [m for m in rss if m is not None]
+        if len(readings) >= 20:
+            verdicts.append(max(readings[-10:]) <= max(readings[:10]) * 1.05)
+    return all(verdicts) if verdicts else None
 
 
 def compare(a: Side, b: Side, mode: str = "full") -> dict:
@@ -79,9 +83,10 @@ def compare(a: Side, b: Side, mode: str = "full") -> dict:
         if a.answers[i] != b.answers[i]
         or any(x[0] == "error" for x in a.answers[i] | b.answers[i])
         or len(a.answers[i]) != 1
+        or a.template[i] != b.template[i]
     ]
     bad = set(mismatches)
-    paired = [i for i in both if i not in bad and i in a.best and i in b.best]
+    paired = [i for i in both if i not in bad and a.best.get(i, 0) > 0 and b.best.get(i, 0) > 0]
     templates: dict[int, dict] = {}
     for q in sorted({a.template[i] for i in paired}):
         ids = [i for i in paired if a.template[i] == q]
@@ -112,7 +117,7 @@ def compare(a: Side, b: Side, mode: str = "full") -> dict:
         "unpaired": unpaired,
         "a_peak_anon_mb": a.peak_anon_mb,
         "b_peak_anon_mb": b.peak_anon_mb,
-        "b_flat": _flat(b.rss_per_mix),
+        "b_flat": _flat(b.rss_rounds),
     }
 
 

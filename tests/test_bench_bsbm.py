@@ -369,3 +369,41 @@ def test_main_prints_and_writes_json(tmp_path, capsys):
     assert compare.main([a, b, "--json", str(tmp_path / "c.json")]) == 0
     assert "Q1" in capsys.readouterr().out
     assert json.loads((tmp_path / "c.json").read_text())["templates"]["1"]["ratio_of_means"] == 0.5
+
+
+def test_geo_all_is_geometric_mean_of_all_ratios(tmp_path):
+    q_of, same = {0: 1, 1: 1}, {i: "d" for i in range(2)}
+    a = _run_file(tmp_path / "a.json", {0: 10, 1: 20}, q_of, same, [100, 100])
+    b = _run_file(tmp_path / "b.json", {0: 20, 1: 40}, q_of, same, [100, 100])
+    out = compare.compare(compare.load([a]), compare.load([b]))
+    assert math.isclose(out["geo_all"], 2.0)
+
+
+def test_flatness_per_round_not_last_file(tmp_path):
+    leaky = _run_file(tmp_path / "leaky.json", {0: 1}, {0: 1}, {0: "d"}, [100] * 10 + [130] * 10)
+    steady = _run_file(tmp_path / "steady.json", {0: 1}, {0: 1}, {0: "d"}, [100] * 10 + [104] * 10)
+    assert compare.compare(compare.load([leaky]), compare.load([leaky, steady]))["b_flat"] is False
+    assert compare.compare(compare.load([steady]), compare.load([steady, leaky]))["b_flat"] is False
+
+
+def test_template_disagreement_is_a_mismatch(tmp_path):
+    a = _run_file(tmp_path / "a.json", {0: 1}, {0: 1}, {0: "d"}, [1])
+    b = _run_file(tmp_path / "b.json", {0: 1}, {0: 2}, {0: "d"}, [1])
+    out = compare.compare(compare.load([a]), compare.load([b]))
+    assert 0 in out["mismatches"]
+
+
+def test_rounds_best_first_order(tmp_path):
+    a1 = _run_file(tmp_path / "a1.json", {0: 10}, {0: 1}, {0: "d"}, [1])
+    a2 = _run_file(tmp_path / "a2.json", {0: 30}, {0: 1}, {0: "d"}, [1])
+    b = _run_file(tmp_path / "b.json", {0: 20}, {0: 1}, {0: "d"}, [1])
+    assert compare.compare(compare.load([a1, a2]), compare.load([b]))["templates"][1][
+        "ratio_of_means"
+    ] == pytest.approx(2.0)
+
+
+def test_b_flat_is_none_with_fewer_than_20_readings(tmp_path):
+    a = _run_file(tmp_path / "a.json", {0: 1}, {0: 1}, {0: "d"}, [1, 2])
+    b = _run_file(tmp_path / "b.json", {0: 1}, {0: 1}, {0: "d"}, [1, 2])
+    out = compare.compare(compare.load([a]), compare.load([b]))
+    assert out["b_flat"] is None
