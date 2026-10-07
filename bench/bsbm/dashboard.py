@@ -65,7 +65,7 @@ def provenance(meta: dict, applied: dict) -> str:
 
 def run(adapters: list[Adapter], prepared: Path, out_path: Path) -> int:
     meta = streams.read_meta(prepared)
-    dataset = streams.dataset_path(prepared, meta)
+    dataset = streams.dataset_path(prepared, meta).resolve()  # the worker's cwd is the repo root
     _warmup, measured = streams.load_streams(prepared)
     applied = limits()
     base = report.base_config(meta, applied, [q["q"] for q in measured])

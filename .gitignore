@@ -16,6 +16,7 @@ dist/
 /bench/results.json
 /bench/history-local/
 /bench/results-bsbm.json
+/bench/results-bsbm.json.tmp
 /bench/bsbm-data/
 /public/
 

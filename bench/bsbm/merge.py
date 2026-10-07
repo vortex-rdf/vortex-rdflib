@@ -62,8 +62,11 @@ def merge_payloads(payloads: list[dict], expected: list[str]) -> dict:
         answers.update(config.get("answers", {}))
         if payload.get("provenance") and payload["provenance"] not in stamps:
             stamps.append(payload["provenance"])
+    # A cut-short job lists every store it was to run in ``config.adapters``, but only the
+    # ones it got through have a report, or a failure of their own.
+    reported = set(stores) | {f["slug"] for f in failures if f.get("slug")}
     for slug in expected:
-        if slug not in entries:
+        if slug not in reported:
             label = BY_SLUG[slug].label if slug in BY_SLUG else slug
             failures.append(
                 {

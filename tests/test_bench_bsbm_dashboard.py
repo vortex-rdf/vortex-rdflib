@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -64,6 +65,22 @@ def partial(answers: dict[str, dict]) -> dict:
     return report.assemble(
         base, entries, [], [], [], stores, answers, "run of " + ",".join(answers)
     )
+
+
+JOB = ["vortex_dict_mem", "rdflib_memory", "oxrdflib"]
+
+
+def mid_run(failures: list[dict]) -> dict:
+    """What ``dashboard.run`` has written after two of the three stores of ``JOB``: all
+    three in ``config.adapters``, a report only for the two that finished."""
+    done = {
+        "vortex_dict_mem": {"0": [2, "a"], "1": [1, "b"]},
+        "rdflib_memory": {"0": [2, "a"], "1": [1, "b"]},
+    }
+    stores = {s: {"mixes": 1, "plannedMixes": 1, "partial": False, "timeouts": {}} for s in done}
+    base = report.base_config(META, LIMITS, [1, 2])
+    entries = [e for e in ENTRIES if e["slug"] in JOB]
+    return report.assemble(base, entries, [], [], failures, stores, done, "cut short")
 
 
 def test_a_store_report_has_template_rows_answers_and_qmph():
@@ -190,6 +207,19 @@ def test_a_store_no_job_reported_is_named():
     assert "did not finish" in merged["failures"][0]["error"]
 
 
+def test_a_store_a_cut_short_job_never_reached_is_named():
+    merged = merge.merge_payloads([mid_run([])], expected=JOB)
+    assert [(f["slug"], f["phase"]) for f in merged["failures"]] == [("oxrdflib", "worker")]
+    assert "did not finish" in merged["failures"][0]["error"]
+    assert [e["slug"] for e in merged["config"]["adapters"]] == JOB
+
+
+def test_a_store_whose_job_recorded_its_failure_is_not_named_again():
+    venv = {"slug": "oxrdflib", "label": "oxrdflib", "phase": "venv", "error": "no such package"}
+    merged = merge.merge_payloads([mid_run([venv])], expected=JOB)
+    assert merged["failures"] == [venv]
+
+
 def test_partials_of_different_runs_are_refused():
     a, b = partial({"rdflib_memory": {}}), partial({"oxrdflib": {}})
     b["config"]["seed"] = 1
@@ -237,7 +267,9 @@ def test_the_worker_runs_every_measured_instance_once(tmp_path):
     assert bsbm["mixes"] == 2 and bsbm["partial"] is False and report_["failures"] == []
 
 
-def test_run_bench_bsbm_reconciles_the_stores_answers(tmp_path):
+def test_run_bench_bsbm_reconciles_the_stores_answers(tmp_path, monkeypatch):
+    # dashboard.run's work dir is a mkdtemp it never removes: keep it under tmp_path
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     prepared = write_prepared(tmp_path / "bsbm", warmup_mixes=1, mixes=1)
     out = tmp_path / "results-bsbm.json"
     args = ["--dataset", "bsbm", "--bsbm-dir", str(prepared), "--out", str(out)]
@@ -253,8 +285,10 @@ def test_run_bench_bsbm_reconciles_the_stores_answers(tmp_path):
     assert config["templates"]["Q5"]["instances"] == 2
 
 
-def test_pyoxigraph_agrees_on_the_row_counts(tmp_path):
+def test_pyoxigraph_agrees_on_the_row_counts(tmp_path, monkeypatch):
     pytest.importorskip("pyoxigraph")
+    # dashboard.run's work dir is a mkdtemp it never removes: keep it under tmp_path
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     prepared = write_prepared(tmp_path / "bsbm", warmup_mixes=0, mixes=1)
     out = tmp_path / "results-bsbm.json"
     args = ["--dataset", "bsbm", "--bsbm-dir", str(prepared), "--out", str(out)]

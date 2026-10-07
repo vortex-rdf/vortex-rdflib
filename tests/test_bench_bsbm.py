@@ -177,6 +177,8 @@ def test_a_query_over_the_timeout_is_aborted_and_the_stream_goes_on():
     first, second = run["results"]
     assert first["timeout"] is True and first["elapsed_ns"] < 2e9
     assert second["rows"] == 1 and "timeout" not in second
+    # QMpH rule: a timed-out query's time, up to the abort, counts in its mix's time
+    assert run["mix_ns"][first["mix"]] >= first["elapsed_ns"]
 
 
 @needs_timer
