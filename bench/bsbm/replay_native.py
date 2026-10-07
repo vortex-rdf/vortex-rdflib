@@ -6,9 +6,10 @@ usage: python -m bench.bsbm.replay_native <store.vortex> <trace.jsonl>
 Opens the store with ``vortex_rdf.VortexRdfStore`` (no vortex-rdflib) and
 re-issues every call in order, timing each; the first passes warm the page
 cache, the last is reported per method and per template. A call the installed
-API rejects (changed signature) counts under ``errors`` and is skipped. On a
-vortex-rdf that accepts ``max_resident_bytes`` (0.11), file stores open with
-vortex-rdflib 0.2.0's 1 GiB default.
+API rejects (a changed signature, an argument out of range, a missing method)
+counts under ``errors`` and is skipped; ``first_error`` keeps the first reason
+per method. On a vortex-rdf that accepts ``max_resident_bytes`` (0.11), file
+stores open with vortex-rdflib 0.2.0's 1 GiB default.
 """
 
 import argparse
@@ -41,6 +42,13 @@ def decode_value(value):
     return value
 
 
+def _reject(stats: dict, reason: str) -> None:
+    """Count a call the installed API rejected; the method keeps its first reason."""
+    stats["errors"] += 1
+    if stats["first_error"] is None:
+        stats["first_error"] = reason
+
+
 def _open(store_path: str, in_memory: bool):
     from vortex_rdf import VortexRdfStore
 
@@ -66,7 +74,7 @@ def replay(
         (
             q["q"],
             [
-                (obj, m, decode_value(a), decode_value(k))
+                (obj, m, decode_value(a), {key: decode_value(v) for key, v in k.items()})
                 for obj, m, a, k, _ns in q["calls"]
                 if m not in skip
             ],
@@ -76,7 +84,7 @@ def replay(
     methods: dict = {}
     templates: dict = {}
     for _ in range(passes):
-        methods = defaultdict(lambda: {"calls": 0, "ms": 0.0, "errors": 0})
+        methods = defaultdict(lambda: {"calls": 0, "ms": 0.0, "errors": 0, "first_error": None})
         templates = defaultdict(lambda: {"queries": 0, "ms": 0.0})
         for q, calls in prepared:
             spent = 0
@@ -85,13 +93,13 @@ def replay(
                 stats = methods[method]
                 stats["calls"] += 1
                 if fn is None:
-                    stats["errors"] += 1
+                    _reject(stats, f"missing: {method}")
                     continue
                 t0 = time.perf_counter_ns()
                 try:
                     fn(*args, **kwargs)
-                except (TypeError, ValueError):
-                    stats["errors"] += 1
+                except Exception as error:  # noqa: BLE001 — a rejected call is counted, never fatal
+                    _reject(stats, f"{type(error).__name__}: {error}")
                     continue
                 ns = time.perf_counter_ns() - t0
                 stats["ms"] += ns / 1e6
@@ -120,7 +128,10 @@ def main(argv: list[str] | None = None) -> int:
     out = replay(args.store, args.trace, args.in_memory, skip, args.passes)
     print(f"vortex-rdf {out['vortex_rdf']}  (skipped: {', '.join(sorted(skip)) or 'none'})")
     for name, m in sorted(out["methods"].items(), key=lambda kv: -kv[1]["ms"]):
-        print(f"  {name:<20} {m['calls']:>8} calls {m['ms']:>10.1f} ms  errors {m['errors']}")
+        row = f"  {name:<20} {m['calls']:>8} calls {m['ms']:>10.1f} ms  errors {m['errors']}"
+        if m["errors"]:
+            row += f" (first: {m['first_error']})"
+        print(row)
     for q, t in out["templates"].items():
         print(
             f"  Q{q:<3} {t['queries']:>5} queries {t['ms']:>10.1f} ms "

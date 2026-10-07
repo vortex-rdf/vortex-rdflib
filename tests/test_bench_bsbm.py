@@ -482,12 +482,102 @@ def test_the_command_lines_record_then_replay(tmp_path, tiny_store, capsys):
     trace, report = tmp_path / "trace.jsonl", tmp_path / "replay.json"
     argv = [str(tiny_store), "--file", str(tmp_path / "w.json"), str(tmp_path / "m.json")]
     assert record_native.main([*argv, str(trace)]) == 0
-    assert f"over {len(measured)} queries" in capsys.readouterr().err
+    assert f"over {len(measured)} queries (0 raised)" in capsys.readouterr().err
     assert replay_native.main([str(tiny_store), str(trace), "--file", "--json", str(report)]) == 0
     printed = capsys.readouterr().out
     assert "skipped: filter_codes" in printed and "Q12" in printed
+    assert "first:" not in printed  # no method erred
     out = json.loads(report.read_text())
     assert "filter_codes" not in out["methods"]
     assert set(out["templates"]) == {str(q) for q in streams.EXPLORE_MIX}
     with pytest.raises(SystemExit):  # one residency is required
         replay_native.main([str(tiny_store), str(trace)])
+
+
+def _trace_with(tmp_path: Path, store: Path, calls: list) -> str:
+    """A one-query trace of ``calls``, as ``record_native`` writes one."""
+    trace = tmp_path / "trace.jsonl"
+    header = {"trace": 1, "store": str(store), "in_memory": False, "vortex_rdf": "?"}
+    trace.write_text(
+        json.dumps(header) + "\n" + json.dumps({"i": 0, "q": 1, "calls": calls}) + "\n"
+    )
+    return str(trace)
+
+
+def test_an_out_of_range_argument_is_counted_not_fatal(tmp_path, tiny_store):
+    trace = _trace_with(tmp_path, tiny_store, [["store", "count_quads", [], {"limit": -1}, 0]])
+    out = replay_native.replay(str(tiny_store), trace, False, skip=set(), passes=2)
+    stats = out["methods"]["count_quads"]
+    assert stats["calls"] == 1 and stats["errors"] == 1
+    assert stats["first_error"].startswith("OverflowError")
+
+
+def test_a_method_the_installed_api_lacks_is_counted_not_fatal(tmp_path, tiny_store):
+    trace = _trace_with(tmp_path, tiny_store, [["store", "no_such_method", [1], {}, 0]])
+    out = replay_native.replay(str(tiny_store), trace, False, skip=set(), passes=1)
+    assert out["methods"]["no_such_method"] == {
+        "calls": 1,
+        "ms": 0.0,
+        "errors": 1,
+        "first_error": "missing: no_such_method",
+    }
+
+
+def test_a_method_keeps_the_first_of_its_errors(tmp_path, tiny_store):
+    calls = [
+        ["store", "count_quads", [], {}, 0],
+        ["store", "count_quads", [], {"limit": -1}, 0],
+        ["store", "count_quads", [], {"bogus": 1}, 0],
+        ["dict", "decode", [1], {}, 0],
+    ]
+    trace = _trace_with(tmp_path, tiny_store, calls)
+    out = replay_native.replay(str(tiny_store), trace, False, skip=set(), passes=1)
+    count_quads, decode = out["methods"]["count_quads"], out["methods"]["decode"]
+    assert count_quads["calls"] == 3 and count_quads["errors"] == 2
+    assert count_quads["first_error"].startswith("OverflowError")
+    assert decode["errors"] == 0 and decode["first_error"] is None
+
+
+def test_a_keyword_named_like_an_encoding_is_still_a_keyword(tmp_path, tiny_store):
+    from vortex_rdf import U32Column
+
+    kwargs = record_native.encode_value({"codes": U32Column([1, 4, 9])})
+    assert kwargs == {"codes": {"codes": [1, 4, 9]}}
+    trace = _trace_with(tmp_path, tiny_store, [["dict", "decode_many", [], kwargs, 0]])
+    out = replay_native.replay(str(tiny_store), trace, False, skip=set(), passes=1)
+    assert out["methods"]["decode_many"]["calls"] == 1
+    assert out["methods"]["decode_many"]["errors"] == 0
+
+
+def test_the_replay_table_says_why_a_method_erred(tmp_path, tiny_store, capsys):
+    trace = _trace_with(tmp_path, tiny_store, [["store", "count_quads", [], {"limit": -1}, 0]])
+    assert replay_native.main([str(tiny_store), trace, "--file", "--passes", "1"]) == 0
+    row = next(r for r in capsys.readouterr().out.splitlines() if "count_quads" in r)
+    assert "errors 1" in row and "OverflowError" in row
+
+
+def test_a_query_that_raises_is_counted_and_the_stream_goes_on(tmp_path, tiny_store, capsys):
+    warmup, measured = tiny_streams(1, 2)
+    broken = [dict(measured[0], text="SELECT * WHERE {"), *measured[1:]]
+    trace = tmp_path / "trace.jsonl"
+    calls = record_native.record(str(tiny_store), False, warmup, broken, str(trace))
+    lines = trace.read_text().splitlines()
+    assert len(lines) == 1 + len(broken) and json.loads(lines[1])["calls"] == []
+    assert calls > 0
+    assert f"over {len(broken)} queries (1 raised)" in capsys.readouterr().err
+
+
+def test_a_query_that_raises_is_recorded_up_to_the_raise(tmp_path, tiny_store, monkeypatch, capsys):
+    def native_call_then_raise(graph, text, **kwargs):
+        graph.store._store().count_quads()  # through the proxy once the measured stream runs
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(record_native, "run_instance", native_call_then_raise)
+    warmup, measured = tiny_streams(1, 1)
+    trace = tmp_path / "trace.jsonl"
+    calls = record_native.record(str(tiny_store), False, warmup, measured, str(trace))
+    lines = trace.read_text().splitlines()
+    assert calls == len(measured) and len(lines) == 1 + len(measured)
+    for line in lines[1:]:
+        assert [c[1] for c in json.loads(line)["calls"]] == ["count_quads"]
+    assert f"({len(measured)} raised)" in capsys.readouterr().err
