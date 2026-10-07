@@ -22,6 +22,7 @@ process whose peak RSS it reports.
 
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import replace
@@ -255,6 +256,29 @@ def test_constant_bearing_queries_have_fresh_variants():
         assert fresh(0) == queries[name].sparql
         assert fresh(1) != queries[name].sparql and fresh(2) != fresh(1)
     assert queries["star-2"].fresh is None
+
+
+def test_paired_queries_step_their_fresh_constants_apart():
+    """The two queries of a pair filter on one constant and run back to back in one
+    store, and a store memoizes work per constant: a number the first has paid for
+    would make the second's sample a warm one. So their variants never write the same one.
+
+    Only these two pairs: at some scales the band equals the cut, and an all-pairs check
+    would flag queries whose memo keys differ."""
+    queries = {q.name: q for q in build_queries(_CFG, moduli(_CFG))}
+
+    def introduced(name: str) -> set[str]:
+        """The numbers the first ten variants of ``name`` write, bar those it already holds."""
+        query = queries[name]
+        fresh = query.fresh
+        assert fresh is not None
+        held = set(re.findall(r"\d+", query.sparql))
+        return {n for k in range(1, 11) for n in re.findall(r"\d+", fresh(k)) if n not in held}
+
+    for first, second in (("minus", "filter-range"), ("filter-band-probe", "filter-arith")):
+        a, b = introduced(first), introduced(second)
+        assert a and b
+        assert a.isdisjoint(b), f"{first} and {second} both write {sorted(a & b)}"
 
 
 class _Namespaces:

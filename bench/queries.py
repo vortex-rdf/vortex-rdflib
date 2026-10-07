@@ -545,7 +545,8 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
             "joins",
             band_probe_text(band),
             heavy=True,
-            fresh=lambda k: band_probe_text(band + k),
+            # Steps down: filter-arith steps up from the same band, and stores memoize per constant.
+            fresh=lambda k: band_probe_text(band - k),
         ),
         Query(
             "values-64",
@@ -586,7 +587,8 @@ def build_queries(cfg: DatasetConfig, m: Moduli) -> list[Query]:
             "joins",
             minus_text(int_cut),
             heavy=True,
-            fresh=lambda k: minus_text(int_cut + k),
+            # Steps down: filter-range steps up from the same cut, and stores memoize per constant.
+            fresh=lambda k: minus_text(int_cut - k),
         ),
         Query(
             "filter-range",
