@@ -114,6 +114,20 @@
   .kpi .value { font-size:22px; font-weight:600; }
   .kpi .sub { font-size:12px; color:var(--ink-2); }
 
+  /* ---- dataset tabs: each section switches between the datasets on its own ---- */
+  .ds-tabs { display:inline-flex; margin-left:auto; }
+  .ds-tabs button {
+    font:inherit; font-size:12px; color:var(--ink-2); background:var(--surface);
+    border:1px solid var(--border-strong); padding:4px 12px; cursor:pointer;
+  }
+  .ds-tabs button + button { border-left:0; }
+  .ds-tabs button:first-child { border-radius:6px 0 0 6px; }
+  .ds-tabs button:last-child { border-radius:0 6px 6px 0; }
+  .ds-tabs button[aria-selected="true"] { color:var(--ink); background:var(--surface-2); font-weight:600; }
+  .ds-tabs button:disabled { opacity:0.45; cursor:not-allowed; }
+  .ds-tabs-row { display:flex; align-items:center; gap:12px; margin:8px 0 12px; }
+  .ds-note { color:var(--ink-muted); font-size:12px; margin-left:8px; }
+
   /* ---- sections ---- */
   section.group { margin-bottom: 52px; scroll-margin-top: 84px; }
   .group-head { display:flex; align-items:center; gap:12px; margin-bottom:6px; }
@@ -160,6 +174,8 @@
   .matrix-table td.num { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
   .matrix-table td.num .ratio { color:var(--ink-muted); font-size:10.5px; margin-left:5px; }
   .matrix-table td.num.best { color:var(--good); font-weight:700; }
+  .matrix-table td.num .badge { color:var(--bad); font-size:10.5px; margin-left:5px; }
+  .matrix-table td.rowh .partial { color:var(--bad); font-size:11px; margin-left:6px; }
   /* Uncollapsed, the break rule would stack on the preceding row's own. */
   .matrix-table tbody tr.group-break td { border-top:1px solid var(--border-strong); }
   .matrix-table tbody tr:has(+ tr.group-break) td { border-bottom:0; }
@@ -230,12 +246,12 @@
   .history-tip .row strong { min-width:5ch; font-variant-numeric:tabular-nums; }
   .history-tip .lbl { color:var(--ink-2); }
   .history-tip .drop { color:var(--ink-muted); font-size:11.5px; margin:0 0 2px 22px; }
-  #history-table { margin-top:12px; }
-  #history-sub { max-width:none; }
+  .history-table { margin-top:12px; }
+  .panel .history-sub { max-width:none; }
 
   footer.prov {
     margin-top:36px; padding-top:16px; border-top:1px solid var(--border);
-    color:var(--ink-muted); font-size:11.5px;
+    color:var(--ink-muted); font-size:11.5px; white-space:pre-line;
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -262,7 +278,7 @@
 </header>
 
 <main>
-  <section id="overview" class="group">
+  <section id="overview" class="group" data-tabbed="overview">
     <p class="lede">
       A run of <code>bench/run_bench.py</code>: <a href="https://github.com/vortex-rdf/vortex-rdflib">vortex-rdflib</a>'s
       <code>VortexRdflibStore</code> against itself and: 
@@ -296,173 +312,273 @@
       — HDT's format has none, and pycottas' store does not expose the proper store interface for it.
       These stores use flattened N-Triples and do not report measurements in the <em>Named graphs</em> panel.
     </p>
-    <div class="kpi-row" id="kpi-row"></div>
-    <div id="failures-host"></div>
+    <p class="lede">
+      The <strong>BSBM</strong> tab of every section runs the same stores on the
+      <a href="https://github.com/Tpt/bsbm-tools">Berlin SPARQL Benchmark</a>'s Explore use case:
+      data from the official generator, and the query streams the unmodified official test driver
+      sends, captured once. Each store answers the warm-up mixes, then every measured query instance
+      once, with the parameters the driver drew for it. A query over the per-query timeout is aborted
+      and counted; a store over its time budget finishes its mix and stops, marked <em>partial</em>.
+    </p>
+    <div class="ds-tabs-row"><div class="ds-tabs"></div></div>
+    <div class="ds-pane" data-ds="synthetic">
+      <div class="kpi-row" data-part="kpis"></div>
+      <div data-part="failures"></div>
+    </div>
+    <div class="ds-pane" data-ds="bsbm" hidden>
+      <div class="kpi-row" data-part="kpis"></div>
+      <div data-part="failures"></div>
+    </div>
   </section>
 
-  <section id="history" class="group" hidden>
+  <section id="history" class="group" data-tabbed="history" hidden>
     <div class="group-head">
       <span class="chan-tag mono">HISTORY</span>
       <h2>Speedup over rdflib, per commit</h2>
+      <div class="ds-tabs"></div>
     </div>
-    <p class="group-desc">
-      How many times faster each vortex-rdflib configuration answers the query set than
-      rdflib's in-memory store. rdflib's time divided by the
-      configuration's, as a geometric mean over all the queries. Above 1× is
-      faster.
-    </p>
-    <div class="history-controls" id="history-controls"></div>
-    <div class="panel wide history-panel">
-      <p class="note mono" id="history-sub"></p>
-      <div class="history-chart" id="history-chart"></div>
-      <div class="history-tip" id="history-tip" aria-live="polite" hidden></div>
-      <div class="table-wrap" id="history-table" hidden></div>
+    <div class="ds-pane" data-ds="synthetic">
+      <p class="group-desc">
+        How many times faster each vortex-rdflib configuration answers the query set than
+        rdflib's in-memory store. rdflib's time divided by the configuration's, as a geometric
+        mean over all the queries. Above 1× is faster.
+      </p>
+      <div data-fill="tpl-history-pane"></div>
+    </div>
+    <div class="ds-pane" data-ds="bsbm" hidden>
+      <p class="group-desc">
+        The same ratio on BSBM: rdflib's median time per Explore template divided by each
+        configuration's, as a geometric mean over the templates. Above 1× is faster.
+      </p>
+      <div data-fill="tpl-history-pane"></div>
     </div>
   </section>
 
-  <section id="load" class="group">
+  <section id="load" class="group" data-tabbed="load">
     <div class="group-head">
       <span class="chan-tag mono">LOAD</span>
       <h2>Source file to queryable store</h2>
+      <div class="ds-tabs"></div>
     </div>
-    <p class="group-desc">
-      Cold start: from the shared source file — <span class="mono">.nq</span> for the stores with
-      named graphs, the flattened <span class="mono">.nt</span> for HDT and COTTAS — to a
-      queryable store. The same statements, but <strong>not the same bytes</strong>:
-      dropping the graph column makes the <span class="mono">.nt</span> about 18% smaller, so
-      those two libraries have that much less to parse. Most
-      libraries build their own format first — <span class="mono">serialize_rdf</span> (vortex-rdflib),
-      <span class="mono">rdf2cottas</span>, <span class="mono">hdt convert</span> — then open it;
-      rdflib and oxrdflib parse directly, and pyoxigraph bulk-loads the file with its own
-      parser. Median of repeated full rebuilds.
-      <strong>rdflib-hdt is read-only</strong>: it cannot write HDT, so its file is built by the
-      Rust <a href="https://crates.io/crates/hdt">hdt</a> crate's CLI and only opened by the
-      library measured here.
-    </p>
-    <div class="panel-grid" id="load-panels"></div>
+    <div class="ds-pane" data-ds="synthetic">
+      <p class="group-desc">
+        Cold start: from the shared source file — <span class="mono">.nq</span> for the stores with
+        named graphs, the flattened <span class="mono">.nt</span> for HDT and COTTAS — to a
+        queryable store. The same statements, but <strong>not the same bytes</strong>:
+        dropping the graph column makes the <span class="mono">.nt</span> about 18% smaller, so
+        those two libraries have that much less to parse. Most
+        libraries build their own format first — <span class="mono">serialize_rdf</span> (vortex-rdflib),
+        <span class="mono">rdf2cottas</span>, <span class="mono">hdt convert</span> — then open it;
+        rdflib and oxrdflib parse directly, and pyoxigraph bulk-loads the file with its own
+        parser. Median of repeated full rebuilds.
+        <strong>rdflib-hdt is read-only</strong>: it cannot write HDT, so its file is built by the
+        Rust <a href="https://crates.io/crates/hdt">hdt</a> crate's CLI and only opened by the
+        library measured here.
+      </p>
+      <div class="panel-grid"></div>
+    </div>
+    <div class="ds-pane" data-ds="bsbm" hidden>
+      <p class="group-desc">
+        From the official generator's <span class="mono">dataset.nt</span> to a queryable store,
+        with each store's own build step as on the synthetic tab. BSBM has no named graphs, so every
+        store reads the same file. One build per store at this scale.
+      </p>
+      <div class="panel-grid"></div>
+    </div>
   </section>
 
-  <section id="queries" class="group">
+  <section id="queries" class="group" data-tabbed="queries">
     <div class="group-head">
       <span class="chan-tag mono">QUERY</span>
       <h2>SPARQL execution, per query</h2>
+      <div class="ds-tabs"></div>
     </div>
-    <p class="group-desc">
-      Median wall-clock time to execute <em>and fully consume</em> each query, reported as a pair
-      of figures taken from one run:
-      <b>exec only</b> is the evaluation of an already-translated algebra — the part a store's
-      speed can move; <b>full</b> adds rdflib's parse and algebra translation. 
-      <b>Green</b> marks the fastest cell in each column,
-      and the grey multiplier is every other cell's slowdown against it.
-    </p>
-    <p class="group-desc">
-      Two marks on the column headers. <b>•</b> is a <em>heavy</em> query — it touches the whole
-      dataset. <b>‡</b> is a query whose answer is a
-      <em>cardinality</em> (e.g., <span class="mono">ASK</span> or <span class="mono">COUNT(*)</span>). 
-    </p>
-    <p class="group-desc">
-      <b>rdflib-hdt</b>'s own <span class="mono">optimize_sparql()</span> fast path is switched
-      off: it answers two of the queries wrongly — <span class="mono">chain-2</span> with 26 results
-      and <span class="mono">optional</span> with 152, against the 18 and 1 that rdflib and
-      rdflib-hdt itself return without it. That row therefore runs on rdflib's engine, as every
-      other row does.
-    </p>
-    <div class="panel-grid" id="query-panels"></div>
+    <div class="ds-pane" data-ds="synthetic">
+      <p class="group-desc">
+        Median wall-clock time to execute <em>and fully consume</em> each query, reported as a pair
+        of figures taken from one run:
+        <b>exec only</b> is the evaluation of an already-translated algebra — the part a store's
+        speed can move; <b>full</b> adds rdflib's parse and algebra translation.
+        <b>Green</b> marks the fastest cell in each column,
+        and the grey multiplier is every other cell's slowdown against it.
+      </p>
+      <p class="group-desc">
+        Two marks on the column headers. <b>•</b> is a <em>heavy</em> query — it touches the whole
+        dataset. <b>‡</b> is a query whose answer is a
+        <em>cardinality</em> (e.g., <span class="mono">ASK</span> or <span class="mono">COUNT(*)</span>).
+      </p>
+      <p class="group-desc">
+        <b>rdflib-hdt</b>'s own <span class="mono">optimize_sparql()</span> fast path is switched
+        off: it answers two of the queries wrongly — <span class="mono">chain-2</span> with 26 results
+        and <span class="mono">optional</span> with 152, against the 18 and 1 that rdflib and
+        rdflib-hdt itself return without it. That row therefore runs on rdflib's engine, as every
+        other row does.
+      </p>
+      <div class="panel-grid"></div>
+    </div>
+    <div class="ds-pane" data-ds="bsbm" hidden>
+      <p class="group-desc">
+        The BSBM Explore mix — 25 queries over eleven templates (Q1–Q12 without Q6, Q5 twice) — run
+        as the official driver runs it: warm-up mixes first, untimed, then every measured instance
+        once with its own parameters. A cell is the template's mean over its instances (BSBM's
+        AQET; hover for the median), <b>exec only</b> and <b>full</b> as on the synthetic tab.
+        Answers are checked instance by instance: the rdflib-engine stores' answer digests must
+        agree and pyoxigraph's row counts must match theirs; a disagreement is listed with the
+        overview's failures.
+      </p>
+      <div class="panel-grid"></div>
+    </div>
   </section>
 
-  <section id="memory" class="group">
+  <section id="memory" class="group" data-tabbed="memory">
     <div class="group-head">
       <span class="chan-tag mono">MEMORY</span>
       <h2>Peak memory</h2>
+      <div class="ds-tabs"></div>
     </div>
-    <p class="group-desc">
-      Each store's whole lifecycle runs in its own process: build, every query, result
-      materialization. <b>Peak RSS</b> is the kernel high-water mark
-      (<span class="mono">VmHWM</span>), which counts file pages a store maps and the kernel may
-      drop again; <b>Peak anon</b> is the highest anonymous memory
-      (<span class="mono">RssAnon</span>) sampled after the build and after every query: the
-      memory the process itself holds. Lower is better.
-    </p>
-    <div class="panel-grid" id="memory-panels"></div>
+    <div class="ds-pane" data-ds="synthetic">
+      <p class="group-desc">
+        Each store's whole lifecycle runs in its own process: build, every query, result
+        materialization. <b>Peak RSS</b> is the kernel high-water mark
+        (<span class="mono">VmHWM</span>), which counts file pages a store maps and the kernel may
+        drop again; <b>Peak anon</b> is the highest anonymous memory
+        (<span class="mono">RssAnon</span>) sampled after the build and after every query: the
+        memory the process itself holds. Lower is better.
+      </p>
+      <div class="panel-grid"></div>
+    </div>
+    <div class="ds-pane" data-ds="bsbm" hidden>
+      <p class="group-desc">
+        The same two figures over the BSBM run: build, warm-up and measured mixes, with
+        <span class="mono">RssAnon</span> sampled after the build and after every measured mix.
+      </p>
+      <div class="panel-grid"></div>
+    </div>
   </section>
 
-  <section id="queryset" class="group">
+  <section id="queryset" class="group" data-tabbed="queryset">
     <div class="group-head">
       <span class="chan-tag mono">SET</span>
       <h2>The query set</h2>
+      <div class="ds-tabs"></div>
     </div>
-    <p class="group-desc">
-      Anchor terms and thresholds come from the dataset generator's modular arithmetic, so every
-      query matches at least one row. <span class="mono">heavy</span> queries touch the whole
-      dataset and run with a lower iteration budget.
-    </p>
-    <div id="queryset-host"></div>
+    <div class="ds-pane" data-ds="synthetic">
+      <p class="group-desc">
+        Anchor terms and thresholds come from the dataset generator's modular arithmetic, so every
+        query matches at least one row. <span class="mono">heavy</span> queries touch the whole
+        dataset and run with a lower iteration budget.
+      </p>
+      <div data-part="queryset"></div>
+    </div>
+    <div class="ds-pane" data-ds="bsbm" hidden>
+      <p class="group-desc">
+        The official BSBM Explore templates of the pinned tools, as the driver fills them: every
+        <span class="mono">%placeholder%</span> takes a fresh value per instance. Q6 (a regex over
+        product labels) is not in the official mix.
+      </p>
+      <div data-part="queryset"></div>
+    </div>
   </section>
 
-  <section id="data" class="group">
+  <section id="data" class="group" data-tabbed="data">
     <div class="group-head">
       <span class="chan-tag mono">DATA</span>
       <h2>Every measurement</h2>
+      <div class="ds-tabs"></div>
     </div>
-    <p class="group-desc">
-      Every (query, store, mode) measurement from this run. Click a column to sort. An id ending
-      in <span class="mono">::exec</span> is the prepared-algebra run; the plain id is the full
-      one, including rdflib's parse and algebra translation.
-    </p>
-    <div class="table-toolbar">
-      <input id="table-filter" type="text" placeholder="filter by name…" autocomplete="off" />
-      <span class="count" id="table-count"></span>
+    <div class="ds-pane" data-ds="synthetic">
+      <p class="group-desc">
+        Every (query, store, mode) measurement from this run. Click a column to sort. An id ending
+        in <span class="mono">::exec</span> is the prepared-algebra run; the plain id is the full
+        one, including rdflib's parse and algebra translation.
+      </p>
+      <div data-fill="tpl-data-table"></div>
     </div>
-    <div class="table-wrap">
-      <table class="data" id="data-table">
-        <thead><tr>
-          <th data-key="id" tabindex="0" role="button" aria-label="Sort by benchmark name">Benchmark</th>
-          <th data-key="fastest_ns" tabindex="0" role="button" aria-label="Sort by fastest">Fastest</th>
-          <th data-key="slowest_ns" tabindex="0" role="button" aria-label="Sort by slowest">Slowest</th>
-          <th data-key="median_ns" tabindex="0" role="button" aria-label="Sort by median">Median</th>
-          <th data-key="mean_ns" tabindex="0" role="button" aria-label="Sort by mean">Mean</th>
-          <th data-key="samples" tabindex="0" role="button" aria-label="Sort by sample count">Samples</th>
-        </tr></thead>
-        <tbody></tbody>
-      </table>
+    <div class="ds-pane" data-ds="bsbm" hidden>
+      <p class="group-desc">
+        Every (template, store, mode) figure of the BSBM run over its measured instances: fastest,
+        slowest, median, mean (BSBM's AQET), and the instance count.
+      </p>
+      <div data-fill="tpl-data-table"></div>
     </div>
   </section>
 
   <footer class="prov mono" id="provenance"></footer>
 </main>
 
-<script>
-const DATA = __BENCH_DATA__;
-const MEMORY = __MEMORY_DATA__;
-const CONFIG = __CONFIG_DATA__;
-const FAILURES = __FAILURES_DATA__;
-const PROVENANCE = __PROVENANCE__;
-const HISTORY = __HISTORY_DATA__;
+<!-- Pane markup both datasets share, written once: the script clones it in place of each
+     [data-fill] placeholder before it renders anything. -->
+<template id="tpl-history-pane">
+  <div class="history-controls"></div>
+  <div class="panel wide history-panel">
+    <p class="note mono history-sub"></p>
+    <div class="history-chart"></div>
+    <div class="history-tip" aria-live="polite" hidden></div>
+    <div class="table-wrap history-table" hidden></div>
+  </div>
+</template>
 
-const byId = new Map(DATA.map(d => [d.id, d]));
-// Memory reshaped to the {median, median_ns} cell shape renderMatrixPanel
-// reads, so the memory panel reuses the same renderer for a different unit.
-const memPeak = new Map(MEMORY.flatMap(m => [
-  [m.slug, cellMb(m.peakRssMb)],
-  [m.slug + ":anon", cellMb(m.peakAnonMb)],
-]));
+<template id="tpl-data-table">
+  <div class="table-toolbar">
+    <input type="text" placeholder="filter by name…" autocomplete="off" />
+    <span class="count"></span>
+  </div>
+  <div class="table-wrap">
+    <table class="data">
+      <thead><tr>
+        <th data-key="id" tabindex="0" role="button" aria-label="Sort by benchmark name">Benchmark</th>
+        <th data-key="fastest_ns" tabindex="0" role="button" aria-label="Sort by fastest">Fastest</th>
+        <th data-key="slowest_ns" tabindex="0" role="button" aria-label="Sort by slowest">Slowest</th>
+        <th data-key="median_ns" tabindex="0" role="button" aria-label="Sort by median">Median</th>
+        <th data-key="mean_ns" tabindex="0" role="button" aria-label="Sort by mean">Mean</th>
+        <th data-key="samples" tabindex="0" role="button" aria-label="Sort by sample count">Samples</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</template>
+
+<script>
+// Both datasets' results, from scripts/render_bench_dashboard.py:
+// {synthetic: set|null, bsbm: set|null, notes: {synthetic, bsbm}}, a set being
+// {results, memory, config, failures, provenance, history}. A dataset with no
+// results has its tab disabled in every section, with the note saying why.
+const SETS = __DATASETS__;
+const DATASETS = [{ key: "synthetic", label: "Synthetic" }, { key: "bsbm", label: "BSBM" }];
+
 function cellMb(mb){ return mb == null ? null : { median: mb.toLocaleString() + " MB", median_ns: mb }; }
 
-const ADAPTERS = CONFIG.adapters || [];
-const QUERIES = CONFIG.queries || [];
-// Queries a store's format cannot express, per store: asked for by nobody, so
-// they get no id and leave a dash rather than a "missing benchmark" warning.
-const SKIPPED = new Map(
-  Object.entries(CONFIG.skipped || {}).map(([slug, names]) => [slug, new Set(names)]));
-function idFor(query, adapter, mode){
-  if (SKIPPED.get(adapter.slug)?.has(query.name)) return null;
-  // A store that answers the query string itself has no prepared algebra to
-  // time, so it reports `full` only and its `exec only` cell stays empty.
-  if (adapter.modes && !adapter.modes.includes(mode)) return null;
-  return `${query.name}::${adapter.slug}` + (mode === "full" ? "" : `::${mode}`);
+/** What every section renders from one dataset's results. */
+function context(key){
+  const set = SETS[key];
+  const CONFIG = set.config || {};
+  const MEMORY = set.memory || [];
+  // Queries a store's format cannot express: no id, a dash, no warning.
+  const SKIPPED = new Map(
+    Object.entries(CONFIG.skipped || {}).map(([slug, names]) => [slug, new Set(names)]));
+  return {
+    key, CONFIG, MEMORY,
+    DATA: set.results,
+    FAILURES: set.failures || [],
+    PROVENANCE: set.provenance || "",
+    HISTORY: set.history,
+    ADAPTERS: CONFIG.adapters || [],
+    QUERIES: CONFIG.queries || [],
+    byId: new Map(set.results.map(d => [d.id, d])),
+    // Memory in the {median, median_ns} cell shape renderMatrixPanel reads.
+    memPeak: new Map(MEMORY.flatMap(m => [
+      [m.slug, cellMb(m.peakRssMb)],
+      [m.slug + ":anon", cellMb(m.peakAnonMb)],
+    ])),
+    idFor(query, adapter, mode){
+      if (SKIPPED.get(adapter.slug)?.has(query.name)) return null;
+      // A store answering the query string itself reports `full` only.
+      if (adapter.modes && !adapter.modes.includes(mode)) return null;
+      return `${query.name}::${adapter.slug}` + (mode === "full" ? "" : `::${mode}`);
+    },
+  };
 }
-// Rule off the rows where what-is-measured changes: the other stores, then
-// the different-engine row.
+// Rule off the rows where what-is-measured changes.
 function rowBreak(slug){ return slug === "rdflib_memory" || slug === "pyoxigraph"; }
 
 function get(map, id){ const r = map.get(id); if(!r) console.warn("missing bench id", id); return r; }
@@ -534,11 +650,16 @@ function renderMatrixPanel(container, cfg, map){
       r.labels.map((l, i) => `<td class="rowh${i ? " sub" : ""}">${l}</td>`).join("") +
       r.recs.map((rec, i) => {
         if (!rec) return `<td ${cls(i, "")}>—</td>`;
+        // A BSBM cell may carry a badge (its timeouts) and a hover text; one with
+        // no time (every instance timed out) shows only those.
+        const badge = rec.badge ? `<span class="badge">${rec.badge}</span>` : "";
+        const title = rec.title ? ` title="${rec.title}"` : "";
+        if (!Number.isFinite(rec.median_ns)) return `<td ${cls(i, "")}${title}>${rec.median}${badge}</td>`;
         const isBest = rec.median_ns === best[i];
         const mult = rec.median_ns / best[i];
         const multStr = mult >= 100 ? Math.round(mult).toLocaleString() : mult.toFixed(1);
         const ratio = isBest ? "" : `<span class="ratio">${multStr}×</span>`;
-        return `<td ${cls(i, isBest ? " best" : "")}>${rec.median}${ratio}</td>`;
+        return `<td ${cls(i, isBest ? " best" : "")}${title}>${rec.median}${ratio}${badge}</td>`;
       }).join("");
     tbody.appendChild(tr);
   }
@@ -548,21 +669,21 @@ function renderMatrixPanel(container, cfg, map){
   container.appendChild(panel);
 }
 
-function storeRows(idFor){
-  return ADAPTERS.map(a => ({
-    labels: [a.label],
-    ids: idFor(a),
-    break: rowBreak(a.slug),
-  }));
+function storeRows(ctx, idsOf, labelOf = a => a.label){
+  return ctx.ADAPTERS.map(a => ({ labels: [labelOf(a)], ids: idsOf(a), break: rowBreak(a.slug) }));
 }
 
 // ---- load ----
-renderMatrixPanel(document.getElementById("load-panels"), {
-  title: "Load (cold start)",
-  note: "Median time from the shared N-Triples file to a queryable store, fastest first. Green = fastest.",
-  rowHeaders: ["Store"], columns: ["Load"], sortByColumn: 0,
-  rows: storeRows(a => [`load::${a.slug}`]),
-}, byId);
+function renderLoad(ctx, host){
+  renderMatrixPanel(host, {
+    title: "Load (cold start)",
+    note: ctx.key === "bsbm"
+      ? "Time from the official generator's N-Triples file to a queryable store, fastest first (one build per store). Green = fastest."
+      : "Median time from the shared N-Triples file to a queryable store, fastest first. Green = fastest.",
+    rowHeaders: ["Store"], columns: ["Load"], sortByColumn: 0,
+    rows: storeRows(ctx, a => [`load::${a.slug}`]),
+  }, ctx.byId);
+}
 
 // ---- query panels, one per group ----
 const GROUP_META = {
@@ -599,78 +720,146 @@ const MARKS = [
         + "decoding a term, so this column compares an approach rather than an implementation's speed" },
 ];
 function marksFor(q){ return MARKS.filter(m => q[m.flag]); }
-const queryHost = document.getElementById("query-panels");
-for (const [group, meta] of Object.entries(GROUP_META)){
-  const qs = QUERIES.filter(q => q.group === group);
-  if (!qs.length) continue;
-  renderMatrixPanel(queryHost, {
-    title: meta.tag,
-    note: meta.note,
-    wide: true,
-    keepEmpty: true,
-    rowHeaders: ["Store"],
-    columnGroups: qs.map(q => ({
-      label: q.name + marksFor(q).map(m => " " + m.glyph).join(""),
-      title: marksFor(q).map(m => `${m.glyph} ${m.hint}`).join("\n\n") || null,
-      sub: MODES.map(m => m.label),
-    })),
-    rows: storeRows(a => qs.flatMap(q => MODES.map(m => idFor(q, a, m.key)))),
-  }, byId);
+function renderSyntheticQueries(ctx, host){
+  for (const [group, meta] of Object.entries(GROUP_META)){
+    const qs = ctx.QUERIES.filter(q => q.group === group);
+    if (!qs.length) continue;
+    renderMatrixPanel(host, {
+      title: meta.tag, note: meta.note, wide: true, keepEmpty: true, rowHeaders: ["Store"],
+      columnGroups: qs.map(q => ({
+        label: q.name + marksFor(q).map(m => " " + m.glyph).join(""),
+        title: marksFor(q).map(m => `${m.glyph} ${m.hint}`).join("\n\n") || null,
+        sub: MODES.map(m => m.label),
+      })),
+      rows: storeRows(ctx, a => qs.flatMap(q => MODES.map(m => ctx.idFor(q, a, m.key)))),
+    }, ctx.byId);
+  }
+}
+
+// ---- BSBM: one matrix of stores × templates, and query mixes per hour ----
+function bsbmStore(ctx, slug){ return ctx.CONFIG.stores?.[slug] || {}; }
+function sumTimeouts(s){ return Object.values(s.timeouts || {}).reduce((x, y) => x + y, 0); }
+function bsbmLabel(ctx, a){
+  const s = bsbmStore(ctx, a.slug), marks = [];
+  if (s.partial) marks.push(`partial (${s.mixes}/${s.plannedMixes} mixes)`);
+  const t = sumTimeouts(s);
+  if (t) marks.push(`${t} timeout${t > 1 ? "s" : ""}`);
+  return a.label + (marks.length ? `<span class="partial">${marks.join(" · ")}</span>` : "");
+}
+function renderBsbmQueries(ctx, host){
+  const C = ctx.CONFIG, cells = new Map();
+  for (const d of ctx.DATA){
+    if (d.group !== "load") cells.set(d.id, { median: d.mean, median_ns: d.mean_ns,
+      title: `median ${d.median} · ${d.samples} instances` });
+  }
+  for (const a of ctx.ADAPTERS){
+    for (const [name, n] of Object.entries(bsbmStore(ctx, a.slug).timeouts || {})){
+      for (const m of MODES){
+        const id = ctx.idFor({ name }, a, m.key);
+        if (!id) continue;
+        const cell = cells.get(id) || { median: "—", median_ns: Infinity };
+        cells.set(id, { ...cell, badge: `⏱${n}`,
+          title: `${cell.title ? cell.title + " · " : ""}${n} timed out (over ${C.queryTimeoutS} s)` });
+      }
+    }
+  }
+  renderMatrixPanel(host, {
+    title: "Explore mix, per template",
+    note: `Mean per template over the measured instances (BSBM's AQET; hover for the median). ⏱n: instances aborted after ${C.queryTimeoutS} s, left out of the mean. A store marked partial ran past its ${C.storeBudgetS} s budget and stopped after the mix it was in.`,
+    wide: true, keepEmpty: true, rowHeaders: ["Store"],
+    columnGroups: ctx.QUERIES.map(q => ({ label: q.name, title: null, sub: MODES.map(m => m.label) })),
+    rows: storeRows(ctx, a => ctx.QUERIES.flatMap(q => MODES.map(m => ctx.idFor(q, a, m.key))), a => bsbmLabel(ctx, a)),
+  }, cells);
+  const qmph = new Map();
+  for (const a of ctx.ADAPTERS){
+    const s = bsbmStore(ctx, a.slug);
+    if (s.meanMixNs) qmph.set(a.slug, { median: Math.round(s.qmph).toLocaleString() + " QMpH", median_ns: s.meanMixNs });
+  }
+  renderMatrixPanel(host, {
+    title: "Query mixes per hour",
+    note: "3600 s over the mean time of one measured mix (full mode; a timed-out query counts its time up to the abort, as the official driver counts it). Highest first; the multiplier is how many times longer a mix takes.",
+    rowHeaders: ["Store"], columns: ["QMpH"], sortByColumn: 0,
+    rows: storeRows(ctx, a => [a.slug], a => bsbmLabel(ctx, a)),
+  }, qmph);
 }
 
 // ---- memory ----
-const memHost = document.getElementById("memory-panels");
-renderMatrixPanel(memHost, {
-  title: "Peak memory — whole lifecycle",
-  note: "Peak RSS: kernel high-water mark (VmHWM) of each store's own process, parse/build + all queries; it includes file pages a store maps. Peak anon: the highest RssAnon sampled after the load and after every query — the memory the process itself holds. Smallest first.",
-  rowHeaders: ["Store"], columns: ["Peak RSS", "Peak anon"], sortByColumn: 1,
-  rows: storeRows(a => [a.slug, a.slug + ":anon"]),
-}, memPeak);
-
-// ---- KPIs ----
-const tiles = [
-  { label:"Stores", value:String(ADAPTERS.length), sub:"vortex-rdflib · rdflib · oxrdflib · pycottas · hdt · pyoxigraph" },
-  { label:"Engines", value:String(new Set(ADAPTERS.map(a => a.engine)).size),
-    sub:"rdflib's, plus pyoxigraph's own as the reference point" },
-  { label:"Queries", value:String(QUERIES.length), sub:"lookups · joins · features · graphs" },
-  { label:"Quads", value:(CONFIG.triples||0).toLocaleString(),
-    sub:`synthetic · ${CONFIG.graphs||1} graphs` },
-  { label:"Distinct terms", value:(CONFIG.cardinality?.terms||0).toLocaleString(),
-    sub:`${(CONFIG.cardinality?.nSubj||0).toLocaleString()} subjects · ${CONFIG.cardinality?.nPred||0} predicates` },
-];
-const host = document.getElementById("kpi-row");
-for (const t of tiles){
-  const el = document.createElement("div");
-  el.className = "kpi";
-  el.innerHTML = `<span class="label">${t.label}</span><span class="value mono">${t.value}</span><span class="sub mono">${t.sub}</span>`;
-  host.appendChild(el);
+function renderMemory(ctx, host){
+  const when = ctx.key === "bsbm" ? "after the load and after every measured mix" : "after the load and after every query";
+  renderMatrixPanel(host, {
+    title: "Peak memory — whole lifecycle",
+    note: `Peak RSS: kernel high-water mark (VmHWM) of each store's own process; it includes file pages a store maps. Peak anon: the highest RssAnon sampled ${when} — the memory the process itself holds. Smallest first.`,
+    rowHeaders: ["Store"], columns: ["Peak RSS", "Peak anon"], sortByColumn: 1,
+    rows: storeRows(ctx, a => [a.slug, a.slug + ":anon"]),
+  }, ctx.memPeak);
 }
 
-if (FAILURES.length){
+// ---- KPIs ----
+function bsbmTiles(ctx){
+  const C = ctx.CONFIG, stores = Object.values(C.stores || {});
+  const timeouts = stores.reduce((n, s) => n + sumTimeouts(s), 0);
+  const partial = stores.filter(s => s.partial).length;
+  const limit = s => s == null ? "none" : `${s} s`;
+  return [
+    { label:"Stores", value:String(ctx.ADAPTERS.length), sub:"the synthetic tab's stores, on BSBM data" },
+    { label:"Products", value:(C.products||0).toLocaleString(), sub:`${(C.triples||0).toLocaleString()} triples · official generator` },
+    { label:"Query mixes", value:`${C.warmupMixes} + ${C.mixes}`, sub:`warm-up + measured · ${(C.mix||[]).length} queries each · seed ${C.seed}` },
+    { label:"Templates", value:String(ctx.QUERIES.length), sub:ctx.QUERIES.map(q => q.name).join(" ") },
+    { label:"Timeouts", value:timeouts.toLocaleString(), sub:`per query ${limit(C.queryTimeoutS)} · ${partial} partial (budget ${limit(C.storeBudgetS)})` },
+  ];
+}
+function renderKpis(ctx, host){
+  const C = ctx.CONFIG;
+  const tiles = ctx.key === "bsbm" ? bsbmTiles(ctx) : [
+    { label:"Stores", value:String(ctx.ADAPTERS.length), sub:"vortex-rdflib · rdflib · oxrdflib · pycottas · hdt · pyoxigraph" },
+    { label:"Engines", value:String(new Set(ctx.ADAPTERS.map(a => a.engine)).size), sub:"rdflib's, plus pyoxigraph's own as the reference point" },
+    { label:"Queries", value:String(ctx.QUERIES.length), sub:"lookups · joins · features · graphs" },
+    { label:"Quads", value:(C.triples||0).toLocaleString(), sub:`synthetic · ${C.graphs||1} graphs` },
+    { label:"Distinct terms", value:(C.cardinality?.terms||0).toLocaleString(),
+      sub:`${(C.cardinality?.nSubj||0).toLocaleString()} subjects · ${C.cardinality?.nPred||0} predicates` },
+  ];
+  for (const t of tiles){
+    const el = document.createElement("div");
+    el.className = "kpi";
+    el.innerHTML = `<span class="label">${t.label}</span><span class="value mono">${t.value}</span><span class="sub mono">${t.sub}</span>`;
+    host.appendChild(el);
+  }
+}
+
+function renderFailures(ctx, host){
+  if (!ctx.FAILURES.length) return;
   const panel = document.createElement("div");
   panel.className = "panel failures";
   panel.innerHTML = `<h3>Unmeasured phases</h3>
-    <p class="note">A missing cell below is a store that could not complete the work, not a benchmark nobody ran.</p>
-    <ul>${FAILURES.map(f => `<li><span class="mono">${f.label} / ${f.phase}</span> — ${f.error}</li>`).join("")}</ul>`;
-  document.getElementById("failures-host").appendChild(panel);
+    <p class="note">A missing cell below is a store that could not complete the work, not a benchmark nobody ran.${ctx.key === "bsbm" ? " A template listed with “answer” or “row count” returned answers other than the other stores' for some instances." : ""}</p>
+    <ul>${ctx.FAILURES.map(f => `<li><span class="mono">${f.label} / ${f.phase}</span> — ${f.error}</li>`).join("")}</ul>`;
+  host.appendChild(panel);
 }
 
 // ---- query set ----
-const qsHost = document.getElementById("queryset-host");
-for (const q of QUERIES){
-  const d = document.createElement("details");
-  d.className = "query";
-  const rowsN = CONFIG.matchedRows?.[q.name];
-  d.innerHTML = `<summary><span class="qname">${q.name}</span><span class="qmeta">${q.group}${q.heavy ? " · heavy" : ""}${rowsN != null ? ` · ${Number(rowsN).toLocaleString()} rows` : ""}</span></summary>
-    <pre>${q.sparql.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</pre>`;
-  qsHost.appendChild(d);
+function renderQuerySet(ctx, host){
+  for (const q of ctx.QUERIES){
+    let meta;
+    if (ctx.key === "bsbm"){
+      const t = ctx.CONFIG.templates?.[q.name];
+      meta = `official query${q.template}.txt` + (t ? ` · ${t.instances} instances · ${t.minRows}–${t.maxRows} rows each${t.empty ? `, ${t.empty} empty` : ""}` : "");
+    } else {
+      const rowsN = ctx.CONFIG.matchedRows?.[q.name];
+      meta = `${q.group}${q.heavy ? " · heavy" : ""}${rowsN != null ? ` · ${Number(rowsN).toLocaleString()} rows` : ""}`;
+    }
+    const d = document.createElement("details");
+    d.className = "query";
+    d.innerHTML = `<summary><span class="qname">${q.name}</span><span class="qmeta">${meta}</span></summary>
+      <pre>${q.sparql.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</pre>`;
+    host.appendChild(d);
+  }
 }
 
 // ---- raw data table ----
-(function makeTable(){
-  const tbody = document.querySelector("#data-table tbody");
-  const countEl = document.getElementById("table-count");
-  const filterEl = document.getElementById("table-filter");
+function makeTable(pane, DATA){
+  const tbody = pane.querySelector("table.data tbody");
+  const countEl = pane.querySelector(".table-toolbar .count");
+  const filterEl = pane.querySelector(".table-toolbar input");
   let sortKey = "median_ns", sortDir = 1, filterText = "";
 
   function draw(){
@@ -696,7 +885,7 @@ for (const q of QUERIES){
       tbody.appendChild(tr);
     }
     countEl.textContent = rows.length + " / " + DATA.length + " rows";
-    document.querySelectorAll("#data-table th").forEach(th => {
+    pane.querySelectorAll("table.data th").forEach(th => {
       th.querySelector(".arrow")?.remove();
       if (th.dataset.key === sortKey){
         const arrow = document.createElement("span");
@@ -707,7 +896,7 @@ for (const q of QUERIES){
     });
   }
 
-  document.querySelectorAll("#data-table th").forEach(th => {
+  pane.querySelectorAll("table.data th").forEach(th => {
     const activate = () => {
       const key = th.dataset.key;
       if (key === sortKey) sortDir *= -1; else { sortKey = key; sortDir = 1; }
@@ -720,15 +909,14 @@ for (const q of QUERIES){
   });
   filterEl.addEventListener("input", () => { filterText = filterEl.value.trim().toLowerCase(); draw(); });
   draw();
-})();
+}
 
 // ---- history: speedup over rdflib, per commit ----
 // HISTORY is bench.history.build_series output, or null when the render had no
-// records; the section then stays hidden.
-(function renderHistory(){
-  if (!HISTORY || !HISTORY.points.length || !HISTORY.configurations.length) return;
-  document.getElementById("history").hidden = false;
-  document.getElementById("nav-history").hidden = false;
+// records for the dataset: this then draws nothing and returns false, and the
+// caller says so in the pane. `unit` names what the geometric mean runs over.
+function renderHistory(pane, HISTORY, unit){
+  if (!HISTORY || !HISTORY.points.length || !HISTORY.configurations.length) return false;
 
   const POINTS = HISTORY.points;
   const SERIES = HISTORY.configurations;
@@ -744,9 +932,9 @@ for (const q of QUERIES){
   const visible = new Set(SERIES.map(s => s.slug));
   let mode = "exec", active = null, lastWidth = 0, cross = null, geo = null;
 
-  const chartEl = document.getElementById("history-chart");
-  const tipEl = document.getElementById("history-tip");
-  const tableEl = document.getElementById("history-table");
+  const chartEl = pane.querySelector(".history-chart");
+  const tipEl = pane.querySelector(".history-tip");
+  const tableEl = pane.querySelector(".history-table");
 
   function svg(tag, attrs, parent){
     const node = document.createElementNS(SVG_NS, tag);
@@ -768,7 +956,7 @@ for (const q of QUERIES){
   const dayOf = p => (p.local ? p.measured : p.commit.date).slice(0, 10);
 
   // ---- controls: timing switch, one chip per configuration (the legend), table ----
-  const controls = document.getElementById("history-controls");
+  const controls = pane.querySelector(".history-controls");
   const seg = html("div", "seg", null, controls);
   seg.setAttribute("role", "group");
   seg.setAttribute("aria-label", "Timing");
@@ -800,8 +988,8 @@ for (const q of QUERIES){
     for (const [key, b] of modeButtons) b.setAttribute("aria-pressed", String(key === mode));
     for (const [slug, b] of chips) b.setAttribute("aria-pressed", String(visible.has(slug)));
     tableButton.setAttribute("aria-pressed", String(!tableEl.hidden));
-    document.getElementById("history-sub").textContent =
-      `geometric mean over ${HISTORY.queries} queries · ${MODE_LABEL[mode]}` +
+    pane.querySelector(".history-sub").textContent =
+      `geometric mean over ${HISTORY.queries} ${unit} · ${MODE_LABEL[mode]}` +
       " · higher is faster · 1× = rdflib (in-mem)";
     drawChart();
     drawTable();
@@ -977,7 +1165,82 @@ for (const q of QUERIES){
   draw();
   new ResizeObserver(() => { if (chartEl.clientWidth !== lastWidth) drawChart(); })
     .observe(chartEl);
-})();
+  return true;
+}
 
-document.getElementById("provenance").textContent = PROVENANCE;
+// ---- dataset tabs: every section switches between the datasets on its own ----
+// The history pane and the data table are the same markup in both datasets' panes: written once
+// as a <template>, cloned in place of each [data-fill] placeholder before anything queries a pane.
+function fillPanes(){
+  for (const el of document.querySelectorAll("[data-fill]"))
+    el.replaceWith(document.getElementById(el.dataset.fill).content.cloneNode(true));
+}
+fillPanes();
+
+const CONTEXTS = Object.fromEntries(DATASETS.filter(d => SETS[d.key]).map(d => [d.key, context(d.key)]));
+const RENDERERS = {
+  overview(ctx, pane){
+    renderKpis(ctx, pane.querySelector("[data-part=kpis]"));
+    renderFailures(ctx, pane.querySelector("[data-part=failures]"));
+  },
+  history(ctx, pane){
+    if (!renderHistory(pane, ctx.HISTORY, ctx.key === "bsbm" ? "templates" : "queries"))
+      pane.innerHTML = `<p class="group-desc">No history records for this dataset yet.</p>`;
+  },
+  load(ctx, pane){ renderLoad(ctx, pane.querySelector(".panel-grid")); },
+  queries(ctx, pane){
+    const host = pane.querySelector(".panel-grid");
+    if (ctx.key === "bsbm") renderBsbmQueries(ctx, host); else renderSyntheticQueries(ctx, host);
+  },
+  memory(ctx, pane){ renderMemory(ctx, pane.querySelector(".panel-grid")); },
+  queryset(ctx, pane){ renderQuerySet(ctx, pane.querySelector("[data-part=queryset]")); },
+  data(ctx, pane){ makeTable(pane, ctx.DATA); },
+};
+for (const section of document.querySelectorAll("[data-tabbed]")){
+  const name = section.dataset.tabbed;
+  const panes = new Map([...section.querySelectorAll(".ds-pane")].map(p => [p.dataset.ds, p]));
+  for (const { key, label } of DATASETS){
+    const pane = panes.get(key);
+    if (!CONTEXTS[key]){ pane.innerHTML = `<p class="group-desc">No ${label} results in this render.</p>`; continue; }
+    try { RENDERERS[name](CONTEXTS[key], pane); }
+    catch (error){
+      console.error(error);
+      pane.insertAdjacentHTML("beforeend", `<p class="group-desc">This section failed to render: ${error}</p>`);
+    }
+  }
+  const tabs = section.querySelector(".ds-tabs");
+  tabs.setAttribute("role", "tablist");
+  tabs.setAttribute("aria-label", "Dataset");
+  const buttons = new Map();
+  const select = key => {
+    for (const [k, b] of buttons) b.setAttribute("aria-selected", String(k === key));
+    for (const [k, p] of panes) p.hidden = k !== key;
+  };
+  for (const { key, label } of DATASETS){
+    const b = document.createElement("button");
+    b.type = "button";
+    b.setAttribute("role", "tab");
+    b.textContent = label;
+    if (CONTEXTS[key]) b.addEventListener("click", () => select(key));
+    else { b.disabled = true; b.title = `No ${label} results: ${SETS.notes?.[key] ?? "none were given"}`; }
+    tabs.appendChild(b);
+    buttons.set(key, b);
+  }
+  const missing = DATASETS.filter(d => !CONTEXTS[d.key]);
+  if (missing.length){
+    const note = document.createElement("span");
+    note.className = "ds-note";
+    note.textContent = missing.map(d => `${d.label}: ${SETS.notes?.[d.key] ?? "no results"}`).join(" · ");
+    tabs.after(note);
+  }
+  select(DATASETS.find(d => CONTEXTS[d.key])?.key ?? DATASETS[0].key);
+}
+if (Object.values(CONTEXTS).some(c => c.HISTORY?.points?.length)){
+  document.getElementById("history").hidden = false;
+  document.getElementById("nav-history").hidden = false;
+}
+document.getElementById("provenance").textContent = DATASETS
+  .filter(d => CONTEXTS[d.key]?.PROVENANCE)
+  .map(d => `${d.label}: ${CONTEXTS[d.key].PROVENANCE}`)
+  .join("\n");
 </script>
