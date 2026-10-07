@@ -21,6 +21,11 @@ Scale knobs (env): ``BENCH_TRIPLES`` (default 250,000), ``BENCH_PREDICATES``,
 ``BENCH_GRAPHS`` (default 8, one of them the default graph),
 ``BENCH_QUERY_ITERS``, ``BENCH_HEAVY_ITERS``, ``BENCH_LOAD_ITERS``,
 ``BENCH_QUERY_BUDGET_S``.
+
+``--dataset bsbm --bsbm-dir DIR`` runs every store over the official BSBM
+streams a ``python -m bench.bsbm.prepare`` directory holds instead, and writes
+``bench/results-bsbm.json`` (see ``bench.bsbm.dashboard``).
+
 A quick local run: ``BENCH_TRIPLES=20000 uv run python -m bench.run_bench``.
 """
 
@@ -45,7 +50,13 @@ WORKER_TIMEOUT_S = int(os.environ.get("BENCH_WORKER_TIMEOUT_S", 3600))
 
 
 def run_worker(
-    adapter: Adapter, nq_path: Path, nt_path: Path, work_dir: Path, python: str
+    adapter: Adapter,
+    nq_path: Path,
+    nt_path: Path,
+    work_dir: Path,
+    python: str,
+    extra_args: tuple[str, ...] = (),
+    extra_env: dict[str, str] | None = None,
 ) -> dict | None:
     out_file = work_dir / f"worker-{adapter.slug}.json"
     cmd = [
@@ -57,10 +68,14 @@ def run_worker(
         str(nt_path),
         str(work_dir),
         str(out_file),
+        *extra_args,
     ]
     try:
         proc = subprocess.run(
-            cmd, cwd=REPO_ROOT, env={**os.environ, **adapter.env}, timeout=WORKER_TIMEOUT_S
+            cmd,
+            cwd=REPO_ROOT,
+            env={**os.environ, **adapter.env, **(extra_env or {})},
+            timeout=WORKER_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
         print(f"[{adapter.slug}] worker timed out after {WORKER_TIMEOUT_S}s — skipping")
@@ -70,6 +85,53 @@ def run_worker(
         return None
     with open(out_file, encoding="utf-8") as f:
         return json.load(f)
+
+
+def measure_adapter(
+    adapter: Adapter,
+    nq_path: Path,
+    nt_path: Path,
+    work_dir: Path,
+    failures: list[dict],
+    *,
+    extra_args: tuple[str, ...] = (),
+    extra_env: dict[str, str] | None = None,
+) -> dict | None:
+    """Build the adapter's isolated env if it needs one, then run its worker.
+
+    Returns the worker's output, its own failures appended to ``failures`` with
+    the adapter's slug and label. Returns None after appending the ``venv`` or
+    ``worker`` failure instead: one store falling over never stops the others."""
+    try:
+        python = ensure_venv(adapter, work_dir) if adapter.venv_packages else sys.executable
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or b"").decode(errors="replace").strip().splitlines()
+        print(f"[{adapter.slug}] isolated env failed to build — skipping; others still run")
+        failures.append(
+            {
+                "slug": adapter.slug,
+                "label": adapter.label,
+                "phase": "venv",
+                "error": detail[-1] if detail else "uv failed",
+            }
+        )
+        return None
+    out = run_worker(
+        adapter, nq_path, nt_path, work_dir, python, extra_args=extra_args, extra_env=extra_env
+    )
+    if out is None:
+        failures.append(
+            {
+                "slug": adapter.slug,
+                "label": adapter.label,
+                "phase": "worker",
+                "error": "worker process failed or timed out",
+            }
+        )
+        return None
+    for f in out.get("failures", []):
+        failures.append({"slug": adapter.slug, "label": adapter.label, **f})
+    return out
 
 
 def ensure_venv(adapter: Adapter, work_dir: Path) -> str:
@@ -115,13 +177,32 @@ def version_of(package: str) -> str:
         return "?"
 
 
-def provenance(n: int, terms: int, graphs: int) -> str:
-    date = datetime.now(UTC).strftime("%Y-%m-%d")
-    py = ".".join(map(str, sys.version_info[:3]))
-    deps = " · ".join(
+def dependency_versions() -> str:
+    return " · ".join(
         f"{p} {version_of(p)}"
         for p in ("vortex-rdflib", "vortex-rdf", "rdflib", "oxrdflib", "pyoxigraph")
     )
+
+
+def adapter_entries(adapters: list[Adapter]) -> list[dict]:
+    """The stores a results file covers, and which modes each reports."""
+    return [
+        {
+            "slug": a.slug,
+            "label": a.label,
+            "engine": a.engine,
+            "quads": a.quads,
+            # A store that answers the query string itself reports only `full`.
+            "modes": ["full"] if a.engine == "native" else ["exec", "full"],
+        }
+        for a in adapters
+    ]
+
+
+def provenance(n: int, terms: int, graphs: int) -> str:
+    date = datetime.now(UTC).strftime("%Y-%m-%d")
+    py = ".".join(map(str, sys.version_info[:3]))
+    deps = dependency_versions()
     return (
         f"Measured {date} · Python {py} · {cpu_model()}, {os.cpu_count()} threads · "
         f"{n:,} quads in {graphs} graphs, {terms:,} distinct terms · {deps} · "
@@ -180,11 +261,27 @@ def memory_entry(adapter: Adapter, out: dict) -> dict:
     }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", default="bench/results.json", help="output JSON path")
+    parser.add_argument(
+        "--dataset",
+        choices=("synthetic", "bsbm"),
+        default="synthetic",
+        help="the generated set (default), or official BSBM streams (--bsbm-dir)",
+    )
+    parser.add_argument("--bsbm-dir", type=Path, help="a directory bench.bsbm.prepare wrote")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="output JSON (default: bench/results.json or bench/results-bsbm.json)",
+    )
     parser.add_argument("--adapters", default=None, help="comma-separated slugs (default: all)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.dataset == "bsbm" and args.bsbm_dir is None:
+        parser.error("--dataset bsbm needs --bsbm-dir (see python -m bench.bsbm.prepare)")
+    out_arg = args.out or (
+        "bench/results-bsbm.json" if args.dataset == "bsbm" else "bench/results.json"
+    )
 
     adapters = ADAPTERS
     if args.adapters:
@@ -209,6 +306,11 @@ def main() -> int:
             f"command(s) not on PATH: {', '.join(no_cli)} — the HDT builder comes from "
             "`cargo install hdt --features cli`"
         )
+
+    if args.dataset == "bsbm":
+        from .bsbm.dashboard import run as run_bsbm
+
+        return run_bsbm(adapters, args.bsbm_dir, Path(out_arg))
 
     cfg = config_from_env()
     m = moduli(cfg)
@@ -237,35 +339,11 @@ def main() -> int:
 
     for adapter in adapters:
         print(f"\n=== {adapter.label} ({adapter.slug}, engine: {adapter.engine}) ===")
-        try:
-            python = ensure_venv(adapter, work_dir) if adapter.venv_packages else sys.executable
-        except subprocess.CalledProcessError as error:
-            detail = (error.stderr or b"").decode(errors="replace").strip().splitlines()
-            print(f"[{adapter.slug}] isolated env failed to build — skipping; others still run")
-            failures.append(
-                {
-                    "slug": adapter.slug,
-                    "label": adapter.label,
-                    "phase": "venv",
-                    "error": detail[-1] if detail else "uv failed",
-                }
-            )
-            continue
-        out = run_worker(adapter, nq_path, nt_path, work_dir, python)
+        out = measure_adapter(adapter, nq_path, nt_path, work_dir, failures)
         if out is None:
-            failures.append(
-                {
-                    "slug": adapter.slug,
-                    "label": adapter.label,
-                    "phase": "worker",
-                    "error": "worker process failed or timed out",
-                }
-            )
             continue
         results.extend(out["rows"])
         memory.append(memory_entry(adapter, out))
-        for f in out.get("failures", []):
-            failures.append({"slug": adapter.slug, "label": adapter.label, **f})
         if out.get("skipped"):
             skipped[adapter.slug] = out["skipped"]
         for name, n in out.get("matched", {}).items():
@@ -294,18 +372,7 @@ def main() -> int:
         # since all of them run the same library code (bench.history).
         "rowCounts": counted,
         "skipped": skipped,
-        "adapters": [
-            {
-                "slug": a.slug,
-                "label": a.label,
-                "engine": a.engine,
-                "quads": a.quads,
-                # Which measurement modes this row has: a store that answers
-                # the query string itself reports only the end-to-end one.
-                "modes": ["full"] if a.engine == "native" else ["exec", "full"],
-            }
-            for a in adapters
-        ],
+        "adapters": adapter_entries(adapters),
         "queries": [
             {
                 "name": q.name,
@@ -321,7 +388,7 @@ def main() -> int:
         "heavyIters": int(os.environ.get("BENCH_HEAVY_ITERS", 3)),
     }
 
-    out_path = Path(args.out)
+    out_path = Path(out_arg)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "provenance": provenance(cfg.n, m.terms, m.n_graph),

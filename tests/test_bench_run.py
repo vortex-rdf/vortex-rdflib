@@ -7,6 +7,10 @@ question — so it has to name a dissenter, and has to keep naming one when the
 dissenter is this package's own store.
 """
 
+import subprocess
+from dataclasses import replace
+
+from bench import run_bench
 from bench.adapters import Adapter
 from bench.run_bench import memory_entry, reconcile
 from rdflib import Graph
@@ -106,3 +110,45 @@ def test_a_memory_entry_carries_peak_anon():
 def test_an_older_worker_without_anon_reads_as_none():
     entry = memory_entry(adapters("vortex")[0], {"peakRssMb": 300})
     assert entry["peakAnonMb"] is None and entry["storeMb"] is None
+
+
+def test_a_store_whose_env_fails_to_build_is_a_venv_failure(monkeypatch, tmp_path):
+    adapter = replace(adapters("pycottas")[0], venv_packages=("x",))
+
+    def broken(*_args):
+        raise subprocess.CalledProcessError(1, ["uv"], stderr=b"first\nno such package")
+
+    monkeypatch.setattr("bench.run_bench.ensure_venv", broken)
+    failures: list[dict] = []
+    out = run_bench.measure_adapter(
+        adapter, tmp_path / "a.nq", tmp_path / "a.nt", tmp_path, failures
+    )
+    assert out is None
+    assert failures == [
+        {"slug": "pycottas", "label": "label pycottas", "phase": "venv", "error": "no such package"}
+    ]
+
+
+def test_a_worker_that_fails_is_a_worker_failure_and_its_own_failures_are_labelled(
+    monkeypatch, tmp_path
+):
+    adapter = adapters("vortex")[0]
+    nq, nt = tmp_path / "a.nq", tmp_path / "a.nt"
+    failures: list[dict] = []
+
+    monkeypatch.setattr("bench.run_bench.run_worker", lambda *args, **kwargs: None)
+    assert run_bench.measure_adapter(adapter, nq, nt, tmp_path, failures) is None
+    assert failures == [
+        {
+            "slug": "vortex",
+            "label": "label vortex",
+            "phase": "worker",
+            "error": "worker process failed or timed out",
+        }
+    ]
+
+    answered = {"rows": [], "failures": [{"phase": "Q1", "error": "boom"}]}
+    monkeypatch.setattr("bench.run_bench.run_worker", lambda *args, **kwargs: answered)
+    failures.clear()
+    assert run_bench.measure_adapter(adapter, nq, nt, tmp_path, failures) is answered
+    assert failures == [{"slug": "vortex", "label": "label vortex", "phase": "Q1", "error": "boom"}]

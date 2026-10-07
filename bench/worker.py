@@ -50,6 +50,10 @@ graphs, the ``.nt`` for one without.
 A query that names a graph is skipped for a store that does not serve them,
 and reported as ``skipped`` rather than a failure: nobody could have measured
 it.
+
+With ``--bsbm DIR`` (``run_bench --dataset bsbm``), the worker builds the store
+from DIR's BSBM ``dataset.nt`` and runs DIR's streams instead of the synthetic
+query set: see ``main_bsbm``.
 """
 
 import gc
@@ -276,9 +280,65 @@ def load_store(
     return graph, row, baseline_mb, loaded_mb
 
 
+def main_bsbm(
+    adapter: Adapter, nq_path: str, nt_path: str, work_dir: str, out_path: str, bsbm_dir: str
+) -> int:
+    """BSBM mode: build the store from the prepared dataset, run the warm-up
+    stream, then every measured instance once (``bench.bsbm.execute``), with
+    ``BSBM_QUERY_TIMEOUT_S`` (default 5 s) and ``BSBM_STORE_BUDGET_S`` (default
+    300 s); 0 turns either off."""
+    from .bsbm import report
+    from .bsbm.execute import (
+        DEFAULT_QUERY_TIMEOUT_S,
+        DEFAULT_STORE_BUDGET_S,
+        QUERY_TIMEOUT_ENV,
+        STORE_BUDGET_ENV,
+        execute_stream,
+        limit_from_env,
+    )
+    from .bsbm.streams import load_streams
+
+    warmup, measured = load_streams(bsbm_dir)
+    native = adapter.engine == "native"
+    graph, load_row, baseline_mb, loaded_mb = load_store(adapter, nq_path, nt_path, work_dir)
+    anon = [mb for mb in (rss_anon_mb(),) if mb is not None]
+    run = execute_stream(
+        graph,
+        warmup,
+        measured,
+        native=native,
+        query_kwargs=adapter.query_kwargs,
+        query_timeout_s=limit_from_env(QUERY_TIMEOUT_ENV, DEFAULT_QUERY_TIMEOUT_S),
+        store_budget_s=limit_from_env(STORE_BUDGET_ENV, DEFAULT_STORE_BUDGET_S),
+    )
+    store = report.store_report(adapter.slug, run, native)
+    anon += [mb for mb in run["rss_anon_per_mix_mb"] if mb is not None]
+    rows = [load_row, *store.pop("rows")]
+    out = {
+        "rows": rows,
+        "bsbm": store,
+        "failures": report.error_failures(store),
+        "baselineMb": baseline_mb,
+        "loadedMb": loaded_mb,
+        "peakRssMb": peak_rss_mb(),
+        "peakAnonMb": max(anon) if anon else None,
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out, f)
+    qmph = f"{store['qmph']:,.0f}" if store["qmph"] else "n/a"
+    print(
+        f"[{adapter.slug}] BSBM: {store['mixes']}/{store['plannedMixes']} mixes, QMpH {qmph}, "
+        f"{sum(store['timeouts'].values())} timeouts" + (" — partial" if store["partial"] else ""),
+        flush=True,
+    )
+    return 0
+
+
 def main() -> int:
     slug, nq_path, nt_path, work_dir, out_path = sys.argv[1:6]
     adapter = BY_SLUG[slug]
+    if sys.argv[6:7] == ["--bsbm"]:
+        return main_bsbm(adapter, nq_path, nt_path, work_dir, out_path, sys.argv[7])
     cfg = config_from_env()
     queries = build_queries(cfg, moduli(cfg))
 
