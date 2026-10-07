@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
-from bench.bsbm import cli, compare, execute, run_stream
+from bench.bsbm import cli, compare, execute, record_native, replay_native, run_stream, streams
 from tests.bsbm_tiny import tiny_streams, write_tiny_bsbm
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -407,3 +407,87 @@ def test_b_flat_is_none_with_fewer_than_20_readings(tmp_path):
     b = _run_file(tmp_path / "b.json", {0: 1}, {0: 1}, {0: "d"}, [1, 2])
     out = compare.compare(compare.load([a]), compare.load([b]))
     assert out["b_flat"] is None
+
+
+def test_values_round_trip_through_the_trace_encoding():
+    from vortex_rdf import U32Column
+
+    for value in (None, 3, "x", (None, "<p>", None, None), range(2, 9), [1, (2, 3)]):
+        assert replay_native.decode_value(record_native.encode_value(value)) == value
+    codes = record_native.encode_value(U32Column([1, 4, 9]))
+    assert codes == {"codes": [1, 4, 9]}
+    assert list(memoryview(replay_native.decode_value(codes)).cast("I")) == [1, 4, 9]
+
+
+def test_a_recorded_stream_replays_and_is_timed(tmp_path, tiny_store):
+    warmup, measured = tiny_streams(1, 2)
+    trace = tmp_path / "trace.jsonl"
+    calls = record_native.record(str(tiny_store), False, warmup, measured, str(trace))
+    assert calls > 0
+    lines = trace.read_text().splitlines()
+    assert json.loads(lines[0])["trace"] == 1 and len(lines) == 1 + len(measured)
+    methods = {c[1] for line in lines[1:] for c in json.loads(line)["calls"]}
+    assert "match_codes" in methods or "count_quads" in methods
+    out = replay_native.replay(str(tiny_store), str(trace), False, skip=set(), passes=1)
+    assert sum(m["calls"] for m in out["methods"].values()) == calls
+    assert set(out["templates"]) == set(streams.EXPLORE_MIX)
+
+
+def test_skipped_methods_are_not_replayed(tmp_path, tiny_store):
+    warmup, measured = tiny_streams(1, 2)
+    trace = tmp_path / "trace.jsonl"
+    record_native.record(str(tiny_store), False, warmup, measured, str(trace))
+    lines = trace.read_text().splitlines()
+    assert "decode_many" in {c[1] for line in lines[1:] for c in json.loads(line)["calls"]}
+    out = replay_native.replay(str(tiny_store), str(trace), False, skip={"decode_many"}, passes=1)
+    assert "decode_many" not in out["methods"]
+
+
+def test_a_call_the_installed_api_rejects_is_counted_not_fatal(tmp_path, tiny_store):
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        json.dumps({"trace": 1, "store": str(tiny_store), "in_memory": False, "vortex_rdf": "?"})
+        + "\n"
+        + json.dumps({"i": 0, "q": 1, "calls": [["store", "count_quads", [], {"bogus": 1}, 0]]})
+        + "\n"
+    )
+    out = replay_native.replay(str(tiny_store), str(trace), False, skip=set(), passes=1)
+    assert out["methods"]["count_quads"]["errors"] == 1
+
+
+def test_the_int_positions_of_a_keep_survive_the_json_trace():
+    call = {"keep": {2: (1, 5), 3: range(1, 9)}, "limit": 3}
+    wire = json.loads(json.dumps(record_native.encode_value(call)))
+    assert wire["keep"] == {"2": {"tuple": [1, 5]}, "3": {"range": [1, 9]}}
+    assert replay_native.decode_value(wire) == call
+
+
+@pytest.mark.parametrize("in_memory", [False, True])
+def test_a_recorded_stream_replays_without_a_rejected_call(tmp_path, tiny_store, in_memory):
+    warmup, measured = tiny_streams(1, 2)
+    trace = tmp_path / "trace.jsonl"
+    record_native.record(str(tiny_store), in_memory, warmup, measured, str(trace))
+    lines = trace.read_text().splitlines()
+    assert json.loads(lines[0])["in_memory"] is in_memory
+    calls = [c for line in lines[1:] for c in json.loads(line)["calls"]]
+    assert any(c[3].get("keep") for c in calls), "no keep-narrowed match was recorded"
+    out = replay_native.replay(str(tiny_store), str(trace), in_memory, skip=set(), passes=1)
+    assert all(m["errors"] == 0 for m in out["methods"].values()), out["methods"]
+
+
+def test_the_command_lines_record_then_replay(tmp_path, tiny_store, capsys):
+    warmup, measured = tiny_streams(1, 2)
+    (tmp_path / "w.json").write_text(json.dumps(warmup))
+    (tmp_path / "m.json").write_text(json.dumps(measured))
+    trace, report = tmp_path / "trace.jsonl", tmp_path / "replay.json"
+    argv = [str(tiny_store), "--file", str(tmp_path / "w.json"), str(tmp_path / "m.json")]
+    assert record_native.main([*argv, str(trace)]) == 0
+    assert f"over {len(measured)} queries" in capsys.readouterr().err
+    assert replay_native.main([str(tiny_store), str(trace), "--file", "--json", str(report)]) == 0
+    printed = capsys.readouterr().out
+    assert "skipped: filter_codes" in printed and "Q12" in printed
+    out = json.loads(report.read_text())
+    assert "filter_codes" not in out["methods"]
+    assert set(out["templates"]) == {str(q) for q in streams.EXPLORE_MIX}
+    with pytest.raises(SystemExit):  # one residency is required
+        replay_native.main([str(tiny_store), str(trace)])
