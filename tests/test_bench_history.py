@@ -58,7 +58,11 @@ def test_a_bsbm_record_keeps_template_medians_and_its_dataset():
         bsbm_results({"rdflib_memory": AGREED, "vortex_dict_mem": AGREED}), COMMIT, "ci"
     )
     assert record["medians"]["vortex_dict_mem"]["exec"] == {"Q1": 10.0, "Q2": 10.0}
-    assert record["dataset"]["name"] == "bsbm" and record["dataset"]["products"] == 10000
+    assert (
+        record["dataset"]["name"] == "bsbm"
+        and record["dataset"]["products"] == 10000
+        and "onlyQuery" in record["dataset"]
+    )
     assert record["dropped"] == {}
 
 
@@ -112,3 +116,79 @@ def test_record_refuses_results_of_the_other_dataset(tmp_path):
             ]
         )
     assert stop.value.code == 2
+
+
+def test_a_configuration_timeout_when_rdflib_also_times_out_drops_the_template():
+    """A vortex timeout (None) drops its template even when rdflib also timed out."""
+    mine = {**AGREED, "1": None}  # Q2, instance 1 times out
+    rdflib = {**AGREED, "1": None}  # rdflib also times out on instance 1
+    results = bsbm_results({"rdflib_memory": rdflib, "vortex_dict_mem": mine})
+    assert history.make_record(results, COMMIT, "ci")["dropped"] == {"vortex_dict_mem": ["Q2"]}
+
+
+def test_a_configuration_timeout_when_rdflib_never_reached_drops_the_template():
+    """A vortex timeout (None) drops its template even when rdflib never reached that instance."""
+    mine = {**AGREED, "1": None}  # Q2, instance 1 times out
+    rdflib = {"0": [3, "a"], "2": [0, "c"], "3": [2, "d"]}  # rdflib never reached instance 1
+    results = bsbm_results({"rdflib_memory": rdflib, "vortex_dict_mem": mine})
+    assert history.make_record(results, COMMIT, "ci")["dropped"] == {"vortex_dict_mem": ["Q2"]}
+
+
+def test_a_configuration_with_answers_check_failure_is_not_dropped():
+    """A configuration's answers matching rdflib is not dropped for answers-check failures."""
+    results = bsbm_results(
+        {"rdflib_memory": AGREED, "vortex_dict_mem": AGREED},
+        failures=[
+            {
+                "slug": "vortex_dict_mem",
+                "phase": "Q2",
+                "check": "answers",
+                "error": "outvoted",
+            }
+        ],
+    )
+    assert history.make_record(results, COMMIT, "ci")["dropped"] == {}
+
+
+def test_record_without_dataset_on_synthetic_results(tmp_path, monkeypatch):
+    """A synthetic results file (no dataset key) works without --dataset."""
+    results = {
+        "results": [
+            row("Q1", "rdflib_memory", "exec", 100.0),
+            row("Q1", "rdflib_memory", "full", 200.0),
+        ],
+        "config": {
+            "triples": 1000,
+            "graphs": 1,
+            "cardinality": None,
+            "rowCounts": {},
+            "adapters": [{"slug": "rdflib_memory", "label": "rdflib"}],
+        },
+        "failures": [],
+    }
+
+    path = tmp_path / "results.json"
+    path.write_text(json.dumps(results))
+    out = tmp_path / "out"
+
+    monkeypatch.setattr("bench.history.commit_info", lambda *a, **kw: COMMIT)
+    exit_code = history.main(
+        [
+            "record",
+            str(path),
+            "--source",
+            "local",
+            "--commit",
+            "HEAD",
+            "--out",
+            str(out),
+        ]
+    )
+
+    assert exit_code == 0
+    records = list(out.glob("*.json"))
+    assert records
+    record = json.loads(records[0].read_text())
+    assert "triples" in record["dataset"]
+    assert "graphs" in record["dataset"]
+    assert "cardinality" in record["dataset"]

@@ -121,15 +121,17 @@ def bsbm_dataset(config: dict) -> dict:
         "seed": config["seed"],
         "warmupMixes": config["warmupMixes"],
         "mixes": config["mixes"],
+        "onlyQuery": config.get("onlyQuery"),
         "tools": config["tools"]["commit"],
     }
 
 
 def bsbm_dropped(config: dict, failures: list[dict]) -> dict[str, list[str]]:
     """Per configuration, the BSBM templates its point leaves out, rdflib being
-    the oracle: an instance answered differently from rdflib's answer, timed out
-    or failed (on either side), or a template that failed outright. Instances
-    rdflib never reached (its budget ran out) are not compared."""
+    the oracle: an instance answered differently from rdflib's answer, a
+    configuration's own timeout, or failed (on either side), or a template that
+    failed outright. Instances rdflib never reached (its budget ran out) are not
+    compared for answer differences."""
     answers = config.get("answers", {})
     reference = answers.get(REFERENCE, {})
     templates = config.get("instanceTemplates", [])
@@ -137,7 +139,7 @@ def bsbm_dropped(config: dict, failures: list[dict]) -> dict[str, list[str]]:
     dropped: dict[str, set[str]] = {}
     for slug in CONFIGURATIONS:
         for i, answer in answers.get(slug, {}).items():
-            if i in reference and answer != reference[i]:
+            if answer is None or (i in reference and answer != reference[i]):
                 dropped.setdefault(slug, set()).add(f"Q{templates[int(i)]}")
     for failure in failures:
         slug, phase = failure.get("slug"), failure.get("phase")
