@@ -187,6 +187,7 @@ def prepare(
     streams_ready = (out / "warmup.json").is_file() and (out / "measured.json").is_file()
     if (
         current is not None
+        and current.get("schema") == SCHEMA
         and current.get("params") == params
         and streams_ready
         and _dataset_ready(out, current)
@@ -212,6 +213,9 @@ def prepare(
     if dataset is None:
         (out / "meta.json").unlink(missing_ok=True)  # the old dataset is about to be replaced
         print(f"generating {products:,} products (official generator) -> {out}", file=sys.stderr)
+        for link in (out / "dataset.nt", out / "td_data"):
+            if link.is_symlink():  # a --from run left links into another directory
+                link.unlink()
         reported = tools.generate(tools_dir, products, out)
         dataset = {
             "path": "dataset.nt",
