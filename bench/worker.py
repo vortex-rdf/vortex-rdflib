@@ -62,6 +62,7 @@ from time import perf_counter_ns
 
 from .adapters import BY_SLUG
 from .dataset import config_from_env, moduli
+from .procmem import peak_rss_mb, rss_anon_mb, rss_mb  # noqa: F401 — re-exported
 from .queries import Query, build_queries
 
 QUERY_ITERS = int(os.environ.get("BENCH_QUERY_ITERS", 10))
@@ -73,26 +74,6 @@ LOAD_ITERS = int(os.environ.get("BENCH_LOAD_ITERS", 3))
 #: docstring). `full` keeps the plain slug, so the ids it has always written
 #: are unchanged and the load row needs no mode at all.
 MODES = ("exec", "full")
-
-
-def _status_mb(key: str) -> int | None:
-    """A memory figure from /proc/self/status (Linux; None elsewhere)."""
-    try:
-        with open("/proc/self/status", encoding="ascii") as f:
-            for line in f:
-                if line.startswith(key + ":"):
-                    return round(int(line.split()[1]) / 1024)
-    except OSError:
-        pass
-    return None
-
-
-def rss_mb() -> int | None:
-    return _status_mb("VmRSS")
-
-
-def peak_rss_mb() -> int | None:
-    return _status_mb("VmHWM")
 
 
 def fmt_ns(ns: float) -> str:
