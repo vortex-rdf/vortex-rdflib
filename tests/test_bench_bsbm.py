@@ -4,6 +4,7 @@ stores that sleep."""
 
 import argparse
 import json
+import math
 import signal
 import subprocess
 import sys
@@ -11,7 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
-from bench.bsbm import cli, execute, run_stream
+from bench.bsbm import cli, compare, execute, run_stream
 from tests.bsbm_tiny import tiny_streams, write_tiny_bsbm
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -262,3 +263,109 @@ def test_a_native_ask_answer_is_one_boolean_row(answer):
     store = AnswerStore(lambda: AskAnswer(answer))
     rows, prep_ns, _exec_ns = execute.run_instance(store, "ASK {}", native=True)
     assert len(rows) == 1 and rows[0] is answer and prep_ns is None
+
+
+def _run_file(
+    path: Path,
+    times_ms: dict[int, float],
+    q_of: dict[int, int],
+    digest: dict[int, str],
+    rss: list[int],
+) -> str:
+    results = [
+        {
+            "q": q_of[i],
+            "i": i,
+            "mix": i // 2,
+            "prep_ns": 0,
+            "exec_ns": int(ms * 1e6),
+            "rows": 1,
+            "digest": digest[i],
+        }
+        for i, ms in times_ms.items()
+    ]
+    path.write_text(
+        json.dumps(
+            {
+                "vortex_rdflib": "x",
+                "vortex_rdf": "y",
+                "peak_anon_mb": max(rss),
+                "rss_anon_per_mix_mb": rss,
+                "results": results,
+            }
+        )
+    )
+    return str(path)
+
+
+def test_ratios_are_paired_by_instance(tmp_path):
+    q_of, same = {0: 1, 1: 1, 2: 2, 3: 2}, {i: "d" for i in range(4)}
+    a = _run_file(tmp_path / "a.json", {0: 10, 1: 10, 2: 4, 3: 4}, q_of, same, [100, 100])
+    b = _run_file(tmp_path / "b.json", {0: 40, 1: 20, 2: 4, 3: 2}, q_of, same, [200, 205])
+    out = compare.compare(compare.load([a]), compare.load([b]))
+    t1, t2 = out["templates"][1], out["templates"][2]
+    assert t1["ratio_of_means"] == pytest.approx(3.0) and t1["geo"] == pytest.approx(math.sqrt(8))
+    assert t1["tail3"] == 1 and t2["median_ratio"] == pytest.approx(0.75)
+    assert out["answers_identical"] == 4 and out["mismatches"] == []
+    assert out["a_peak_anon_mb"] == 100 and out["b_peak_anon_mb"] == 205
+
+
+def test_rounds_keep_the_best_time_per_instance(tmp_path):
+    a1 = _run_file(tmp_path / "a1.json", {0: 30}, {0: 1}, {0: "d"}, [1])
+    a2 = _run_file(tmp_path / "a2.json", {0: 10}, {0: 1}, {0: "d"}, [1])
+    b = _run_file(tmp_path / "b.json", {0: 20}, {0: 1}, {0: "d"}, [1])
+    assert compare.compare(compare.load([a1, a2]), compare.load([b]))["templates"][1][
+        "ratio_of_means"
+    ] == pytest.approx(2.0)
+
+
+def test_a_different_answer_or_an_error_is_a_mismatch(tmp_path):
+    a = _run_file(tmp_path / "a.json", {0: 1, 1: 1}, {0: 1, 1: 1}, {0: "x", 1: "y"}, [1])
+    b = _run_file(tmp_path / "b.json", {0: 1, 1: 1}, {0: 1, 1: 1}, {0: "x", 1: "z"}, [1])
+    data = json.loads(Path(b).read_text())
+    data["results"][0] = {"q": 1, "i": 0, "mix": 0, "error": "SPARQLError: boom"}
+    Path(b).write_text(json.dumps(data))
+    assert compare.compare(compare.load([a]), compare.load([b]))["mismatches"] == [
+        0,
+        1,
+    ]
+
+
+def test_a_timeout_is_neither_paired_nor_a_mismatch(tmp_path):
+    a = _run_file(tmp_path / "a.json", {0: 10, 1: 10}, {0: 1, 1: 1}, {0: "d", 1: "d"}, [1])
+    b = _run_file(tmp_path / "b.json", {0: 20, 1: 20}, {0: 1, 1: 1}, {0: "d", 1: "d"}, [1])
+    data = json.loads(Path(b).read_text())
+    data["results"][1] = {
+        "q": 1,
+        "i": 1,
+        "mix": 0,
+        "timeout": True,
+        "elapsed_ns": 5_000_000_000,
+    }
+    Path(b).write_text(json.dumps(data))
+    out = compare.compare(compare.load([a]), compare.load([b]))
+    assert out["timeouts"] == [1] and out["mismatches"] == []
+    assert out["answers_total"] == 1 and out["templates"][1]["n"] == 1
+
+
+def test_instances_one_side_never_reached_are_unpaired(tmp_path):
+    a = _run_file(tmp_path / "a.json", {0: 10, 1: 10}, {0: 1, 1: 1}, {0: "d", 1: "d"}, [1])
+    b = _run_file(tmp_path / "b.json", {0: 20}, {0: 1}, {0: "d"}, [1])
+    out = compare.compare(compare.load([a]), compare.load([b]))
+    assert out["unpaired"] == [1] and out["mismatches"] == [] and out["answers_total"] == 1
+
+
+def test_flatness_compares_the_first_and_last_ten_mixes(tmp_path):
+    flat = _run_file(tmp_path / "f.json", {0: 1}, {0: 1}, {0: "d"}, [100] * 10 + [104] * 10)
+    grows = _run_file(tmp_path / "g.json", {0: 1}, {0: 1}, {0: "d"}, [100] * 10 + [130] * 10)
+    a = compare.load([flat])
+    assert compare.compare(a, compare.load([flat]))["b_flat"] is True
+    assert compare.compare(a, compare.load([grows]))["b_flat"] is False
+
+
+def test_main_prints_and_writes_json(tmp_path, capsys):
+    a = _run_file(tmp_path / "a.json", {0: 10}, {0: 1}, {0: "d"}, [1])
+    b = _run_file(tmp_path / "b.json", {0: 5}, {0: 1}, {0: "d"}, [1])
+    assert compare.main([a, b, "--json", str(tmp_path / "c.json")]) == 0
+    assert "Q1" in capsys.readouterr().out
+    assert json.loads((tmp_path / "c.json").read_text())["templates"]["1"]["ratio_of_means"] == 0.5
