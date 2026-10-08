@@ -268,12 +268,13 @@ def test_the_worker_runs_every_measured_instance_once(tmp_path):
 
 
 def test_run_bench_bsbm_reconciles_the_stores_answers(tmp_path, monkeypatch):
-    # dashboard.run's work dir is a mkdtemp it never removes: keep it under tmp_path
+    # dashboard.run's work dir is a mkdtemp: under tmp_path, to see that the run removes it
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     prepared = write_prepared(tmp_path / "bsbm", warmup_mixes=1, mixes=1)
     out = tmp_path / "results-bsbm.json"
     args = ["--dataset", "bsbm", "--bsbm-dir", str(prepared), "--out", str(out)]
     assert run_bench.main([*args, "--adapters", "vortex_dict_mem,rdflib_memory"]) == 0
+    assert list(tmp_path.glob("vortex-rdflib-bsbm-*")) == []
     payload = json.loads(out.read_text())
     config = payload["config"]
     assert config["dataset"] == "bsbm" and config["products"] == 6
@@ -287,7 +288,7 @@ def test_run_bench_bsbm_reconciles_the_stores_answers(tmp_path, monkeypatch):
 
 def test_pyoxigraph_agrees_on_the_row_counts(tmp_path, monkeypatch):
     pytest.importorskip("pyoxigraph")
-    # dashboard.run's work dir is a mkdtemp it never removes: keep it under tmp_path
+    # dashboard.run's work dir is a mkdtemp: under tmp_path, should a failed run leave it
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     prepared = write_prepared(tmp_path / "bsbm", warmup_mixes=0, mixes=1)
     out = tmp_path / "results-bsbm.json"

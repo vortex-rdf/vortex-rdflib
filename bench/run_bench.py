@@ -20,7 +20,10 @@ Scale knobs (env): ``BENCH_TRIPLES`` (default 250,000), ``BENCH_PREDICATES``,
 ``BENCH_SUBJ_RATIO``, ``BENCH_OBJ_RATIO``, ``BENCH_LITERAL_FRAC``,
 ``BENCH_GRAPHS`` (default 8, one of them the default graph),
 ``BENCH_QUERY_ITERS``, ``BENCH_HEAVY_ITERS``, ``BENCH_LOAD_ITERS``,
-``BENCH_QUERY_BUDGET_S``.
+``BENCH_QUERY_BUDGET_S``. ``BENCH_FRESH_CONSTANTS=1`` asks a query with a
+FILTER constant a new constant in every sample (see ``worker.py``); the
+results say so (``config.freshConstants`` and their provenance), and their
+history record is another dataset, never plotted on the repeated-text line.
 
 ``--dataset bsbm --bsbm-dir DIR`` runs every store over the official BSBM
 streams a ``python -m bench.bsbm.prepare`` directory holds instead, and writes
@@ -44,6 +47,7 @@ from shutil import which
 from .adapters import ADAPTERS, Adapter
 from .dataset import config_from_env, moduli, write_nquads, write_ntriples
 from .queries import build_queries
+from .worker import FRESH_CONSTANTS_ENV
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKER_TIMEOUT_S = int(os.environ.get("BENCH_WORKER_TIMEOUT_S", 3600))
@@ -199,13 +203,14 @@ def adapter_entries(adapters: list[Adapter]) -> list[dict]:
     ]
 
 
-def provenance(n: int, terms: int, graphs: int) -> str:
+def provenance(n: int, terms: int, graphs: int, fresh: bool = False) -> str:
     date = datetime.now(UTC).strftime("%Y-%m-%d")
     py = ".".join(map(str, sys.version_info[:3]))
     deps = dependency_versions()
+    sampling = " · fresh constants" if fresh else ""
     return (
         f"Measured {date} · Python {py} · {cpu_model()}, {os.cpu_count()} threads · "
-        f"{n:,} quads in {graphs} graphs, {terms:,} distinct terms · {deps} · "
+        f"{n:,} quads in {graphs} graphs, {terms:,} distinct terms{sampling} · {deps} · "
         f"wall-clock perf_counter · one adapter per process, isolated"
     )
 
@@ -277,8 +282,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--adapters", default=None, help="comma-separated slugs (default: all)")
     args = parser.parse_args(argv)
+    if args.dataset != "bsbm" and args.bsbm_dir is not None:
+        parser.error("--bsbm-dir needs --dataset bsbm")
     if args.dataset == "bsbm" and args.bsbm_dir is None:
         parser.error("--dataset bsbm needs --bsbm-dir (see python -m bench.bsbm.prepare)")
+    if args.dataset == "bsbm" and not (args.bsbm_dir / "meta.json").is_file():
+        parser.error(
+            f"{args.bsbm_dir} holds no meta.json: "
+            "prepare it first with python -m bench.bsbm.prepare"
+        )
     out_arg = args.out or (
         "bench/results-bsbm.json" if args.dataset == "bsbm" else "bench/results.json"
     )
@@ -387,11 +399,15 @@ def main(argv: list[str] | None = None) -> int:
         "queryIters": int(os.environ.get("BENCH_QUERY_ITERS", 10)),
         "heavyIters": int(os.environ.get("BENCH_HEAVY_ITERS", 3)),
     }
+    # The workers inherit this environment, so it says how they sampled.
+    fresh = os.environ.get(FRESH_CONSTANTS_ENV) == "1"
+    if fresh:
+        config["freshConstants"] = True
 
     out_path = Path(out_arg)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "provenance": provenance(cfg.n, m.terms, m.n_graph),
+        "provenance": provenance(cfg.n, m.terms, m.n_graph, fresh),
         "results": results,
         "memory": memory,
         "config": config,

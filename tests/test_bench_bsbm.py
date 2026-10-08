@@ -138,6 +138,31 @@ def test_a_zero_limit_on_the_command_line_is_no_limit(tmp_path, tiny_store):
     assert out["query_timeout_s"] is None and out["store_budget_s"] is None
 
 
+@pytest.mark.parametrize("value", ["-1", "inf", "nan"])
+def test_a_negative_or_infinite_limit_on_the_command_line_is_no_limit(tmp_path, tiny_store, value):
+    warmup, measured = tiny_streams(1, 2)
+    (tmp_path / "w.json").write_text(json.dumps(warmup))
+    (tmp_path / "m.json").write_text(json.dumps(measured))
+    code = run_stream.main(
+        [
+            str(tiny_store),
+            "--file",
+            str(tmp_path / "w.json"),
+            str(tmp_path / "m.json"),
+            str(tmp_path / "run.json"),
+            "--query-timeout",
+            value,
+            "--store-budget",
+            value,
+        ]
+    )
+    assert code == 0
+    out = json.loads((tmp_path / "run.json").read_text())
+    assert out["query_timeout_s"] is None and out["store_budget_s"] is None
+    assert [r for r in out["results"] if "error" in r or r.get("timeout")] == []
+    assert out["partial"] is False and out["mixes_done"] == out["mixes_planned"] == 2
+
+
 def test_the_shared_cli_helpers_need_a_residency_and_read_both_streams(tmp_path):
     parser = argparse.ArgumentParser()
     cli.add_residency(parser)
@@ -189,9 +214,104 @@ def test_a_warmup_query_over_the_timeout_is_counted():
     assert run["warmup_timeouts"] == 1 and run["results"][0]["rows"] == 1
 
 
-def test_over_budget_a_store_finishes_its_mix_and_stops():
+class InterruptedStore:
+    """``SleepyStore`` turning the interrupt into an error of its own, as DuckDB does under
+    pycottas: it runs Python's signal handlers in its interrupt checks, catches what they raise,
+    and raises ``RuntimeError: Query interrupted``."""
+
+    def query(self, text, **kwargs):
+        try:
+            time.sleep(float(text))
+        except BaseException as interrupt:
+            raise RuntimeError("Query interrupted") from interrupt
+        return [("x",)]
+
+
+class SwallowingStore:
+    """``SleepyStore`` swallowing the interrupt and answering, as rdflib's bare ``except:``
+    blocks can."""
+
+    def query(self, text, **kwargs):
+        try:
+            time.sleep(float(text))
+        except BaseException:
+            pass
+        return [("x",)]
+
+
+class FailingStore:
+    def query(self, text, **kwargs):
+        raise ValueError("boom")
+
+
+@needs_timer
+def test_a_timeout_the_store_turns_into_an_error_is_a_timeout():
     run = execute.execute_stream(
-        SleepyStore(), [], stream([[0.1, 0.1]] * 3), native=True, store_budget_s=0.15
+        InterruptedStore(), stream([[5]]), stream([[5, 0]]), native=True, query_timeout_s=0.2
+    )
+    assert run["warmup_timeouts"] == 1 and run["warmup_errors"] == 0
+    first, second = run["results"]
+    assert first["timeout"] is True and "error" not in first and first["elapsed_ns"] < 2e9
+    assert second["rows"] == 1 and "timeout" not in second
+
+
+@needs_timer
+def test_a_timeout_the_store_swallows_is_a_timeout():
+    run = execute.execute_stream(
+        SwallowingStore(), stream([[5]]), stream([[5, 0]]), native=True, query_timeout_s=0.2
+    )
+    assert run["warmup_timeouts"] == 1 and run["warmup_errors"] == 0
+    first, second = run["results"]
+    assert first["timeout"] is True and "rows" not in first and first["elapsed_ns"] < 2e9
+    assert second["rows"] == 1 and "timeout" not in second
+
+
+@pytest.mark.parametrize("timeout", [None, pytest.param(5.0, marks=needs_timer)])
+def test_an_error_before_any_deadline_fired_is_an_error(timeout):
+    run = execute.execute_stream(
+        FailingStore(), stream([[0]]), stream([[0]]), native=True, query_timeout_s=timeout
+    )
+    assert run["warmup_errors"] == 1 and run["warmup_timeouts"] == 0
+    assert run["results"][0]["error"] == "ValueError: boom" and "timeout" not in run["results"][0]
+
+
+def test_an_answer_that_cannot_be_digested_is_an_error_not_a_crash(monkeypatch):
+    monkeypatch.setattr(execute, "run_instance", lambda *args, **kwargs: ([("no n3",)], 1, 1))
+    record, _ns = execute._attempt(object(), "SELECT * {}", False, {}, {}, None)
+    assert record["error"].startswith("AttributeError") and "digest" not in record
+
+
+@needs_timer
+def test_the_deadline_says_whether_it_fired():
+    with execute.deadline(None) as timer:
+        pass
+    assert timer.expired is False
+    with execute.deadline(5) as timer:
+        pass
+    assert timer.expired is False
+    with pytest.raises(execute.QueryTimeout), execute.deadline(0.05) as timer:
+        time.sleep(5)
+    assert timer.expired is True
+
+
+@needs_timer
+def test_a_deadline_that_cannot_be_armed_leaves_no_handler_behind():
+    def mine(signum, frame):
+        pass
+
+    before = signal.signal(signal.SIGALRM, mine)
+    try:
+        with pytest.raises(signal.ItimerError), execute.deadline(-1):
+            pass
+        assert signal.getsignal(signal.SIGALRM) is mine
+    finally:
+        signal.signal(signal.SIGALRM, before if before is not None else signal.SIG_DFL)
+
+
+def test_over_budget_a_store_finishes_its_mix_and_stops():
+    # over budget after the first query: a stop mid-mix would leave one result, not two
+    run = execute.execute_stream(
+        SleepyStore(), [], stream([[0.1, 0.1]] * 3), native=True, store_budget_s=0.05
     )
     assert run["partial"] is True and run["mixes_done"] == 1 and run["mixes_planned"] == 3
     assert len(run["results"]) == 2 and len(run["mix_ns"]) == 1
@@ -202,6 +322,13 @@ def test_without_limits_every_mix_runs():
     assert run["mixes_done"] == 3 and run["partial"] is False and len(run["results"]) == 6
 
 
+def test_a_store_budget_of_zero_is_no_budget():
+    run = execute.execute_stream(
+        SleepyStore(), [], stream([[0, 0]] * 3), native=True, store_budget_s=0
+    )
+    assert run["mixes_done"] == 3 and run["partial"] is False and len(run["results"]) == 6
+
+
 def test_a_limit_of_zero_is_off(monkeypatch):
     monkeypatch.setenv("BSBM_QUERY_TIMEOUT_S", "0")
     assert execute.limit_from_env("BSBM_QUERY_TIMEOUT_S", 5) is None
@@ -209,6 +336,12 @@ def test_a_limit_of_zero_is_off(monkeypatch):
     assert execute.limit_from_env("BSBM_QUERY_TIMEOUT_S", 5) == 2.5
     monkeypatch.delenv("BSBM_QUERY_TIMEOUT_S")
     assert execute.limit_from_env("BSBM_QUERY_TIMEOUT_S", 5) == 5
+
+
+@pytest.mark.parametrize("value", ["inf", "-inf", "nan", "-1"])
+def test_a_limit_that_is_not_a_positive_number_is_off(monkeypatch, value):
+    monkeypatch.setenv("BSBM_STORE_BUDGET_S", value)
+    assert execute.limit_from_env("BSBM_STORE_BUDGET_S", 300) is None
 
 
 def test_a_native_stream_never_imports_rdflib():
@@ -308,6 +441,8 @@ def test_ratios_are_paired_by_instance(tmp_path):
     t1, t2 = out["templates"][1], out["templates"][2]
     assert t1["ratio_of_means"] == pytest.approx(3.0) and t1["geo"] == pytest.approx(math.sqrt(8))
     assert t1["tail3"] == 1 and t2["median_ratio"] == pytest.approx(0.75)
+    # ratios 4, 2, 1 and 0.5: geometric mean sqrt(2), arithmetic 1.875, median 1.5
+    assert out["geo_all"] == pytest.approx(math.sqrt(2))
     assert out["answers_identical"] == 4 and out["mismatches"] == []
     assert out["a_peak_anon_mb"] == 100 and out["b_peak_anon_mb"] == 205
 
@@ -409,6 +544,20 @@ def test_b_flat_is_none_with_fewer_than_20_readings(tmp_path):
     b = _run_file(tmp_path / "b.json", {0: 1}, {0: 1}, {0: "d"}, [1, 2])
     out = compare.compare(compare.load([a]), compare.load([b]))
     assert out["b_flat"] is None
+
+
+@pytest.mark.parametrize(
+    "rss",
+    [[100] * 10 + [130] * 9, [100] * 10 + [None] + [130] * 9],
+    ids=["19 mixes", "20 mixes, one without a reading"],
+)
+def test_b_flat_is_none_one_reading_short_of_20(tmp_path, rss):
+    # judged, these would grow (not flat): one reading short, they are not judged at all
+    a = _run_file(tmp_path / "a.json", {0: 1}, {0: 1}, {0: "d"}, [1])
+    b = tmp_path / "b.json"
+    _run_file(b, {0: 1}, {0: 1}, {0: "d"}, [1])
+    b.write_text(json.dumps({**json.loads(b.read_text()), "rss_anon_per_mix_mb": rss}))
+    assert compare.compare(compare.load([a]), compare.load([str(b)]))["b_flat"] is None
 
 
 def test_values_round_trip_through_the_trace_encoding():

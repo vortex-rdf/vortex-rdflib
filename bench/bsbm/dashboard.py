@@ -5,13 +5,15 @@ The synthetic bench's adapters and worker processes, on a directory
 both its N-Quads and N-Triples source (N-Triples is valid N-Quads), runs the
 warm-up, then each measured instance once (``bench.worker ... --bsbm DIR``).
 The results file is rewritten after every store, so a cut-short run keeps every
-store that finished. Env: ``BSBM_QUERY_TIMEOUT_S`` (5), ``BSBM_STORE_BUDGET_S``
-(300; 0 turns either off), ``BSBM_LOAD_ITERS`` (1: a rebuild at BSBM scale costs
-minutes for the stores that parse).
+store that finished. The work dir (isolated venvs, built stores: about 1 GB at
+10K products) is removed at the end. Env: ``BSBM_QUERY_TIMEOUT_S`` (5),
+``BSBM_STORE_BUDGET_S`` (300; 0 turns either off), ``BSBM_LOAD_ITERS`` (1: a
+rebuild at BSBM scale costs minutes for the stores that parse).
 """
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 from datetime import UTC, datetime
@@ -91,25 +93,28 @@ def run(adapters: list[Adapter], prepared: Path, out_path: Path) -> int:
         return payload
 
     load_iters = os.environ.get("BSBM_LOAD_ITERS", "1")
-    for adapter in adapters:
-        print(f"\n=== {adapter.label} ({adapter.slug}, BSBM) ===")
-        out = measure_adapter(
-            adapter,
-            dataset,
-            dataset,
-            work_dir,
-            failures,
-            extra_args=("--bsbm", str(prepared.resolve())),
-            extra_env={"BENCH_LOAD_ITERS": load_iters},
-        )
-        if out is None:
+    try:
+        for adapter in adapters:
+            print(f"\n=== {adapter.label} ({adapter.slug}, BSBM) ===")
+            out = measure_adapter(
+                adapter,
+                dataset,
+                dataset,
+                work_dir,
+                failures,
+                extra_args=("--bsbm", str(prepared.resolve())),
+                extra_env={"BENCH_LOAD_ITERS": load_iters},
+            )
+            if out is None:
+                write()
+                continue
+            results.extend(out["rows"])
+            memory.append(memory_entry(adapter, out))
+            answers[adapter.slug] = out["bsbm"].pop("answers")
+            stores[adapter.slug] = out["bsbm"]
             write()
-            continue
-        results.extend(out["rows"])
-        memory.append(memory_entry(adapter, out))
-        answers[adapter.slug] = out["bsbm"].pop("answers")
-        stores[adapter.slug] = out["bsbm"]
-        write()
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
     found = write()["failures"]
     print(
         f"\nWrote {len(results)} BSBM rows, {len(memory)} memory readings"

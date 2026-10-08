@@ -8,8 +8,9 @@ best. Per template: ratio of means (b / a), median and geometric mean of the
 paired ratios, their range, and how many are 3x or more slower. A differing
 digest or a failure on either side is a mismatch. A timeout on either side is
 neither paired nor compared; an instance only one side reached (a run stopped by
-its budget) is unpaired. Memory: peak RssAnon per side, and whether b's last 10
-mixes stay within 5% of its first 10 (spec S3).
+its budget) is unpaired. Memory: peak RssAnon per side, and whether b stays flat
+(spec S3), decided per round: every round of b with 20 or more RssAnon readings
+must keep its last 10 within 5% of its first 10. None when no round has 20.
 """
 
 import argparse

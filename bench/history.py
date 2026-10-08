@@ -66,15 +66,8 @@ def make_record(results: dict, commit: dict, source: str) -> dict:
             "python": platform.python_version(),
             "versions": {package: version_of(package) for package in ("vortex-rdf", "rdflib")},
         },
-        # Everything the generator was told, not only its size: a run with any
-        # other knob set is another dataset, skipped beside main's line.
-        "dataset": bsbm_dataset(config)
-        if bsbm
-        else {
-            "triples": config["triples"],
-            "graphs": config["graphs"],
-            "cardinality": config.get("cardinality"),
-        },
+        # A run with any other knob set is another dataset, skipped beside main's line.
+        "dataset": bsbm_dataset(config) if bsbm else synthetic_dataset(config),
         "reference": REFERENCE,
         "labels": {
             a["slug"]: a["label"] for a in config["adapters"] if a["slug"] in CONFIGURATIONS
@@ -112,6 +105,21 @@ def dropped_queries(
     return {slug: sorted(queries) for slug, queries in dropped.items()}
 
 
+def synthetic_dataset(config: dict) -> dict:
+    """What makes two synthetic runs comparable: everything the generator was
+    told, not only its size, and whether the queries asked fresh constants
+    (``BENCH_FRESH_CONSTANTS=1``). That flag is there only when set, so the
+    records written before it keep their identity."""
+    dataset = {
+        "triples": config["triples"],
+        "graphs": config["graphs"],
+        "cardinality": config.get("cardinality"),
+    }
+    if config.get("freshConstants"):
+        dataset["freshConstants"] = True
+    return dataset
+
+
 def bsbm_dataset(config: dict) -> dict:
     """What makes two BSBM runs comparable: the same official data and streams."""
     return {
@@ -128,10 +136,13 @@ def bsbm_dataset(config: dict) -> dict:
 
 def bsbm_dropped(config: dict, failures: list[dict]) -> dict[str, list[str]]:
     """Per configuration, the BSBM templates its point leaves out, rdflib being
-    the oracle: an instance answered differently from rdflib's answer, a
-    configuration's own timeout, or failed (on either side), or a template that
-    failed outright. Instances rdflib never reached (its budget ran out) are not
-    compared for answer differences."""
+    the oracle rather than the majority: a template with an instance the
+    configuration answered differently from rdflib, or that timed out or failed
+    on either side (the configuration's, or rdflib's where the configuration
+    answered), and a template one of the configuration's own failures names
+    (not the majority answer check's). An instance rdflib never reached (its
+    budget ran out) has no answer to compare: there, only the configuration's
+    own timeout or failure drops the template."""
     answers = config.get("answers", {})
     reference = answers.get(REFERENCE, {})
     templates = config.get("instanceTemplates", [])

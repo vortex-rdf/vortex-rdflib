@@ -10,11 +10,14 @@ outside the timing. RssAnon is sampled after every measured mix.
 Limits, off unless given: a per-query timeout (SIGALRM via ``setitimer``,
 raising ``QueryTimeout`` once Python regains control; POSIX only), and a store
 budget over the measured mixes, past which the store finishes its mix and
-stops (``partial``). Imports only the standard library at module level.
+stops (``partial``). An instance timed out when its deadline fired, whatever
+the store made of the interrupt. Imports only the standard library at module
+level.
 """
 
 import gc
 import hashlib
+import math
 import os
 import signal
 import threading
@@ -36,31 +39,49 @@ class QueryTimeout(BaseException):
     ``except Exception`` swallows it."""
 
 
+def limit(seconds: float | None) -> float | None:
+    """A limit in seconds, or None for no limit: 0, a negative value, ``inf``
+    and ``nan`` all turn it off."""
+    return seconds if seconds is not None and math.isfinite(seconds) and seconds > 0 else None
+
+
 def limit_from_env(name: str, default: float) -> float | None:
     value = os.environ.get(name, "").strip()
-    seconds = float(value) if value else default
-    return seconds if seconds > 0 else None
+    return limit(float(value) if value else default)
+
+
+class Deadline:
+    """What ``deadline`` yields: ``expired`` once its time has run out."""
+
+    def __init__(self) -> None:
+        self.expired = False
 
 
 @contextmanager
-def deadline(seconds: float | None) -> Iterator[None]:
-    """Raise ``QueryTimeout`` in the block after ``seconds``. Off when None, off
-    the main thread, and without ``setitimer`` (Windows)."""
+def deadline(seconds: float | None) -> Iterator[Deadline]:
+    """Raise ``QueryTimeout`` in the block after ``seconds``, and mark the
+    yielded ``Deadline`` expired: a store that catches the interrupt and raises
+    an error of its own, or swallows it, cannot hide that the time ran out.
+    Never expires when ``seconds`` is None or 0, off the main thread, and
+    without ``setitimer`` (Windows). The previous SIGALRM handler is back, and
+    the timer disarmed, however the block ends."""
+    state = Deadline()
     if (
         not seconds
         or not hasattr(signal, "setitimer")
         or threading.current_thread() is not threading.main_thread()
     ):
-        yield
+        yield state
         return
 
     def expire(signum: int, frame: object) -> None:
+        state.expired = True
         raise QueryTimeout(f"over {seconds:g} s")
 
     previous = signal.signal(signal.SIGALRM, expire)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
     try:
-        yield
+        signal.setitimer(signal.ITIMER_REAL, seconds)  # in here: a refused value still restores
+        yield state
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous if previous is not None else signal.SIG_DFL)
@@ -117,26 +138,38 @@ def run_instance(
 def _attempt(
     graph, text: str, native: bool, kwargs: dict, init_ns: dict, timeout_s: float | None
 ) -> tuple[dict, int]:
-    """One instance, never raising: its record and the time it took."""
+    """One instance, never raising: its record and the time it took.
+
+    It timed out when its deadline fired, whatever the store did next: raised
+    ``QueryTimeout``, raised an error of its own (DuckDB, under pycottas, turns
+    the interrupt into ``RuntimeError: Query interrupted``), or swallowed it
+    and answered (rdflib's bare ``except:`` blocks can). A timed-out or failed
+    instance's time is its elapsed time, up to where it stopped. The digest is
+    taken outside the timing, inside the guard."""
     t0 = perf_counter_ns()
+    timer = Deadline()  # stays unexpired when the deadline cannot be armed
+    error = None
     try:
-        with deadline(timeout_s):
+        with deadline(timeout_s) as timer:
             rows, prep_ns, exec_ns = run_instance(
                 graph, text, native=native, query_kwargs=kwargs, init_ns=init_ns
             )
+        if not timer.expired:
+            record = {
+                "prep_ns": prep_ns,
+                "exec_ns": exec_ns,
+                "rows": len(rows),
+                "digest": None if native else answer_digest(rows),
+            }
+            return record, (prep_ns or 0) + exec_ns
     except QueryTimeout:
-        elapsed = perf_counter_ns() - t0
-        return {"timeout": True, "elapsed_ns": elapsed}, elapsed
-    except Exception as error:  # noqa: BLE001 — one instance must not sink the stream
-        elapsed = perf_counter_ns() - t0
-        return {"error": f"{type(error).__name__}: {error}", "elapsed_ns": elapsed}, elapsed
-    record = {
-        "prep_ns": prep_ns,
-        "exec_ns": exec_ns,
-        "rows": len(rows),
-        "digest": None if native else answer_digest(rows),
-    }
-    return record, (prep_ns or 0) + exec_ns
+        pass
+    except Exception as failure:  # noqa: BLE001 — one instance must not sink the stream
+        error = f"{type(failure).__name__}: {failure}"
+    elapsed = perf_counter_ns() - t0
+    if error is not None and not timer.expired:
+        return {"error": error, "elapsed_ns": elapsed}, elapsed
+    return {"timeout": True, "elapsed_ns": elapsed}, elapsed
 
 
 def execute_stream(
@@ -178,7 +211,7 @@ def execute_stream(
             spent += ns
         mix_ns.append(spent)
         rss.append(rss_anon_mb())
-        if store_budget_s is not None and perf_counter_ns() - started > store_budget_s * 1e9:
+        if store_budget_s and perf_counter_ns() - started > store_budget_s * 1e9:
             break
     readings = [mb for mb in rss if mb is not None]
     return {

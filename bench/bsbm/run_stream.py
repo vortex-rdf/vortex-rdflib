@@ -19,7 +19,7 @@ import sys
 from time import perf_counter_ns
 
 from .cli import add_residency, read_streams
-from .execute import execute_stream
+from .execute import execute_stream, limit
 
 
 def run(
@@ -76,14 +76,15 @@ def main(argv: list[str] | None = None) -> int:
         "--query-timeout",
         type=float,
         metavar="SECONDS",
-        help="abort a query after this long; 0 means no limit, as with BSBM_QUERY_TIMEOUT_S",
+        help="abort a query after this long; 0 (or a negative or infinite value) means no "
+        "limit, as with BSBM_QUERY_TIMEOUT_S",
     )
     parser.add_argument(
         "--store-budget",
         type=float,
         metavar="SECONDS",
-        help="stop after the mix during which the measured mixes pass this; "
-        "0 means no limit, as with BSBM_STORE_BUDGET_S",
+        help="stop after the mix during which the measured mixes pass this; 0 (or a negative "
+        "or infinite value) means no limit, as with BSBM_STORE_BUDGET_S",
     )
     args = parser.parse_args(argv)
     warmup, measured = read_streams(args.warmup, args.measured)
@@ -92,8 +93,8 @@ def main(argv: list[str] | None = None) -> int:
         args.in_memory,
         warmup,
         measured,
-        query_timeout_s=args.query_timeout or None,
-        store_budget_s=args.store_budget or None,
+        query_timeout_s=limit(args.query_timeout),
+        store_budget_s=limit(args.store_budget),
     )
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(out, f)

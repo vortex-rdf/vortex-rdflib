@@ -43,6 +43,12 @@ queries (full-scan class) get ``BENCH_HEAVY_ITERS`` fixed samples and no
 warmup, so they carry no such check. The orchestrator's cross-store count
 comparison still covers them.
 
+With ``BENCH_FRESH_CONSTANTS=1``, a query with a FILTER constant asks a new
+constant in every sample (its ``Query.fresh`` variants) instead of repeating
+its text, so work a store memoizes per constant is paid in every sample, as in
+a BSBM run (see ``measure_query``). The orchestrator marks such results
+(``config.freshConstants``): their history record is another dataset.
+
 The load is sampled ``BENCH_LOAD_ITERS`` times, each a full rebuild of the
 store's own file from the shared source — the ``.nq`` for a store with named
 graphs, the ``.nt`` for one without.
@@ -67,7 +73,7 @@ from time import perf_counter_ns
 
 from .adapters import BY_SLUG, Adapter
 from .dataset import config_from_env, moduli
-from .procmem import peak_rss_mb, rss_anon_mb, rss_mb  # noqa: F401 — re-exported
+from .procmem import peak_rss_mb, rss_anon_mb, rss_mb
 from .queries import Query, build_queries
 
 QUERY_ITERS = int(os.environ.get("BENCH_QUERY_ITERS", 10))
@@ -75,9 +81,10 @@ QUERY_MIN_ITERS = 3
 QUERY_BUDGET_NS = float(os.environ.get("BENCH_QUERY_BUDGET_S", 2.0)) * 1e9
 HEAVY_ITERS = int(os.environ.get("BENCH_HEAVY_ITERS", 3))
 LOAD_ITERS = int(os.environ.get("BENCH_LOAD_ITERS", 3))
+FRESH_CONSTANTS_ENV = "BENCH_FRESH_CONSTANTS"
 #: Sample a query's fresh-constant variants (``Query.fresh``) instead of
 #: repeating its text, so per-constant costs cannot hide behind warm caches.
-FRESH_CONSTANTS = os.environ.get("BENCH_FRESH_CONSTANTS") == "1"
+FRESH_CONSTANTS = os.environ.get(FRESH_CONSTANTS_ENV) == "1"
 #: Measurement modes, in the order the dashboard shows them (see the module
 #: docstring). `full` keeps the plain slug, so the ids it has always written
 #: are unchanged and the load row needs no mode at all.
