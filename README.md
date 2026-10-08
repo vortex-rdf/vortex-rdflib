@@ -152,30 +152,87 @@ store, [oxrdflib](https://github.com/oxigraph/oxrdflib) (Oxigraph),
 on every push to `main` and publishes the current numbers to GitHub Pages:
 **<https://vortex-rdf.github.io/vortex-rdflib/>**.
 
-It executes a synthetic representative SPARQL set with each store's full lifecycle running in its own process. SPARQL evaluation is rdflib's engine for every store but `pyoxigraph`.
+Every section of the dashboard has a tab per dataset:
 
-Results are cross-checked across stores after every run: same data, same
-query, so a store that returns a different number is reported as a failure on
-the dashboard.
+- **Synthetic**: a generated dataset of 250,000 quads in 8 graphs and a
+  representative SPARQL set (lookups and scans, star and chain joins, FILTER /
+  DISTINCT / ORDER BY / GROUP BY, named graphs).
+- **BSBM**: the [Berlin SPARQL Benchmark](https://github.com/Tpt/bsbm-tools)
+  Explore use case at 10,000 products (3.5M triples). The data comes from the
+  official generator. The queries come from the unmodified official test driver
+  (seed 808080, 5 warm-up and 20 measured mixes), so every query instance
+  carries its own parameters. A query running past 5 s is aborted and counted as
+  a timeout. Its 5 s still count in its mix's time, and so in QMpH, as the
+  official driver counts them. A store still running after 300 s of measured
+  mixes finishes its mix, stops, and is marked *partial*.
+
+Each store's whole lifecycle runs in its own process. SPARQL evaluation is
+rdflib's engine for every store but `pyoxigraph`. Results are cross-checked
+across stores after every run:
+- on the synthetic set, every store must return the same number of rows;
+- on BSBM, the rdflib-engine stores must return the same answer to every
+  instance (compared by digest), and pyoxigraph the same number of rows.
+
+A store that does not is reported as a failure on the dashboard. The memory
+panel shows each store's peak RSS and its peak anonymous memory (RssAnon). A
+memory-mapped store's RSS includes file pages the kernel may drop again; its
+RssAnon does not.
 
 Run it locally with `scripts/refresh.sh` — it syncs the contenders, ensures
 the HDT builder, measures, and re-renders the dashboard:
 
 ```bash
-scripts/refresh.sh                      # every stage, at the 250k CI scale
-BENCH_TRIPLES=20000 scripts/refresh.sh  # scale down
-scripts/refresh.sh --only render        # template-only edits: no re-measurement
-scripts/refresh.sh --history            # plot the working tree on the history chart
+scripts/refresh.sh                             # every default stage, at the 250k CI scale
+BENCH_TRIPLES=20000 scripts/refresh.sh         # scale down
+scripts/refresh.sh --bsbm                      # the BSBM tab at CI's scale (needs Java)
+BSBM_PRODUCTS=1000 scripts/refresh.sh --bsbm   # a smaller BSBM run
+scripts/refresh.sh --only render               # template-only edits: no re-measurement
+scripts/refresh.sh --history                   # plot the working tree on the synthetic history chart
 ```
 
-Below the overview, the dashboard has a history chart: for each commit on
-`main`, how many times faster each vortex-rdflib configuration answers the
-query set than rdflib's in-memory store, as a geometric mean (exec only, or
-full). CI records one point per benchmark run on the `bench-history` branch.
-To plot a change on your branch against that line before merging it, run
-`scripts/refresh.sh --history` (about 6 minutes at the default scale): it
-measures the working tree and renders `public/index.html` with your point after
-`main`'s.
+`BENCH_FRESH_CONSTANTS=1` makes every sample of a synthetic query with a FILTER
+constant (`filter-range`, `filter-arith`, `filter-band-probe`, `minus`) use a
+new constant. Work a store memoizes per constant is then paid in every sample,
+as in a BSBM run. CodSpeed tracks the same for `filter-range` and
+`filter-arith` on every commit (`test_query_fresh_constant`).
+
+Below the overview, each dataset has a history chart. For each commit on `main`,
+it shows how many times faster each vortex-rdflib configuration answers than
+rdflib's in-memory store. The figure is a geometric mean over the queries
+(synthetic) or the Explore templates (BSBM), exec only or full. CI records one
+point per dataset and run on the `bench-history` branch (`records/`,
+`records-bsbm/`). To plot a change on your branch against the synthetic line
+before merging it, run `scripts/refresh.sh --history` (about 6 minutes at the
+default scale). It measures the working tree on the synthetic set and renders
+`public/index.html` with your point after `main`'s. The BSBM chart takes no
+local points.
+
+### BSBM harness
+
+`bench/bsbm` prepares the BSBM tab's data and streams. It also runs paired
+comparisons of two vortex-rdflib or vortex-rdf builds at any scale. `prepare`
+downloads the official tools ([Tpt/bsbm-tools](https://github.com/Tpt/bsbm-tools),
+pinned and checksum-verified, cached in `$BENCH_CACHE` or
+`~/.cache/vortex-rdflib/bsbm`). It needs Java:
+
+```bash
+python -m bench.bsbm.prepare --products 10000 --warmup-mixes 5 --mixes 50 --out out/s10k
+python -m bench.bsbm.prepare --from out/s10k --only-query 6 --warmup-mixes 2 --mixes 50 --out out/q6
+python -m bench.bsbm.run_stream store.vortex --file out/s10k/warmup.json out/s10k/measured.json out/run.json
+python -m bench.bsbm.compare out/baseline.json out/run.json
+python -m bench.run_bench --dataset bsbm --bsbm-dir out/s10k   # every store, as on the dashboard
+```
+
+- `prepare`: re-running it with the same parameters is a cache hit.
+  - `--from` reuses another prepared directory's dataset, without regenerating
+    or copying it.
+  - `--only-query 6` captures the official Q6 (regex), which the official mix
+    leaves out.
+- `run_stream` applies no limit unless given `--query-timeout` and
+  `--store-budget`. The dashboard's limits come from `BSBM_QUERY_TIMEOUT_S` (5)
+  and `BSBM_STORE_BUDGET_S` (300).
+- `bench.bsbm.record_native` and `bench.bsbm.replay_native` record a stream's
+  native calls and replay them against another vortex-rdf build.
 
 ## Development
 
