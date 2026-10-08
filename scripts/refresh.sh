@@ -5,7 +5,7 @@
 #   scripts/refresh.sh --only render         # template-only edits: no re-measurement
 #   scripts/refresh.sh --only bench,render   # re-measure, skip the dependency sync
 #   scripts/refresh.sh --bsbm                # the BSBM tab: prepare, measure, render (Java)
-#   scripts/refresh.sh --history             # plot the working tree on the history chart
+#   scripts/refresh.sh --history             # plot the working tree on the synthetic history chart
 #   scripts/refresh.sh --adapters a,b        # measure a subset (see the warning below)
 #   scripts/refresh.sh --force-build         # reinstall the HDT builder even if present
 #   BENCH_TRIPLES=20000 scripts/refresh.sh   # scale down (default: the code's 250k)
@@ -15,7 +15,8 @@
 # and `history` are not in the default set: --bsbm is --only bsbm,render and
 # --history is --only history,render. BSBM knobs, CI's values by default:
 # BSBM_PRODUCTS (10000), BSBM_WARMUP_MIXES (5), BSBM_MIXES (20), BSBM_SEED
-# (808080), BSBM_QUERY_TIMEOUT_S (5), BSBM_STORE_BUDGET_S (300).
+# (808080), BSBM_QUERY_TIMEOUT_S (5), BSBM_STORE_BUDGET_S (300), BSBM_LOAD_ITERS
+# (1). 0 turns either limit, the query timeout or the store budget, off.
 #
 # The measurement runs one process per store, sequentially, so the timings do
 # not contend with each other — the same reason bench/worker.py exists.
@@ -34,7 +35,7 @@ while [ $# -gt 0 ]; do
     --force-build) FORCE_BUILD=1; shift ;;
     --history) ONLY="history,render"; shift ;;
     --bsbm) ONLY="bsbm,render"; shift ;;
-    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -89,9 +90,10 @@ if has bsbm; then
   BSBM_MIXES="${BSBM_MIXES:-20}"
   BSBM_SEED="${BSBM_SEED:-808080}"
   stage "BSBM (${BSBM_PRODUCTS} products, ${BSBM_WARMUP_MIXES}+${BSBM_MIXES} mixes, seed ${BSBM_SEED})"
-  # The official tools write the data and capture the streams once per scale (a
-  # re-run is a cache hit); then every store runs them in its own process.
-  bsbm_dir="bench/bsbm-data/p${BSBM_PRODUCTS}-w${BSBM_WARMUP_MIXES}-m${BSBM_MIXES}-s${BSBM_SEED}"
+  # One directory per scale: the official tools write its data once, and capture
+  # the streams again only when the mixes or the seed change (the same values
+  # again are a cache hit). Then every store runs them in its own process.
+  bsbm_dir="bench/bsbm-data/p${BSBM_PRODUCTS}"
   uv run python -m bench.bsbm.prepare --products "$BSBM_PRODUCTS" \
     --warmup-mixes "$BSBM_WARMUP_MIXES" --mixes "$BSBM_MIXES" --seed "$BSBM_SEED" --out "$bsbm_dir"
   bsbm_args=(--dataset bsbm --bsbm-dir "$bsbm_dir" --out bench/results-bsbm.json)
