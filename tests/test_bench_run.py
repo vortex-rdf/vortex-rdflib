@@ -7,8 +7,15 @@ question — so it has to name a dissenter, and has to keep naming one when the
 dissenter is this package's own store.
 """
 
+import json
+import subprocess
+import tempfile
+from dataclasses import replace
+
+import pytest
+from bench import run_bench
 from bench.adapters import Adapter
-from bench.run_bench import reconcile
+from bench.run_bench import memory_entry, reconcile
 from rdflib import Graph
 
 
@@ -84,3 +91,105 @@ def test_a_store_that_was_never_asked_is_not_a_dissenter():
     )
     assert agreed == {"graph-scan": 76}
     assert disputed == [] and failures == []
+
+
+def test_a_memory_entry_carries_peak_anon():
+    entry = memory_entry(
+        adapters("vortex")[0],
+        {"peakRssMb": 300, "peakAnonMb": 120, "baselineMb": 40, "loadedMb": 160},
+    )
+    assert entry == {
+        "slug": "vortex",
+        "label": "label vortex",
+        "engine": "rdflib",
+        "peakRssMb": 300,
+        "peakAnonMb": 120,
+        "baselineMb": 40,
+        "loadedMb": 160,
+        "storeMb": 120,
+    }
+
+
+def test_an_older_worker_without_anon_reads_as_none():
+    entry = memory_entry(adapters("vortex")[0], {"peakRssMb": 300})
+    assert entry["peakAnonMb"] is None and entry["storeMb"] is None
+
+
+def test_a_store_whose_env_fails_to_build_is_a_venv_failure(monkeypatch, tmp_path):
+    adapter = replace(adapters("pycottas")[0], venv_packages=("x",))
+
+    def broken(*_args):
+        raise subprocess.CalledProcessError(1, ["uv"], stderr=b"first\nno such package")
+
+    monkeypatch.setattr("bench.run_bench.ensure_venv", broken)
+    failures: list[dict] = []
+    out = run_bench.measure_adapter(
+        adapter, tmp_path / "a.nq", tmp_path / "a.nt", tmp_path, failures
+    )
+    assert out is None
+    assert failures == [
+        {"slug": "pycottas", "label": "label pycottas", "phase": "venv", "error": "no such package"}
+    ]
+
+
+def test_a_worker_that_fails_is_a_worker_failure_and_its_own_failures_are_labelled(
+    monkeypatch, tmp_path
+):
+    adapter = adapters("vortex")[0]
+    nq, nt = tmp_path / "a.nq", tmp_path / "a.nt"
+    failures: list[dict] = []
+
+    monkeypatch.setattr("bench.run_bench.run_worker", lambda *args, **kwargs: None)
+    assert run_bench.measure_adapter(adapter, nq, nt, tmp_path, failures) is None
+    assert failures == [
+        {
+            "slug": "vortex",
+            "label": "label vortex",
+            "phase": "worker",
+            "error": "worker process failed or timed out",
+        }
+    ]
+
+    answered = {"rows": [], "failures": [{"phase": "Q1", "error": "boom"}]}
+    monkeypatch.setattr("bench.run_bench.run_worker", lambda *args, **kwargs: answered)
+    failures.clear()
+    assert run_bench.measure_adapter(adapter, nq, nt, tmp_path, failures) is answered
+    assert failures == [{"slug": "vortex", "label": "label vortex", "phase": "Q1", "error": "boom"}]
+
+
+def test_a_bsbm_dir_without_the_bsbm_dataset_is_refused(tmp_path, monkeypatch, capsys):
+    def synthetic(*_args):
+        raise AssertionError("ran the synthetic benchmark")
+
+    monkeypatch.setattr("bench.run_bench.config_from_env", synthetic)
+    with pytest.raises(SystemExit) as stop:
+        run_bench.main(["--bsbm-dir", str(tmp_path), "--adapters", "vortex_dict_mem"])
+    assert stop.value.code == 2
+    assert "--bsbm-dir needs --dataset bsbm" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("fresh", [False, True], ids=["repeated text", "fresh constants"])
+def test_a_fresh_constants_run_says_so(tmp_path, monkeypatch, fresh):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))  # main's work dir: under tmp_path
+    monkeypatch.setenv("BENCH_TRIPLES", "5000")
+    if fresh:
+        monkeypatch.setenv("BENCH_FRESH_CONSTANTS", "1")
+    else:
+        monkeypatch.delenv("BENCH_FRESH_CONSTANTS", raising=False)
+    monkeypatch.setattr(
+        "bench.run_bench.measure_adapter", lambda *args, **kwargs: {"rows": [], "matched": {}}
+    )
+    out = tmp_path / "results.json"
+    assert run_bench.main(["--adapters", "rdflib_memory", "--out", str(out)]) == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["config"].get("freshConstants", False) is fresh
+    assert ("fresh constants" in payload["provenance"]) is fresh
+
+
+def test_a_bsbm_dir_without_meta_json_is_refused(tmp_path, capsys):
+    argv = ["--dataset", "bsbm", "--bsbm-dir", str(tmp_path), "--adapters", "vortex_dict_mem"]
+    with pytest.raises(SystemExit) as stop:
+        run_bench.main(argv)
+    assert stop.value.code == 2
+    err = capsys.readouterr().err
+    assert f"{tmp_path} holds no meta.json" in err and "python -m bench.bsbm.prepare" in err

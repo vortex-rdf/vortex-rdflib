@@ -1,31 +1,171 @@
 name: Benchmark History Backfill
 
-# Measures older commits of main with today's benchmark and writes their
-# records to the bench-history branch, so the history chart has points from
-# before CI recorded them. Each commit's own library code runs under today's
-# harness, dataset and queries: the worktree's src/ goes first on PYTHONPATH,
-# ahead of the editable install. Started by hand; re-running a commit
-# replaces its record. Only the locked project environment is installed, so
-# no third-party code runs next to the write token.
+# Measures older commits of main with today's harness and writes their records to
+# bench-history, so the history charts have points from before CI recorded them.
+# Each commit's own library code runs: its worktree's src/ goes first on
+# PYTHONPATH, ahead of the editable install, and so does the vortex-rdf release
+# its uv.lock pins, installed into a directory of its own. Started by hand;
+# re-running a commit replaces its record. The measure job holds a read-only
+# token and keeps no credentials (it runs the BSBM tools' Java); the push job
+# holds the write token and runs nothing but git.
 on:
   workflow_dispatch:
     inputs:
       commits:
         description: Commits of main to measure, space-separated
         default: 36caede 2e04fb1 8813a97 0007bb6
+      dataset:
+        description: Which history to backfill
+        type: choice
+        options:
+          - both
+          - synthetic
+          - bsbm
+        default: both
 
 permissions:
-  contents: write
+  contents: read
 
-# Shared with the dashboard workflow, so one job writes bench-history at a time.
-concurrency:
-  group: pages
-  cancel-in-progress: false
+env:
+  BSBM_TOOLS_COMMIT: 59d0a8a605b26f21506789fa1a713beb5abf1cab
+  BSBM_PRODUCTS: 10000
+  BSBM_WARMUP_MIXES: 5
+  BSBM_MIXES: 20
+  BSBM_SEED: 808080
+  BSBM_DIR: bench/bsbm-data/ci
+  BSBM_QUERY_TIMEOUT_S: 5
+  BSBM_STORE_BUDGET_S: 300
 
 jobs:
-  backfill:
+  measure:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --locked
+      - uses: actions/setup-java@v4
+        if: inputs.dataset != 'synthetic'
+        with:
+          distribution: temurin
+          java-version: '21'
+      # The dashboard workflow's cache key: the same prepared data.
+      - name: Restore the prepared BSBM data
+        if: inputs.dataset != 'synthetic'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BSBM_DIR }}
+          key: bsbm-${{ env.BSBM_TOOLS_COMMIT }}-p${{ env.BSBM_PRODUCTS }}-w${{ env.BSBM_WARMUP_MIXES }}-m${{ env.BSBM_MIXES }}-s${{ env.BSBM_SEED }}-${{ hashFiles('bench/bsbm/tools.py', 'bench/bsbm/capture.py', 'bench/bsbm/streams.py', 'bench/bsbm/prepare.py') }}
+      - name: Prepare the official BSBM data and streams
+        if: inputs.dataset != 'synthetic'
+        run: >-
+          uv run python -m bench.bsbm.prepare --products "$BSBM_PRODUCTS"
+          --warmup-mixes "$BSBM_WARMUP_MIXES" --mixes "$BSBM_MIXES" --seed "$BSBM_SEED"
+          --out "$BSBM_DIR"
+      # One commit's failure is reported and skipped; everything recorded is
+      # handed to the push job together, even when a later commit fails or this
+      # step runs out of time. The step's limit sits under the job's: a step that
+      # times out fails, so the upload below still runs, where a job that times
+      # out is cancelled and skips it.
+      - name: Measure and record each commit
+        timeout-minutes: 280
+        env:
+          COMMITS: ${{ inputs.commits }}
+          DATASET: ${{ inputs.dataset }}
+        run: |
+          mkdir -p out/records out/records-bsbm
+          adapters="$(uv run python -m bench.history adapters)"
+          recorded=""
+          # A commit is listed as soon as one of its records exists, and the list is
+          # rewritten each time, so a run cut short still hands over a true one.
+          note() {
+            case " $recorded " in
+              *" $commit "*) ;;
+              *) recorded="$recorded $commit"; echo "$recorded" > out/recorded.txt ;;
+            esac
+          }
+          for commit in $COMMITS; do
+            lib="$RUNNER_TEMP/lib-$commit"
+            deps="$RUNNER_TEMP/deps-$commit"
+            if ! git worktree add --detach "$lib" "$commit"; then
+              echo "::error::$commit: not a commit of this repository; skipped"; continue
+            fi
+            # The vortex-rdf release this commit locked: today's may not serve its code.
+            if ! version="$(git show "$commit:uv.lock" | uv run python -c 'import sys, tomllib; lock = tomllib.loads(sys.stdin.read()); print(next(p["version"] for p in lock["package"] if p["name"] == "vortex-rdf"))')"; then
+              echo "::error::$commit: its uv.lock pins no vortex-rdf; skipped"; continue
+            fi
+            if ! uv pip install --quiet --python .venv/bin/python --target "$deps" --no-deps "vortex-rdf==$version"; then
+              echo "::error::$commit: vortex-rdf $version did not install; skipped"; continue
+            fi
+            path="$deps:$lib/src"
+            if ! found="$(PYTHONPATH="$path" uv run python -c 'import vortex_rdf, vortex_rdflib; print(vortex_rdflib.__file__); print(vortex_rdf.__file__)')"; then
+              echo "::error::$commit: vortex_rdflib or vortex_rdf does not import; skipped"; continue
+            fi
+            case "$(echo "$found" | sed -n 1p)" in "$lib"/*) ;; *)
+              echo "::error::$commit: vortex_rdflib resolved outside $lib; skipped"; continue ;;
+            esac
+            case "$(echo "$found" | sed -n 2p)" in "$deps"/*) ;; *)
+              echo "::error::$commit: vortex_rdf resolved outside $deps; skipped"; continue ;;
+            esac
+            # The record step runs today's bench.history with $deps first, so the
+            # record names the commit's vortex-rdf version.
+            if [ "$DATASET" != bsbm ]; then
+              if PYTHONPATH="$path" uv run python -m bench.run_bench --adapters "$adapters" \
+                    --out "$RUNNER_TEMP/results-$commit.json" \
+                  && PYTHONPATH="$deps" uv run python -m bench.history record \
+                    "$RUNNER_TEMP/results-$commit.json" --source backfill --commit "$commit" \
+                    --ref main --out out/records; then
+                note
+              else
+                echo "::error::$commit: the synthetic benchmark or its record did not complete"
+              fi
+            fi
+            if [ "$DATASET" != synthetic ]; then
+              if PYTHONPATH="$path" uv run python -m bench.run_bench --dataset bsbm --bsbm-dir "$BSBM_DIR" \
+                    --adapters "$adapters" --out "$RUNNER_TEMP/results-bsbm-$commit.json" \
+                  && PYTHONPATH="$deps" uv run python -m bench.history record \
+                    "$RUNNER_TEMP/results-bsbm-$commit.json" --dataset bsbm --source backfill \
+                    --commit "$commit" --ref main --out out/records-bsbm; then
+                note
+              else
+                echo "::error::$commit: the BSBM benchmark or its record did not complete"
+              fi
+            fi
+          done
+          if ! compgen -G 'out/records*/*.json' >/dev/null; then
+            echo "::error::no record was produced"
+            exit 1
+          fi
+      - name: Hand the records to the push job
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: backfill-records
+          path: out
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 7
+
+  # Runs after a failed or timed-out measure job too, for whatever that handed over.
+  # The group serializes it with the dashboard's record job; a push that loses a race
+  # anyway rebases once. The measure job holds no group, so a long backfill never
+  # delays a dashboard run.
+  push:
+    needs: measure
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: bench-history
+      cancel-in-progress: false
+    permissions:
+      contents: write
     env:
       GIT_AUTHOR_NAME: github-actions[bot]
       GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
@@ -33,21 +173,13 @@ jobs:
       GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
     steps:
       - uses: actions/checkout@v5
+      # No artifact when the measure job produced no record: nothing to push then.
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
-          fetch-depth: 0
-
-      - uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
-
-      - name: Install
-        run: uv sync --locked
-
-      # One commit's failure is reported and skipped; the others still run,
-      # and everything recorded is pushed together at the end.
-      - name: Measure and record each commit
-        env:
-          COMMITS: ${{ inputs.commits }}
+          name: backfill-records
+          path: incoming
+      - name: Push the records to bench-history
         run: |
           if git ls-remote --exit-code --heads origin bench-history >/dev/null; then
             git fetch --quiet origin bench-history
@@ -55,37 +187,21 @@ jobs:
           else
             git worktree add --orphan -b bench-history history
           fi
-          adapters="$(uv run python -m bench.history adapters)"
-          recorded=""
-          for commit in $COMMITS; do
-            lib="$RUNNER_TEMP/lib-$commit"
-            if ! git worktree add --detach "$lib" "$commit"; then
-              echo "::error::$commit: not a commit of this repository; skipped"
-              continue
-            fi
-            if ! found="$(PYTHONPATH="$lib/src" uv run python -c 'import vortex_rdflib; print(vortex_rdflib.__file__)')"; then
-              echo "::error::$commit: vortex_rdflib does not import; skipped"
-              continue
-            fi
-            case "$found" in
-              "$lib"/*) ;;
-              *) echo "::error::$commit: vortex_rdflib resolved to $found, not $lib; skipped"; continue ;;
-            esac
-            if PYTHONPATH="$lib/src" uv run python -m bench.run_bench \
-                 --adapters "$adapters" --out "$RUNNER_TEMP/results-$commit.json" \
-               && uv run python -m bench.history record "$RUNNER_TEMP/results-$commit.json" \
-                 --source backfill --commit "$commit" --ref main --out history/records; then
-              recorded="$recorded $commit"
-            else
-              echo "::error::$commit: the benchmark or its record did not complete; skipped"
+          for folder in records records-bsbm; do
+            if compgen -G "incoming/$folder/*.json" >/dev/null; then
+              mkdir -p "history/$folder"
+              cp "incoming/$folder/"*.json "history/$folder/"
             fi
           done
-          if [ -z "$recorded" ]; then
-            echo "::error::no commit was recorded"
-            exit 1
-          fi
+          recorded="$(cat incoming/recorded.txt 2>/dev/null || true)"
           cd history
-          git add records
+          for folder in records records-bsbm; do
+            if [ -d "$folder" ]; then git add "$folder"; fi
+          done
+          if git diff --cached --quiet; then
+            echo "no record to push"
+            exit 0
+          fi
           git commit --quiet -m "bench: backfill$recorded"
           git push --quiet origin HEAD:bench-history \
             || { git fetch --quiet origin bench-history && git rebase --quiet FETCH_HEAD \

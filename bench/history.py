@@ -9,13 +9,18 @@ count than rdflib. CI writes one per commit on ``main`` to the
 writes older commits' there, and ``scripts/refresh.sh --history`` writes
 local ones to ``bench/history-local/``.
 
+A BSBM results file (``run_bench --dataset bsbm``) makes a record of the same
+shape, per Explore template, stored under ``records-bsbm/``; its point leaves
+out a template a configuration answered differently from rdflib, timed out on
+or failed (``bsbm_dropped``).
+
 The chart plots, per record and configuration, rdflib's time divided by the
 configuration's: how many times faster than rdflib, in the same run, so runs
 on different machines stay roughly comparable.
 
     python -m bench.history adapters
     python -m bench.history record RESULTS --source ci|backfill|local
-        --commit REV [--ref NAME] --out DIR
+        --commit REV [--ref NAME] [--dataset synthetic|bsbm] --out DIR
 """
 
 import argparse
@@ -41,8 +46,9 @@ SOURCES = ("ci", "backfill", "local")
 
 
 def make_record(results: dict, commit: dict, source: str) -> dict:
-    """Reduce one ``run_bench`` results file to a history record."""
+    """Reduce one ``run_bench`` results file, synthetic or BSBM, to a history record."""
     config = results["config"]
+    bsbm = config.get("dataset") == "bsbm"
     wanted = {*CONFIGURATIONS, REFERENCE}
     medians: dict[str, dict[str, dict[str, float]]] = {}
     for row in results["results"]:
@@ -60,19 +66,16 @@ def make_record(results: dict, commit: dict, source: str) -> dict:
             "python": platform.python_version(),
             "versions": {package: version_of(package) for package in ("vortex-rdf", "rdflib")},
         },
-        # Everything the generator was told, not only its size: a run with any
-        # other knob set is another dataset, skipped beside main's line.
-        "dataset": {
-            "triples": config["triples"],
-            "graphs": config["graphs"],
-            "cardinality": config.get("cardinality"),
-        },
+        # A run with any other knob set is another dataset, skipped beside main's line.
+        "dataset": bsbm_dataset(config) if bsbm else synthetic_dataset(config),
         "reference": REFERENCE,
         "labels": {
             a["slug"]: a["label"] for a in config["adapters"] if a["slug"] in CONFIGURATIONS
         },
         "medians": medians,
-        "dropped": dropped_queries(config.get("rowCounts", {}), results.get("failures", [])),
+        "dropped": bsbm_dropped(config, results.get("failures", []))
+        if bsbm
+        else dropped_queries(config.get("rowCounts", {}), results.get("failures", [])),
     }
 
 
@@ -100,6 +103,65 @@ def dropped_queries(
         if slug in CONFIGURATIONS and query in row_counts:
             dropped.setdefault(slug, set()).add(query)
     return {slug: sorted(queries) for slug, queries in dropped.items()}
+
+
+def synthetic_dataset(config: dict) -> dict:
+    """What makes two synthetic runs comparable: everything the generator was
+    told, not only its size, and whether the queries asked fresh constants
+    (``BENCH_FRESH_CONSTANTS=1``). That flag is there only when set, so the
+    records written before it keep their identity."""
+    dataset = {
+        "triples": config["triples"],
+        "graphs": config["graphs"],
+        "cardinality": config.get("cardinality"),
+    }
+    if config.get("freshConstants"):
+        dataset["freshConstants"] = True
+    return dataset
+
+
+def bsbm_dataset(config: dict) -> dict:
+    """What makes two BSBM runs comparable: the same official data and streams."""
+    return {
+        "name": "bsbm",
+        "products": config["products"],
+        "triples": config["triples"],
+        "seed": config["seed"],
+        "warmupMixes": config["warmupMixes"],
+        "mixes": config["mixes"],
+        "onlyQuery": config.get("onlyQuery"),
+        "tools": config["tools"]["commit"],
+    }
+
+
+def bsbm_dropped(config: dict, failures: list[dict]) -> dict[str, list[str]]:
+    """Per configuration, the BSBM templates its point leaves out, rdflib being
+    the oracle rather than the majority: a template with an instance the
+    configuration answered differently from rdflib, or that timed out or failed
+    on either side (the configuration's, or rdflib's where the configuration
+    answered), and a template one of the configuration's own failures names
+    (not the majority answer check's). An instance rdflib never reached (its
+    budget ran out) has no answer to compare: there, only the configuration's
+    own timeout or failure drops the template."""
+    answers = config.get("answers", {})
+    reference = answers.get(REFERENCE, {})
+    templates = config.get("instanceTemplates", [])
+    names = {q["name"] for q in config.get("queries", [])}
+    dropped: dict[str, set[str]] = {}
+    for slug in CONFIGURATIONS:
+        for i, answer in answers.get(slug, {}).items():
+            if answer is None or (i in reference and answer != reference[i]):
+                dropped.setdefault(slug, set()).add(f"Q{templates[int(i)]}")
+    for failure in failures:
+        slug, phase = failure.get("slug"), failure.get("phase")
+        if (
+            slug in CONFIGURATIONS
+            and isinstance(phase, str)
+            and phase in names
+            and failure.get("check") != "answers"
+        ):
+            dropped.setdefault(slug, set()).add(phase)
+    return {slug: sorted(qs, key=lambda n: int(n[1:])) for slug, qs in dropped.items()}
 
 
 def load_records(folder: Path) -> tuple[list[dict], list[str]]:
@@ -253,6 +315,12 @@ def main(argv: list[str] | None = None) -> int:
     rec.add_argument("--source", choices=SOURCES, required=True)
     rec.add_argument("--commit", required=True, help="the commit those results measured")
     rec.add_argument("--ref", help="the branch it was measured on (default: the current one)")
+    rec.add_argument(
+        "--dataset",
+        choices=("synthetic", "bsbm"),
+        default="synthetic",
+        help="which results the file holds",
+    )
     rec.add_argument("--out", type=Path, required=True, help="folder to write the record to")
     args = parser.parse_args(argv)
 
@@ -261,6 +329,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     results = json.loads(args.results.read_text(encoding="utf-8"))
+    found = results.get("config", {}).get("dataset", "synthetic")
+    if found != args.dataset:
+        parser.error(f"{args.results} holds {found} results: pass --dataset {found}")
     commit = commit_info(args.commit, args.ref, local=args.source == "local")
     record = make_record(results, commit, args.source)
     if not record["medians"].get(REFERENCE):

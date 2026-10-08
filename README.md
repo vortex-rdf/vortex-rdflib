@@ -152,30 +152,106 @@ store, [oxrdflib](https://github.com/oxigraph/oxrdflib) (Oxigraph),
 on every push to `main` and publishes the current numbers to GitHub Pages:
 **<https://vortex-rdf.github.io/vortex-rdflib/>**.
 
-It executes a synthetic representative SPARQL set with each store's full lifecycle running in its own process. SPARQL evaluation is rdflib's engine for every store but `pyoxigraph`.
+Every section of the dashboard has a tab per dataset:
 
-Results are cross-checked across stores after every run: same data, same
-query, so a store that returns a different number is reported as a failure on
-the dashboard.
+- **Synthetic**: a generated dataset of 250,000 quads in 8 graphs and a
+  representative SPARQL set (lookups and scans, star and chain joins, FILTER /
+  DISTINCT / ORDER BY / GROUP BY, named graphs).
+- **BSBM**: the [Berlin SPARQL Benchmark](https://github.com/Tpt/bsbm-tools)
+  Explore use case at 10,000 products (3.5M triples). The data comes from the
+  official generator. The queries come from the unmodified official test driver
+  (seed 808080, 5 warm-up and 20 measured mixes), so every query instance
+  carries its own parameters. A query running past 5 s is aborted and counted as
+  a timeout. Its time up to the abort still counts in its mix's time, and so in
+  QMpH, as the official driver counts it. A store still running after 300 s of
+  measured mixes finishes its mix, stops, and is marked *partial*.
+
+Each store's whole lifecycle runs in its own process. SPARQL evaluation is
+rdflib's engine for every store but `pyoxigraph`. Results are cross-checked
+across stores after every run:
+- on the synthetic set, every store must return the same number of rows;
+- on BSBM, the rdflib-engine stores must return the same answer to every
+  instance (compared by digest), and pyoxigraph the same number of rows.
+
+A store that does not is reported as a failure on the dashboard. The memory
+panel shows each store's peak RSS and its peak anonymous memory (RssAnon). A
+memory-mapped store's RSS includes file pages the kernel may drop again; its
+RssAnon does not.
 
 Run it locally with `scripts/refresh.sh` — it syncs the contenders, ensures
 the HDT builder, measures, and re-renders the dashboard:
 
 ```bash
-scripts/refresh.sh                      # every stage, at the 250k CI scale
-BENCH_TRIPLES=20000 scripts/refresh.sh  # scale down
-scripts/refresh.sh --only render        # template-only edits: no re-measurement
-scripts/refresh.sh --history            # plot the working tree on the history chart
+scripts/refresh.sh                             # every default stage, at the 250k CI scale
+BENCH_TRIPLES=20000 scripts/refresh.sh         # scale down
+scripts/refresh.sh --bsbm                      # the BSBM tab at CI's scale (needs Java)
+BSBM_PRODUCTS=1000 scripts/refresh.sh --bsbm   # a smaller BSBM run
+scripts/refresh.sh --only render               # template-only edits: no re-measurement
+scripts/refresh.sh --history                   # plot the working tree on the synthetic history chart
 ```
 
-Below the overview, the dashboard has a history chart: for each commit on
-`main`, how many times faster each vortex-rdflib configuration answers the
-query set than rdflib's in-memory store, as a geometric mean (exec only, or
-full). CI records one point per benchmark run on the `bench-history` branch.
-To plot a change on your branch against that line before merging it, run
-`scripts/refresh.sh --history` (about 6 minutes at the default scale): it
-measures the working tree and renders `public/index.html` with your point after
-`main`'s.
+`--bsbm` runs the BSBM and render stages alone, so install the contenders
+first: `uv sync --group bench`, or one plain `scripts/refresh.sh`, which also
+installs the HDT builder. It needs Java and bash, on Linux or macOS.
+
+`BENCH_FRESH_CONSTANTS=1` makes every sample of a synthetic query with a FILTER
+constant (`filter-range`, `filter-arith`, `filter-band-probe`, `minus`) use a
+new constant. Work a store memoizes per constant is then paid in every sample,
+as in a BSBM run. CodSpeed tracks the same for `filter-range` and
+`filter-arith` on every commit (`test_query_fresh_constant`).
+
+Below the overview, each dataset has a history chart. For each commit on `main`,
+it shows how many times faster each vortex-rdflib configuration answers than
+rdflib's in-memory store. The figure is a geometric mean over the queries
+(synthetic) or the Explore templates (BSBM), exec only or full. CI records one
+point per dataset and run on the `bench-history` branch (`records/`,
+`records-bsbm/`). To plot a change on your branch against the synthetic line
+before merging it, run `scripts/refresh.sh --history` (about 6 minutes at the
+default scale). It measures the working tree on the synthetic set and renders
+`public/index.html` with your point after `main`'s. The BSBM chart takes no
+local points.
+
+### BSBM harness
+
+`bench/bsbm` prepares the BSBM tab's data and streams. It also runs paired
+comparisons of two vortex-rdflib or vortex-rdf builds at any scale. `prepare`
+downloads the official tools ([Tpt/bsbm-tools](https://github.com/Tpt/bsbm-tools),
+pinned and checksum-verified, cached in `$BENCH_CACHE` or
+`~/.cache/vortex-rdflib/bsbm`). It needs Java and bash, on Linux or macOS. The
+examples keep everything under `bench/bsbm-data/`, which git ignores:
+
+```bash
+# the dashboard's data and streams: 10,000 products, 5 warm-up and 20 measured mixes
+python -m bench.bsbm.prepare --products 10000 --warmup-mixes 5 --mixes 20 --out bench/bsbm-data/s10k
+python -m bench.run_bench --dataset bsbm --bsbm-dir bench/bsbm-data/s10k   # every store, as on the dashboard
+# the official Q6 (regex) alone, over the same dataset
+python -m bench.bsbm.prepare --from bench/bsbm-data/s10k --only-query 6 --warmup-mixes 2 --mixes 50 --out bench/bsbm-data/q6
+# a paired comparison: one store file, then the stream once per build
+python -c 'import vortex_rdf; vortex_rdf.serialize_rdf("bench/bsbm-data/s10k/dataset.nt", "bench/bsbm-data/store.vortex", format="ntriples", layout="dictionary")'
+PYTHONPATH=../baseline/src python -m bench.bsbm.run_stream bench/bsbm-data/store.vortex --file bench/bsbm-data/s10k/warmup.json bench/bsbm-data/s10k/measured.json bench/bsbm-data/baseline.json
+python -m bench.bsbm.run_stream bench/bsbm-data/store.vortex --file bench/bsbm-data/s10k/warmup.json bench/bsbm-data/s10k/measured.json bench/bsbm-data/run.json
+python -m bench.bsbm.compare bench/bsbm-data/baseline.json bench/bsbm-data/run.json
+```
+
+- `prepare`: re-running it with the same parameters is a cache hit. Other
+  mixes, or another seed, in the same directory reuse its dataset and capture
+  the streams again.
+  - `--from` reuses another prepared directory's dataset, without regenerating
+    or copying it.
+  - `--only-query 6` captures the official Q6 (regex), which the official mix
+    leaves out.
+- `run_stream` measures the vortex-rdflib and vortex-rdf that Python imports,
+  so a baseline is the same stream run once per build, each chosen by
+  `PYTHONPATH`: above, `../baseline` is a worktree of the baseline commit, and
+  its `src/` goes first. A vortex-rdf build is a directory it was installed into
+  (`uv pip install --target DIR --no-deps vortex-rdf==VERSION`).
+- `run_stream` applies a limit only when given one: `--query-timeout`,
+  `--store-budget`, or both. The dashboard's limits come from
+  `BSBM_QUERY_TIMEOUT_S` (5) and `BSBM_STORE_BUDGET_S` (300). The two limits
+  are independent, and 0 turns either off. A timed-out query counts its time up
+  to the abort.
+- `bench.bsbm.record_native` and `bench.bsbm.replay_native` record a stream's
+  native calls and replay them against another vortex-rdf build.
 
 ## Development
 

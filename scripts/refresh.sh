@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 # One-command dashboard refresh, whole or partial.
 #
-#   scripts/refresh.sh                       # every stage
+#   scripts/refresh.sh                       # every default stage
 #   scripts/refresh.sh --only render         # template-only edits: no re-measurement
 #   scripts/refresh.sh --only bench,render   # re-measure, skip the dependency sync
-#   scripts/refresh.sh --history             # plot the working tree on the history chart
+#   scripts/refresh.sh --bsbm                # the BSBM tab: prepare, measure, render (Java)
+#   scripts/refresh.sh --history             # plot the working tree on the synthetic history chart
 #   scripts/refresh.sh --adapters a,b        # measure a subset (see the warning below)
 #   scripts/refresh.sh --force-build         # reinstall the HDT builder even if present
 #   BENCH_TRIPLES=20000 scripts/refresh.sh   # scale down (default: the code's 250k)
+#   BSBM_PRODUCTS=1000 scripts/refresh.sh --bsbm   # a smaller BSBM run (default: CI's 10K)
 #
-# Stages, in the order they run: deps, hdt, bench, history, render. `history`
-# is not in the default set; --history is shorthand for --only history,render.
+# Stages, in the order they run: deps, hdt, bench, bsbm, history, render. `bsbm`
+# and `history` are not in the default set: --bsbm is --only bsbm,render and
+# --history is --only history,render. BSBM knobs, CI's values by default:
+# BSBM_PRODUCTS (10000), BSBM_WARMUP_MIXES (5), BSBM_MIXES (20), BSBM_SEED
+# (808080), BSBM_QUERY_TIMEOUT_S (5), BSBM_STORE_BUDGET_S (300), BSBM_LOAD_ITERS
+# (1). 0 turns either limit, the query timeout or the store budget, off.
 #
 # The measurement runs one process per store, sequentially, so the timings do
 # not contend with each other — the same reason bench/worker.py exists.
@@ -28,14 +34,15 @@ while [ $# -gt 0 ]; do
     --adapters=*) ADAPTERS="${1#*=}"; shift ;;
     --force-build) FORCE_BUILD=1; shift ;;
     --history) ONLY="history,render"; shift ;;
-    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --bsbm) ONLY="bsbm,render"; shift ;;
+    -h|--help) awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
 
 for s in ${ONLY//,/ }; do
-  case "$s" in deps|hdt|bench|history|render) ;; *)
-    echo "unknown stage: $s (stages: deps, hdt, bench, history, render)" >&2; exit 2 ;;
+  case "$s" in deps|hdt|bench|bsbm|history|render) ;; *)
+    echo "unknown stage: $s (stages: deps, hdt, bench, bsbm, history, render)" >&2; exit 2 ;;
   esac
 done
 
@@ -77,6 +84,26 @@ if has bench; then
   uv run python -m bench.run_bench "${args[@]}"
 fi
 
+if has bsbm; then
+  BSBM_PRODUCTS="${BSBM_PRODUCTS:-10000}"
+  BSBM_WARMUP_MIXES="${BSBM_WARMUP_MIXES:-5}"
+  BSBM_MIXES="${BSBM_MIXES:-20}"
+  BSBM_SEED="${BSBM_SEED:-808080}"
+  stage "BSBM (${BSBM_PRODUCTS} products, ${BSBM_WARMUP_MIXES}+${BSBM_MIXES} mixes, seed ${BSBM_SEED})"
+  # One directory per scale: the official tools write its data once, and capture
+  # the streams again only when the mixes or the seed change (the same values
+  # again are a cache hit). Then every store runs them in its own process.
+  bsbm_dir="bench/bsbm-data/p${BSBM_PRODUCTS}"
+  uv run python -m bench.bsbm.prepare --products "$BSBM_PRODUCTS" \
+    --warmup-mixes "$BSBM_WARMUP_MIXES" --mixes "$BSBM_MIXES" --seed "$BSBM_SEED" --out "$bsbm_dir"
+  bsbm_args=(--dataset bsbm --bsbm-dir "$bsbm_dir" --out bench/results-bsbm.json)
+  if [ -n "$ADAPTERS" ]; then
+    echo "note: --adapters replaces bench/results-bsbm.json with only these rows"
+    bsbm_args+=(--adapters "$ADAPTERS")
+  fi
+  uv run python -m bench.run_bench "${bsbm_args[@]}"
+fi
+
 if has history; then
   stage "History point for the working tree (BENCH_TRIPLES=${BENCH_TRIPLES:-250000})"
   # The 8 vortex configurations plus rdflib, the reference the chart divides
@@ -92,18 +119,20 @@ fi
 
 if has render; then
   stage "Render (public/index.html)"
-  if [ ! -f bench/results.json ]; then
-    echo "bench/results.json is missing — run the bench stage at least once first" >&2
+  if [ ! -f bench/results.json ] && [ ! -f bench/results-bsbm.json ]; then
+    echo "neither bench/results.json nor bench/results-bsbm.json exists — run bench or bsbm first" >&2
     exit 1
   fi
-  render_args=(bench/results.json public/index.html)
-  # The history chart: main's records from the bench-history branch, plus this
-  # machine's local points. Either may be missing; the chart shows what there
-  # is, or stays hidden.
+  # A missing results file disables its dataset's tabs, with a note on the page.
+  render_args=(bench/results.json public/index.html --bsbm bench/results-bsbm.json)
   history_dir="$(mktemp -d)"
-  if git fetch --quiet origin bench-history 2>/dev/null \
-    && git archive FETCH_HEAD records | tar -x -C "$history_dir" 2>/dev/null; then
-    render_args+=(--history "$history_dir/records")
+  if git fetch --quiet origin bench-history 2>/dev/null; then
+    if git archive FETCH_HEAD records 2>/dev/null | tar -x -C "$history_dir" 2>/dev/null; then
+      render_args+=(--history "$history_dir/records")
+    fi
+    if git archive FETCH_HEAD records-bsbm 2>/dev/null | tar -x -C "$history_dir" 2>/dev/null; then
+      render_args+=(--bsbm-history "$history_dir/records-bsbm")
+    fi
   else
     echo "note: origin has no bench-history branch yet; the history chart shows local points only"
   fi

@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Render bench/results.json into the static HTML dashboard.
+"""Render the benchmark results into the static HTML dashboard.
 
 Usage:
-    uv run python -m bench.run_bench --out bench/results.json
     python3 scripts/render_bench_dashboard.py bench/results.json public/index.html
-        [--history DIR] [--local DIR]
+        [--bsbm bench/results-bsbm.json] [--history DIR] [--local DIR] [--bsbm-history DIR]
 
-Unlike vortex-rdf's renderer (which parses divan's text tables), the Python
-bench emits dashboard-shaped JSON directly, so this is pure template
-substitution. ``--history`` (the ``records/`` folder of the ``bench-history``
-branch) and ``--local`` (``bench/history-local``) add the history chart's
-series (``bench.history.build_series``); without either, the chart stays
-hidden.
+Both datasets' results go into one page, where every section has a tab per
+dataset. A results file missing (or not given) disables its tabs with a note;
+with neither, nothing renders. ``--history`` (``records/`` of the
+``bench-history`` branch) and ``--local`` (``bench/history-local``) feed the
+synthetic history chart, ``--bsbm-history`` (``records-bsbm/``) the BSBM one.
 """
 
 import argparse
@@ -19,12 +17,12 @@ import json
 import sys
 from pathlib import Path
 
-# The history series come from the bench package; this script runs as a file,
-# so the repo root is not on sys.path by itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from bench.history import build_series, load_records  # noqa: E402
 
 TEMPLATE = Path(__file__).resolve().parent / "bench_dashboard_template.html"
+#: Per-instance answers: for merges and history records, not the page.
+PAGE_DROPS = ("answers",)
 
 
 def history_data(history: Path | None, local: Path | None) -> dict | None:
@@ -39,41 +37,71 @@ def history_data(history: Path | None, local: Path | None) -> dict | None:
     return series
 
 
+def load_results(path: Path | None, what: str) -> tuple[dict | None, str | None]:
+    """A dataset's results, or None and why its tabs are disabled."""
+    if path is None:
+        return None, f"this render was given no {what} results"
+    if not path.is_file():
+        return None, f"{path} does not exist"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not data.get("results"):
+        return None, f"{path} has no benchmark rows"
+    return data, None
+
+
+def page_set(data: dict, history: dict | None) -> dict:
+    config = {k: v for k, v in data.get("config", {}).items() if k not in PAGE_DROPS}
+    return {
+        "results": data["results"],
+        "memory": data.get("memory", []),
+        "config": config,
+        "failures": data.get("failures", []),
+        "provenance": data.get("provenance", ""),
+        "history": history,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("results", type=Path, help="bench/results.json")
+    parser.add_argument("results", type=Path, help="bench/results.json (synthetic)")
     parser.add_argument("output", type=Path, help="the HTML file to write")
-    parser.add_argument("--history", type=Path, help="folder of main's history records")
-    parser.add_argument("--local", type=Path, help="folder of local history records")
+    parser.add_argument("--bsbm", type=Path, help="bench/results-bsbm.json")
+    parser.add_argument("--history", type=Path, help="folder of main's synthetic history records")
+    parser.add_argument("--local", type=Path, help="folder of local synthetic history records")
+    parser.add_argument("--bsbm-history", type=Path, help="folder of main's BSBM history records")
     args = parser.parse_args()
-
-    data = json.loads(args.results.read_text(encoding="utf-8"))
-    if not data.get("results"):
-        print("results.json has no benchmark rows — did the bench run?", file=sys.stderr)
+    synthetic, synthetic_note = load_results(args.results, "synthetic")
+    bsbm, bsbm_note = load_results(args.bsbm, "BSBM")
+    if synthetic is None and bsbm is None:
+        print(f"nothing to render: {synthetic_note}; {bsbm_note}", file=sys.stderr)
         return 1
-    history = history_data(args.history, args.local)
-
-    html = (
-        TEMPLATE.read_text(encoding="utf-8")
-        .replace("__BENCH_DATA__", json.dumps(data["results"]))
-        .replace("__MEMORY_DATA__", json.dumps(data.get("memory", [])))
-        .replace("__CONFIG_DATA__", json.dumps(data.get("config", {})))
-        .replace("__FAILURES_DATA__", json.dumps(data.get("failures", [])))
-        .replace("__PROVENANCE__", json.dumps(data.get("provenance", "")))
-        # Commit subjects are free text, and "</script>" or "<!--" in one must
-        # not end or swallow the page's script: every "<" goes in as \u003c,
-        # the same character to JSON and to JavaScript.
-        .replace("__HISTORY_DATA__", json.dumps(history).replace("<", "\\u003c"))
+    synthetic_history = history_data(args.history, args.local) if synthetic else None
+    bsbm_history = history_data(args.bsbm_history, None) if bsbm else None
+    sets = {
+        "synthetic": page_set(synthetic, synthetic_history) if synthetic else None,
+        "bsbm": page_set(bsbm, bsbm_history) if bsbm else None,
+        "notes": {"synthetic": synthetic_note, "bsbm": bsbm_note},
+    }
+    # Commit subjects and query texts are free text: "</script>" or "<!--" in one
+    # must not end the page's script, so every "<" goes in as <.
+    html = TEMPLATE.read_text(encoding="utf-8").replace(
+        "__DATASETS__", json.dumps(sets).replace("<", "\\u003c")
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(html, encoding="utf-8")
-    points = f", {len(history['points'])} history points" if history else ""
-    print(
-        f"rendered {len(data['results'])} rows, {len(data.get('memory', []))} memory readings"
-        f"{points} -> {args.output}"
-    )
+    for key, data, series, note in (
+        ("synthetic", synthetic, synthetic_history, synthetic_note),
+        ("bsbm", bsbm, bsbm_history, bsbm_note),
+    ):
+        if data is None:
+            print(f"{key}: tab disabled ({note})")
+            continue
+        points = f", {len(series['points'])} history points" if series else ""
+        memory = len(data.get("memory", []))
+        print(f"{key}: {len(data['results'])} rows, {memory} memory readings{points}")
+    print(f"rendered -> {args.output}")
     return 0
 
 
