@@ -56,11 +56,14 @@ jobs:
       # Full scale: 250k quads over 8 graphs, one worker per store.
       - name: Run comparative benchmark
         run: uv run python -m bench.run_bench --out bench/results.json
+      # Every upload overwrites: a re-run job finds its first attempt's artifact
+      # under the same name, and would fail on it.
       - name: Hand the results to the render job
         uses: actions/upload-artifact@v4
         with:
           name: results-synthetic
           path: bench/results.json
+          overwrite: true
           retention-days: 7
       # On main only; a failure costs the point, never the deploy.
       - name: Record this commit's point
@@ -76,6 +79,7 @@ jobs:
           name: history-record
           path: out/records/${{ github.sha }}.json
           if-no-files-found: ignore
+          overwrite: true
           retention-days: 7
 
   # The official BSBM data and streams, cached across runs (a cache hit is a
@@ -111,6 +115,7 @@ jobs:
         with:
           name: bsbm-prepared
           path: ${{ env.BSBM_DIR }}
+          overwrite: true
           retention-days: 1
 
   # Every store over the streams, in six groups side by side; within a group the
@@ -209,6 +214,7 @@ jobs:
         with:
           name: results-bsbm
           path: bench/results-bsbm.json
+          overwrite: true
           retention-days: 7
       - name: Record this commit's BSBM point
         if: github.ref == 'refs/heads/main'
@@ -223,6 +229,7 @@ jobs:
           name: history-record-bsbm
           path: out/records-bsbm/${{ github.sha }}.json
           if-no-files-found: ignore
+          overwrite: true
           retention-days: 7
 
   render:
@@ -343,8 +350,11 @@ jobs:
             || { git fetch --quiet origin bench-history && git rebase --quiet FETCH_HEAD \
                  && git push --quiet origin HEAD:bench-history; }
 
+  # Whenever render built the page, even after a failed job before it: with no
+  # if:, a job runs only when every job before it succeeded.
   deploy:
     needs: render
+    if: ${{ !cancelled() && needs.render.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
