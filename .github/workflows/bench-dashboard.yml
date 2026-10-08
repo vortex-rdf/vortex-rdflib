@@ -4,17 +4,17 @@ on:
   push:
     branches:
       - main
-    # Skip the ~15-minute comparative bench on doc-only pushes. Deliberately
-    # narrow: bench/ and scripts/ are dashboard inputs.
+    # Skip the comparative benches on doc-only pushes. Deliberately narrow:
+    # bench/ and scripts/ are dashboard inputs.
     paths-ignore:
       - '**.md'
       - 'LICENSE'
       - '.gitignore'
   workflow_dispatch:
 
-# The build job installs third-party code (the contenders, the hdt crate), so
-# its token can only read the repository. The record job below is the one
-# place that writes, and it runs nothing but git.
+# The measuring jobs install third-party code (the contenders, the hdt crate, the
+# official BSBM tools' Java), so their token can only read the repository. The
+# record job is the one place that writes, and it runs nothing but git.
 permissions:
   contents: read
   pages: write
@@ -24,76 +24,241 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
+# The BSBM run CI measures; the prepared data is cached under these and the
+# hash of the code that prepares it.
+env:
+  BSBM_TOOLS_COMMIT: 59d0a8a605b26f21506789fa1a713beb5abf1cab
+  BSBM_PRODUCTS: 10000
+  BSBM_WARMUP_MIXES: 5
+  BSBM_MIXES: 20
+  BSBM_SEED: 808080
+  BSBM_DIR: bench/bsbm-data/ci
+
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
-
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-
       - name: Install (with bench contenders)
         run: uv sync --locked --group bench
-
-      # rdflib-hdt reads HDT but cannot write it, so its build step shells out
-      # to the Rust crate's CLI. The contenders whose pins conflict with the
-      # project environment (pycottas, rdflib-hdt) get isolated venvs that
-      # run_bench builds itself; rdflib-hdt compiles hdt-cpp from source there,
-      # which needs the C++ toolchain ubuntu-latest already ships.
+      # rdflib-hdt reads HDT but cannot write it, so its build step shells out to
+      # the Rust crate's CLI; isolated venvs (pycottas, rdflib-hdt) are built by
+      # run_bench itself.
       - name: Install the HDT builder
         run: cargo install hdt --features cli --locked
-
-      # Full scale: the code defaults (250k quads over 8 graphs). One worker per
-      # store; peak-RSS readings are per-store and uncontaminated.
+      # Full scale: 250k quads over 8 graphs, one worker per store.
       - name: Run comparative benchmark
         run: uv run python -m bench.run_bench --out bench/results.json
+      - name: Hand the results to the render job
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-synthetic
+          path: bench/results.json
+          retention-days: 7
+      # On main only; a failure costs the point, never the deploy.
+      - name: Record this commit's point
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: >-
+          uv run python -m bench.history record bench/results.json
+          --source ci --commit "$GITHUB_SHA" --ref main --out out/records
+      - name: Hand the record to the record job
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-record
+          path: out/records/${{ github.sha }}.json
+          if-no-files-found: ignore
+          retention-days: 7
 
-      # The history chart's data: one record per main commit on the
-      # bench-history branch, kept across deploys. Read here, pushed by the
-      # record job.
+  # The official BSBM data and streams, cached across runs (a cache hit is a
+  # cache hit for prepare too: nothing runs).
+  bsbm-prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install
+        run: uv sync --locked
+      - name: Restore the prepared BSBM data
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BSBM_DIR }}
+          key: bsbm-${{ env.BSBM_TOOLS_COMMIT }}-p${{ env.BSBM_PRODUCTS }}-w${{ env.BSBM_WARMUP_MIXES }}-m${{ env.BSBM_MIXES }}-s${{ env.BSBM_SEED }}-${{ hashFiles('bench/bsbm/tools.py', 'bench/bsbm/capture.py', 'bench/bsbm/streams.py', 'bench/bsbm/prepare.py') }}
+      - name: Prepare the official BSBM data and streams
+        run: >-
+          uv run python -m bench.bsbm.prepare --products "$BSBM_PRODUCTS"
+          --warmup-mixes "$BSBM_WARMUP_MIXES" --mixes "$BSBM_MIXES" --seed "$BSBM_SEED"
+          --out "$BSBM_DIR"
+      - name: Hand the prepared data to the BSBM jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: bsbm-prepared
+          path: ${{ env.BSBM_DIR }}
+          retention-days: 1
+
+  # Every store over the streams, in six groups side by side; within a group the
+  # stores run one after another.
+  bsbm:
+    needs: bsbm-prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: vortex-pushdown
+            adapters: vortex_dict_mem,vortex_dict_mem_copy,vortex_dict_mem_ref,vortex_dict_file,vortex_dict_file_copy,vortex_dict_file_ref
+            minutes: 22
+          # The two pushdown-off rows are the slowest vortex stores (rdflib's own
+          # evaluator, ~3 min each on CI at 10K): their own job keeps the
+          # pushdown group well under the cap (decided 2026-10-07).
+          - group: vortex-nopushdown
+            adapters: vortex_dict_mem_nopushdown,vortex_dict_file_nopushdown
+            minutes: 22
+          - group: rdflib-pyoxigraph
+            adapters: rdflib_memory,pyoxigraph
+            minutes: 22
+          - group: oxrdflib
+            adapters: oxrdflib
+            minutes: 22
+          - group: hdt
+            adapters: rdflib_hdt
+            minutes: 17
+          - group: pycottas
+            adapters: pycottas
+            minutes: 21
+    env:
+      BSBM_QUERY_TIMEOUT_S: 5
+      BSBM_STORE_BUDGET_S: 300
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install (with bench contenders)
+        run: uv sync --locked --group bench
+      - name: Install the HDT builder
+        if: matrix.group == 'hdt'
+        run: cargo install hdt --features cli --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: bsbm-prepared
+          path: ${{ env.BSBM_DIR }}
+      # Under the job's limit, so a long group still uploads every store it
+      # finished (run_bench rewrites the file after each).
+      - name: Run the BSBM streams
+        timeout-minutes: ${{ matrix.minutes }}
+        run: >-
+          uv run python -m bench.run_bench --dataset bsbm --bsbm-dir "$BSBM_DIR"
+          --adapters ${{ matrix.adapters }} --out bsbm-partial/${{ matrix.group }}.json
+      - name: Hand the group's results to the merge job
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bsbm-partial-${{ matrix.group }}
+          path: bsbm-partial/${{ matrix.group }}.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  bsbm-merge:
+    needs: [bsbm-prepare, bsbm]
+    if: always() && needs.bsbm-prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --locked
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: bsbm-partial-*
+          path: bsbm-partial
+          merge-multiple: true
+      # A group without a file is named as a failure on the page; no file at all fails this job.
+      - name: Merge the groups and check answers across every store
+        run: uv run python -m bench.bsbm.merge --out bench/results-bsbm.json bsbm-partial/*.json
+      - name: Hand the results to the render job
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-bsbm
+          path: bench/results-bsbm.json
+          retention-days: 7
+      - name: Record this commit's BSBM point
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: >-
+          uv run python -m bench.history record bench/results-bsbm.json --dataset bsbm
+          --source ci --commit "$GITHUB_SHA" --ref main --out out/records-bsbm
+      - name: Hand the record to the record job
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-record-bsbm
+          path: out/records-bsbm/${{ github.sha }}.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  render:
+    needs: [build, bsbm-merge]
+    if: always() && (needs.build.result == 'success' || needs.bsbm-merge.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --locked
+      # A missing file disables its dataset's tabs, with a note on the page.
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: results-synthetic
+          path: bench
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: results-bsbm
+          path: bench
+      # One record per main commit and dataset, kept across deploys on bench-history.
       - name: Fetch the history
         run: |
           if git ls-remote --exit-code --heads origin bench-history >/dev/null; then
             git fetch --quiet origin bench-history
             git worktree add --detach history FETCH_HEAD
           fi
-
-      # This commit's point, on main only: a manual run on another branch must
-      # not land on main's line. A failure costs the point, never the deploy.
-      - name: Record this commit's point
-        if: github.ref == 'refs/heads/main'
-        continue-on-error: true
-        run: >-
-          uv run python -m bench.history record bench/results.json
-          --source ci --commit "$GITHUB_SHA" --ref main --out history/records
-
-      - name: Hand the record to the record job
-        if: github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v4
-        with:
-          name: history-record
-          path: history/records/${{ github.sha }}.json
-          if-no-files-found: ignore
-          retention-days: 7
-
       - name: Render dashboard
         run: >-
           uv run python scripts/render_bench_dashboard.py bench/results.json public/index.html
-          --history history/records
-
+          --bsbm bench/results-bsbm.json --history history/records
+          --bsbm-history history/records-bsbm
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
           path: public
 
-  # Pushes the build job's record to bench-history. The only job with write
-  # access, and it runs nothing but git. A push that loses a race rebases once.
+  # Pushes both records to bench-history: the only job with write access, and it
+  # runs nothing but git. A push that loses a race rebases once.
   record:
-    needs: build
-    if: github.ref == 'refs/heads/main'
+    needs: [build, bsbm-merge]
+    if: always() && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -104,13 +269,17 @@ jobs:
       GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
     steps:
       - uses: actions/checkout@v5
-
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: history-record
-          path: incoming
-
-      - name: Push the record to bench-history
+          path: incoming/records
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: history-record-bsbm
+          path: incoming/records-bsbm
+      - name: Push the records to bench-history
         run: |
           if git ls-remote --exit-code --heads origin bench-history >/dev/null; then
             git fetch --quiet origin bench-history
@@ -118,17 +287,27 @@ jobs:
           else
             git worktree add --orphan -b bench-history history
           fi
-          mkdir -p history/records
-          cp incoming/*.json history/records/
+          for folder in records records-bsbm; do
+            if compgen -G "incoming/$folder/*.json" >/dev/null; then
+              mkdir -p "history/$folder"
+              cp "incoming/$folder/"*.json "history/$folder/"
+            fi
+          done
           cd history
-          git add records
+          for folder in records records-bsbm; do
+            if [ -d "$folder" ]; then git add "$folder"; fi
+          done
+          if git diff --cached --quiet; then
+            echo "no record to push"
+            exit 0
+          fi
           git commit --quiet -m "bench: record ${GITHUB_SHA::7}"
           git push --quiet origin HEAD:bench-history \
             || { git fetch --quiet origin bench-history && git rebase --quiet FETCH_HEAD \
                  && git push --quiet origin HEAD:bench-history; }
 
   deploy:
-    needs: build
+    needs: render
     runs-on: ubuntu-latest
     environment:
       name: github-pages
