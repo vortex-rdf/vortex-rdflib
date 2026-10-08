@@ -6,8 +6,8 @@ name: Benchmark History Backfill
 # PYTHONPATH, ahead of the editable install, and so does the vortex-rdf release
 # its uv.lock pins, installed into a directory of its own. Started by hand;
 # re-running a commit replaces its record. The measure job holds a read-only
-# token (it runs the BSBM tools' Java); the push job holds the write token and
-# runs nothing but git.
+# token and keeps no credentials (it runs the BSBM tools' Java); the push job
+# holds the write token and runs nothing but git.
 on:
   workflow_dispatch:
     inputs:
@@ -25,11 +25,6 @@ on:
 
 permissions:
   contents: read
-
-# Shared with the dashboard workflow, so one job writes bench-history at a time.
-concurrency:
-  group: pages
-  cancel-in-progress: false
 
 env:
   BSBM_TOOLS_COMMIT: 59d0a8a605b26f21506789fa1a713beb5abf1cab
@@ -49,6 +44,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -73,8 +69,12 @@ jobs:
           --warmup-mixes "$BSBM_WARMUP_MIXES" --mixes "$BSBM_MIXES" --seed "$BSBM_SEED"
           --out "$BSBM_DIR"
       # One commit's failure is reported and skipped; everything recorded is
-      # handed to the push job together.
+      # handed to the push job together, even when a later commit fails or this
+      # step runs out of time. The step's limit sits under the job's: a step that
+      # times out fails, so the upload below still runs, where a job that times
+      # out is cancelled and skips it.
       - name: Measure and record each commit
+        timeout-minutes: 280
         env:
           COMMITS: ${{ inputs.commits }}
           DATASET: ${{ inputs.dataset }}
@@ -82,6 +82,14 @@ jobs:
           mkdir -p out/records out/records-bsbm
           adapters="$(uv run python -m bench.history adapters)"
           recorded=""
+          # A commit is listed as soon as one of its records exists, and the list is
+          # rewritten each time, so a run cut short still hands over a true one.
+          note() {
+            case " $recorded " in
+              *" $commit "*) ;;
+              *) recorded="$recorded $commit"; echo "$recorded" > out/recorded.txt ;;
+            esac
+          }
           for commit in $COMMITS; do
             lib="$RUNNER_TEMP/lib-$commit"
             deps="$RUNNER_TEMP/deps-$commit"
@@ -105,42 +113,57 @@ jobs:
             case "$(echo "$found" | sed -n 2p)" in "$deps"/*) ;; *)
               echo "::error::$commit: vortex_rdf resolved outside $deps; skipped"; continue ;;
             esac
-            ok=1
             # The record step runs today's bench.history with $deps first, so the
             # record names the commit's vortex-rdf version.
             if [ "$DATASET" != bsbm ]; then
-              PYTHONPATH="$path" uv run python -m bench.run_bench --adapters "$adapters" \
-                  --out "$RUNNER_TEMP/results-$commit.json" \
-                && PYTHONPATH="$deps" uv run python -m bench.history record \
-                  "$RUNNER_TEMP/results-$commit.json" --source backfill --commit "$commit" \
-                  --ref main --out out/records \
-                || { echo "::error::$commit: the synthetic benchmark or its record did not complete"; ok=0; }
+              if PYTHONPATH="$path" uv run python -m bench.run_bench --adapters "$adapters" \
+                    --out "$RUNNER_TEMP/results-$commit.json" \
+                  && PYTHONPATH="$deps" uv run python -m bench.history record \
+                    "$RUNNER_TEMP/results-$commit.json" --source backfill --commit "$commit" \
+                    --ref main --out out/records; then
+                note
+              else
+                echo "::error::$commit: the synthetic benchmark or its record did not complete"
+              fi
             fi
             if [ "$DATASET" != synthetic ]; then
-              PYTHONPATH="$path" uv run python -m bench.run_bench --dataset bsbm --bsbm-dir "$BSBM_DIR" \
-                  --adapters "$adapters" --out "$RUNNER_TEMP/results-bsbm-$commit.json" \
-                && PYTHONPATH="$deps" uv run python -m bench.history record \
-                  "$RUNNER_TEMP/results-bsbm-$commit.json" --dataset bsbm --source backfill \
-                  --commit "$commit" --ref main --out out/records-bsbm \
-                || { echo "::error::$commit: the BSBM benchmark or its record did not complete"; ok=0; }
+              if PYTHONPATH="$path" uv run python -m bench.run_bench --dataset bsbm --bsbm-dir "$BSBM_DIR" \
+                    --adapters "$adapters" --out "$RUNNER_TEMP/results-bsbm-$commit.json" \
+                  && PYTHONPATH="$deps" uv run python -m bench.history record \
+                    "$RUNNER_TEMP/results-bsbm-$commit.json" --dataset bsbm --source backfill \
+                    --commit "$commit" --ref main --out out/records-bsbm; then
+                note
+              else
+                echo "::error::$commit: the BSBM benchmark or its record did not complete"
+              fi
             fi
-            if [ "$ok" = 1 ]; then recorded="$recorded $commit"; fi
           done
-          if [ -z "$recorded" ]; then
-            echo "::error::no commit was recorded"
+          if ! compgen -G 'out/records*/*.json' >/dev/null; then
+            echo "::error::no record was produced"
             exit 1
           fi
-          echo "$recorded" > out/recorded.txt
       - name: Hand the records to the push job
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: backfill-records
           path: out
+          if-no-files-found: ignore
+          overwrite: true
           retention-days: 7
 
+  # Runs after a failed or timed-out measure job too, for whatever that handed over.
+  # The group serializes it with the dashboard's record job; a push that loses a race
+  # anyway rebases once. The measure job holds no group, so a long backfill never
+  # delays a dashboard run.
   push:
     needs: measure
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: bench-history
+      cancel-in-progress: false
     permissions:
       contents: write
     env:
@@ -150,7 +173,9 @@ jobs:
       GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
     steps:
       - uses: actions/checkout@v5
+      # No artifact when the measure job produced no record: nothing to push then.
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: backfill-records
           path: incoming
@@ -168,7 +193,7 @@ jobs:
               cp "incoming/$folder/"*.json "history/$folder/"
             fi
           done
-          recorded="$(cat incoming/recorded.txt)"
+          recorded="$(cat incoming/recorded.txt 2>/dev/null || true)"
           cd history
           for folder in records records-bsbm; do
             if [ -d "$folder" ]; then git add "$folder"; fi

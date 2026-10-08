@@ -13,13 +13,14 @@ on:
   workflow_dispatch:
 
 # The measuring jobs install third-party code (the contenders, the hdt crate, the
-# official BSBM tools' Java), so their token can only read the repository. The
-# record job is the one place that writes, and it runs nothing but git.
+# official BSBM tools' Java), so the workflow's token only reads the repository,
+# and their checkouts leave no credentials behind. Two jobs ask for more, and each
+# runs nothing but its one task: record is the one place that writes the repository
+# (nothing but git), and deploy is the one that publishes the page.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
+# One dashboard run at a time. The record job also holds the bench-history group.
 concurrency:
   group: pages
   cancel-in-progress: false
@@ -40,6 +41,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -82,6 +85,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -144,6 +149,8 @@ jobs:
       BSBM_STORE_BUDGET_S: 300
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -163,6 +170,7 @@ jobs:
         run: >-
           uv run python -m bench.run_bench --dataset bsbm --bsbm-dir "$BSBM_DIR"
           --adapters ${{ matrix.adapters }} --out bsbm-partial/${{ matrix.group }}.json
+      # A re-run of one leg replaces that leg's earlier partial.
       - name: Hand the group's results to the merge job
         if: always()
         uses: actions/upload-artifact@v4
@@ -170,15 +178,18 @@ jobs:
           name: bsbm-partial-${{ matrix.group }}
           path: bsbm-partial/${{ matrix.group }}.json
           if-no-files-found: ignore
+          overwrite: true
           retention-days: 7
 
   bsbm-merge:
     needs: [bsbm-prepare, bsbm]
-    if: always() && needs.bsbm-prepare.result == 'success'
+    if: ${{ !cancelled() && needs.bsbm-prepare.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -216,11 +227,14 @@ jobs:
 
   render:
     needs: [build, bsbm-merge]
-    if: always() && (needs.build.result == 'success' || needs.bsbm-merge.result == 'success')
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.bsbm-merge.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # No credentials are kept: the history fetch below is a public read.
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -244,6 +258,23 @@ jobs:
             git fetch --quiet origin bench-history
             git worktree add --detach history FETCH_HEAD
           fi
+      # This run's own points, straight from the jobs that measured them. The record
+      # job pushes the same files, but nothing orders it before this job, so the
+      # branch alone may not hold them yet. After the fetch, because git will not
+      # add a worktree over a directory that already has files in it. A failure
+      # costs the point, never the deploy.
+      - uses: actions/download-artifact@v4
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        with:
+          name: history-record
+          path: history/records
+      - uses: actions/download-artifact@v4
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        with:
+          name: history-record-bsbm
+          path: history/records-bsbm
       - name: Render dashboard
         run: >-
           uv run python scripts/render_bench_dashboard.py bench/results.json public/index.html
@@ -255,11 +286,17 @@ jobs:
           path: public
 
   # Pushes both records to bench-history: the only job with write access, and it
-  # runs nothing but git. A push that loses a race rebases once.
+  # runs nothing but git. The group serializes it with the backfill's push job; a
+  # push that loses a race anyway rebases once. The render job does not wait for
+  # this one: it reads the same records from the build and merge jobs' artifacts.
   record:
     needs: [build, bsbm-merge]
-    if: always() && github.ref == 'refs/heads/main'
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: bench-history
+      cancel-in-progress: false
     permissions:
       contents: write
     env:
@@ -309,6 +346,11 @@ jobs:
   deploy:
     needs: render
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
