@@ -279,6 +279,46 @@ def test_an_argument_vortex_rdf_cannot_take_leaves_every_candidate_undecided(spe
     assert not passed and set(undecided) == codes
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [
+        NativeShape("is_literal", ""),
+        NativeShape("is_iri", ""),
+        NativeShape("is_blank", ""),
+        NativeShape("iri_in", ("<http://ex.org/x>", "<urn:x>")),
+        NativeShape("num_ne", f'"5"^^<{XSD}integer>'),
+        NativeShape("num_lt", f'"5"^^<{XSD}integer>'),
+        NativeShape("str_prefix", "a"),
+        NativeShape("regex", "a"),
+        NativeShape("regex", "a|\ud800"),
+    ],
+    ids=[
+        "is_literal",
+        "is_iri",
+        "is_blank",
+        "iri_in",
+        "num_ne",
+        "num_lt",
+        "str_prefix",
+        "regex",
+        "regex-refused",
+    ],
+)
+def test_a_code_that_is_no_term_is_left_undecided_under_every_shape(spelling_store, shape):
+    """The empty graph name (code 0), a code past the dictionary's end and a
+    negative code lie in none of the kinds' ranges: whatever the shape, they
+    go to the Python routes, which fail on them, and the verdicts on the
+    terms are what they are without them."""
+    dictionary = spelling_store._dict
+    assert dictionary.decode(0) == ""
+    not_terms = {0, len(dictionary), len(dictionary) + 7, -1}
+    codes = _all_codes(spelling_store)
+    passed, undecided = candidates.evaluate(spelling_store, shape, codes)
+    passed_with, undecided_with = candidates.evaluate(spelling_store, shape, codes | not_terms)
+    assert passed_with == passed
+    assert sorted(undecided_with) == sorted([*undecided, *not_terms])
+
+
 def test_ctx_bound_constant_side_is_evaluated_by_rdflib():
     """The constant side of a comparison may be an expression over visible
     ctx-bound variables (BSBM Explore Q5's `?ref + N`): rdflib computes it."""

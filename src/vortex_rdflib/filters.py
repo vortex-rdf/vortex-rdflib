@@ -1110,8 +1110,9 @@ def evaluate_constant(conjunct: Conjunct) -> bool:
 
 def evaluate_column(store, conjuncts: list, codes) -> set:
     """The subset of ``codes`` (distinct codes of one variable) passing every
-    conjunct. Kind-only predicates never decode; a conjunct with a native
-    shape is answered by vortex-rdf over the codes still in play
+    conjunct — ``codes`` itself when it is a set that no conjunct narrows.
+    Kind-only predicates never decode; a conjunct with a native shape is
+    answered by vortex-rdf over the codes still in play
     (:func:`candidates.evaluate`), and only the codes it leaves undecided go
     on; the others decode the surviving codes once, in one batch, and parse
     their spellings."""

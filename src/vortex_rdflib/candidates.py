@@ -20,11 +20,14 @@ others needs no native call: the literal predicates fail every IRI and blank
 node (``!=`` passes them), the string functions fail them too unless their
 text is ``STR(?v)``, which reads an IRI as its string — sent — and a blank
 node as its label — left to the Python routes. Only the codes a predicate
-reads are sent, sorted and unique as ``filter_codes`` requires.
+reads are sent, sorted and unique as ``filter_codes`` requires. A code in
+none of the term kinds' ranges (the empty graph name, a code past the
+dictionary's end, a negative one) is no term: it is left undecided under every
+shape.
 """
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import NamedTuple
 
 from vortex_rdf import U64Column
@@ -58,7 +61,8 @@ STRING_KINDS = frozenset({"regex", "contains", "strstarts", "strends"})
 
 #: The pushdown's query trace (``pushdown._trace_native_filter``), installed
 #: when that module is imported; called after every ``filter_codes`` call
-#: with the kind and how many codes were sent, passed and left undecided.
+#: that answers, with the kind, how many codes were sent, passed and left
+#: undecided, and the call's nanoseconds.
 TRACE: Callable[[str, int, int, int, int], None] | None = None
 
 
@@ -77,27 +81,48 @@ def keep_of(store, shape: NativeShape):
     return None
 
 
-def evaluate(store, shape: NativeShape, codes) -> tuple[set, list]:
-    """Of ``codes`` — distinct codes of one variable, in any order — the set
-    that passes ``shape`` and the codes left undecided, for the Python
-    routes; every other code fails."""
+def _not_terms(codes: Collection[int], ranges: dict) -> list:
+    """The codes that are no term's: the empty graph name (below the term
+    kinds' ranges), a code past the dictionary's end, a negative one. The
+    ranges are adjacent (literals, IRIs, blank nodes), so the terms are the
+    codes from the lowest bound to the highest, and ``min`` and ``max`` clear
+    a collection of terms without a test per code."""
+    low = min(lo for lo, _ in ranges.values())
+    high = max(hi for _, hi in ranges.values())
+    if min(codes) >= low and max(codes) < high:
+        return []
+    return [code for code in codes if not low <= code < high]
+
+
+def evaluate(store, shape: NativeShape, codes: Collection[int]) -> tuple[set, list]:
+    """Of ``codes`` — a collection of distinct codes of one variable, in any
+    order — the set that passes ``shape`` and the codes left undecided, for
+    the Python routes; every other code fails. A code that is no term's (the
+    empty graph name, a code past the dictionary's end, a negative one) is
+    undecided under every shape."""
+    if not codes:
+        return set(), []
     try:
         keep = keep_of(store, shape)
     except ValueError:
         return set(), list(codes)
+    ranges = store._kind_ranges()
+    undecided = _not_terms(codes, ranges)
     if isinstance(keep, tuple):
         lo, hi = keep
-        return {code for code in codes if lo <= code < hi}, []
+        return {code for code in codes if lo <= code < hi}, undecided
     if keep is not None:
         allowed = set(memoryview(keep).cast("Q").tolist())
-        return {code for code in codes if code in allowed}, []
-    ranges = store._kind_ranges()
+        return {code for code in codes if code in allowed}, undecided
     literal_lo, literal_hi = ranges[LITERAL]
     iri_lo, iri_hi = ranges[IRI]
     blank_lo, blank_hi = ranges[BLANK]
     passed: set = set()
-    undecided: list = []
-    if shape.kind == "str_prefix" or (shape.kind in STRING_KINDS and shape.as_str):
+    # str_prefix is STRSTARTS(STR(?v), ...): it reads STR() like the string
+    # kinds under as_str, and filter_codes reads an IRI or a typed literal as
+    # STR() only under as_str.
+    as_str = shape.kind == "str_prefix" or (shape.kind in STRING_KINDS and shape.as_str)
+    if as_str:
         # STR(?v): an IRI reads as its string, a blank node as its label.
         undecided.extend(code for code in codes if blank_lo <= code < blank_hi)
         inside = sorted(
@@ -118,9 +143,7 @@ def evaluate(store, shape: NativeShape, codes) -> tuple[set, list]:
         options["flags"] = shape.flags
     if shape.case is not None:
         options["case"] = shape.case
-    if shape.as_str or shape.kind == "str_prefix":
-        # str_prefix is STRSTARTS(STR(?v), ...): filter_codes reads an IRI or a
-        # typed literal as STR() only under as_str.
+    if as_str:
         options["as_str"] = True
     started = time.perf_counter_ns()
     try:
