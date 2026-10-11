@@ -1,8 +1,10 @@
 import pytest
 from rdflib import BNode, Dataset, Graph, Literal, URIRef
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, ConjunctiveGraph
+from vortex_rdf import serialize_rdf
 
 from conftest import GRAPH_1, GRAPH_2, LAYOUTS
+from test_pushdown import both_ways
 from vortex_rdflib import VortexRdflibStore
 
 FOAF_NAME = URIRef("http://xmlns.com/foaf/0.1/name")
@@ -287,6 +289,31 @@ def test_from_n3_safe_dbpedia_escaped_apostrophe():
     # Language-tagged literal with a non-canonical \' escape (DBpedia quirk).
     term = VortexRdflibStore._from_n3_safe('"L\\\'agent"@fr')
     assert term == Literal("L'agent", lang="fr")
+
+
+def test_literals_decode_as_the_ntriples_parser_reads_them(tmp_path):
+    """Stored literals become the terms rdflib's N-Triples parser makes from
+    the same file: escapes such as an escaped backslash before ``x41`` stay
+    as written, in results and in the FILTER values rdflib evaluates."""
+    lines = [
+        '<http://ex.org/s1> <http://ex.org/p> "a\\\\x41" .',
+        '<http://ex.org/s2> <http://ex.org/p> "b\\\\u0041"@en .',
+        '<http://ex.org/s3> <http://ex.org/p> "t\\tq\\"it\'s \\u00e9" .',
+        '<http://ex.org/s4> <http://ex.org/p> "c\\\\"^^<http://ex.org/dt> .',
+    ]
+    nt = tmp_path / "escapes.nt"
+    nt.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out = tmp_path / "escapes.vortex"
+    serialize_rdf(str(nt), str(out), layout="dictionary")
+    expected = Graph()
+    expected.parse(str(nt), format="nt")
+    assert len(expected) == 4
+    query = 'SELECT ?s WHERE { ?s <http://ex.org/p> ?o FILTER(contains(str(?o), "\\\\x4")) }'
+    for in_memory in (True, False):
+        graph = Graph(store=VortexRdflibStore(str(out), in_memory=in_memory))
+        assert sorted(graph.triples((None, None, None))) == sorted(expected)
+        with_pushdown, without_pushdown = both_ways(graph, query)
+        assert with_pushdown == without_pushdown == [(URIRef("http://ex.org/s1"),)]
 
 
 def test_no_path_store():

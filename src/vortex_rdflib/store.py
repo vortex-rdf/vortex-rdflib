@@ -2,9 +2,9 @@ import os
 from pathlib import Path
 
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, Dataset, Graph
+from rdflib.plugins.parsers.ntriples import unquote
 from rdflib.store import NO_STORE, VALID_STORE, Store
 from rdflib.term import BNode, IdentifiedNode, Literal, Node, URIRef
-from rdflib.util import from_n3
 from vortex_rdf import VortexRdfStore
 
 from .pushdown import register_sparql_pushdown
@@ -564,44 +564,22 @@ class VortexRdflibStore(Store):
 
     @staticmethod
     def _from_n3_safe(value: str) -> Node:
-        # URIRefs and blank nodes have unambiguous standalone N3 forms.  Build
-        # them directly rather than routing every dictionary term through
-        # RDFLib's generic from_n3 parser.  Besides avoiding parser overhead,
-        # this accepts valid absolute IRIs that from_n3 rejects in some RDFLib
-        # versions/configurations when no namespace manager is supplied.
+        """The rdflib term for a stored N-Triples spelling, as rdflib's
+        N-Triples parser reads it: an IRI, a blank node, or a literal whose
+        lexical form is unescaped by the N-Triples rules (``\\x41`` stays a
+        backslash and ``x41``)."""
         if len(value) >= 2 and value[0] == "<" and value[-1] == ">":
             return URIRef(value[1:-1])
         if value.startswith("_:"):
             return BNode(value[2:])
-
-        try:
-            term = from_n3(value)
-        except Exception as error:
-            # DBpedia contains a small number of language-tagged literals with
-            # an escaped apostrophe (\') even though the literal itself is
-            # double quoted.  RDFLib rejects that non-canonical escape.  The
-            # fallback is deliberately restricted to simple, language-tagged,
-            # double-quoted literals; typed and multiline literals still fail
-            # loudly through the generic error below.
-            split = value.rfind('"@')
-            if value.startswith('"') and split > 0:
-                lexical = value[1:split]
-                language = value[split + 2 :]
-                if language and all(
-                    character.isalnum() or character == "-" for character in language
-                ):
-                    lexical = lexical.replace("\\'", "'")
-                    try:
-                        parsed = from_n3(f'"{lexical}"')
-                    except Exception:
-                        parsed = None
-                    if isinstance(parsed, Literal):
-                        return Literal(parsed.value, lang=language)
-            raise ValueError(f"Could not parse returned RDF term as N3: {value!r}") from error
-
-        # from_n3 may also return None or a plain str (e.g. for prefixed names
-        # with no namespace manager); the native store only emits full
-        # N-Triples forms, so anything but a Node is a bug worth surfacing.
-        if not isinstance(term, Node):
-            raise ValueError(f"RDFLib returned no RDF term for N3 value: {value!r}")
-        return term
+        end = value.rfind('"')
+        if not value.startswith('"') or end <= 0:
+            raise ValueError(f"Could not parse returned RDF term as N-Triples: {value!r}")
+        lexical, suffix = unquote(value[1:end]), value[end + 1 :]
+        if not suffix:
+            return Literal(lexical)
+        if suffix.startswith("@") and len(suffix) > 1:
+            return Literal(lexical, lang=suffix[1:])
+        if suffix.startswith("^^<") and suffix.endswith(">"):
+            return Literal(lexical, datatype=URIRef(suffix[3:-1]))
+        raise ValueError(f"Could not parse returned RDF term as N-Triples: {value!r}")
