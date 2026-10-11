@@ -2,13 +2,12 @@ import os
 from pathlib import Path
 
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, Dataset, Graph
-from rdflib.plugins.parsers.ntriples import unquote
 from rdflib.store import NO_STORE, VALID_STORE, Store
 from rdflib.term import BNode, IdentifiedNode, Literal, Node, URIRef
 from vortex_rdf import VortexRdfStore
 
 from .pushdown import register_sparql_pushdown
-from .terms import BLANK, IRI, LITERAL, canonical_spelling, kind_bounds
+from .terms import BLANK, IRI, LITERAL, canonical_spelling, kind_bounds, unescape
 
 # The cottas-bench branch's layout names are accepted as aliases so its
 # benchmark scripts keep working. The layout is only a label here: VortexRdfStore
@@ -564,10 +563,10 @@ class VortexRdflibStore(Store):
 
     @staticmethod
     def _from_n3_safe(value: str) -> Node:
-        """The rdflib term for a stored N-Triples spelling, as rdflib's
-        N-Triples parser reads it: an IRI, a blank node, or a literal whose
-        lexical form is unescaped by the N-Triples rules (``\\x41`` stays a
-        backslash and ``x41``)."""
+        """The rdflib term for a stored N-Triples spelling: an IRI, a blank
+        node, or a literal whose lexical form is unescaped by the N-Triples
+        rules (:func:`~vortex_rdflib.terms.unescape`), so an escaped backslash
+        before ``x41`` decodes to a backslash and ``x41``."""
         if len(value) >= 2 and value[0] == "<" and value[-1] == ">":
             return URIRef(value[1:-1])
         if value.startswith("_:"):
@@ -575,7 +574,7 @@ class VortexRdflibStore(Store):
         end = value.rfind('"')
         if not value.startswith('"') or end <= 0:
             raise ValueError(f"Could not parse returned RDF term as N-Triples: {value!r}")
-        lexical, suffix = unquote(value[1:end]), value[end + 1 :]
+        lexical, suffix = unescape(value[1:end]), value[end + 1 :]
         if not suffix:
             return Literal(lexical)
         if suffix.startswith("@") and len(suffix) > 1:

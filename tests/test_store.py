@@ -1,6 +1,9 @@
+import re
+
 import pytest
 from rdflib import BNode, Dataset, Graph, Literal, URIRef
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, ConjunctiveGraph
+from rdflib.plugins.parsers import ntriples
 from vortex_rdf import serialize_rdf
 
 from conftest import GRAPH_1, GRAPH_2, LAYOUTS
@@ -314,6 +317,30 @@ def test_literals_decode_as_the_ntriples_parser_reads_them(tmp_path):
         assert sorted(graph.triples((None, None, None))) == sorted(expected)
         with_pushdown, without_pushdown = both_ways(graph, query)
         assert with_pushdown == without_pushdown == [(URIRef("http://ex.org/s1"),)]
+
+
+def test_literal_decoding_ignores_the_ntriples_validate_flag(monkeypatch):
+    """rdflib's N-Triples parser has a module-wide ``validate`` flag that
+    makes its ``unquote`` reject non-ASCII text; the store decodes the same
+    spellings whatever the flag says."""
+    monkeypatch.setattr(ntriples, "validate", True)
+    assert VortexRdflibStore._from_n3_safe('"café"@fr') == Literal("café", lang="fr")
+    assert VortexRdflibStore._from_n3_safe('"a\\\\x41"') == Literal("a\\x41")
+
+
+def test_from_n3_safe_reads_iris_and_blank_nodes():
+    assert VortexRdflibStore._from_n3_safe("<http://ex.org/a>") == URIRef("http://ex.org/a")
+    assert VortexRdflibStore._from_n3_safe("_:b1") == BNode("b1")
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["", "<", '"abc', '"abc"@', '"abc"^^<x', "abc"],
+    ids=["empty", "lone-bracket", "open-quote", "empty-tag", "open-datatype", "bare-text"],
+)
+def test_from_n3_safe_rejects_a_malformed_spelling(spelling):
+    with pytest.raises(ValueError, match=re.escape(repr(spelling))):
+        VortexRdflibStore._from_n3_safe(spelling)
 
 
 def test_no_path_store():
