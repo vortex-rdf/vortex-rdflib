@@ -27,7 +27,7 @@ def _key(key):
 
 
 def decode_value(value):
-    from vortex_rdf import U32Column
+    from vortex_rdf import U64Column
 
     if isinstance(value, list):
         return [decode_value(v) for v in value]
@@ -37,7 +37,7 @@ def decode_value(value):
         if set(value) == {"tuple"}:
             return tuple(decode_value(v) for v in value["tuple"])
         if set(value) == {"codes"}:
-            return U32Column(value["codes"])
+            return U64Column(value["codes"])
         return {_key(k): decode_value(v) for k, v in value.items()}
     return value
 
@@ -55,7 +55,11 @@ def _open(store_path: str, in_memory: bool):
     if in_memory:
         return VortexRdfStore(store_path, in_memory=True)
     try:
-        return VortexRdfStore(store_path, in_memory=False, max_resident_bytes=1 << 30)
+        return VortexRdfStore(
+            store_path,
+            in_memory=False,
+            max_resident_bytes=1 << 30,  # ty: ignore[unknown-argument]
+        )
     except TypeError:  # 0.12+: memory-mapped, no residency budget
         return VortexRdfStore(store_path, in_memory=False)
 

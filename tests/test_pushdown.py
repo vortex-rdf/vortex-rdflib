@@ -732,12 +732,12 @@ def variant_vortex(tmp_path_factory):
     return files
 
 
-#: Store configurations the native layer serves differently: a dictionary
-#: left in the file (read on demand, `TermDict.file_backed`), and the
-#: secondary indexes, whose served views order an unlimited match their own
-#: way — which a LIMIT pushed into the match must not change.
+#: Store configurations the native layer serves differently: a memory-mapped
+#: dictionary (`TermDict.file_backed`), and the secondary indexes, whose
+#: served views order an unlimited match their own way — which a LIMIT
+#: pushed into the match must not change.
 STORE_VARIANTS: dict[str, tuple[str, dict[str, Any]]] = {
-    "file-backed-dictionary": ("none", {"max_resident_bytes": 0}),
+    "file-backed-dictionary": ("none", {"in_memory": False}),
     "secondary-by-copy": ("by-copy", {}),
     "secondary-by-reference-mem": ("by-reference", {"in_memory": True}),
 }
@@ -747,7 +747,7 @@ STORE_VARIANTS: dict[str, tuple[str, dict[str, Any]]] = {
 def variant_graph(variant_vortex, request):
     index, kwargs = STORE_VARIANTS[request.param]
     store = VortexRdflibStore(str(variant_vortex[index]), **kwargs)
-    if "max_resident_bytes" in kwargs:
+    if request.param == "file-backed-dictionary":
         assert store._dict is not None and store._dict.file_backed
     return Graph(store=store)
 
@@ -809,7 +809,7 @@ def test_store_variants_equal_default_evaluator(variant_graph, sparql):
 
 @pytest.mark.parametrize("sparql", GRAPH_QUERIES)
 def test_graph_pattern_over_a_file_backed_dictionary(dict_vortex_quads, sparql):
-    store = VortexRdflibStore(str(dict_vortex_quads), max_resident_bytes=0)
+    store = VortexRdflibStore(str(dict_vortex_quads))
     assert store._dict is not None and store._dict.file_backed
     dataset = Dataset(store=store, default_union=True)
     with_pushdown, without_pushdown = both_ways(dataset, sparql)
@@ -1354,8 +1354,8 @@ def test_columnar_join_matches_row_join():
     expected = pd._join(
         schema_a, list(zip(ka, va, strict=True)), schema_b, list(zip(kb, vb, strict=True))
     )[1]
-    cols_a = (array("I", ka), array("I", va))
-    cols_b = (array("I", kb), array("I", vb))
+    cols_a = (array("Q", ka), array("Q", va))
+    cols_b = (array("Q", kb), array("Q", vb))
     joined = pd._join_columns(schema_a, cols_a, schema_b, cols_b)
     assert joined is not None
     schema, cols = joined
@@ -1385,8 +1385,8 @@ def test_hash_join_kernels_join_like_a_nested_loop(tail_width):
     expected = [ra + rb[1:] for ra in rows_a for rb in rows_b if ra[0] == rb[0]]
 
     assert pd._join(schema_a, rows_a, schema_b, rows_b) == (schema_a + schema_b[1:], expected)
-    cols_a = tuple(array("I", column) for column in zip(*rows_a, strict=True))
-    cols_b = tuple(array("I", column) for column in zip(*rows_b, strict=True))
+    cols_a = tuple(array("Q", column) for column in zip(*rows_a, strict=True))
+    cols_b = tuple(array("Q", column) for column in zip(*rows_b, strict=True))
     joined = pd._join_columns(schema_a, cols_a, schema_b, cols_b)
     assert joined is not None
     assert pd._cols_to_rows(joined[1]) == expected

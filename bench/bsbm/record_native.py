@@ -9,10 +9,10 @@ the warm-up has run; every measured call on them is written with its
 arguments, so ``replay_native`` re-issues the same native work against another
 vortex-rdf build, separating native time from Python time.
 
-Not recorded: operations on the ``U32Column`` results the proxies return
+Not recorded: operations on the ``U64Column`` results the proxies return
 (``join_indices``, ``take``, ``distinct``, ``value_counts``), ``len()`` on the
 proxies, and calls that raise (a call is logged once it has returned). They are
-negligible: about 0.5 ms of ``U32Column`` calls over the 10k-product stream.
+negligible: about 0.5 ms of ``U64Column`` calls over the 10k-product stream.
 """
 
 import argparse
@@ -37,7 +37,7 @@ def encode_value(value):
     if isinstance(value, dict):
         return {k: encode_value(v) for k, v in value.items()}
     try:
-        return {"codes": memoryview(value).cast("I").tolist()}
+        return {"codes": memoryview(value).cast("Q").tolist()}
     except TypeError:
         return {"repr": repr(value)}
 

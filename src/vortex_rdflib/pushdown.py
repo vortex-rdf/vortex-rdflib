@@ -2,7 +2,7 @@
 
 rdflib evaluates a query as a tree of algebra operators and offers every node
 to the ``CUSTOM_EVALS`` hooks before running its own evaluator. This module's
-hook answers the nodes it understands in **code space** — over the ``u32``
+hook answers the nodes it understands in **code space** — over the ``u64``
 term codes of a Dictionary-layout store — and hands everything else back to
 rdflib by raising ``NotImplementedError``; rdflib then evaluates that node
 itself and re-enters the hook for the nodes below it, so every supported
@@ -76,9 +76,9 @@ rdflib only catches ``NotImplementedError`` at hook-call time, so every
 capability check and every native call happens before a generator is handed
 back; the generators only decode. The hook applies when the active graph's
 store is a VortexRdflibStore with the code path available (Dictionary layout,
-its dictionary resident or read from the file on demand); behaviour is
-identical to rdflib's default evaluation, only faster, and the equivalence
-tests compare both paths on every query shape.
+its dictionary memory-mapped from the file or loaded with the store);
+behaviour is identical to rdflib's default evaluation, only faster, and the
+equivalence tests compare both paths on every query shape.
 
 Registration happens automatically when the first ``VortexRdflibStore`` is
 constructed. ``VORTEX_RDF_DISABLE_PUSHDOWN=1`` keeps rdflib's evaluator
@@ -109,7 +109,7 @@ from rdflib.plugins.sparql import CUSTOM_EVALS
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
-from vortex_rdf import U32Column
+from vortex_rdf import U64Column
 
 from . import filters
 from .terms import canonical_spelling
@@ -502,9 +502,9 @@ def _peel_graph(ctx, node, scope) -> tuple:
 class Relation:
     """A code-space relation.
 
-    ``schema`` names the variable-like terms. The body is either ``u32``
+    ``schema`` names the variable-like terms. The body is either ``u64``
     columns (``cols``, one per schema entry: zero-copy views over native
-    ``U32Column`` buffers — a single matched pattern's, or a hash join's
+    ``U64Column`` buffers — a single matched pattern's, or a hash join's
     gathered columns) or materialized ``rows`` of ``int`` codes. ``None`` in
     a row is an unbound variable and
     ``nullable`` lists the variables that may hold it; ``foreign`` maps
@@ -514,7 +514,7 @@ class Relation:
     """
 
     schema: tuple
-    cols: tuple | None  # a u32 memoryview per entry (slice, tolist, iterate)
+    cols: tuple | None  # a u64 memoryview per entry (slice, tolist, iterate)
     rows: list[tuple] | None
     nrows: int
     nullable: frozenset = frozenset()
@@ -1133,8 +1133,8 @@ def _columnar_groups(rel: Relation, key_cols, specs, new_group) -> dict:
         key_col = _native_column(cols[key_cols[0]])
         values, tallies = key_col.value_counts()
         for code, n in zip(
-            memoryview(values).cast("I").tolist(),
-            memoryview(tallies).cast("I").tolist(),
+            memoryview(values).cast("Q").tolist(),
+            memoryview(tallies).cast("Q").tolist(),
             strict=True,
         ):
             groups[(code,)] = new_group(n)
@@ -1156,13 +1156,13 @@ def _columnar_groups(rel: Relation, key_cols, specs, new_group) -> dict:
                 groups[()].sets[j] = set(_distinct_codes(column))
             elif len(groups) <= _NATIVE_GROUPS_MAX:
                 if members is None:
-                    members = {key: key_col.join_indices(U32Column([key[0]]))[0] for key in groups}
+                    members = {key: key_col.join_indices(U64Column([key[0]]))[0] for key in groups}
                 for key, rows in members.items():
                     groups[key].sets[j] = set(_distinct_codes(column.take(rows)))
             else:
                 if keys is None:
-                    keys = memoryview(key_col).cast("I").tolist()
-                for key, code in set(zip(keys, memoryview(column).cast("I").tolist(), strict=True)):
+                    keys = memoryview(key_col).cast("Q").tolist()
+                for key, code in set(zip(keys, memoryview(column).cast("Q").tolist(), strict=True)):
                     groups[(key,)].sets[j].add(code)
         elif spec.kind == "rows" and spec.distinct:
             rows = set(zip(*(col.tolist() for col in cols), strict=True))
@@ -2073,7 +2073,7 @@ def _split_keeps(store, nkeep) -> tuple[dict, dict]:
         if isinstance(keep, tuple) or len(keep) not in _FILE_LIST_CONTAINS:
             native[position] = keep
         else:
-            view = memoryview(keep).cast("I")
+            view = memoryview(keep).cast("Q")
             native[position] = (view[0], view[-1] + 1)
             tested[position] = keep
     return native, tested
@@ -2207,7 +2207,7 @@ def _match_resolved_pattern(store, pat, memo=None, limit=None) -> tuple[int, int
         for var, positions in pat["varpos"].items():
             for position in positions:
                 if position in tested:
-                    allowed = set(memoryview(tested[position]).cast("I"))
+                    allowed = set(memoryview(tested[position]).cast("Q"))
                     previous = allowed_by_var.get(var)
                     allowed_by_var[var] = allowed if previous is None else previous & allowed
     return calls, time.perf_counter_ns() - then if then else 0
@@ -2458,7 +2458,7 @@ def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) 
                 continue
             proxy = filters.Conjunct(conjunct.expr, (var,), None, False, consts, None, shape)
             positions = pat["varpos"][var]
-            keep, _ = filters.native_restriction(store, [proxy], positions)
+            keep, _ = filters.native_restriction(store, [proxy])
             if keep is None:
                 continue
             for position in positions:
@@ -2481,7 +2481,7 @@ def _single_code(cols, rows, index: int) -> int | None:
     row, or ``None`` when it holds several."""
     if cols is not None:
         distinct = _native_column(cols[index]).distinct()
-        return memoryview(distinct).cast("I")[0] if len(distinct) == 1 else None
+        return memoryview(distinct).cast("Q")[0] if len(distinct) == 1 else None
     first = rows[0][index]
     return first if all(row[index] == first for row in rows) else None
 
@@ -2662,7 +2662,7 @@ def _push_native_restrictions(store, pat, var_preds) -> dict:
         conjuncts = var_preds.get(var)
         if not conjuncts:
             continue
-        keep, rest = filters.native_restriction(store, conjuncts, positions)
+        keep, rest = filters.native_restriction(store, conjuncts)
         if keep is not None:
             for position in positions:
                 _set_native_keep(pat, position, keep)
@@ -2680,21 +2680,21 @@ def _push_native_restrictions(store, pat, var_preds) -> dict:
     return residual
 
 
-def _native_column(col) -> U32Column:
+def _native_column(col) -> U64Column:
     """A relation column as the native column behind it: a view over a
-    ``U32Column`` is that column, anything else (an ``array('I')``) is
+    ``U64Column`` is that column, anything else (an ``array('Q')``) is
     copied into one."""
-    if isinstance(col, U32Column):
+    if isinstance(col, U64Column):
         return col
     owner = getattr(col, "obj", None)
-    if isinstance(owner, U32Column) and len(owner) == len(col):
+    if isinstance(owner, U64Column) and len(owner) == len(col):
         return owner
-    return U32Column(col)
+    return U64Column(col)
 
 
 def _distinct_codes(col) -> list:
     """A column's distinct codes in first-seen order, by the native kernel."""
-    return memoryview(_native_column(col).distinct()).cast("I").tolist()
+    return memoryview(_native_column(col).distinct()).cast("Q").tolist()
 
 
 def _restrict_pattern(store, pat, var_preds) -> None:
@@ -2757,7 +2757,7 @@ def _rel_from_pattern(pat) -> Relation:
     if pat["nrows"] == 0 or not varpos or any(len(pos) > 1 for pos in varpos.values()):
         return Relation.from_rows(*_materialize(pat))
     schema = tuple(varpos)
-    cols = tuple(memoryview(pat["cols"][pos[0]]).cast("I") for pos in varpos.values())
+    cols = tuple(memoryview(pat["cols"][pos[0]]).cast("Q") for pos in varpos.values())
     preds = tuple(
         _member_predicate(schema.index(var), allowed)
         for var, allowed in (pat.get("keep") or {}).items()
@@ -2770,7 +2770,7 @@ def _member_predicate(index: int, allowed: set) -> Callable[[tuple], bool]:
 
 
 def _materialize(pat):
-    """A matched pattern as ``(schema, rows)`` of u32 code tuples.
+    """A matched pattern as ``(schema, rows)`` of u64 code tuples.
 
     Same-variable repeats (e.g. ``?x :p ?x``) and the ``keep`` restriction
     become row filters; a repeated variable keeps its first position. An
@@ -2789,7 +2789,7 @@ def _materialize(pat):
         return schema, pat["rows"]
 
     needed = sorted({idx for pos in varpos.values() for idx in pos})
-    views = {idx: memoryview(pat["cols"][idx]).cast("I").tolist() for idx in needed}
+    views = {idx: memoryview(pat["cols"][idx]).cast("Q").tolist() for idx in needed}
     eq_checks = [(pos[0], later) for pos in varpos.values() for later in pos[1:]]
     members = [(varpos[var][0], allowed) for var, allowed in (pat.get("keep") or {}).items()]
     if eq_checks or members:
@@ -2815,7 +2815,7 @@ def _pattern_body(pat) -> tuple:
         and not pat.get("keep")
         and all(len(pos) == 1 for pos in varpos.values())
     ):
-        cols = tuple(memoryview(pat["cols"][pos[0]]).cast("I") for pos in varpos.values())
+        cols = tuple(memoryview(pat["cols"][pos[0]]).cast("Q") for pos in varpos.values())
         return tuple(varpos), cols, None
     schema, rows = _materialize(pat)
     return schema, None, rows
@@ -2848,7 +2848,7 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
     a_idx, b_idx = left[ia].join_indices(_native_column(cols_b[ib]))
     out = [col.take(a_idx) for col in left]
     out += [_native_column(cols_b[i]).take(b_idx) for i in keep_b]
-    return schema, tuple(memoryview(col).cast("I") for col in out)
+    return schema, tuple(memoryview(col).cast("Q") for col in out)
 
 
 def _materialize_eager_restrictions(store, pat, bound) -> None:
@@ -2946,7 +2946,7 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
                 cols = next(answers)
                 if cols is None:
                     raise NotImplementedError
-                views = {idx: memoryview(cols[idx]).cast("I").tolist() for idx in needed}
+                views = {idx: memoryview(cols[idx]).cast("Q").tolist() for idx in needed}
                 for j in range(len(views[needed[0]])):
                     if (
                         all(views[a][j] == views[b][j] for a, b in eq_checks)

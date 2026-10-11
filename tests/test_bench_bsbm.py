@@ -561,13 +561,13 @@ def test_b_flat_is_none_one_reading_short_of_20(tmp_path, rss):
 
 
 def test_values_round_trip_through_the_trace_encoding():
-    from vortex_rdf import U32Column
+    from vortex_rdf import U64Column
 
     for value in (None, 3, "x", (None, "<p>", None, None), range(2, 9), [1, (2, 3)]):
         assert replay_native.decode_value(record_native.encode_value(value)) == value
-    codes = record_native.encode_value(U32Column([1, 4, 9]))
+    codes = record_native.encode_value(U64Column([1, 4, 9]))
     assert codes == {"codes": [1, 4, 9]}
-    assert list(memoryview(replay_native.decode_value(codes)).cast("I")) == [1, 4, 9]
+    assert list(memoryview(replay_native.decode_value(codes)).cast("Q")) == [1, 4, 9]
 
 
 def test_a_recorded_stream_replays_and_is_timed(tmp_path, tiny_store):
@@ -616,6 +616,16 @@ def test_the_int_positions_of_a_keep_survive_the_json_trace():
 @pytest.mark.parametrize("in_memory", [False, True])
 def test_a_recorded_stream_replays_without_a_rejected_call(tmp_path, tiny_store, in_memory):
     warmup, measured = tiny_streams(1, 2)
+    # The official mix's FILTERs are evaluated over candidate codes, with no
+    # keep: a kind test puts a keep-narrowed match in the trace.
+    measured = [
+        *measured,
+        {
+            **measured[-1],
+            "i": measured[-1]["i"] + 1,
+            "text": "SELECT ?s WHERE { ?s ?p ?o FILTER(isLiteral(?o)) } LIMIT 5",
+        },
+    ]
     trace = tmp_path / "trace.jsonl"
     record_native.record(str(tiny_store), in_memory, warmup, measured, str(trace))
     lines = trace.read_text().splitlines()
@@ -690,9 +700,9 @@ def test_a_method_keeps_the_first_of_its_errors(tmp_path, tiny_store):
 
 
 def test_a_keyword_named_like_an_encoding_is_still_a_keyword(tmp_path, tiny_store):
-    from vortex_rdf import U32Column
+    from vortex_rdf import U64Column
 
-    kwargs = record_native.encode_value({"codes": U32Column([1, 4, 9])})
+    kwargs = record_native.encode_value({"codes": U64Column([1, 4, 9])})
     assert kwargs == {"codes": {"codes": [1, 4, 9]}}
     trace = _trace_with(tmp_path, tiny_store, [["dict", "decode_many", [], kwargs, 0]])
     out = replay_native.replay(str(tiny_store), trace, False, skip=set(), passes=1)

@@ -10,8 +10,7 @@ import pytest
 from rdflib.term import Variable
 from vortex_rdf import serialize_rdf
 
-import vortex_rdflib.pushdown as pd
-from test_filters import SPELLINGS, filter_expr, rdflib_answer, typed
+from test_filters import SPELLINGS, filter_expr, typed
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 
 V = Variable("v")
@@ -146,60 +145,6 @@ def test_expression_outside_the_native_shapes_is_not_mapped(sparql_expr):
     assert filters.native_shape(filter_expr(sparql_expr), V, {}) is None
 
 
-@pytest.mark.filterwarnings("ignore:Parsing weird boolean:UserWarning")
-@pytest.mark.parametrize("sparql_expr", [m[0] for m in MAPPED])
-def test_native_verdicts_agree_with_rdflib(spelling_store, sparql_expr):
-    """For every spelling the native partition decides, rdflib answers the
-    same; the ones it leaves undecided go to the Python routes."""
-    expr = filter_expr(sparql_expr)
-    shape = filters.native_shape(expr, V, {})
-    assert shape is not None
-    verdicts = spelling_store._native_verdicts(*shape)
-    assert verdicts is not None
-    dictionary = spelling_store._dict
-    literals = spelling_store._kind_ranges()[filters.LITERAL]
-    decided = 0
-    for spelling in ALL_SPELLINGS:
-        code = dictionary.encode(spelling)
-        stored = dictionary.decode(code)
-        passed, undecided = verdicts.split([code], literals)
-        if undecided:
-            continue
-        decided += 1
-        assert (code in passed) == rdflib_answer(expr, stored), (sparql_expr, stored)
-    assert decided > 0, sparql_expr
-
-
-def test_wide_integers_are_left_undecided(spelling_store):
-    """rdflib bounds neither xsd:long nor xsd:unsignedLong from above and
-    compares such a literal by value; the native model holds them to 64
-    bits. The ones past it must not get a native verdict."""
-    wide = {
-        spelling_store._dict.encode(typed(lexical, datatype))
-        for lexical, datatype in [
-            ("9223372036854775808", "long"),
-            ("-9223372036854775809", "long"),
-            ("18446744073709551616", "unsignedLong"),
-        ]
-    }
-    suspects = set(spelling_store._wide_integer_codes())
-    assert wide <= suspects
-    assert spelling_store._dict.encode(typed("5", "long")) not in suspects
-    for kind in ("num_lt", "num_gt", "num_eq"):
-        verdicts = spelling_store._native_verdicts(kind, '"1e+100"^^<' + XSD + "double>")
-        literals = spelling_store._kind_ranges()[filters.LITERAL]
-        _, undecided = verdicts.split(wide, literals)
-        assert set(undecided) == wide
-
-
-def test_refused_constant_has_no_native_verdicts(spelling_store):
-    """A numeric constant outside the native value model (past 64 bits for
-    xsd:long) is refused by the native layer: the conjunct stays on the
-    Python routes."""
-    assert spelling_store._native_verdicts("num_lt", f'"1e400"^^<{XSD}double>') is None
-    assert spelling_store._native_verdicts("num_lt", f'"9223372036854775808"^^<{XSD}long>') is None
-
-
 def test_ctx_bound_constant_side_is_evaluated_by_rdflib():
     """The constant side of a comparison may be an expression over visible
     ctx-bound variables (BSBM Explore Q5's `?ref + N`): rdflib computes it."""
@@ -256,48 +201,3 @@ def _outcome(graph, sparql):
         return run(graph, sparql)
     except Exception as error:  # noqa: BLE001 - the exception is the answer
         return type(error)
-
-
-def test_mid_size_code_set_goes_to_a_file_scan_as_a_range(tmp_path, monkeypatch, capsys):
-    """A file-backed store's scan would evaluate a keep of 33 to 4,096
-    codes as one slow `list_contains`: the code set goes as its bounding
-    range, and its codes are tested on the rows that range admits."""
-    import json
-
-    from rdflib import Graph
-
-    from test_pushdown import both_ways
-
-    nt = tmp_path / "ints.nt"
-    nt.write_text(
-        "".join(
-            f'<http://ex.org/s{i}> <http://ex.org/p> "{i}"^^<{XSD}integer> .\n'
-            f'<http://ex.org/s{i}> <http://ex.org/p> "label {i}" .\n'
-            for i in range(200)
-        ),
-        encoding="utf-8",
-    )
-    out = tmp_path / "ints.vortex"
-    serialize_rdf(str(nt), str(out), layout="dictionary")
-    graph = Graph(store=VortexRdflibStore(str(out), in_memory=False))
-    query = (
-        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?s ?v WHERE { "
-        "?s <http://ex.org/p> ?v FILTER(datatype(?v) = xsd:integer && ?v < 100) }"
-    )
-    register_sparql_pushdown()
-    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
-    capsys.readouterr()
-    with_pushdown, without_pushdown = both_ways(graph, query)
-    assert with_pushdown == without_pushdown
-    assert len(with_pushdown) == 100
-    trace = [
-        json.loads(line[len(pd._TRACE_PREFIX) :])
-        for line in capsys.readouterr().err.splitlines()
-        if line.startswith(pd._TRACE_PREFIX)
-    ]
-    pushed = next(e for e in trace if e["event"] == "bgp_native_restriction")
-    assert pushed["keep"] == {"2": {"codes": 100}}
-    match = next(
-        e for e in trace if e["event"] == "native_call_complete" and e["operation"] == "match_codes"
-    )
-    assert set(match["keep"]["2"]) == {"range"}
