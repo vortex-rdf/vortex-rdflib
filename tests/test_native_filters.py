@@ -1,17 +1,19 @@
 """The native term predicates (``TermDict.filter_codes``) must agree with
 rdflib's own evaluator wherever they give a definite answer: a FILTER
-conjunct mapped to one (``filters.native_shape``) is answered from the
-dictionary's partition alone, so a disagreement would be a wrong answer, not
-a slow one. The matrix of spellings is the fast route's (``test_filters``)
-plus the shapes the native value model treats specially: decimals against
-doubles, integers past 2^53, 64-bit bounds, language subtags."""
+conjunct mapped to one (``filters.native_shape``) is answered by vortex-rdf
+over the codes a query produced (``candidates.evaluate``), so a
+disagreement would be a wrong answer, not a slow one. The matrix of
+spellings is the fast route's (``test_filters``) plus the shapes the native
+value model treats specially: decimals against doubles, integers past 2^53,
+64-bit bounds, language subtags."""
 
 import pytest
 from rdflib.term import Variable
 from vortex_rdf import serialize_rdf
 
-from test_filters import SPELLINGS, filter_expr, typed
-from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
+from test_filters import SPELLINGS, filter_expr, rdflib_answer, typed
+from vortex_rdflib import VortexRdflibStore, candidates, filters, register_sparql_pushdown
+from vortex_rdflib.candidates import NativeShape
 
 V = Variable("v")
 XSD = "http://www.w3.org/2001/XMLSchema#"
@@ -137,12 +139,144 @@ def spelling_store(tmp_path_factory):
 
 @pytest.mark.parametrize(("sparql_expr", "expected"), MAPPED, ids=[m[0] for m in MAPPED])
 def test_expression_maps_to_its_native_predicate(sparql_expr, expected):
-    assert filters.native_shape(filter_expr(sparql_expr), V, {}) == expected
+    assert filters.native_shape(filter_expr(sparql_expr), V, {}) == NativeShape(*expected)
 
 
 @pytest.mark.parametrize("sparql_expr", UNMAPPED)
 def test_expression_outside_the_native_shapes_is_not_mapped(sparql_expr):
     assert filters.native_shape(filter_expr(sparql_expr), V, {}) is None
+
+
+def _all_codes(store) -> set:
+    return {store._dict.encode(spelling) for spelling in ALL_SPELLINGS}
+
+
+@pytest.mark.filterwarnings("ignore:Parsing weird boolean:UserWarning")
+@pytest.mark.parametrize("sparql_expr", [m[0] for m in MAPPED])
+def test_native_candidates_agree_with_rdflib(spelling_store, sparql_expr):
+    """Every spelling of the matrix at once, as one query's candidate codes:
+    each code vortex-rdf decides gets rdflib's answer; the codes it leaves
+    undecided go to the Python routes."""
+    expr = filter_expr(sparql_expr)
+    shape = filters.native_shape(expr, V, {})
+    assert shape is not None
+    codes = _all_codes(spelling_store)
+    passed, undecided = candidates.evaluate(spelling_store, shape, codes)
+    undecided = set(undecided)
+    assert passed <= codes and undecided <= codes and not passed & undecided
+    decided = 0
+    for code in sorted(codes - undecided):
+        decided += 1
+        stored = spelling_store._dict.decode(code)
+        assert (code in passed) == rdflib_answer(expr, stored), (sparql_expr, stored)
+    assert decided > 0, sparql_expr
+
+
+def test_wide_integers_are_left_undecided(spelling_store):
+    """rdflib bounds neither xsd:long nor xsd:unsignedLong from above and
+    compares such a literal by value; vortex-rdf holds them to 64 bits and
+    leaves the ones past it undecided."""
+    wide = {
+        spelling_store._dict.encode(typed(lexical, datatype))
+        for lexical, datatype in [
+            ("9223372036854775808", "long"),
+            ("-9223372036854775809", "long"),
+            ("18446744073709551616", "unsignedLong"),
+        ]
+    }
+    for kind in ("num_lt", "num_gt", "num_eq"):
+        shape = NativeShape(kind, f'"1e+100"^^<{XSD}double>')
+        passed, undecided = candidates.evaluate(spelling_store, shape, wide)
+        assert not passed and set(undecided) == wide
+
+
+class _Recording:
+    """A TermDict that records the candidate codes of every filter_codes call
+    (or refuses every argument, with ``refuse``)."""
+
+    def __init__(self, inner, refuse: bool = False):
+        self._inner = inner
+        self.refuse = refuse
+        self.sent: list[list[int]] = []
+
+    def filter_codes(self, kind, arg, codes, **options):
+        self.sent.append(memoryview(codes).cast("Q").tolist())
+        if self.refuse:
+            raise ValueError(f"refused: {kind} {arg}")
+        return self._inner.filter_codes(kind, arg, codes, **options)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_a_refused_argument_leaves_every_candidate_to_the_python_routes(
+    spelling_store, monkeypatch
+):
+    codes = _all_codes(spelling_store)
+    lo, hi = spelling_store._kind_ranges()[filters.LITERAL]
+    monkeypatch.setattr(spelling_store, "_dict", _Recording(spelling_store._dict, refuse=True))
+    shape = NativeShape("num_lt", f'"1e400"^^<{XSD}double>')
+    passed, undecided = candidates.evaluate(spelling_store, shape, codes)
+    assert not passed
+    assert set(undecided) == {code for code in codes if lo <= code < hi}
+
+
+def test_only_the_codes_a_predicate_reads_are_sent(spelling_store, monkeypatch):
+    """vortex-rdf fails every code in neither answer set, so the codes outside
+    a predicate's domain are decided here by rdflib's rule and never sent —
+    `!=` passes every IRI and blank node, `<` fails them — and what is sent is
+    sorted and unique, as filter_codes requires."""
+    codes = _all_codes(spelling_store)
+    lo, hi = spelling_store._kind_ranges()[filters.LITERAL]
+    nonliterals = {code for code in codes if not lo <= code < hi}
+    assert nonliterals
+    recording = _Recording(spelling_store._dict)
+    monkeypatch.setattr(spelling_store, "_dict", recording)
+    five = f'"5"^^<{XSD}integer>'
+    passed_ne, _ = candidates.evaluate(spelling_store, NativeShape("num_ne", five), codes)
+    passed_lt, _ = candidates.evaluate(spelling_store, NativeShape("num_lt", five), codes)
+    assert nonliterals <= passed_ne
+    assert not nonliterals & passed_lt
+    assert len(recording.sent) == 2
+    for sent in recording.sent:
+        assert sent == sorted(set(sent))
+        assert not set(sent) & nonliterals
+
+
+def test_str_of_a_blank_node_is_left_to_the_python_routes(spelling_store, monkeypatch):
+    """rdflib reads STR(_:abc) as "abc": under STR() the blank nodes are never
+    sent, they come back undecided, while the IRIs are sent."""
+    codes = _all_codes(spelling_store)
+    ranges = spelling_store._kind_ranges()
+    blanks = {c for c in codes if ranges[filters.BLANK][0] <= c < ranges[filters.BLANK][1]}
+    iris = {c for c in codes if ranges[filters.IRI][0] <= c < ranges[filters.IRI][1]}
+    assert blanks and iris
+    recording = _Recording(spelling_store._dict)
+    monkeypatch.setattr(spelling_store, "_dict", recording)
+    _, undecided = candidates.evaluate(spelling_store, NativeShape("str_prefix", "a"), codes)
+    assert blanks <= set(undecided)
+    [sent] = recording.sent
+    assert not set(sent) & blanks and iris <= set(sent)
+
+
+def test_an_argument_vortex_rdf_cannot_take_leaves_every_candidate_undecided(spelling_store):
+    """filter_codes raises ValueError (here UnicodeEncodeError, a lone
+    surrogate) for an argument it cannot take: every candidate it would have
+    read goes to the Python routes, for every string kind and for IRI
+    equality."""
+    codes = _all_codes(spelling_store)
+    lo, hi = spelling_store._kind_ranges()[filters.LITERAL]
+    literals = {code for code in codes if lo <= code < hi}
+    for shape in (
+        NativeShape("regex", "a|\ud800"),
+        NativeShape("contains", '"\ud800"'),
+        NativeShape("strstarts", '"\ud800"', as_str=True),
+    ):
+        passed, undecided = candidates.evaluate(spelling_store, shape, codes)
+        assert not passed and literals <= set(undecided), shape
+    shape = NativeShape("iri_in", ("<http://ex.org/\ud800>",))
+    passed, undecided = candidates.evaluate(spelling_store, shape, codes)
+    assert not passed and set(undecided) == codes
 
 
 def test_ctx_bound_constant_side_is_evaluated_by_rdflib():
@@ -152,7 +286,7 @@ def test_ctx_bound_constant_side_is_evaluated_by_rdflib():
 
     expr = filter_expr("?v < ?w + 10")
     shape = filters.native_shape(expr, V, {Variable("w"): Literal(5)})
-    assert shape == ("num_lt", f'"15"^^<{XSD}integer>')
+    assert shape == NativeShape("num_lt", f'"15"^^<{XSD}integer>')
     # an error on the constant side is no constant
     assert filters.native_shape(expr, V, {Variable("w"): Literal("x")}) is None
     assert filters.native_shape(expr, V, {}) is None
