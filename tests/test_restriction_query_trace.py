@@ -61,3 +61,42 @@ def test_restriction_trace_reports_distinct_bindings_and_rows(tmp_path, capsys, 
     assert record["distinct_binding_count"] == 3
     assert record["allowed_binding_count"] == 2
     assert record["elapsed_ns"] > 0
+
+
+def test_native_candidate_trace(tmp_path, capsys, monkeypatch):
+    """A conjunct vortex-rdf decides is traced as the filter_codes call it
+    made — its kind and how many codes it was sent, passed and left
+    undecided — beside the restriction it served; no keep rides the match."""
+    source = tmp_path / "native.nt"
+    source.write_text(
+        "".join(
+            f'<http://ex/s{i}> <http://ex/name> "n{i}"@{"en" if i % 3 else "fr"} .\n'
+            for i in range(30)
+        ),
+        encoding="utf-8",
+    )
+    artifact = tmp_path / "native.vortex"
+    serialize_rdf(str(source), str(artifact), layout="dictionary")
+    graph = Graph(store=VortexRdflibStore(str(artifact), in_memory=True))
+    register_sparql_pushdown()
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    rows = list(
+        graph.query(
+            'SELECT ?s WHERE { ?s <http://ex/name> ?n FILTER(langMatches(lang(?n), "FR")) }'
+        )
+    )
+    payloads = _events(capsys.readouterr())
+    assert len(rows) == 10
+    [call] = [e for e in payloads if e["event"] == "native_filter_complete"]
+    assert (call["kind"], call["candidate_codes"]) == ("lang_matches", 30)
+    assert (call["passed_codes"], call["undecided_codes"]) == (10, 0)
+    assert not [e for e in payloads if e["event"] == "bgp_native_restriction"]
+    [record] = [e for e in payloads if e["event"] == "bgp_restriction_complete"]
+    assert (record["input_rows"], record["output_rows"]) == (30, 10)
+    assert record["native_predicate_count"] == 1
+    match = next(
+        e
+        for e in payloads
+        if e["event"] == "native_call_complete" and e["operation"] == "match_codes"
+    )
+    assert match["keep"] is None and match["returned_rows"] == 30

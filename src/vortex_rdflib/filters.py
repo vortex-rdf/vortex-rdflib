@@ -1096,6 +1096,28 @@ def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
     return plan
 
 
+def specialize(conjunct: Conjunct, var, consts: dict) -> Conjunct | None:
+    """``conjunct`` as a test of ``var`` alone, its other variables fixed to
+    the terms ``consts`` gives them: a single-variable conjunct carrying the
+    native shape that makes it (:func:`native_shape`), its fast route compiled
+    over those constants — or ``None`` when it has no native shape that way.
+    Its generic route is rdflib's evaluator over the same constants, so every
+    value it decides is rdflib's answer."""
+    shape = native_shape(conjunct.expr, var, consts)
+    if shape is None:
+        return None
+    fast = None
+    if _FAST_ENABLED:
+        try:
+            views = {v: view_of_node(term) for v, term in consts.items()}
+        except _NotFast:
+            views = None
+        if views is not None:
+            fast = compile_fast(conjunct.expr, (var,), views)
+    kind_only = fast is not None and is_kind_only(conjunct.expr)
+    return Conjunct(conjunct.expr, (var,), fast, kind_only, consts, conjunct.ctx, shape)
+
+
 # --- evaluation ----------------------------------------------------------------
 
 

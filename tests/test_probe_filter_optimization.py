@@ -4,6 +4,7 @@ from rdflib import Graph, URIRef
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
+from test_candidate_filters import _spy_filters
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 
 PREFIX = "VORTEX_RDF_QUERY_TRACE "
@@ -154,3 +155,40 @@ def test_non_probe_filter_keeps_eager_route(tmp_path, monkeypatch):
     assert len(rows) == 1
     assert len(seen) == 1
     assert len(seen[0]) == 300
+
+
+def test_native_probe_filter_evaluates_only_the_reached_code(tmp_path, capsys, monkeypatch):
+    """With the native predicate, the langMatches filter is answered by
+    vortex-rdf over the one name the probe reached: no value goes to the
+    Python routes."""
+    graph = _graph(tmp_path)
+    recording = _spy_filters(graph)
+    decoded = []
+    original_decode = filters.decode_views
+    monkeypatch.setattr(
+        filters, "decode_views", lambda *a: decoded.append(a) or original_decode(*a)
+    )
+    generic = []
+    original_generic = filters.Conjunct.generic
+    monkeypatch.setattr(
+        filters.Conjunct, "generic", lambda self, b: generic.append(b) or original_generic(self, b)
+    )
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    register_sparql_pushdown()
+    rows = list(
+        graph.query("""SELECT ?s ?name WHERE {
+        ?s <http://ex/anchor> "yes" .
+        ?s <http://ex/name> ?name
+        FILTER(langMatches(lang(?name), "EN"))
+    }""")
+    )
+    payloads = _events(capsys.readouterr())
+    assert rows == [(URIRef("http://ex/s0"), rows[0][1])]
+    assert [(kind, len(codes)) for kind, _, _, codes in recording.calls] == [("lang_matches", 1)]
+    assert decoded == [] and generic == []
+    step = next(
+        e
+        for e in payloads
+        if e["event"] == "bgp_join_step_complete" and e["original_pattern_index"] == 1
+    )
+    assert step["strategy"] == "probe"

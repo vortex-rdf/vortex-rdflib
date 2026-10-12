@@ -191,16 +191,22 @@ def test_wide_integers_are_left_undecided(spelling_store):
 
 
 class _Recording:
-    """A TermDict that records the candidate codes of every filter_codes call
-    (or refuses every argument, with ``refuse``)."""
+    """A TermDict that records every filter_codes call as ``(kind, arg,
+    options, candidate codes)`` (or refuses every argument, with
+    ``refuse``)."""
 
     def __init__(self, inner, refuse: bool = False):
         self._inner = inner
         self.refuse = refuse
-        self.sent: list[list[int]] = []
+        self.calls: list[tuple] = []
+
+    @property
+    def sent(self) -> list[list[int]]:
+        """The candidate codes of each call."""
+        return [codes for _, _, _, codes in self.calls]
 
     def filter_codes(self, kind, arg, codes, **options):
-        self.sent.append(memoryview(codes).cast("Q").tolist())
+        self.calls.append((kind, arg, options, memoryview(codes).cast("Q").tolist()))
         if self.refuse:
             raise ValueError(f"refused: {kind} {arg}")
         return self._inner.filter_codes(kind, arg, codes, **options)

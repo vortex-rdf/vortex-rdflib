@@ -21,19 +21,20 @@ What runs in code space:
   pattern that counts to nothing empties the block before anything is
   matched, and the join itself never decodes a term;
 - a ``Filter`` over a block is split into conjuncts (:mod:`.filters`):
-  those over one variable that the native layer decides from its dictionary
-  (kind tests, ``datatype``, ``lang``, ``langMatches``, numeric comparisons,
-  ``strstarts(str(?v), ...)``) become a ``keep`` on the match of every
-  pattern binding the variable, so the rows that fail never leave it; the
-  others over one variable are evaluated once per distinct code of the
-  variable, on the pattern that binds it — over the pattern's whole column
-  when it is matched, over the codes the probes reach when it is probed —
-  the rest per distinct code tuple, after the join (mid-join when that lets
-  a later pattern be probed, and as a keep when the relation binds all but
-  one of its variables to single values); a whitelist of expression shapes
-  runs over the stored spellings, anything else (and any value outside its
-  exact domain) goes to rdflib's own evaluator, per distinct value, not per
-  row;
+  those over one variable that are a kind test become a ``keep`` on the
+  match of every pattern binding the variable, so the rows that fail never
+  leave it; the others over one variable are evaluated once per distinct
+  code of the variable, on the pattern that binds it — over the pattern's
+  whole column when it is matched, over the codes the probes reach when it
+  is probed — by vortex-rdf when they have a native shape
+  (``TermDict.filter_codes`` over exactly those codes, :mod:`.candidates`),
+  and the match is compacted natively to the rows that pass; the rest per
+  distinct code tuple, after the join (mid-join when that lets a later
+  pattern be probed, and as a test of one variable when the relation binds
+  all but one of its variables to single values); a whitelist of expression
+  shapes runs over the stored spellings, anything else (and any value
+  vortex-rdf or the whitelist leaves undecided) goes to rdflib's own
+  evaluator, per distinct value, not per row;
 - group joins (``Join``), ``OPTIONAL`` (``LeftJoin``), ``MINUS`` and
   ``FILTER (NOT) EXISTS`` over blocks run as hash joins, left joins, anti-
   and semi-joins over code tuples, with a one-pattern inner side counted
@@ -111,7 +112,7 @@ from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
 
-from . import filters
+from . import candidates, filters
 from .terms import canonical_spelling
 
 _EVAL_KEY = "vortex_rdflib_bgp"
@@ -203,6 +204,24 @@ def _trace_event(event: str, **fields) -> None:
     trace = _TRACE.get()
     if trace is not None:
         trace.emit(event, **fields)
+
+
+def _trace_native_filter(
+    kind: str, sent: int, passed: int, undecided: int, elapsed_ns: int
+) -> None:
+    """One ``TermDict.filter_codes`` call (:func:`candidates.evaluate`) as a
+    trace event."""
+    _trace_event(
+        "native_filter_complete",
+        kind=kind,
+        candidate_codes=sent,
+        passed_codes=passed,
+        undecided_codes=undecided,
+        elapsed_ns=elapsed_ns,
+    )
+
+
+candidates.TRACE = _trace_native_filter
 
 
 def _keep_summary(keep) -> dict | None:
@@ -1230,7 +1249,7 @@ class _Pushed(dict):
     binds all of theirs may prune with mid-join (a pre-filter: the FILTER
     still applies them); ``views``, the terms parsed for those, shared with
     the FILTER so none is decoded twice; ``applied``, the ids of the tuple
-    conjuncts a BGP decided entirely inside a native match (see
+    conjuncts a BGP turned into restrictions of one of its patterns (see
     :func:`_specialize_tuple_conjuncts`), which every row the block yields
     therefore passes. They travel together wherever the block solvers pass
     them — a group join's sides, an OPTIONAL's or a MINUS's left side, a
@@ -2250,8 +2269,8 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
     to the variables the relation does not bind yet: a variable already
     bound was restricted by the pattern that bound it, and the join keeps
     its rows to those codes. Before a step, a tuple conjunct the relation
-    binds all but one variable of may become a keep on the pattern binding
-    that one (:func:`_specialize_tuple_conjuncts`).
+    binds all but one variable of may become a restriction of the pattern
+    binding that one (:func:`_specialize_tuple_conjuncts`).
     """
     counts: dict[tuple, int] = {}
     memo: dict[tuple, tuple] = {}
@@ -2329,13 +2348,8 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
         step_then = time.perf_counter_ns() if traced else 0
         probe_calls = probe_ns = 0
         if tuples and pushed is not None:
-            narrowed = _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed)
+            _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed)
             tuples = tuple(c for c in tuples if id(c) not in pushed.applied)
-            if narrowed and shared:
-                # Narrower than it counted: count it again, narrowed, since
-                # its size decides how it joins.
-                pat["estimate"] = _count_pattern(store, pat, counts, exact=True)
-                stats["estimate_calls"] += 1
         estimate = pat["estimate"]
 
         if shared and running * _PROBE_FANOUT < estimate:
@@ -2419,22 +2433,25 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
     return Relation.from_rows(schema, rows), stats
 
 
-def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) -> bool:
-    """Push the tuple conjuncts the relation all but decides into ``pat``'s
-    native match. Returns whether ``pat`` was narrowed.
+def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) -> int:
+    """Turn the tuple conjuncts the relation all but decides into
+    per-variable conjuncts of ``pat``. Returns how many it turned.
 
     A pending conjunct whose variables the relation binds — all but one,
     which ``pat`` binds — is a test of that one variable once each of the
     others holds a single value in every row: BSBM Explore Q5's band
     ``?v < ?ref + N && ?v > ?ref - N`` after the anchor has bound ``?ref``.
     With those values substituted (rdflib's own evaluator computes the
-    constant side, ``?ref + N``), a shape the native layer decides becomes a
-    keep on ``pat``'s match, so the rows outside the band never leave it.
-    Every row the BGP then yields passes the conjunct, which is marked
-    applied: neither the mid-join prune nor the FILTER above evaluates it
-    again.
+    constant side, ``?ref + N``), a shape vortex-rdf decides
+    (:func:`filters.specialize`) joins ``pat``'s deferred restrictions and is
+    evaluated over the codes ``pat`` brings — the rows its match returns, or
+    the rows its probes reach. Every row the BGP then yields passes the
+    conjunct, which is marked applied: neither the mid-join prune nor the
+    FILTER above evaluates it again.
     """
-    narrowed = False
+    if not (filters._FAST_ENABLED and filters._NATIVE_ENABLED):
+        return 0
+    turned = 0
     single: dict = {}
     for conjunct in tuples:
         if id(conjunct) in pushed.applied:
@@ -2453,27 +2470,21 @@ def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) 
                 break
             consts[other] = store._decode_term(single[other])
         else:
-            shape = filters.native_shape(conjunct.expr, var, consts)
-            if shape is None:
+            proxy = filters.specialize(conjunct, var, consts)
+            if proxy is None or proxy.native is None:
                 continue
-            proxy = filters.Conjunct(conjunct.expr, (var,), None, False, consts, None, shape)
-            positions = pat["varpos"][var]
-            keep, _ = filters.native_restriction(store, [proxy])
-            if keep is None:
-                continue
-            for position in positions:
-                _set_native_keep(pat, position, keep)
+            deferred = pat.setdefault("deferred_var_preds", {})
+            deferred[var] = [*deferred.get(var, ()), proxy]
             pushed.applied.add(id(conjunct))
-            narrowed = True
+            turned += 1
             if _TRACE.get() is not None:
                 _trace_event(
                     "bgp_tuple_specialized",
                     original_pattern_index=pat.get("index"),
                     variable=str(var),
-                    native_predicate=shape[0],
-                    keep=_keep_summary({positions[0]: keep}),
+                    native_predicate=proxy.native.kind,
                 )
-    return narrowed
+    return turned
 
 
 def _single_code(cols, rows, index: int) -> int | None:
@@ -2698,60 +2709,89 @@ def _distinct_codes(col) -> list:
 
 
 def _restrict_pattern(store, pat, var_preds) -> None:
-    """Turn per-variable conjuncts into allowed-code restrictions."""
+    """Evaluate per-variable conjuncts over the distinct codes of a matched
+    pattern's columns (:func:`filters.evaluate_column`: vortex-rdf answers the
+    ones with a native shape over exactly those codes) and compact the match
+    to the rows that pass (:func:`_compact_pattern`), so it stays columnar and
+    its real size is what a join sees."""
     if pat["nrows"] == 0:
         return
     traced = _TRACE.get() is not None
-    keep = dict(pat.get("keep") or {})
-    trace_records = []
+    keep = pat.pop("keep", None) or {}
+    input_rows = pat["nrows"]
+    records = []
     for var, positions in pat["varpos"].items():
         conjuncts = var_preds.get(var)
-        if conjuncts:
-            started = time.perf_counter_ns() if traced else 0
-            values = set(_distinct_codes(pat["cols"][positions[0]]))
-            if var in keep:
-                values &= keep[var]
-            distinct_binding_count = len(values)
-            allowed = filters.evaluate_column(store, conjuncts, values)
+        if not conjuncts:
+            continue
+        started = time.perf_counter_ns() if traced else 0
+        tested = var in keep
+        values = set(_distinct_codes(pat["cols"][positions[0]]))
+        if tested:
+            values &= keep[var]
+        distinct_binding_count = len(values)
+        allowed = filters.evaluate_column(store, conjuncts, values)
+        if tested or len(allowed) < distinct_binding_count:
             keep[var] = allowed
-            if traced:
-                trace_records.append(
-                    {
-                        "variable": str(var),
-                        "predicate_count": len(conjuncts),
-                        "fast_predicate_count": sum(c.fast is not None for c in conjuncts),
-                        "kind_only_predicate_count": sum(c.kind_only for c in conjuncts),
-                        "generic_only_predicate_count": sum(c.fast is None for c in conjuncts),
-                        "distinct_binding_count": distinct_binding_count,
-                        "allowed_binding_count": len(allowed),
-                        "elapsed_ns": time.perf_counter_ns() - started,
-                    }
-                )
+        if traced:
+            records.append(
+                {
+                    "variable": str(var),
+                    "mode": "match",
+                    "predicate_count": len(conjuncts),
+                    "native_predicate_count": sum(
+                        c.native is not None and not c.kind_only for c in conjuncts
+                    ),
+                    "fast_predicate_count": sum(c.fast is not None for c in conjuncts),
+                    "kind_only_predicate_count": sum(c.kind_only for c in conjuncts),
+                    "generic_only_predicate_count": sum(c.fast is None for c in conjuncts),
+                    "distinct_binding_count": distinct_binding_count,
+                    "allowed_binding_count": len(allowed),
+                    "elapsed_ns": time.perf_counter_ns() - started,
+                }
+            )
     if keep:
-        pat["keep"] = keep
-    if trace_records:
-        pat["_trace_restrictions"] = trace_records
-
-
-def _emit_restriction_trace(pat, output_rows: int) -> None:
-    """Emit deferred restriction events after row compaction gives a row count."""
-    for record in pat.pop("_trace_restrictions", ()):
+        _compact_pattern(pat, keep)
+    for record in records:
         _trace_event(
             "bgp_restriction_complete",
             original_pattern_index=pat.get("index"),
-            input_rows=pat["nrows"],
-            output_rows=output_rows,
+            input_rows=input_rows,
+            output_rows=pat["nrows"],
             **record,
         )
+
+
+def _compact_pattern(pat, keep: dict[Variable, set[int]]) -> None:
+    """Keep only the matched rows whose code at each variable of ``keep`` is
+    in that variable's allowed set, with the native kernels: the allowed codes
+    as an ascending column, ``join_indices`` for the rows holding one (in row
+    order: each row matches at most one code of a unique column) and ``take``
+    for every column a variable reads. A repeated variable is tested at its
+    first position, as ``_materialize`` reads it."""
+    varpos = pat["varpos"]
+    positions = sorted({idx for pos in varpos.values() for idx in pos})
+    if not positions:
+        return
+    columns = {idx: _native_column(pat["cols"][idx]) for idx in positions}
+    for var, allowed in keep.items():
+        if not allowed:
+            columns = {idx: U64Column([]) for idx in positions}
+            break
+        rows, _ = columns[varpos[var][0]].join_indices(U64Column(sorted(allowed)))
+        if len(rows) != len(columns[positions[0]]):
+            columns = {idx: column.take(rows) for idx, column in columns.items()}
+    pat["cols"] = tuple(columns.get(idx) for idx in range(4))
+    pat["nrows"] = len(columns[positions[0]])
 
 
 def _rel_from_pattern(pat) -> Relation:
     """A single matched pattern as a relation — columnar when it can be.
 
-    The zero-copy views are kept as the body and a restriction becomes a
-    streamed row predicate; nothing is copied into Python objects until rows
-    are consumed. Repeated variables (``?x :p ?x``) and ground patterns go
-    through ``_materialize`` instead.
+    The zero-copy views are kept as the body and a code set the match left to
+    test becomes a streamed row predicate; nothing is copied into Python
+    objects until rows are consumed. Repeated variables (``?x :p ?x``) and
+    ground patterns go through ``_materialize`` instead.
     """
     varpos = pat["varpos"]
     if pat["nrows"] == 0 or not varpos or any(len(pos) > 1 for pos in varpos.values()):
@@ -2854,19 +2894,17 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
 def _materialize_eager_restrictions(store, pat, bound) -> None:
     """Apply a matched pattern's deferred per-variable restrictions — over
     the variables not in ``bound``, the relation it is about to join — and
-    compact it to the rows that pass, so its real size, not the match's,
-    is what the join sees."""
+    any code sets its match left to test, compacting it natively to the rows
+    that pass, so its real size, not the match's, is what the join sees."""
+    input_rows = pat["nrows"]
     pending = pat.pop("deferred_var_preds", None)
     if pending:
         pending = {v: conjuncts for v, conjuncts in pending.items() if v not in bound}
     if pending:
         _restrict_pattern(store, pat, pending)
     if pat.get("keep") and pat["nrows"]:
-        input_rows = pat["nrows"]
-        _, rows = _materialize(pat)
-        _emit_restriction_trace(pat, len(rows))
-        pat["rows"], pat["nrows"] = rows, len(rows)
-        pat["_trace_match_rows"] = input_rows
+        _compact_pattern(pat, pat.pop("keep"))
+    pat["_trace_match_rows"] = input_rows
 
 
 def _join_patterns(store, patterns, stats=None, pushed=None) -> Relation:
