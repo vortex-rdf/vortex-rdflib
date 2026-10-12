@@ -1575,17 +1575,20 @@ def test_limit_decodes_only_the_first_chunk(tmp_path):
 
 class _CountingNative:
     """A VortexRdfStore stand-in that counts the counts and matches the
-    pushdown asks for — each probe of a batch call is one."""
+    pushdown asks for — each probe of a batch call is one. ``count_calls``
+    lists the pattern and limit of each plain ``count_quads`` call."""
 
     def __init__(self, inner):
         self._inner = inner
         self.counts = 0
         self.matches = 0
         self.batches = 0
+        self.count_calls: list[tuple[tuple, int | None]] = []
 
     def count_quads(self, *args, **kwargs):
         if not is_graph_name_check(args):
             self.counts += 1
+            self.count_calls.append((args, kwargs.get("limit")))
         return self._inner.count_quads(*args, **kwargs)
 
     def match_codes(self, *args, **kwargs):

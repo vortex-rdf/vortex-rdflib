@@ -10,16 +10,19 @@ subtree of a query still runs here.
 
 What runs in code space:
 
-- a basic graph pattern is solved in one pass: every triple pattern is
-  *counted* natively first, in one concurrent batch (a count is a fraction
-  of a match's cost and moves no columns), the smallest is matched and
-  seeds the relation, and each further pattern — smallest first among those
-  sharing a variable with the relation — is either re-probed per row of the
-  relation when the relation is far smaller than the pattern's count
-  (``_probe_join``, the probes batched into one native call) or matched
-  once and hash-joined by the native ``join_indices``/``take`` kernels; a
-  pattern that counts to nothing empties the block before anything is
-  matched, and the join itself never decodes a term;
+- a basic graph pattern is solved in one pass: its point patterns are
+  *counted* natively first, one at a time, the scans after them in one
+  concurrent batch (a count is a fraction of a match's cost and moves no
+  columns); a pattern sharing a variable with one that counts at most
+  ``_PROBE_FANOUT`` rows is not counted until its join step, and then only as
+  far as the probe-or-match decision needs; the smallest counted pattern is
+  matched and seeds the relation, and each further pattern — smallest first
+  among those sharing a variable with the relation — is either re-probed per
+  row of the relation when the relation is far smaller than the pattern's
+  count (``_probe_join``, the probes batched into one native call) or
+  matched once and hash-joined by the native ``join_indices``/``take``
+  kernels; a pattern that counts to nothing empties the block before
+  anything is matched, and the join itself never decodes a term;
 - a ``Filter`` over a block is split into conjuncts (:mod:`.filters`):
   those over one variable that are a kind test or an IRI equality (``=``,
   ``sameTerm``, ``IN``) become a ``keep`` on the match of every pattern
@@ -108,6 +111,7 @@ probed, restricted and joined, with row counts and timings.
 
 import heapq
 import json
+import math
 import os
 import sys
 import time
@@ -1660,7 +1664,8 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
             if (
                 exact
                 and not repeated_free
-                and len(rows) * _PROBE_FANOUT < _count_pattern(store, pat, {})
+                and len(rows) * _PROBE_FANOUT
+                < _count_pattern(store, pat, {}, limit=len(rows) * _PROBE_FANOUT + 1)
             ):
                 flags = _probe_exists(store, rel.schema, rows, pat)
                 kept = [row for row, found in zip(rows, flags, strict=True) if found != negate]
@@ -2247,7 +2252,7 @@ def _pattern_key(pat) -> tuple:
     return (*pat["n3"], narrowing)
 
 
-def _count_pattern(store, pat, counts: dict, exact: bool = False) -> int:
+def _count_pattern(store, pat, counts: dict, exact: bool = False, limit: int | None = None) -> int:
     """The number of quads a resolved pattern selects, from ``count_quads``
     — the row selection's size, a fraction of a match's cost, and no
     columns. Memoized across the patterns of one block, like the matches.
@@ -2257,7 +2262,9 @@ def _count_pattern(store, pat, counts: dict, exact: bool = False) -> int:
     it by the pattern's native keep costs the native layer a pass over the
     selected rows, more than an estimate is worth, and it decides nothing a
     narrowed match would not repair. An ``exact`` count — an answer, or a
-    size a join decision hinges on — narrows by the keep.
+    size a join decision hinges on — narrows by the keep. With ``limit`` the
+    count stops there: an answer that reaches it is a lower bound, which is
+    never memoized as the count. A count already memoized is returned whole.
     """
     if pat["unsatisfiable"]:
         return 0
@@ -2265,12 +2272,10 @@ def _count_pattern(store, pat, counts: dict, exact: bool = False) -> int:
     key = _pattern_key(pat) if nkeep else tuple(pat["n3"])
     n = counts.get(key)
     if n is None:
-        native = _native(store)
-        if nkeep:
-            n = native.count_quads(*pat["n3"], **_narrowing(_split_keeps(store, nkeep)[0]))
-        else:
-            n = native.count_quads(*pat["n3"])
-        counts[key] = n
+        keep = _split_keeps(store, nkeep)[0] if nkeep else None
+        n = _native(store).count_quads(*pat["n3"], **_narrowing(keep, limit))
+        if limit is None or n < limit:
+            counts[key] = n
     return n
 
 
@@ -2280,11 +2285,18 @@ def _count_patterns(store, patterns, counts: dict) -> int:
     hold yet, in static rank order, and stop at the first zero, which
     empties the block: the patterns left uncounted get no ``"estimate"``.
 
-    Enough patterns that scan (``_SCAN_BATCH_MIN``,
-    ``_MEMORY_SCAN_BATCH_MIN``) are counted last, in one ``count_quads_many``
-    batch that runs them concurrently, one GIL release for all — after the
-    point counts, any of which may still end the block first. Returns the
-    counts made."""
+    Once a pattern counts at most ``_PROBE_FANOUT`` rows, every pattern not
+    yet counted that shares a variable with it is marked ``"probe"`` and is
+    not counted at all: joined after it, it is probed unless it is small,
+    which a count capped at the decision's threshold settles at its join
+    step (:func:`_join_incremental_bgp`).
+
+    The patterns are counted one at a time, except the scans: enough of them
+    (``_SCAN_BATCH_MIN``, ``_MEMORY_SCAN_BATCH_MIN``) are counted last, in
+    one ``count_quads_many`` batch that runs them concurrently, one GIL
+    release for all — after the point counts (:func:`_cheap_probe`: those
+    the native layer answers without a scan), any of which may still end the
+    block first. Returns the counts made."""
     before = len(counts)
     ordered = sorted(patterns, key=_pattern_static_rank)
     minimum = _MEMORY_SCAN_BATCH_MIN if store.in_memory else _SCAN_BATCH_MIN
@@ -2300,16 +2312,34 @@ def _count_patterns(store, patterns, counts: dict) -> int:
         if len({tuple(pat["n3"]) for pat in scans}) < minimum:
             scans = []
     batched = {id(pat) for pat in scans}
+    small: set = set()  # the variables of the patterns counted at most _PROBE_FANOUT rows
     for pat in ordered:
-        if id(pat) not in batched:
+        if id(pat) in batched:
+            continue
+        if small.intersection(pat["varpos"]):
+            pat["probe"] = True
+            continue
+        pat["estimate"] = _count_pattern(store, pat, counts)
+        if pat["estimate"] == 0:
+            return len(counts) - before
+        if pat["estimate"] <= _PROBE_FANOUT:
+            small.update(pat["varpos"])
+    rest = []
+    for pat in scans:
+        if small.intersection(pat["varpos"]):
+            pat["probe"] = True
+        else:
+            rest.append(pat)
+    if len({tuple(pat["n3"]) for pat in rest}) >= minimum:
+        keys = list(dict.fromkeys(tuple(pat["n3"]) for pat in rest))
+        counts.update(zip(keys, _native(store).count_quads_many(keys), strict=True))
+        for pat in rest:
+            pat["estimate"] = counts[tuple(pat["n3"])]
+    else:
+        for pat in rest:
             pat["estimate"] = _count_pattern(store, pat, counts)
             if pat["estimate"] == 0:
                 return len(counts) - before
-    if scans:
-        keys = list(dict.fromkeys(tuple(pat["n3"]) for pat in scans))
-        counts.update(zip(keys, _native(store).count_quads_many(keys), strict=True))
-        for pat in scans:
-            pat["estimate"] = counts[tuple(pat["n3"])]
     return len(counts) - before
 
 
@@ -2498,23 +2528,27 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
     """Seed with the smallest pattern, then extend one connected pattern at
     a time.
 
-    Every pattern is counted before anything is matched, in static rank
+    The patterns are counted before anything is matched, in static rank
     order up to the first zero — the scans together, in one concurrent
     native batch, when there are enough of them (:func:`_count_patterns`) —
-    so a pattern that selects nothing ends the block before any match. The
-    smallest is matched and is the seed. Each further step
-    takes the smallest pattern sharing a variable with the relation so far
-    (the smallest of all for a cross product) and either re-probes it
-    natively per row of the relation, when the relation is at least
-    ``_PROBE_FANOUT`` times smaller than the pattern's count
-    (``_probe_join``), or matches it once and hash-joins it — columnar while
-    the shapes allow, as rows otherwise. A pattern's native keep narrows it
-    on whichever path it takes; its deferred per-variable restrictions apply
-    to the variables the relation does not bind yet: a variable already
-    bound was restricted by the pattern that bound it, and the join keeps
-    its rows to those codes. Before a step, a tuple conjunct the relation
-    binds all but one variable of may become a restriction of the pattern
-    binding that one (:func:`_specialize_tuple_conjuncts`).
+    so a pattern that selects nothing ends the block before any match. A
+    pattern sharing a variable with one of at most ``_PROBE_FANOUT`` rows is
+    left uncounted until its step, where it is counted only up to
+    ``running * _PROBE_FANOUT + 1`` rows: a count that reaches the cap is
+    large, and probes. The smallest counted pattern is matched and is the
+    seed. Each further step takes the smallest pattern sharing a variable
+    with the relation so far (the smallest of all for a cross product; an
+    uncounted pattern ranks last) and either re-probes it natively per row of
+    the relation, when the relation is at least ``_PROBE_FANOUT`` times
+    smaller than the pattern's count (``_probe_join``), or matches it once
+    and hash-joins it — columnar while the shapes allow, as rows otherwise.
+    A pattern's native keep narrows it on whichever path it takes; its
+    deferred per-variable restrictions apply to the variables the relation
+    does not bind yet: a variable already bound was restricted by the
+    pattern that bound it, and the join keeps its rows to those codes.
+    Before a step, a tuple conjunct the relation binds all but one variable
+    of may become a restriction of the pattern binding that one
+    (:func:`_specialize_tuple_conjuncts`).
     """
     counts: dict[tuple, int] = {}
     memo: dict[tuple, tuple] = {}
@@ -2541,11 +2575,11 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
         stats["estimate_calls"] += _count_patterns(store, patterns, counts)
     stats["native_ns"] += time.perf_counter_ns() - then if then else 0
     remaining = sorted(
-        (pat for pat in patterns if "estimate" in pat),
-        key=lambda pat: (pat["estimate"], _pattern_static_rank(pat)),
+        (pat for pat in patterns if "estimate" in pat or pat.get("probe")),
+        key=lambda pat: (pat.get("estimate", math.inf), _pattern_static_rank(pat)),
     )
     # An empty block still names every variable of the patterns.
-    if not remaining or remaining[0]["estimate"] == 0:
+    if not remaining or remaining[0].get("estimate") == 0:
         schema: tuple = ()
         for pat in patterns:
             schema += tuple(v for v in pat["varpos"] if v not in schema)
@@ -2595,6 +2629,16 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
         if tuples and pushed is not None:
             _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed)
             tuples = tuple(c for c in tuples if id(c) not in pushed.applied)
+        count_limit = None
+        if "estimate" not in pat:
+            # Next to a pattern of at most _PROBE_FANOUT rows, so not counted
+            # when planned: counted here, only as far as the probe-or-match
+            # decision needs; a capped answer means probe.
+            count_limit = running * _PROBE_FANOUT + 1
+            then = time.perf_counter_ns() if traced else 0
+            pat["estimate"] = _count_pattern(store, pat, counts, limit=count_limit)
+            stats["native_ns"] += time.perf_counter_ns() - then if then else 0
+            stats["estimate_calls"] += 1
         estimate = pat["estimate"]
 
         if shared and running * _PROBE_FANOUT < estimate:
@@ -2644,6 +2688,7 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
             cardinality_source=source,
             input_rows=running,
             estimated_rows=estimate,
+            estimate_limit=count_limit,
             pattern_match_rows=match_rows,
             pattern_restricted_rows=restricted_rows,
             native_initial_match_count=int(source == "matched"),
@@ -2759,7 +2804,11 @@ def _prune_early(store, schema, cols, rows, pending, remaining, views):
     if not ready:
         return cols, rows, pending
     probeable = max(
-        (pat["estimate"] for pat in remaining if any(v in schema for v in pat["varpos"])),
+        (
+            pat["estimate"]
+            for pat in remaining
+            if "estimate" in pat and any(v in schema for v in pat["varpos"])
+        ),
         default=0,
     )
     if _PROBE_FANOUT >= probeable:  # not even one survivor would be probed
@@ -2801,13 +2850,16 @@ def _plan_pattern_side(ctx, store, triple, scope, left: Relation, left_rows, var
     """The one-pattern right side of a lazy join or an OPTIONAL, counted
     before it is matched.
 
-    Returns ``(pat, estimate, probe)``. When the pattern shares a variable
-    with the left relation and the relation is at least ``_PROBE_FANOUT``
-    times smaller than the pattern's count, ``probe`` is true and ``pat`` is
-    left unmatched — the caller re-probes it per left row, and the
-    per-variable restrictions over its free variables travel with it.
-    Otherwise ``pat`` is matched, restricted on its free variables, and ready
-    for a hash join. A variable the left side binds was restricted there.
+    Returns ``(pat, estimate, probe)``. The count stops at
+    ``len(left_rows) * _PROBE_FANOUT + 1``, as far as the decision needs:
+    ``estimate`` is exact below that and a lower bound at it. When the
+    pattern shares a variable with the left relation and the relation is at
+    least ``_PROBE_FANOUT`` times smaller than the pattern's count, ``probe``
+    is true and ``pat`` is left unmatched — the caller re-probes it per left
+    row, and the per-variable restrictions over its free variables travel
+    with it. Otherwise ``pat`` is matched, restricted on its free variables,
+    and ready for a hash join. A variable the left side binds was restricted
+    there.
     """
     pat = _pattern_terms(ctx, store, *triple, scope=scope)
     shared = [v for v in pat["varpos"] if v in left.schema]
@@ -2818,7 +2870,7 @@ def _plan_pattern_side(ctx, store, triple, scope, left: Relation, left_rows, var
     )
     if free_preds:
         free_preds = _push_native_restrictions(store, pat, free_preds)
-    estimate = _count_pattern(store, pat, {})
+    estimate = _count_pattern(store, pat, {}, limit=len(left_rows) * _PROBE_FANOUT + 1)
     if shared and len(left_rows) * _PROBE_FANOUT < estimate:
         _shared_key_ok(left, Relation((), None, [], 0), shared)
         if free_preds:

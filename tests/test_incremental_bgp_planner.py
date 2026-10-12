@@ -5,6 +5,7 @@ from rdflib import Graph, URIRef
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
+from test_pushdown import _counting_native, both_ways
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 
 PREFIX = "VORTEX_RDF_QUERY_TRACE "
@@ -135,7 +136,8 @@ def test_seed_is_the_smallest_count_not_the_most_selective_shape(tmp_path, monke
     assert plan["estimate_calls"] == 2
     steps = [e for e in payloads if e["event"] == "bgp_join_step_complete"]
     assert [e["strategy"] for e in steps] == ["probe"]
-    assert steps[0]["estimated_rows"] == 300
+    # Next to a one-row pattern, so counted at its step only up to 1 x 100 + 1.
+    assert (steps[0]["estimated_rows"], steps[0]["estimate_limit"]) == (101, 101)
 
 
 @pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
@@ -261,3 +263,113 @@ def test_native_filter_narrows_every_pattern_it_reaches(tmp_path, monkeypatch, c
     pushed = [e for e in payloads if e["event"] == "bgp_native_restriction"]
     assert sorted(e["original_pattern_index"] for e in pushed) == [0, 1]
     assert all(e["residual_predicate_count"] == 0 for e in pushed)
+
+
+def indexed_graph_of(tmp_path, anchors=1, size=300, in_memory=True):
+    """``graph_of``'s data behind a secondary-by-copy index, where every
+    pattern with a bound predicate is a point pattern (`_cheap_probe`); the
+    anchor rows are subjects s0 to s{anchors - 1}."""
+    source = tmp_path / "indexed.nt"
+    source.write_text(
+        "".join(f'<http://ex/s{i}> <http://ex/anchor> "yes" .\n' for i in range(anchors))
+        + "".join(f'<http://ex/s{i}> <http://ex/name> "name-{i}"@en .\n' for i in range(size))
+        + "".join(f"<http://ex/s{i}> <http://ex/tag> <http://ex/t{i}> .\n" for i in range(size)),
+        encoding="utf-8",
+    )
+    artifact = tmp_path / "indexed.vortex"
+    serialize_rdf(str(source), str(artifact), layout="dictionary", indexes=["secondary-by-copy"])
+    return Graph(store=VortexRdflibStore(str(artifact), in_memory=in_memory))
+
+
+@pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
+def test_patterns_next_to_a_small_count_are_not_counted_when_planned(
+    tmp_path, monkeypatch, capsys, in_memory
+):
+    """The anchor counts 1 row, at most _PROBE_FANOUT: name and tag share ?s
+    with it, so planning leaves them uncounted. At its join step each is
+    counted only as far as the decision needs — capped at 1 x 100 + 1 rows —
+    and the capped answer says probe."""
+    graph = indexed_graph_of(tmp_path, in_memory=in_memory)
+    counting = _counting_native(graph)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    register_sparql_pushdown()
+    query = """SELECT ?s ?name ?tag WHERE {
+        ?s <http://ex/anchor> "yes" . ?s <http://ex/name> ?name . ?s <http://ex/tag> ?tag }"""
+    rows = list(graph.query(query))
+    payloads = events(capsys.readouterr())
+    assert len(rows) == 1
+    assert [(args[1], limit) for args, limit in counting.count_calls] == [
+        ("<http://ex/anchor>", None),
+        ("<http://ex/name>", 101),
+        ("<http://ex/tag>", 101),
+    ]
+    steps = [e for e in payloads if e["event"] == "bgp_join_step_complete"]
+    assert [(e["strategy"], e["estimated_rows"], e["estimate_limit"]) for e in steps] == [
+        ("probe", 101, 101),
+        ("probe", 101, 101),
+    ]
+    assert next(e for e in payloads if e["event"] == "bgp_plan_complete")["estimate_calls"] == 3
+    monkeypatch.delenv("VORTEX_RDF_TRACE_QUERY")
+    with_pushdown, without_pushdown = both_ways(graph, query)
+    assert with_pushdown == without_pushdown
+
+
+def test_a_decision_count_under_its_cap_matches_and_hash_joins(tmp_path, monkeypatch, capsys):
+    """50 anchors: name is counted at its step capped at 50 x 100 + 1 rows;
+    its 300 rows come back exact, under the cap, and are matched and
+    hash-joined."""
+    graph = indexed_graph_of(tmp_path, anchors=50)
+    counting = _counting_native(graph)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    register_sparql_pushdown()
+    rows = list(
+        graph.query("""SELECT ?s ?name WHERE {
+        ?s <http://ex/anchor> "yes" . ?s <http://ex/name> ?name }""")
+    )
+    payloads = events(capsys.readouterr())
+    assert len(rows) == 50
+    assert [(args[1], limit) for args, limit in counting.count_calls] == [
+        ("<http://ex/anchor>", None),
+        ("<http://ex/name>", 5001),
+    ]
+    [step] = [e for e in payloads if e["event"] == "bgp_join_step_complete"]
+    assert step["strategy"] in {"hash_columns", "hash_rows"}
+    assert (step["estimated_rows"], step["estimate_limit"]) == (300, 5001)
+
+
+def test_a_zero_point_count_still_ends_the_block_first(tmp_path):
+    graph = indexed_graph_of(tmp_path)
+    counting = _counting_native(graph)
+    register_sparql_pushdown()
+    rows = list(
+        graph.query("""SELECT ?s ?name WHERE {
+        ?s <http://ex/name> ?name . ?s <http://ex/anchor> "no" }""")
+    )
+    assert rows == []
+    assert [args[1] for args, _ in counting.count_calls] == ["<http://ex/anchor>"]
+
+
+def test_the_mid_join_prune_weighs_only_the_patterns_that_have_a_count(tmp_path):
+    """The conjunct over ?s and ?name is ready once name is joined, while tag
+    remains to join. Tag is next to the one-row anchor, so it is not counted
+    when planned and has no estimate to weigh."""
+    graph = indexed_graph_of(tmp_path)
+    register_sparql_pushdown()
+    query = """SELECT ?s ?name ?tag WHERE {
+        ?s <http://ex/anchor> "yes" . ?s <http://ex/name> ?name . ?s <http://ex/tag> ?tag
+        FILTER(?s != ?name) }"""
+    with_pushdown, without_pushdown = both_ways(graph, query)
+    assert len(with_pushdown) == 1
+    assert with_pushdown == without_pushdown
+
+
+def test_a_capped_count_is_not_remembered_as_exact(tmp_path):
+    """A capped answer is a lower bound: it is never shared with a pattern
+    that needs the count itself."""
+    graph = indexed_graph_of(tmp_path)
+    pat = {"n3": [None, "<http://ex/name>", None, None], "varpos": {}, "unsatisfiable": False}
+    counts: dict = {}
+    assert pd._count_pattern(graph.store, pat, counts, limit=11) == 11
+    assert counts == {}
+    assert pd._count_pattern(graph.store, pat, counts) == 300
+    assert pd._count_pattern(graph.store, pat, counts, limit=11) == 300

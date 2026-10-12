@@ -4,7 +4,7 @@ from rdflib import Graph, URIRef
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_pushdown import is_graph_name_check
+from test_pushdown import _counting_native, is_graph_name_check
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
 
 PREFIX = "VORTEX_RDF_QUERY_TRACE "
@@ -65,11 +65,11 @@ def test_probe_optional_counts_before_match_and_skips_complete_match(tmp_path, m
     # One full match for the left BGP and one selective probe. There is no
     # full match for the 300-row OPTIONAL predicate.
     assert len(matches) == 2
-    assert len(counts) == 1
+    assert [kwargs.get("limit") for _, kwargs in counts] == [101]
     event = next(item for item in payloads if item["event"] == "left_join_plan_complete")
     assert event["strategy"] == "probe"
     assert event["input_rows"] == 1
-    assert event["estimated_right_rows"] == 300
+    assert event["estimated_right_rows"] == 101
     assert event["native_initial_match_count"] == 0
     assert event["native_probe_call_count"] == 1
     assert event["matched_left_rows"] == 1
@@ -110,11 +110,31 @@ def test_lazy_join_counts_before_match_and_probes(tmp_path, monkeypatch, capsys)
     payloads = _events(capsys.readouterr())
     assert rows == [(URIRef("http://ex/s0"), URIRef("http://ex/o0"))]
     assert len(matches) == 2
-    assert len(counts) == 1
+    assert [kwargs.get("limit") for _, kwargs in counts] == [101]
     event = next(item for item in payloads if item["event"] == "join_plan_complete")
     assert event["strategy"] == "probe"
-    assert event["estimated_right_rows"] == 300
+    assert event["estimated_right_rows"] == 101
     assert event["native_probe_call_count"] == 1
+
+
+def test_exists_counts_its_pattern_only_as_far_as_the_probe_decision_needs(tmp_path):
+    """A one-row block and an EXISTS over the 300-row predicate: the pattern
+    is counted up to 1 x 100 + 1 rows, the capped answer says probe, and the
+    row is probed with a count capped at one row."""
+    graph = _graph(tmp_path)
+    counting = _counting_native(graph)
+    register_sparql_pushdown()
+    rows = list(
+        graph.query("""SELECT ?s WHERE {
+        ?s <http://ex/anchor> "yes"
+        FILTER EXISTS { ?s <http://ex/optional> ?o }
+    }""")
+    )
+    assert rows == [(URIRef("http://ex/s0"),)]
+    assert [(args[1], limit) for args, limit in counting.count_calls] == [
+        ("<http://ex/optional>", 101),
+        ("<http://ex/optional>", 1),
+    ]
 
 
 def test_probe_optional_preserves_unmatched_padding(tmp_path, monkeypatch):

@@ -70,7 +70,8 @@ def test_probe_filter_evaluates_only_reached_codes(tmp_path, capsys, monkeypatch
         if e["event"] == "bgp_join_step_complete" and e["original_pattern_index"] == 1
     )
     assert step["strategy"] == "probe"
-    assert step["pattern_match_rows"] == 300
+    # Counted at its step only as far as the probe decision needs.
+    assert (step["pattern_match_rows"], step["estimate_limit"]) == (101, 101)
     assert step["pattern_restricted_rows"] == 1
 
 
