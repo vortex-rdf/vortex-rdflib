@@ -15,10 +15,12 @@ body, once per row with that row's bindings: a MINUS there reads them on its
 right side and always shares them between its sides, and an EXISTS key the
 body leaves unbound is the row's. A FILTER rdflib evaluates itself once per
 row forgets the row's bindings outside its node's ``_vars``, an EXISTS in it
-included."""
+included.
+
+A conjunct on a variable a VALUES table binds holds on the table's rows."""
 
 import pytest
-from rdflib import Dataset
+from rdflib import Dataset, Variable
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
@@ -835,6 +837,129 @@ REENTRY_SHAPES = [
     ),
 ]
 
+# A FILTER pushes a conjunct on one variable down to the pattern scans that
+# bind it, and a VALUES table that binds it applies it too: alone, joined, in a
+# group, on a MINUS's left side, in a MINUS, a GRAPH or an EXISTS body, and
+# ahead of a pattern, which leaves the variable to the table. Over a UNION or
+# an OPTIONAL rdflib applies the FILTER, and an UNDEF leaves it to the
+# residual.
+VALUES_SHAPES = [
+    pytest.param('SELECT * WHERE { VALUES ?o { "y1" "a" } FILTER (?o = "a") }', id="values-eq"),
+    pytest.param(
+        'SELECT * WHERE { ?s ex:p ?o2 VALUES ?o { "y1" "a" } FILTER (?o = "a") }',
+        id="values-joined-eq",
+    ),
+    pytest.param(
+        'SELECT * WHERE { ?s ex:p ?o2 { VALUES ?o { "y1" "a" } } FILTER (?o = "a") }',
+        id="values-group-eq",
+    ),
+    pytest.param(
+        """SELECT * WHERE { VALUES (?s ?o) { (ex:s1 "a") (ex:s2 "zz") }
+            ?s ex:p ?o2 FILTER (?o = "a") }""",
+        id="values-pair-eq",
+    ),
+    pytest.param(
+        'SELECT * WHERE { ?s ex:p ?o2 VALUES ?o { "y1" "a" } FILTER (strstarts(?o, "y")) }',
+        id="values-strstarts",
+    ),
+    pytest.param(
+        'SELECT * WHERE { ?s ex:p ?o2 VALUES ?o { "y1" "a" } FILTER (isIRI(?o)) }',
+        id="values-isiri",
+    ),
+    pytest.param('SELECT ?o WHERE { VALUES ?o { "y1" "a" } FILTER (?o != "a") }', id="values-ne"),
+    pytest.param(
+        'SELECT * WHERE { ?s ex:p ?o2 VALUES ?o { "y1" "a" } FILTER (!bound(?o)) }',
+        id="values-not-bound",
+    ),
+    pytest.param(
+        """SELECT * WHERE { VALUES ?o { "y1" "a" }
+            FILTER (COALESCE(EXISTS { ?t ex:p ?o }, false)) }""",
+        id="values-coalesce-exists",
+    ),
+    pytest.param(
+        'SELECT * WHERE { VALUES ?o { "y1" "a" } MINUS { ?c ex:zz ?d } FILTER (?o = "a") }',
+        id="values-minus-left",
+    ),
+    pytest.param(
+        'SELECT * WHERE { VALUES ?o { "y1" "a" } MINUS { ?s ex:p ?o } FILTER (?o = "a") }',
+        id="values-minus-shared",
+    ),
+    pytest.param(
+        'SELECT * WHERE { ?s ex:p ?o MINUS { VALUES ?o { "a" "b" } FILTER (?o = "a") } }',
+        id="values-in-minus",
+    ),
+    pytest.param(
+        """SELECT * WHERE { { VALUES ?o { "y1" "a" } } UNION { ?s ex:p ?o }
+            FILTER (?o = "a") }""",
+        id="values-union",
+    ),
+    pytest.param(
+        """SELECT * WHERE { VALUES ?o { "y1" "a" } OPTIONAL { ?s ex:p ?o }
+            FILTER (?o = "a") }""",
+        id="values-optional",
+    ),
+    pytest.param(
+        """SELECT * WHERE { GRAPH ?g { ?s ex:p ?o2 VALUES ?o { "y1" "a" }
+            FILTER (?o = "a") } }""",
+        id="graph-var-values-joined-eq",
+    ),
+    pytest.param(
+        'SELECT * WHERE { GRAPH ?g { VALUES ?o { "y1" "a" } FILTER (?o = "a") } }',
+        id="graph-var-values-eq",
+    ),
+    pytest.param(
+        """SELECT * WHERE { GRAPH ex:g1 { ?s ex:p ?o2 VALUES ?o { "y1" "a" }
+            FILTER (?o = "a") } }""",
+        id="named-graph-values-joined-eq",
+    ),
+    pytest.param(
+        'SELECT * WHERE { GRAPH ex:g1 { VALUES ?o { "y1" "a" } FILTER (?o = "a") } }',
+        id="named-graph-values-eq",
+    ),
+    pytest.param(
+        'SELECT * WHERE { ?s ex:p ?o2 VALUES ?o { UNDEF "a" } FILTER (?o = "a") }',
+        id="values-undef-eq",
+    ),
+    pytest.param(
+        'SELECT * WHERE { ?s ex:p ?o VALUES ?o { "a" "b" } FILTER (?o = "a") }',
+        id="values-pattern-eq",
+    ),
+    pytest.param(
+        'SELECT * WHERE { VALUES ?o { "a" "b" } ?s ex:p ?o FILTER (?o = "a") }',
+        id="values-first-pattern-eq",
+    ),
+    pytest.param(
+        'SELECT * WHERE { VALUES ?o { "a" ex:o3 } ?s ex:p ?o FILTER (isLiteral(?o)) }',
+        id="values-first-pattern-isliteral",
+    ),
+    pytest.param(
+        """SELECT ?s ?g WHERE { GRAPH ?g {
+            VALUES ?g { ex:g1 ex:g2 } ?s ex:p ?o FILTER (?g = ex:g2) } }""",
+        id="graph-values-first-eq",
+    ),
+    pytest.param(
+        'SELECT * WHERE { VALUES ?o { "zz" "a" } FILTER (?o != "a") }', id="values-foreign-ne"
+    ),
+    pytest.param("SELECT * WHERE { VALUES ?n { 1 5 } FILTER (?n < 3) }", id="values-number-lt"),
+    # rdflib compares the query's "300"^^xsd:byte by its value, a data
+    # literal out of its type's range not at all.
+    pytest.param(
+        """SELECT * WHERE { VALUES ?n { "300"^^<http://www.w3.org/2001/XMLSchema#byte> 1 }
+            FILTER (?n > 5) }""",
+        id="values-out-of-range-gt",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o2 { VALUES ?o { "y1" "a" } FILTER (?o != "zz") }
+            FILTER (?o = "a") }""",
+        id="values-nested-filter-eq",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o2
+            FILTER EXISTS { VALUES ?o { "y1" "a" } FILTER (?o = "zz") } }""",
+        id="exists-values-eq",
+    ),
+]
+
 
 @pytest.fixture(scope="module")
 def quad_files(tmp_path_factory):
@@ -923,7 +1048,13 @@ def test_an_exists_re_entered_with_a_row_sees_only_its_filters_bindings(dataset,
     assert with_pushdown == without_pushdown
 
 
-_BY_ID = {param.id: param for param in SHAPES + GROUP_SHAPES}
+@pytest.mark.parametrize("sparql", VALUES_SHAPES)
+def test_a_filter_on_a_values_variable_answers_as_rdflib_does(dataset, route, sparql):
+    with_pushdown, without_pushdown = both_ways(dataset, PREFIX + sparql)
+    assert with_pushdown == without_pushdown
+
+
+_BY_ID = {param.id: param for param in SHAPES + GROUP_SHAPES + VALUES_SHAPES}
 
 # Shapes the pushdown answers whole, with no block node handed to rdflib.
 NATIVE = [
@@ -985,6 +1116,17 @@ NATIVE = [
         "or-exists",
         "named-graph-exists",
         "named-graph-not-exists",
+        "values-eq",
+        "values-joined-eq",
+        "values-pair-eq",
+        "values-minus-shared",
+        "values-in-minus",
+        "named-graph-values-eq",
+        "values-pattern-eq",
+        "values-first-pattern-eq",
+        "graph-values-first-eq",
+        "values-foreign-ne",
+        "exists-values-eq",
     )
 ]
 
@@ -1010,6 +1152,38 @@ def test_the_pushdown_answers_these_shapes_whole(
     )
 
 
+@pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
+def test_a_values_variable_a_pattern_binds_keeps_its_route(quad_files, monkeypatch, in_memory):
+    """Where a pattern binds the VALUES variable too, its scan tests the
+    conjunct over its codes, as for any pushed conjunct, and the FILTER
+    filters no row itself; the fast route decides every value, the table's
+    own terms included."""
+    dataset = Dataset(
+        store=VortexRdflibStore(str(quad_files["copy"]), in_memory=in_memory), default_union=True
+    )
+    register_sparql_pushdown()
+    restricted, filtered, generic = [], [], []
+    restrict, filter_relation = pd._restrict_pattern, pd._filter_relation
+    original_generic = filters.Conjunct.generic
+    monkeypatch.setattr(
+        pd,
+        "_restrict_pattern",
+        lambda store, pat, preds: restricted.extend(preds) or restrict(store, pat, preds),
+    )
+    monkeypatch.setattr(
+        pd, "_filter_relation", lambda *a: filtered.append(a) or filter_relation(*a)
+    )
+    monkeypatch.setattr(
+        filters.Conjunct,
+        "generic",
+        lambda self, bound: generic.append(bound) or original_generic(self, bound),
+    )
+    query = PREFIX + str(_BY_ID["values-pattern-eq"].values[0])
+    rows = run(dataset, query)
+    assert restricted == [Variable("o")] and not filtered and not generic
+    assert rows == both_ways(dataset, query)[1] and len(rows) == 1
+
+
 # The EXISTS shapes among those: a semi- or anti-join never asks rdflib's
 # evaluator; the generic route, for a body that reads the row's values or an
 # EXISTS under another operator, asks it once per distinct tuple, without
@@ -1021,6 +1195,7 @@ EXISTS_ROUTES = [
         ("not-exists-minus", False),
         ("named-graph-exists", False),
         ("named-graph-not-exists", False),
+        ("exists-values-eq", False),
         ("exists-minus-outer-var", True),
         ("not-exists-minus-outer-var", True),
         ("or-exists", True),

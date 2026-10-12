@@ -1272,6 +1272,31 @@ def tuple_predicate(
     return predicate
 
 
+def constant_predicate(conjunct: Conjunct) -> Callable[[Any], bool]:
+    """A single-variable conjunct as a test of a query constant (a VALUES
+    table's term, as rdflib binds it), memoized per term: the fast route over
+    the constant's view, rdflib's evaluator where that is unknown, a number
+    the fast route refuses included (see :func:`_constant_view`)."""
+    memo: dict = {}
+    fast = conjunct.fast
+    var = conjunct.vars[0]
+
+    def predicate(term) -> bool:
+        r = memo.get(term)
+        if r is None:
+            r = UNKNOWN
+            if fast is not None:
+                view = _constant_view(term)
+                if view is not UNKNOWN:
+                    r = fast((view,))
+            if r is UNKNOWN:
+                r = conjunct.generic({var: term})
+            memo[term] = r
+        return r is True
+
+    return predicate
+
+
 def tuple_fast_reject_predicate(
     store, conjunct: Conjunct, positions: list, shared_views: dict | None = None
 ) -> Callable[[tuple], bool]:

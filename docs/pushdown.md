@@ -269,8 +269,8 @@ are grouped by how many of the block's variables they use
 - **No variable:** evaluated once
   ([`evaluate_constant`](../src/vortex_rdflib/filters.py#L1198)). If it is
   false, the block is empty and nothing is matched.
-- **One variable:** pushed down to the pattern that binds the variable, so rows
-  are dropped before any join.
+- **One variable:** pushed down to the patterns and `VALUES` tables that bind
+  the variable, so rows are dropped before any join.
   - If vortex-rdf can decide it, it becomes a keep on the match (see
     [Native predicates](#native-predicates)).
   - Otherwise it is evaluated once per distinct code of the variable: over the
@@ -406,7 +406,7 @@ outer bindings when it sits directly inside an `EXISTS` body (see
   not see (an `OPTIONAL`'s filter sees none), where rdflib evaluates the
   filter once per row and calls the hook with the row bound: the `EXISTS`
   would see the binding
-  ([`_reject_forgotten_exists`](../src/vortex_rdflib/pushdown.py#L1667)).
+  ([`_reject_forgotten_exists`](../src/vortex_rdflib/pushdown.py#L1675)).
 
 ## Projection, LIMIT/OFFSET and ASK
 
@@ -643,6 +643,10 @@ a relation, which then joins like any other:
   ([`_foreign_code`](../src/vortex_rdflib/store.py#L540)). It joins nothing,
   but is still returned as written.
 - Rows that contradict an outer binding are dropped, as in rdflib.
+- Rows whose term fails a `FILTER` conjunct pushed down to the table are
+  dropped. Each distinct term is tested once, as the query writes it, which is
+  the term rdflib binds
+  ([`constant_predicate`](../src/vortex_rdflib/filters.py#L1275)).
 
 **Left to rdflib:** a constant whose rdflib term differs from the dictionary's
 term, such as `"042"^^xsd:integer` (rdflib would return the query's own

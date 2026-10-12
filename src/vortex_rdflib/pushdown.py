@@ -1293,7 +1293,8 @@ def _single_pattern(ctx, store, block, scope) -> dict | None:
 
 class _Pushed(dict):
     """The filter conjuncts a FILTER hands down into its block. As a dict,
-    each variable's single-variable conjuncts, for the scans that bind it;
+    each variable's single-variable conjuncts, for the scans and VALUES
+    tables that bind it;
     ``tuples``, the fast conjuncts over several variables, which a BGP that
     binds all of theirs may prune with mid-join (a pre-filter: the FILTER
     still applies them); ``views``, the terms parsed for those, shared with
@@ -1325,12 +1326,13 @@ def _solve_block(
     independently and joined, which is only exact while nothing inside
     depends on those values (a FILTER that could see them falls back).
     ``var_preds`` (a :class:`_Pushed`) are the filter conjuncts a FILTER
-    above pushed down: single-variable ones to the pattern scans binding the
-    variable, tuple ones to the BGPs binding all of theirs. ``scope`` is the
-    graph every pattern below is matched in (:class:`_GraphScope`); ``None``
-    means the graph the context has made active. ``limit`` says only that
-    many rows will be read: a block that is one native match fetches no
-    more (see :func:`_solve_bgp`); any other ignores it.
+    above pushed down: single-variable ones to the pattern scans and VALUES
+    tables binding the variable, tuple ones to the BGPs binding all of
+    theirs. ``scope`` is the graph every pattern below is matched in
+    (:class:`_GraphScope`); ``None`` means the graph the context has made
+    active. ``limit`` says only that many rows will be read: a block that is
+    one native match fetches no more (see :func:`_solve_bgp`); any other
+    ignores it.
     """
     if scope is None:
         scope = _active_scope(ctx, store)
@@ -1351,7 +1353,7 @@ def _solve_block(
         elif name == "Minus":
             rel = _solve_minus(ctx, store, node, env, var_preds, scope)
         elif name == "ToMultiSet":
-            rel = _solve_values(ctx, store, node)
+            rel = _solve_values(ctx, store, node, var_preds)
         elif name == "Graph":
             inner = _graph_scope(ctx, node)
             if inner.var is not None and not _carries_graph(node.p, inner.var):
@@ -1375,12 +1377,15 @@ def _solve_block(
     return rel
 
 
-def _solve_values(ctx, store, node) -> Relation:
+def _solve_values(ctx, store, node, var_preds=None) -> Relation:
     """An inline VALUES table as a relation: its constants looked up in one
     batch (:func:`_constant_codes`; a term the dictionary does not hold gets
     a negative code, so it joins nothing but is still yielded verbatim),
     UNDEF unbound. A row that contradicts a context binding is dropped, as
-    rdflib's ``evalValues`` skips it on AlreadyBound."""
+    rdflib's ``evalValues`` skips it on AlreadyBound, and so is a row whose
+    term fails a conjunct a FILTER above pushed down (``var_preds``; the
+    variables they name are bound in every row), tested on the table's own
+    terms (:func:`filters.constant_predicate`)."""
     variables = _node_vars(node)
     schema = tuple(v for v in variables if ctx[v] is None)
     bound = {v: ctx[v] for v in variables if ctx[v] is not None}
@@ -1393,6 +1398,9 @@ def _solve_values(ctx, store, node) -> Relation:
         dict.fromkeys(row[v] for row in rows_in for v in schema if row.get(v, "UNDEF") != "UNDEF")
     )
     codes = dict(zip(terms, _constant_codes(store, terms), strict=True))
+    if var_preds:
+        tests = [(v, filters.constant_predicate(c)) for v in schema for c in var_preds.get(v, ())]
+        rows_in = [row for row in rows_in if all(test(row[v]) for v, test in tests)]
     rows = [
         tuple(None if row.get(v, "UNDEF") == "UNDEF" else codes[row[v]] for v in schema)
         for row in rows_in
@@ -1435,9 +1443,9 @@ def _constant_codes(store, terms: list) -> list:
 def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None) -> Relation:
     """A ``Filter`` over a block: constant conjuncts decide the whole block
     before anything is matched, single-variable conjuncts over variables the
-    block always binds restrict the pattern scans, the rest filters the
-    solved rows. A ``limit`` reaches the block only when nothing is left to
-    filter above it.
+    block always binds restrict the pattern scans and VALUES tables that bind
+    them, the rest filters the solved rows. A ``limit`` reaches the block
+    only when nothing is left to filter above it.
 
     The expression's block variables are those its group binds
     (:func:`_group_vars`; see :func:`filters.analyze_filter` for the rest of
