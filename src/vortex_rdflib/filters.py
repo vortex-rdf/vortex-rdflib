@@ -80,6 +80,9 @@ _XSD_STRING = _XSD + "string"
 _XSD_BOOLEAN = _XSD + "boolean"
 _XSD_INTEGER = _XSD + "integer"
 _RDF_LANGSTRING = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+#: How rdflib's parser spells ``IN ()``; its evaluator reads it back as the
+#: empty list.
+_RDF_NIL = URIRef("http://www.w3.org/1999/02/22-rdf-syntax-ns#nil")
 _XML_COMPARABLE = frozenset(
     {
         "http://www.w3.org/1999/02/22-rdf-syntax-ns#XMLLiteral",
@@ -487,7 +490,9 @@ def _compile_relational(node, slots, consts):
         raise _NotFast
     left = _compile(node.expr, slots, consts)
     if op in ("IN", "NOT IN"):
-        others = node.other if isinstance(node.other, list) else [node.other]
+        others = node.other
+        if not isinstance(others, list):
+            others = [] if others == _RDF_NIL else [others]
         views = [view_of_node(x) for x in others]
         negate = op == "NOT IN"
 

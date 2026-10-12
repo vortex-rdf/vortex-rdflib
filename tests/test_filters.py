@@ -76,6 +76,7 @@ SPELLINGS = [
     "<http://ex.org/x>",
     "<http://ex.org/y>",
     "_:b0",
+    "<http://www.w3.org/1999/02/22-rdf-syntax-ns#nil>",
     None,
 ]
 
