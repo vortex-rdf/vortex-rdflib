@@ -17,6 +17,7 @@ from rdflib.term import Variable
 from vortex_rdf import serialize_rdf
 
 from test_filters import filter_expr, rdflib_answer
+from test_native_filters import _outcome
 from test_pushdown import both_ways
 from vortex_rdflib import VortexRdflibStore, candidates, filters, register_sparql_pushdown
 from vortex_rdflib.candidates import NativeShape
@@ -31,6 +32,11 @@ TEXTS = [
     '"ÉCOLE"', '"straße"', '"ſ s S"', '"K k"', '"tab\\there"',
     '"a\\u0001b"', '"a\\\\x41"', '"abc"@en', '"ABC def"@en-gb', '"x\\n"@fr', f'"5"^^<{XSD}integer>',
     f'"042"^^<{XSD}integer>', f'"1e2"^^<{XSD}double>', '"x"^^<http://ex.org/dt>',
+    # \s, \w and \d over characters Python's re and Unicode-property engines class
+    # differently: no-break space, U+001C, superscript two, Arabic-Indic three,
+    # Roman numeral four, a combining mark, dotted and dotless i
+    '"a\xa0b"', '"a\\u001Cb"', '"\xb2"', '"\u0663"',
+    '"\u2163"', '"e\u0301"', '"\u0130"', '"\u0131"',
     "<http://ex.org/abc>", "<urn:x:ABC>", "_:abc",
 ]  # fmt: skip
 
@@ -197,7 +203,7 @@ def test_random_allow_list_patterns_agree_with_python_re(corpus, seed, case, as_
     for _ in range(40):
         flags = rng.choice(["", "i", "s", "m", "is", "im", "sm", "ism"])
         checked += _check_regex(store, codes, spellings, _pattern(rng), flags, case, as_str)
-    assert checked > 0
+    assert checked > 400
 
 
 FUNCTIONS = ("contains", "strstarts", "strends")
@@ -253,7 +259,7 @@ def test_bsbm_literals_agree_with_python_re():
     }
     assert len(spellings) == len(ordered)
     rng = random.Random(20261007)
-    checked = 0
+    checked = completed = 0
     for _ in range(60):
         flags = rng.choice(["", "i", "m", "s"])
         pattern = _pattern(rng)
@@ -262,9 +268,11 @@ def test_bsbm_literals_agree_with_python_re():
             # patterns over long texts: a pattern past the limit is skipped.
             with _time_limit(10):
                 checked += _check_regex(store, codes, spellings, pattern, flags, None, False)
+            completed += 1
         except TimeoutError:
             continue
-    assert checked > 0
+    assert completed >= 50
+    assert checked >= 20 * len(codes)
     words = []
     for spelling in list(spellings.values())[:400]:
         view = parse_spelling(spelling)
@@ -312,3 +320,37 @@ def test_stored_language_tags_are_lower_case(tmp_path):
         query = f"SELECT ?s WHERE {{ ?s <http://ex.org/p> ?o FILTER({condition}) }}"
         with_pushdown, without_pushdown = both_ways(graph, query)
         assert with_pushdown == without_pushdown, condition
+
+
+#: Patterns Python's `re` refuses with an exception other than `re.error`: a
+#: repetition count past its limit, and nesting past the recursion limit.
+UNCOMPILABLE = {
+    "overflow": ("a{99999999999999999999}", OverflowError),
+    "recursion": ("(" * 3000 + ")" * 3000, RecursionError),
+}
+
+
+@pytest.mark.parametrize("native", [True, False], ids=["native", "python"])
+@pytest.mark.parametrize("string", [False, True], ids=["iris", "string"])
+@pytest.mark.parametrize(("pattern", "error"), UNCOMPILABLE.values(), ids=list(UNCOMPILABLE))
+def test_a_pattern_re_cannot_compile_answers_as_rdflib_does(
+    tmp_path, monkeypatch, native, string, pattern, error
+):
+    """rdflib compiles a REGEX pattern only for a string text: over IRIs and
+    blank nodes the FILTER fails every row, over a string it raises. The
+    pushdown plans the FILTER whatever the pattern, through the native shape
+    (``native``) or the fast route alone, and raises only where rdflib does."""
+    objects = ["<http://ex.org/a>", "<http://ex.org/b>", "_:c", *(['"text"'] if string else [])]
+    nt = tmp_path / "objects.nt"
+    nt.write_text(
+        "".join(f"<http://ex.org/s{i}> <http://ex.org/p> {o} .\n" for i, o in enumerate(objects)),
+        encoding="utf-8",
+    )
+    out = tmp_path / "objects.vortex"
+    serialize_rdf(str(nt), str(out), layout="dictionary")
+    graph = Graph(store=VortexRdflibStore(str(out), in_memory=True))
+    monkeypatch.setattr(filters, "_NATIVE_ENABLED", native)
+    query = f'SELECT ?s ?o WHERE {{ ?s <http://ex.org/p> ?o FILTER(regex(?o, "{pattern}")) }}'
+    with_pushdown, without_pushdown = both_ways(graph, query, runner=_outcome)
+    assert without_pushdown == (error if string else [])
+    assert with_pushdown == without_pushdown

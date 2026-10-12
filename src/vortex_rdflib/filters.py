@@ -687,6 +687,20 @@ _TWO_ARGS = {
     "Builtin_sameTerm": _same_term,
 }
 _REGEX_FLAGS = {"i": re.IGNORECASE, "s": re.DOTALL, "m": re.MULTILINE}
+#: What ``re.compile`` raises for a pattern it cannot compile: a syntax error,
+#: a repetition count past its limit, nesting past the recursion limit.
+_COMPILE_ERRORS = (re.error, OverflowError, RecursionError)
+
+
+def _regex_flags(flags) -> tuple[str, int]:
+    """The flags of a REGEX flags literal (``None`` for none) that rdflib maps
+    (``i``, ``s``, ``m``; it ignores every other letter), as those letters and
+    as ``re`` flags."""
+    kept = "".join(flag for flag in ("" if flags is None else str(flags)) if flag in _REGEX_FLAGS)
+    compile_flags = 0
+    for flag in kept:
+        compile_flags |= _REGEX_FLAGS[flag]
+    return kept, compile_flags
 
 
 def _compile_regex(node, slots, consts):
@@ -697,12 +711,10 @@ def _compile_regex(node, slots, consts):
         flags is not None and not _string_like(view_of_node(flags))
     ):
         raise _NotFast
-    cflags = 0
-    for flag in str(flags or ""):
-        cflags |= _REGEX_FLAGS.get(flag, 0)
+    _, compile_flags = _regex_flags(flags)
     try:
-        regex = re.compile(str(pattern), cflags)
-    except re.error as error:
+        regex = re.compile(str(pattern), compile_flags)
+    except _COMPILE_ERRORS as error:
         raise _NotFast from error
     text = _compile(node.text, slots, consts)
 
@@ -772,14 +784,18 @@ def _call_on(node, name: str, var) -> bool:
     return isinstance(node, CompValue) and node.name == name and node.arg == var
 
 
+def _string_literal(term) -> bool:
+    """rdflib's ``string()``: a plain, ``xsd:string`` or language-tagged
+    literal."""
+    return isinstance(term, Literal) and (
+        term.datatype is None or str(term.datatype) == _XSD_STRING
+    )
+
+
 def _string_constant(term) -> bool:
     """A plain or ``xsd:string`` literal: what the native string predicates
     take as their argument."""
-    return (
-        isinstance(term, Literal)
-        and term.language is None
-        and (term.datatype is None or str(term.datatype) == _XSD_STRING)
-    )
+    return _string_literal(term) and term.language is None
 
 
 #: The string functions with a native kind, by rdflib's builtin name.
@@ -790,14 +806,6 @@ _STRING_FUNCTIONS = {
 }
 #: The case wrappers a native string kind takes as its ``case``.
 _CASE_WRAPPERS = {"Builtin_LCASE": "lower", "Builtin_UCASE": "upper"}
-
-
-def _string_literal(term) -> bool:
-    """rdflib's ``string()``: a plain, ``xsd:string`` or language-tagged
-    literal."""
-    return isinstance(term, Literal) and (
-        term.datatype is None or str(term.datatype) == _XSD_STRING
-    )
 
 
 def _text_shape(node, var) -> tuple[str | None, bool] | None:
@@ -847,13 +855,10 @@ def _regex_shape(expr, var, consts) -> NativeShape | None:
         return None
     if expr.flags is not None and not _string_literal(flags):
         return None
-    kept = "".join(flag for flag in ("" if flags is None else str(flags)) if flag in _REGEX_FLAGS)
-    compile_flags = 0
-    for flag in kept:
-        compile_flags |= _REGEX_FLAGS[flag]
+    kept, compile_flags = _regex_flags(flags)
     try:
         re.compile(str(pattern), compile_flags)
-    except re.error:
+    except _COMPILE_ERRORS:
         return None
     case, as_str = text
     return NativeShape("regex", str(pattern), flags=kept, case=case, as_str=as_str)
@@ -910,9 +915,7 @@ def native_shape(expr, var, consts: dict) -> NativeShape | None:
         # rdflib's `string()` admits a language-tagged range: its lexical
         # form is the range either way.
         rng = _constant_term(expr.arg2, consts)
-        if not isinstance(rng, Literal) or (
-            rng.datatype is not None and str(rng.datatype) != _XSD_STRING
-        ):
+        if not _string_literal(rng):
             return None
         return NativeShape("lang_matches", str(rng)) if _LANG_RANGE.fullmatch(str(rng)) else None
     if name == "Builtin_STRSTARTS" and _call_on(expr.arg1, "Builtin_STR", var):
