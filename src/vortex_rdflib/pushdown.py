@@ -1454,6 +1454,9 @@ def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None) -> Relati
         raise NotImplementedError
     decided = plan.constant + plan.tuples + [c for cs in plan.per_var.values() for c in cs]
     _reject_graph_exists(ctx, store, decided, scope)
+    if not getattr(node, "no_isolated_scope", False):
+        kept = set(node._vars or ()) | set(ctx.initBindings or ())
+        _reject_forgotten_exists(ctx, decided + [e.conjunct for e in plan.exists], kept)
     if env:
         _reject_env_references(node, plan, env, ctx)
     for conjunct in plan.constant:
@@ -1661,6 +1664,20 @@ def _reject_graph_exists(ctx, store, conjuncts, scope) -> None:
         raise NotImplementedError
 
 
+def _reject_forgotten_exists(ctx, conjuncts, kept) -> None:
+    """rdflib evaluates a FILTER, and an OPTIONAL's condition, with the
+    context's bindings outside ``kept`` forgotten (see
+    :func:`filters.analyze_filter`; a condition keeps the ``initBindings``
+    alone). An EXISTS here would see them: its body is solved through the
+    context, and rdflib's evaluator, handed no binding, thaws the whole
+    context. A conjunct holding an EXISTS that names one is left to rdflib."""
+    for conjunct in conjuncts:
+        if filters.has_exists(conjunct.expr) and any(
+            ctx[var] is not None and var not in kept for var in filters.expr_vars(conjunct.expr)
+        ):
+            raise NotImplementedError
+
+
 def _rows_of(rel: Relation) -> list:
     """The relation's rows, materialized."""
     if rel.rows is not None:
@@ -1784,6 +1801,7 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
             raise NotImplementedError
         conjuncts = plan.tuples + [c for cs in plan.per_var.values() for c in cs]
         _reject_graph_exists(ctx, store, plan.constant + conjuncts, scope)
+        _reject_forgotten_exists(ctx, plan.constant + conjuncts, init)
         for conjunct in plan.constant:
             if not filters.evaluate_constant(conjunct):
                 return None  # no pair can pass: every left row is unmatched

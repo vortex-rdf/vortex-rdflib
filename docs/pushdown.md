@@ -401,7 +401,12 @@ outer bindings when it sits directly inside an `EXISTS` body (see
   `BNODE()`), since remembering its result per value would change the answer;
 - a conjunct that, in rdflib, could see a variable an enclosing join binds row
   by row; the hook solves both sides separately, so the conjunct could not see
-  it ([`_reject_env_references`](../src/vortex_rdflib/pushdown.py#L1545)).
+  it ([`_reject_env_references`](../src/vortex_rdflib/pushdown.py#L1545));
+- a conjunct holding an `EXISTS` that names an outer binding the filter does
+  not see (an `OPTIONAL`'s filter sees none), where rdflib evaluates the
+  filter once per row and calls the hook with the row bound: the `EXISTS`
+  would see the binding
+  ([`_reject_forgotten_exists`](../src/vortex_rdflib/pushdown.py#L1667)).
 
 ## Projection, LIMIT/OFFSET and ASK
 
@@ -583,12 +588,12 @@ body in a `Join` with an empty `BGP`, which the hook skips
 tuple of values, when a shared variable may be unbound in the block or in the
 body's solutions, when the body is not a block, or when a `FILTER` in the body
 sees the block's bindings. Where such a top-level `EXISTS` conjunct's body
-holds a `MINUS`, and the `EXISTS` names no variable of the block or one the
+holds a `MINUS`, and the `EXISTS` names no variable of the block, or one the
 block may leave unbound, the whole `FILTER` goes to rdflib: rdflib binds the
-whole row in the body, so the `MINUS` always shares a binding. An `EXISTS` inside `||` or another
-operator is decided by rdflib's evaluator too, and its `FILTER` goes to rdflib
-whole when its body holds a `MINUS`. Under `GRAPH ?g`, the whole block goes to
-rdflib (see [Named graphs](#named-graphs)).
+whole row in the body, so the `MINUS` always shares a binding. An `EXISTS`
+inside `||` or another operator is decided by rdflib's evaluator too, and its
+`FILTER` goes to rdflib whole when its body holds a `MINUS`. Under `GRAPH ?g`,
+the whole block goes to rdflib (see [Named graphs](#named-graphs)).
 
 ## ORDER BY
 

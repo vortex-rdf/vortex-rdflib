@@ -13,7 +13,9 @@ pushdown gives rdflib's answer too.
 it. rdflib solves the right side of a lazy join or an OPTIONAL, and an EXISTS
 body, once per row with that row's bindings: a MINUS there reads them on its
 right side and always shares them between its sides, and an EXISTS key the
-body leaves unbound is the row's."""
+body leaves unbound is the row's. A FILTER rdflib evaluates itself once per
+row forgets the row's bindings outside its node's ``_vars``, an EXISTS in it
+included."""
 
 import pytest
 from rdflib import Dataset
@@ -725,6 +727,21 @@ GROUP_SHAPES = [
         id="named-graph-or-not-exists",
     ),
     pytest.param(
+        """SELECT * WHERE { GRAPH ex:g2 { ?s ex:p ?o
+            FILTER (false || EXISTS { ?a ex:q ex:x3 }) } }""",
+        id="named-graph-or-second-exists",
+    ),
+    pytest.param(
+        """SELECT * WHERE { GRAPH ex:g2 { ?s ex:p ?o
+            FILTER (false || NOT EXISTS { ?a ex:q ex:x3 }) } }""",
+        id="named-graph-or-second-not-exists",
+    ),
+    pytest.param(
+        """SELECT * WHERE { GRAPH ex:g2 { ?s ex:p ?o
+            FILTER (COALESCE(EXISTS { ?a ex:q ex:x3 }, false)) } }""",
+        id="named-graph-coalesce-exists",
+    ),
+    pytest.param(
         "SELECT ?s ?g WHERE { GRAPH ?g { ?s ex:p ?o FILTER (EXISTS { ?s ex:q ?x } || false) } }",
         id="graph-or-exists",
     ),
@@ -750,6 +767,74 @@ GROUP_SHAPES = [
     ),
 ]
 
+# A FILTER rdflib evaluates itself, once per row of an enclosing join it was
+# handed, sees only the row's bindings its node's _vars keep, and an
+# OPTIONAL's FILTER none. The _vars leave out a variable that only a FILTER in
+# an EXISTS body names, or only a comparison: an EXISTS in the expression does
+# not see it, whether the EXISTS is the conjunct or sits under another
+# operator.
+REENTRY_SHAPES = [
+    pytest.param(
+        """SELECT * WHERE { ?s ex:in ?h GRAPH ex:g1 { ?a ex:q ?b
+            FILTER (EXISTS { FILTER (COALESCE(EXISTS { ?s ex:q ?x }, false)) }) } }""",
+        id="reentry-exists-filter-coalesce",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?x ex:r ?y GRAPH ex:g2 { ?h ex:p ?o
+            FILTER (EXISTS { FILTER ((EXISTS { ?x ex:r ?y } || bound(?s))) }) } }""",
+        id="reentry-exists-filter-or-bound",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:in ?h { ?a ex:q ?b
+            FILTER (EXISTS { FILTER (EXISTS { ?s ex:q ?x }) }) MINUS { ?c ex:zz ?d } } }""",
+        id="reentry-exists-filter-minus",
+    ),
+    pytest.param(
+        """SELECT * WHERE { FILTER ((EXISTS { MINUS { ?h ex:p ?o } }
+            || EXISTS { { FILTER (EXISTS { ?s ex:q ?o }) . ?s ex:in ?h } })) . ?s ex:p ?o }""",
+        id="reentry-or-exists-minus",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            FILTER (false || EXISTS { { FILTER (EXISTS { ?s ex:q ?o }) . ?s ex:in ?h } }) }""",
+        id="reentry-or-exists-group-filter",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:in ?h GRAPH ex:g1 { ?a ex:q ?b
+            FILTER (EXISTS { ?s ex:q ?x } = true) } }""",
+        id="reentry-exists-eq",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?x ex:r ?y GRAPH ex:g2 { ?h ex:p ?o
+            FILTER ((EXISTS { ?x ex:r ?y } = true) || bound(?s)) } }""",
+        id="reentry-exists-eq-or-bound",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:in ?h GRAPH ex:g1 { ?a ex:q ?b OPTIONAL { ?a ex:zz ?k }
+            FILTER ((EXISTS { ?s ex:q ?x } = true) || bound(?k)) } }""",
+        id="reentry-exists-eq-or-unbound",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:in ?h { ?a ex:q ?b
+            FILTER (EXISTS { ?s ex:q ?x } = true) MINUS { ?c ex:zz ?d } } }""",
+        id="reentry-exists-eq-minus",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:in ?h GRAPH ex:g1 { ?a ex:q ?b
+            OPTIONAL { ?a ex:q ?c FILTER (COALESCE(EXISTS { ?s ex:q ?x }, false)) } } }""",
+        id="reentry-optional-coalesce-exists",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:in ?h GRAPH ex:g1 { ?a ex:q ?b
+            OPTIONAL { ?a ex:q ?c FILTER (EXISTS { ?s ex:q ?x } = true) } } }""",
+        id="reentry-optional-exists-eq",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:in ?h GRAPH ex:g1 { ?a ex:q ?b FILTER EXISTS { ?s ex:q ?x } } }",
+        id="reentry-exists-kept",
+    ),
+]
+
 
 @pytest.fixture(scope="module")
 def quad_files(tmp_path_factory):
@@ -766,14 +851,21 @@ def quad_files(tmp_path_factory):
     return files
 
 
+@pytest.fixture
+def union():
+    """Whether the query's default graph is the union of the graphs; a test
+    parametrizes it to query the default graph alone too."""
+    return True
+
+
 @pytest.fixture(
     params=[("copy", True), ("copy", False), ("reference", True), ("reference", False)],
     ids=["copy-mem", "copy-file", "reference-mem", "reference-file"],
 )
-def dataset(quad_files, request):
+def dataset(quad_files, request, union):
     layout, in_memory = request.param
     store = VortexRdflibStore(str(quad_files[layout]), in_memory=in_memory)
-    return Dataset(store=store, default_union=True)
+    return Dataset(store=store, default_union=union)
 
 
 @pytest.fixture(params=["default", "probe", "generic"])
@@ -820,6 +912,13 @@ def test_a_filter_on_a_variable_the_graph_group_binds_stays_native(
 
 @pytest.mark.parametrize("sparql", GROUP_SHAPES)
 def test_graph_minus_and_exists_answer_as_rdflib_does(dataset, route, sparql):
+    with_pushdown, without_pushdown = both_ways(dataset, PREFIX + sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("union", [True, False], ids=["union", "default-graph"])
+@pytest.mark.parametrize("sparql", REENTRY_SHAPES)
+def test_an_exists_re_entered_with_a_row_sees_only_its_filters_bindings(dataset, route, sparql):
     with_pushdown, without_pushdown = both_ways(dataset, PREFIX + sparql)
     assert with_pushdown == without_pushdown
 
