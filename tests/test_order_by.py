@@ -145,3 +145,24 @@ def test_blank_nodes_order_by_label(tmp_path, ranked):
     stored = Dataset(store=store, default_union=True)
     assert [tuple(row) for row in stored.query(sparql)] == expected
     assert ranked
+
+
+def test_an_iri_code_without_a_spelling_raises_the_store_error(order_files):
+    """An IRI code ``decode_many`` answers ``None`` for raises the error the
+    store's own decode raises."""
+    store = VortexRdflibStore(str(order_files["secondary-by-copy"]))
+    dictionary = store._dict
+    assert dictionary is not None
+    code = dictionary.encode(f"<{EX}a>")
+    assert code is not None
+
+    class _Dict:
+        def decode_many(self, codes):
+            return [None for _ in codes]
+
+        def __getattr__(self, name):
+            return getattr(dictionary, name)
+
+    store._dict = _Dict()  # ty: ignore[invalid-assignment]
+    with pytest.raises(ValueError, match=f"term code {code} is not in the store dictionary"):
+        pd._rank_codes(store, {}, {code})

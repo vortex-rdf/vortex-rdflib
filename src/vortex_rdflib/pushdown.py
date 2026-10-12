@@ -55,9 +55,10 @@ What runs in code space:
   decodes a few dozen codes, an ASK none, a ``DISTINCT ?p`` over the whole
   store only its distinct predicates (found by the native ``distinct``); an
   ORDER BY ranks each distinct code once (blank nodes by code, as the
-  spelling ``_:label`` sorts as the label; IRIs and literals decoded once
-  per query and ranked by rdflib's comparison) and sorts the code rows, a
-  top-k when a LIMIT follows;
+  spelling ``_:label`` sorts as the label; IRIs by their spelling without
+  the brackets, the string rdflib compares, with no term built; literals
+  decoded once per query and ranked by rdflib's comparison) and sorts the
+  code rows, a top-k when a LIMIT follows;
 - ``COUNT`` aggregates (``COUNT(*)``, ``COUNT(?v)``, ``COUNT(DISTINCT ?v)``,
   with or without ``GROUP BY`` variables) are computed over the code
   columns — a column at a time by the native ``value_counts`` and
@@ -899,14 +900,16 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
     """Ranks reproducing rdflib's ORDER BY comparison (``_val``): unbound
     first, then blank nodes, IRIs and literals.
 
-    A blank node is spelled ``_:label``, which sorts as its label, so blank
-    nodes rank in code order. An IRI is spelled ``<iri>``, and the closing
-    ``>`` sorts it after the IRIs it is a prefix of whenever the next
-    character is below ``>`` (``<…/a>`` after ``<…/a/b>``), so IRIs are
-    decoded and sorted as their strings. Literals are decoded and sorted with
-    rdflib's own comparator. IRIs and literals are decoded in one batch
-    through the query's term cache; adjacent terms that compare equal share
-    a rank, so the stable sort keeps their input order."""
+    Blank nodes rank by code: the spelling ``_:label`` sorts as the label.
+    IRIs rank by their spelling without the brackets, the string rdflib
+    compares, read in one ``decode_many`` with no term built. Their codes
+    are not in that order: the closing ``>`` of ``<iri>`` sorts an IRI after
+    the IRIs it is a prefix of whenever the next character is below ``>``
+    (``<…/a>`` after ``<…/a/b>``). Literals are decoded once per query, in
+    one batch through the query's term cache, and ranked by rdflib's own
+    comparator. Adjacent keys that compare equal share a rank, so the stable
+    sort keeps their input order. With a query constant outside the
+    dictionary among the codes, every code ranks as the literals do."""
     started = time.perf_counter_ns() if _TRACE.get() is not None else 0
     codes = set(codes)
     cache_before = set(store._terms().decode) if _TRACE.get() is not None else set()
@@ -927,10 +930,18 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
     for code in sorted(blanks):
         ranks[code] = rank
         rank += 1
-    local = iris + [code for code in others if code >= 0]
-    if iris or others:
+    if iris:
+        # ``<iri>`` decodes to ``URIRef(iri)``, so the string rdflib compares
+        # is the spelling without its brackets.
+        spellings = store._dict.decode_many(iris)
+        if None in spellings:
+            code = iris[spellings.index(None)]
+            raise ValueError(f"term code {code} is not in the store dictionary")
+        keyed = [(spelling[1:-1], code) for spelling, code in zip(spellings, iris, strict=True)]
+        rank = _rank_keyed(ranks, keyed, rank)
+    local = [code for code in others if code >= 0]
+    if others:
         cached = store._prime_decode_cache(local)
-        rank = _rank_keyed(ranks, [(str(cached[code]), code) for code in iris], rank)
         keyed = [(_val(cached[code] if code >= 0 else foreign[code]), code) for code in others]
         _rank_keyed(ranks, keyed, rank)
     if _TRACE.get() is not None:
@@ -954,8 +965,9 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
 
 def _rank_keyed(ranks: dict, keyed: list, rank: int) -> int:
     """Rank the codes of ``keyed``, ``(key, code)`` pairs, in key order from
-    ``rank`` on, adjacent keys that compare equal sharing a rank; return the
-    first rank above them."""
+    ``rank`` on, adjacent keys that compare equal sharing a rank. Returns one
+    more than the last rank given, or ``rank + 1`` for an empty ``keyed``: a
+    gap, which leaves the order of the ranks unchanged."""
     keyed.sort(key=itemgetter(0))
     previous = None
     for key, code in keyed:
