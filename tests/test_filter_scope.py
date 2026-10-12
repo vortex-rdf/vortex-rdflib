@@ -25,7 +25,8 @@ from test_pushdown import both_ways, run
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 
 # Two named graphs and the default graph: a first hop (p), a second and third
-# hop for the nested groups, OPTIONAL and MINUS (q, r), a graph named in its
+# hop for the nested groups, OPTIONAL and MINUS (q, r), a subject with a first
+# hop in one named graph and a second in the other (s3), a graph named in its
 # own subject position (g1), and graph names a pattern reaches (in).
 QUADS = """\
 <http://ex/s1> <http://ex/p> "a" <http://ex/g1> .
@@ -34,6 +35,7 @@ QUADS = """\
 <http://ex/s4> <http://ex/p> "c" .
 <http://ex/s1> <http://ex/q> <http://ex/x1> <http://ex/g1> .
 <http://ex/s2> <http://ex/q> <http://ex/x2> <http://ex/g2> .
+<http://ex/s3> <http://ex/q> <http://ex/x3> <http://ex/g1> .
 <http://ex/s4> <http://ex/q> <http://ex/x4> .
 <http://ex/x1> <http://ex/r> "y1" <http://ex/g1> .
 <http://ex/x2> <http://ex/r> "y2" <http://ex/g2> .
@@ -367,6 +369,10 @@ GROUP_SHAPES = [
         id="graph-minus-shared",
     ),
     pytest.param(
+        "SELECT ?s ?g WHERE { GRAPH ?g { ?s ex:p ?o MINUS { GRAPH ?g { ?s ex:q ?x } } } }",
+        id="graph-minus-graph-same-var",
+    ),
+    pytest.param(
         """SELECT ?z ?g ?s WHERE { ?z ex:in ?g .
             GRAPH ?g { ?s ex:p ?o MINUS { ?x ex:q ?y } } }""",
         id="graph-joined-minus-disjoint",
@@ -401,6 +407,11 @@ GROUP_SHAPES = [
         """SELECT ?s ?g ?x WHERE { GRAPH ?g { ?s ex:p ?o
             OPTIONAL { ?s ex:q ?x MINUS { ?g ex:p ?y } } } }""",
         id="graph-optional-minus-names-g",
+    ),
+    pytest.param(
+        """SELECT ?s ?g ?x WHERE { GRAPH ?g { ?s ex:p ?o
+            OPTIONAL { GRAPH ?g { ?s ex:q ?x } } } }""",
+        id="graph-optional-graph-same-var",
     ),
     pytest.param(
         "SELECT ?g ?o ?x WHERE { GRAPH ?g { ?g ex:p ?o OPTIONAL { ?g ex:q ?x } } }",
@@ -520,7 +531,9 @@ GROUP_SHAPES = [
         id="graph-ground-row-minus-disjoint",
     ),
     # FILTER (NOT) EXISTS: rdflib solves the body once per row, with the row's
-    # bindings; a key the body's solutions may leave unbound is the row's.
+    # bindings; a key the body's solutions may leave unbound is the row's, and
+    # a MINUS in the body shares the row's bindings where the EXISTS names
+    # none of them.
     pytest.param(
         "SELECT * WHERE { ?s ex:p ?o FILTER EXISTS { ?s ex:q ?x MINUS { ?x ex:r ?o } } }",
         id="exists-minus-outer-var",
@@ -552,6 +565,42 @@ GROUP_SHAPES = [
     pytest.param(
         "SELECT * WHERE { ?s ex:p ?o FILTER EXISTS { VALUES (?s ?o) { (ex:s1 UNDEF) } } }",
         id="exists-values-undef-pair",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o FILTER EXISTS { ?s ex:q ?x OPTIONAL { ?x ex:r ?o } } }",
+        id="exists-optional-outer-var",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o FILTER NOT EXISTS { ?s ex:q ?x OPTIONAL { ?x ex:r ?o } } }",
+        id="not-exists-optional-outer-var",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o FILTER EXISTS { ?a ex:q ?x MINUS { ?c ex:r ?b } } }",
+        id="exists-uncorrelated-minus-disjoint",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o FILTER NOT EXISTS { ?a ex:q ?x MINUS { ?c ex:r ?b } } }",
+        id="not-exists-uncorrelated-minus-disjoint",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o FILTER EXISTS {
+            { ?a ex:q ?x MINUS { ?c ex:r ?b } } UNION { ?a ex:zz ?b } } }""",
+        id="exists-union-minus-disjoint",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o FILTER NOT EXISTS {
+            { ?a ex:q ?x MINUS { ?c ex:r ?b } } UNION { ?a ex:zz ?b } } }""",
+        id="not-exists-union-minus-disjoint",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o OPTIONAL { ?s ex:zz ?k }
+            FILTER EXISTS { ?a ex:q ?k MINUS { ?c ex:r ?b } } }""",
+        id="exists-unbound-key-minus-disjoint",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o OPTIONAL { ?s ex:zz ?k }
+            FILTER NOT EXISTS { ?a ex:q ?k MINUS { ?c ex:r ?b } } }""",
+        id="not-exists-unbound-key-minus-disjoint",
     ),
     pytest.param(
         "SELECT * WHERE { ?s ex:p ?o FILTER EXISTS { ?s ex:q ?x MINUS { ?s ex:r ?y } } }",
@@ -713,6 +762,29 @@ def test_the_pushdown_answers_these_shapes_whole(
     capsys.readouterr()
     run(dataset, PREFIX + sparql)
     events = _trace(capsys)
+    assert any(e["event"] == "eval_part_complete" for e in events)
     assert {e["algebra_node"] for e in events if e["event"] == "eval_part_fallback"}.isdisjoint(
         _BLOCK_NODES
     )
+
+
+@pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
+@pytest.mark.parametrize("sparql", [shape for shape in NATIVE if "exists" in str(shape.id)])
+def test_an_exists_the_pushdown_answers_whole_is_a_semi_join(
+    quad_files, monkeypatch, in_memory, sparql
+):
+    """rdflib's evaluator decides none of its rows, as it does those of an
+    EXISTS whose key the body may leave unbound."""
+    dataset = Dataset(
+        store=VortexRdflibStore(str(quad_files["copy"]), in_memory=in_memory), default_union=True
+    )
+    register_sparql_pushdown()
+    calls = []
+    generic = filters.Conjunct.generic
+    monkeypatch.setattr(
+        filters.Conjunct, "generic", lambda self, bound: calls.append(bound) or generic(self, bound)
+    )
+    run(dataset, PREFIX + sparql)
+    assert calls == []
+    run(dataset, PREFIX + str(_BY_ID["exists-values-undef"].values[0]))
+    assert calls

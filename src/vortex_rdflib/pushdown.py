@@ -73,10 +73,11 @@ one match answers what rdflib would walk the store's graphs for. A FILTER in
 the block still reads ``?g`` unbound unless a pattern of its group binds it:
 rdflib joins the graph in after the group is solved. Where no pattern of the
 group is matched in that scope, or an OPTIONAL or MINUS has one on its right
-side only, or binds ``?g`` there only, the ``Graph`` node is left to rdflib,
-which solves the group once per named graph. The rows of the default graph
-are dropped from a variable's match, which is what makes ``GRAPH`` range over
-the named graphs only.
+side only, or an OPTIONAL binds ``?g`` on its right side only, or a MINUS does
+and its two sides share a binding, the ``Graph`` node is left to rdflib, which
+solves the group once per named graph. The rows of the default graph are
+dropped from a variable's match, which is what makes ``GRAPH`` range over the
+named graphs only.
 
 rdflib only catches ``NotImplementedError`` at hook-call time, so every
 capability check and every native call happens before a generator is handed
@@ -113,6 +114,7 @@ from typing import Any
 
 from rdflib.plugins.sparql import CUSTOM_EVALS
 from rdflib.plugins.sparql.evalutils import _val
+from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
@@ -707,8 +709,9 @@ def _block_nullable(node) -> frozenset:
     introduces, every one its left side does not bind.
 
     A ``GRAPH ?g``'s variable is among them only where an OPTIONAL's right
-    side names it and its left side does not bind it, which the solver
-    leaves to rdflib (see :func:`_solve_left_join` and :func:`_solve_minus`).
+    side names it and its left side does not bind it, or a VALUES table
+    leaves it UNDEF; the solver leaves both to rdflib (see
+    :func:`_solve_left_join`, :func:`_solve_minus` and :func:`_shared_key_ok`).
     Otherwise the graph column is bound in every row below the ``GRAPH``,
     and when both sides of an OPTIONAL are under the same one, the join on it
     keeps them in the same graph.
@@ -1497,11 +1500,13 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
     """``FILTER (NOT) EXISTS { body }`` as a semi- or anti-join on the
     variables the body shares with the block: the body is solved once (or,
     for a small block and a one-pattern body, probed per row with counts
-    capped at one row, in native batches) instead of once per row. Shapes rdflib would evaluate
-    differently on an independently solved body — a nullable shared
-    variable, a body the solver cannot take, a body FILTER that sees the
-    block's bindings — take the generic route, rdflib's own evaluator per
-    distinct tuple."""
+    capped at one row, in native batches) instead of once per row. Shapes
+    rdflib would evaluate differently on an independently solved body — a
+    shared variable the block or the body's solutions may leave unbound, a
+    body the solver cannot take, a body FILTER that sees the block's bindings
+    — take the generic route, rdflib's own evaluator per distinct tuple of
+    the variables the EXISTS names. Where the body holds a MINUS and a row
+    may bind none of them, the FILTER is left to rdflib."""
     body, negate = _unwrap_empty_joins(exists.body), exists.negate
     rows = _rows_of(rel)
     if not rows:
@@ -1509,6 +1514,13 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
 
     def generic():
         conjunct = exists.conjunct
+        if _has_minus(body) and (
+            not conjunct.vars or any(v in rel.nullable for v in conjunct.vars)
+        ):
+            # rdflib binds the whole row in the body, so a MINUS there always
+            # shares a binding; this route binds only the conjunct's
+            # variables, which a row may leave without any.
+            raise NotImplementedError
         positions = [rel.schema.index(v) for v in conjunct.vars]
         return _filter_relation(rel, (filters.tuple_predicate(store, conjunct, positions),))
 
@@ -1559,6 +1571,21 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
     keys = {tuple(row[i] for i in ib) for row in _code_rows(inner)}
     kept = [row for row in rows if (tuple(row[i] for i in ia) in keys) != negate]
     return Relation(rel.schema, None, kept, len(kept), rel.nullable, rel.foreign)
+
+
+def _has_minus(node) -> bool:
+    """Whether an algebra tree holds a MINUS, one in a nested EXISTS body
+    included (walked in its translated form, as :func:`filters.expr_vars`
+    does)."""
+    if isinstance(node, (list, tuple)):
+        return any(_has_minus(item) for item in node)
+    if not isinstance(node, CompValue):
+        return False
+    if node.name == "Minus":
+        return True
+    if node.name in ("Builtin_EXISTS", "Builtin_NOTEXISTS"):
+        return _has_minus(getattr(node, "graph", None))
+    return any(_has_minus(dict.__getitem__(node, key)) for key in node.keys() if key != "_vars")
 
 
 def _unwrap_empty_joins(node):
