@@ -674,6 +674,18 @@ GROUP_SHAPES = [
         'SELECT * WHERE { ?s ex:p ?o FILTER (?o = "a" || EXISTS { ?s ex:q ?x }) }',
         id="or-exists",
     ),
+    # ... and a FILTER in a group of the body forgets the row's bindings, even
+    # of a variable its own pattern binds.
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            FILTER EXISTS { { ?x ex:p ?o FILTER (?o != "zz") } } }""",
+        id="exists-group-filter-outer-var",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o FILTER EXISTS { ?x ex:q ?y
+            { ?t ex:p ?o FILTER (COALESCE(?o = "zz", true)) } } }""",
+        id="exists-nested-group-filter-outer-var",
+    ),
     # A FILTER (NOT) EXISTS in a group on a lazy join's or an OPTIONAL's right
     # side: its body sees the enclosing row's binding of a variable the group
     # does not bind.
@@ -957,6 +969,93 @@ VALUES_SHAPES = [
         """SELECT * WHERE { ?s ex:p ?o2
             FILTER EXISTS { VALUES ?o { "y1" "a" } FILTER (?o = "zz") } }""",
         id="exists-values-eq",
+    ),
+    # On a lazy join's or an OPTIONAL's right side, or in an EXISTS body,
+    # rdflib's FILTER forgets the row's binding of a variable the group's
+    # VALUES table binds too, outside the node's _vars: a comparison sees it
+    # unbound.
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            { FILTER (COALESCE(?o = "zz", true)) VALUES ?o { "a" } } }""",
+        id="row-values-coalesce-eq",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            { FILTER (COALESCE(?o, "x") = "x") VALUES ?o { "a" } } }""",
+        id="row-values-coalesce-var",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            { FILTER (bound(?o) = false) VALUES ?o { "a" } } }""",
+        id="row-values-bound-eq-false",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            { FILTER (COALESCE(?o = "zz", true)) VALUES ?o { "a" "b" } } }""",
+        id="row-values-coalesce-two",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            { FILTER (COALESCE(?o = "zz", true)) VALUES (?o ?k) { ("a" 1) ("b" 2) } } }""",
+        id="row-values-pair-coalesce",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            { FILTER (COALESCE(?o = "zz", true)) VALUES (?o ?s) { ("a" ex:s1) } } }""",
+        id="row-values-pair-shared",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            GRAPH ex:g1 { FILTER (COALESCE(?o = "zz", true)) VALUES ?o { "a" } } }""",
+        id="row-values-named-graph",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o FILTER EXISTS { ?x ex:q ?y
+            { FILTER (COALESCE(?o = "zz", true)) VALUES ?o { "a" } } } }""",
+        id="row-values-exists-group",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o FILTER EXISTS {
+            { FILTER (COALESCE(?o = "zz", true)) VALUES ?o { "a" } } } }""",
+        id="row-values-exists-subgroup",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o FILTER NOT EXISTS { ?x ex:q ?y
+            { FILTER (COALESCE(?o = "zz", true)) VALUES ?o { "a" } } } }""",
+        id="row-values-not-exists-group",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o OPTIONAL { ?s ex:q ?x
+            { FILTER (COALESCE(?o = "zz", true)) VALUES ?o { "a" } } } }""",
+        id="row-values-optional-group",
+    ),
+    pytest.param(
+        """SELECT * WHERE { VALUES ?o { "a" }
+            { FILTER (COALESCE(?o = "zz", true)) VALUES ?o { "a" } } }""",
+        id="row-values-outer-values",
+    ),
+    pytest.param(
+        'SELECT * WHERE { ?s ex:p ?o { FILTER (?o != "zz") VALUES ?o { "a" } } }',
+        id="row-values-ne",
+    ),
+    pytest.param(
+        """SELECT * WHERE { VALUES ?o { "y1" "a" } GRAPH ex:g2 {
+            FILTER ((?o = ex:s1 || ?o != "a"))
+            VALUES (?s ?o) { (ex:s4 1) (ex:s4 "y1") (ex:zz "a") } } }""",
+        id="row-values-named-graph-pair-or",
+    ),
+    # ... where no row binds it first (a MINUS's right side, or a join of a
+    # join, which rdflib does not evaluate row by row), the FILTER sees the
+    # table's binding.
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o MINUS { ?s ex:q ?x
+            { FILTER (COALESCE(?o = "zz", true)) VALUES ?o { "a" } } } }""",
+        id="values-in-minus-group",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o { ?s ex:q ?x
+            { FILTER (COALESCE(?o = "zz", true)) VALUES ?o { "a" } } } }""",
+        id="values-in-nested-group",
     ),
 ]
 

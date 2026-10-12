@@ -1650,17 +1650,23 @@ def _substituted_patterns(store, rows, pat, bound) -> list:
 
 
 def _reject_env_references(node, plan, env, ctx) -> None:
-    """A conjunct referencing a variable an enclosing join binds row by row,
-    an EXISTS body included, where rdflib would let the filter see that
-    binding, cannot be evaluated on an independently solved block."""
+    """rdflib evaluates a filter on a lazy join's or an OPTIONAL's right side,
+    or in an EXISTS body, once per row of the left side or of the block the
+    EXISTS filters, whose variables are ``env``. Its expression sees the
+    row's binding of such a variable only where the node keeps it: in its
+    ``_vars`` or the query's ``initBindings``, or anywhere directly inside an
+    EXISTS body. On the independently solved block a conjunct sees the
+    variable bound only where the block binds it too; ``_vars`` leaves out a
+    VALUES table's variables, and a filter in a group of an EXISTS body has
+    none. Where the two differ, the conjunct is left to rdflib."""
     everything = getattr(node, "no_isolated_scope", False)
     allowed = set(node._vars or ()) | set(ctx.initBindings or ())
     conjuncts = plan.constant + plan.tuples + [c for cs in plan.per_var.values() for c in cs]
     conjuncts += [exists.conjunct for exists in plan.exists]
     for conjunct in conjuncts:
         for var in filters.expr_vars(conjunct.expr):
-            if var in env and var not in conjunct.vars and var not in conjunct.consts:
-                if everything or var in allowed:
+            if var in env and var not in conjunct.consts:
+                if (var in conjunct.vars) != (everything or var in allowed):
                     raise NotImplementedError
 
 

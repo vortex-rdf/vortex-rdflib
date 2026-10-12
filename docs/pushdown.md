@@ -401,12 +401,15 @@ outer bindings when it sits directly inside an `EXISTS` body (see
   `BNODE()`), since remembering its result per value would change the answer;
 - a conjunct that, in rdflib, could see a variable an enclosing join binds row
   by row; the hook solves both sides separately, so the conjunct could not see
-  it ([`_reject_env_references`](../src/vortex_rdflib/pushdown.py#L1545));
+  it ([`_reject_env_references`](../src/vortex_rdflib/pushdown.py#L1652));
+- a conjunct on a variable both the block and such a row bind, where rdflib's
+  filter forgets the row's binding (a `VALUES` table's, outside the node's
+  `_vars`, or any in a group of an `EXISTS` body), so sees it unbound;
 - a conjunct holding an `EXISTS` that names an outer binding the filter does
-  not see (an `OPTIONAL`'s filter sees none), where rdflib evaluates the
-  filter once per row and calls the hook with the row bound: the `EXISTS`
-  would see the binding
-  ([`_reject_forgotten_exists`](../src/vortex_rdflib/pushdown.py#L1675)).
+  not see (an `OPTIONAL`'s filter sees only the query's `initBindings`), where
+  rdflib evaluates the filter once per row and calls the hook with the row
+  bound: the `EXISTS` would see the binding
+  ([`_reject_forgotten_exists`](../src/vortex_rdflib/pushdown.py#L1681)).
 
 ## Projection, LIMIT/OFFSET and ASK
 
@@ -644,8 +647,9 @@ a relation, which then joins like any other:
   but is still returned as written.
 - Rows that contradict an outer binding are dropped, as in rdflib.
 - Rows whose term fails a `FILTER` conjunct pushed down to the table are
-  dropped. Each distinct term is tested once, as the query writes it, which is
-  the term rdflib binds
+  dropped, even where a pattern that binds the variable tests it too. Each
+  distinct term is tested once, as the query writes it, which is the term
+  rdflib binds
   ([`constant_predicate`](../src/vortex_rdflib/filters.py#L1275)).
 
 **Left to rdflib:** a constant whose rdflib term differs from the dictionary's
