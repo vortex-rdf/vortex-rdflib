@@ -666,6 +666,88 @@ GROUP_SHAPES = [
         "SELECT * WHERE { ?s ex:p ?o FILTER NOT EXISTS { ?s ex:q ?x MINUS { ?x ex:r ?y } } }",
         id="not-exists-minus",
     ),
+    pytest.param(
+        'SELECT * WHERE { ?s ex:p ?o FILTER (?o = "a" || EXISTS { ?s ex:q ?x }) }',
+        id="or-exists",
+    ),
+    # A FILTER (NOT) EXISTS in a group on a lazy join's or an OPTIONAL's right
+    # side: its body sees the enclosing row's binding of a variable the group
+    # does not bind.
+    pytest.param(
+        """SELECT * WHERE { VALUES ?o { "y1" }
+            { ?x ex:r ?y FILTER EXISTS { ?x ex:r ?o } } }""",
+        id="values-group-exists-outer-var",
+    ),
+    pytest.param(
+        """SELECT * WHERE { VALUES ?o { "y1" }
+            { ?x ex:r ?y FILTER NOT EXISTS { ?x ex:r ?o } } }""",
+        id="values-group-not-exists-outer-var",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            { ?s ex:q ?x2 FILTER EXISTS { ?s ex:q ?x MINUS { ?x ex:r ?o } } } }""",
+        id="nested-group-exists-outer-var",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            { ?s ex:q ?x2 FILTER NOT EXISTS { ?s ex:q ?x MINUS { ?x ex:r ?o } } } }""",
+        id="nested-group-not-exists-outer-var",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            OPTIONAL { { ?s ex:q ?x FILTER EXISTS { ?x ex:r ?o } } } }""",
+        id="optional-group-exists-outer-var",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            OPTIONAL { { ?s ex:q ?x FILTER NOT EXISTS { ?x ex:r ?o } } } }""",
+        id="optional-group-not-exists-outer-var",
+    ),
+    # Under GRAPH, an EXISTS is matched in that graph, also where rdflib's
+    # evaluator decides it: under another operator, in an OPTIONAL's
+    # condition, or on the generic route.
+    pytest.param(
+        "SELECT * WHERE { GRAPH ex:g2 { ?s ex:p ?o FILTER EXISTS { ?s ex:q ?x } } }",
+        id="named-graph-exists",
+    ),
+    pytest.param(
+        "SELECT * WHERE { GRAPH ex:g2 { ?s ex:p ?o FILTER NOT EXISTS { ?s ex:q ?x } } }",
+        id="named-graph-not-exists",
+    ),
+    pytest.param(
+        """SELECT * WHERE { GRAPH ex:g2 { ?s ex:p ?o
+            FILTER (EXISTS { ?a ex:q ex:x3 } || false) } }""",
+        id="named-graph-or-exists",
+    ),
+    pytest.param(
+        """SELECT * WHERE { GRAPH ex:g2 { ?s ex:p ?o
+            FILTER (NOT EXISTS { ?a ex:q ex:x3 } || false) } }""",
+        id="named-graph-or-not-exists",
+    ),
+    pytest.param(
+        "SELECT ?s ?g WHERE { GRAPH ?g { ?s ex:p ?o FILTER (EXISTS { ?s ex:q ?x } || false) } }",
+        id="graph-or-exists",
+    ),
+    pytest.param(
+        """SELECT ?s ?g WHERE { GRAPH ?g { ?s ex:p ?o
+            FILTER (NOT EXISTS { ?s ex:q ?x } || false) } }""",
+        id="graph-or-not-exists",
+    ),
+    pytest.param(
+        """SELECT * WHERE { GRAPH ex:g2 { ?s ex:p ?o
+            OPTIONAL { ?s ex:q ?x FILTER (EXISTS { ?a ex:q ex:x3 } || false) } } }""",
+        id="named-graph-optional-or-exists",
+    ),
+    pytest.param(
+        """SELECT * WHERE { GRAPH ex:g2 { ?s ex:p ?o
+            FILTER EXISTS { { ?a ex:q ex:x3 } UNION { ?a ex:zz ?b } } } }""",
+        id="named-graph-exists-generic",
+    ),
+    pytest.param(
+        """SELECT * WHERE { GRAPH ex:g2 { ?s ex:p ?o
+            FILTER NOT EXISTS { { ?a ex:q ex:x3 } UNION { ?a ex:zz ?b } } } }""",
+        id="named-graph-not-exists-generic",
+    ),
 ]
 
 
@@ -801,6 +883,9 @@ NATIVE = [
         "not-exists-minus",
         "exists-minus-outer-var",
         "not-exists-minus-outer-var",
+        "or-exists",
+        "named-graph-exists",
+        "named-graph-not-exists",
     )
 ]
 
@@ -827,15 +912,19 @@ def test_the_pushdown_answers_these_shapes_whole(
 
 
 # The EXISTS shapes among those: a semi- or anti-join never asks rdflib's
-# evaluator; the generic route, for a body that reads the row's values, asks
-# it once per distinct tuple, without handing the FILTER to rdflib.
+# evaluator; the generic route, for a body that reads the row's values or an
+# EXISTS under another operator, asks it once per distinct tuple, without
+# handing the FILTER to rdflib.
 EXISTS_ROUTES = [
     pytest.param(str(_BY_ID[shape].values[0]), generic, id=shape)
     for shape, generic in (
         ("exists-minus-shared-outer-var", False),
         ("not-exists-minus", False),
+        ("named-graph-exists", False),
+        ("named-graph-not-exists", False),
         ("exists-minus-outer-var", True),
         ("not-exists-minus-outer-var", True),
+        ("or-exists", True),
     )
 ]
 

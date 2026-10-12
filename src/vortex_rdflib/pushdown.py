@@ -1452,6 +1452,8 @@ def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None) -> Relati
         # a column here — so the body would be answered over the union. Hand
         # the whole block back and let rdflib walk the graphs itself.
         raise NotImplementedError
+    decided = plan.constant + plan.tuples + [c for cs in plan.per_var.values() for c in cs]
+    _reject_graph_exists(ctx, store, decided, scope)
     if env:
         _reject_env_references(node, plan, env, ctx)
     for conjunct in plan.constant:
@@ -1504,8 +1506,11 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
     shared variable the block or the body's solutions may leave unbound, a
     body the solver cannot take, a body FILTER that sees the block's bindings
     — take the generic route, rdflib's own evaluator per distinct tuple of
-    the variables the EXISTS names. Where the body holds a MINUS and a row
-    may bind none of them, the FILTER is left to rdflib."""
+    the variables the EXISTS names. The FILTER is left to rdflib where that
+    route would differ: under a ``GRAPH`` scoping the block to a graph other
+    than the context's (see :func:`_reject_graph_exists`), and where the
+    body holds a MINUS and the EXISTS names no variable of the block, or one
+    the block may leave unbound."""
     body, negate = _unwrap_empty_joins(exists.body), exists.negate
     rows = _rows_of(rel)
     if not rows:
@@ -1513,12 +1518,14 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
 
     def generic():
         conjunct = exists.conjunct
+        _reject_graph_exists(ctx, store, [conjunct], scope)
         if filters.has_minus(body) and (
             not conjunct.vars or any(v in rel.nullable for v in conjunct.vars)
         ):
             # rdflib binds the whole row in the body, so a MINUS there always
-            # shares a binding; this route binds only the conjunct's
-            # variables, which a row may leave without any.
+            # shares a binding; this route binds only the variables the EXISTS
+            # names, so it is not taken where it names none of the block's,
+            # or one the block may leave unbound.
             raise NotImplementedError
         positions = [rel.schema.index(v) for v in conjunct.vars]
         return _filter_relation(rel, (filters.tuple_predicate(store, conjunct, positions),))
@@ -1633,16 +1640,25 @@ def _substituted_patterns(store, rows, pat, bound) -> list:
 
 def _reject_env_references(node, plan, env, ctx) -> None:
     """A conjunct referencing a variable an enclosing join binds row by row,
-    where rdflib would let the filter see that binding, cannot be evaluated
-    on an independently solved block."""
+    an EXISTS body included, where rdflib would let the filter see that
+    binding, cannot be evaluated on an independently solved block."""
     everything = getattr(node, "no_isolated_scope", False)
     allowed = set(node._vars or ()) | set(ctx.initBindings or ())
     conjuncts = plan.constant + plan.tuples + [c for cs in plan.per_var.values() for c in cs]
+    conjuncts += [exists.conjunct for exists in plan.exists]
     for conjunct in conjuncts:
         for var in filters.expr_vars(conjunct.expr):
             if var in env and var not in conjunct.vars and var not in conjunct.consts:
                 if everything or var in allowed:
                     raise NotImplementedError
+
+
+def _reject_graph_exists(ctx, store, conjuncts, scope) -> None:
+    """rdflib's evaluator matches an EXISTS body in the graph the context has
+    made active: a conjunct it decides that holds one cannot be evaluated
+    under a ``GRAPH`` that scopes the block to another graph."""
+    if scope != _active_scope(ctx, store) and any(filters.has_exists(c.expr) for c in conjuncts):
+        raise NotImplementedError
 
 
 def _rows_of(rel: Relation) -> list:
@@ -1766,10 +1782,11 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
             # the padded rows is not what rdflib computes, so the whole
             # LeftJoin goes back to it.
             raise NotImplementedError
+        conjuncts = plan.tuples + [c for cs in plan.per_var.values() for c in cs]
+        _reject_graph_exists(ctx, store, plan.constant + conjuncts, scope)
         for conjunct in plan.constant:
             if not filters.evaluate_constant(conjunct):
                 return None  # no pair can pass: every left row is unmatched
-        conjuncts = plan.tuples + [c for cs in plan.per_var.values() for c in cs]
         return tuple(
             filters.tuple_predicate(store, c, [schema.index(v) for v in c.vars]) for c in conjuncts
         )

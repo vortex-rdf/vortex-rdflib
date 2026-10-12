@@ -512,7 +512,7 @@ combines them on their shared variables:
   join ([`_left_join_rows`](../src/vortex_rdflib/pushdown.py#L1735)). The
   optional group's `FILTER` is checked on each candidate pair. A left row with
   no passing match is kept, with the right side's variables unbound.
-- **`MINUS`** ([`_solve_minus`](../src/vortex_rdflib/pushdown.py#L1858)): an
+- **`MINUS`** ([`_solve_minus`](../src/vortex_rdflib/pushdown.py#L1875)): an
   anti-join. When the sides share no variable (under `GRAPH ?g`, the graph
   column alone does not count), it follows rdflib's rule: with no outer
   bindings (the usual top-level case) nothing is removed; with outer bindings,
@@ -540,7 +540,7 @@ matched once and hash-joined.
   bound, which can change the answer (a similar check covers the `OPTIONAL`'s
   filter);
 - a `FILTER` inside a side that, in rdflib, would see a binding from an
-  enclosing join;
+  enclosing join, in an `EXISTS` body too;
 - an `OPTIONAL` whose filter contains `EXISTS`;
 - a `MINUS` that rdflib solves once per row of an enclosing lazy join,
   `OPTIONAL` or `EXISTS`, when its right side binds a variable of that row
@@ -583,9 +583,9 @@ body in a `Join` with an empty `BGP`, which the hook skips
 tuple of values, when a shared variable may be unbound in the block or in the
 body's solutions, when the body is not a block, or when a `FILTER` in the body
 sees the block's bindings. Where such a top-level `EXISTS` conjunct's body
-holds a `MINUS` and a row may bind none of the variables the `EXISTS` names,
-the whole `FILTER` goes to rdflib: rdflib binds the whole row in the body, so
-the `MINUS` always shares a binding. An `EXISTS` inside `||` or another
+holds a `MINUS`, and the `EXISTS` names no variable of the block or one the
+block may leave unbound, the whole `FILTER` goes to rdflib: rdflib binds the
+whole row in the body, so the `MINUS` always shares a binding. An `EXISTS` inside `||` or another
 operator is decided by rdflib's evaluator too, and its `FILTER` goes to rdflib
 whole when its body holds a `MINUS`. Under `GRAPH ?g`, the whole block goes to
 rdflib (see [Named graphs](#named-graphs)).
@@ -685,6 +685,10 @@ a named graph.
 
 - `FILTER (NOT) EXISTS` under `GRAPH ?g`: rdflib evaluates the body in the
   active graph, and under a graph variable there is no single active graph;
+- under any `GRAPH`, an `EXISTS` that rdflib's evaluator decides (one under
+  another operator, in an `OPTIONAL`'s condition, or on the generic route):
+  rdflib would match its body in the query's graph
+  ([`_reject_graph_exists`](../src/vortex_rdflib/pushdown.py#L1656));
 - a `GRAPH` variable bound to something that cannot name a graph, such as a
   literal;
 - a `GRAPH ?g` group none of whose patterns is matched in its scope (an empty

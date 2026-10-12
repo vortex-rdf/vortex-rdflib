@@ -984,6 +984,17 @@ def has_minus(node) -> bool:
     return any(has_minus(dict.__getitem__(node, key)) for key in node.keys() if key != "_vars")
 
 
+def has_exists(node) -> bool:
+    """Whether an expression holds an EXISTS or a NOT EXISTS."""
+    if isinstance(node, (list, tuple)):
+        return any(has_exists(item) for item in node)
+    if not isinstance(node, CompValue):
+        return False
+    if node.name in ("Builtin_EXISTS", "Builtin_NOTEXISTS"):
+        return True
+    return any(has_exists(dict.__getitem__(node, key)) for key in node.keys() if key != "_vars")
+
+
 def _is_impure(node) -> bool:
     if isinstance(node, CompValue):
         if node.name in _IMPURE:
