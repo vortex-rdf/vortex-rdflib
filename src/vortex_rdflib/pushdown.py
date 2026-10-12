@@ -1840,11 +1840,14 @@ def _pattern_trace_shape(ctx, triple) -> dict:
 def _solve_bgp(ctx, store, triples, scope, var_preds=None, limit=None) -> Relation:
     """Evaluate a BGP by matching one seed and probing connected patterns.
 
-    The filter conjuncts the native layer decides become keeps on each
-    pattern's native match before anything is counted (see
-    :func:`_push_native_restrictions`); the others stay on the Python routes.
-    A single pattern with nothing left to restrict in Python takes
-    ``limit`` into its match as well (see :func:`_limit_reaches_match`).
+    The filter conjuncts that are native keeps (see
+    :func:`filters.native_restriction`) become keeps on each pattern's native
+    match before anything is counted (see :func:`_push_native_restrictions`);
+    the others are evaluated over the codes the pattern brings
+    (:func:`filters.evaluate_column`): vortex-rdf decides those with a native
+    shape first, and only the codes it leaves undecided go to the Python
+    routes. A single pattern with no such residual conjunct takes ``limit``
+    into its match as well (see :func:`_limit_reaches_match`).
     """
     trace = _TRACE.get()
     traced = trace is not None
@@ -2371,7 +2374,7 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
             then = time.perf_counter_ns() if traced else 0
             _materialize_eager_restrictions(store, pat, schema)
             stats["restriction_ns"] += time.perf_counter_ns() - then if then else 0
-            match_rows = pat.get("_trace_match_rows", pat["nrows"])
+            match_rows = pat["_trace_match_rows"]
             restricted_rows = pat["nrows"]
             schema_b, cols_b, rows_b = _pattern_body(pat)
             joined = (
@@ -2433,9 +2436,9 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
     return Relation.from_rows(schema, rows), stats
 
 
-def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) -> int:
+def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) -> None:
     """Turn the tuple conjuncts the relation all but decides into
-    per-variable conjuncts of ``pat``. Returns how many it turned.
+    per-variable conjuncts of ``pat``.
 
     A pending conjunct whose variables the relation binds — all but one,
     which ``pat`` binds — is a test of that one variable once each of the
@@ -2450,8 +2453,7 @@ def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) 
     FILTER above evaluates it again.
     """
     if not (filters._FAST_ENABLED and filters._NATIVE_ENABLED):
-        return 0
-    turned = 0
+        return
     single: dict = {}
     for conjunct in tuples:
         if id(conjunct) in pushed.applied:
@@ -2476,7 +2478,6 @@ def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) 
             deferred = pat.setdefault("deferred_var_preds", {})
             deferred[var] = [*deferred.get(var, ()), proxy]
             pushed.applied.add(id(conjunct))
-            turned += 1
             if _TRACE.get() is not None:
                 _trace_event(
                     "bgp_tuple_specialized",
@@ -2484,7 +2485,6 @@ def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) 
                     variable=str(var),
                     native_predicate=proxy.native.kind,
                 )
-    return turned
 
 
 def _single_code(cols, rows, index: int) -> int | None:
@@ -2660,10 +2660,13 @@ def _set_native_keep(pat, position: int, keep) -> None:
 
 
 def _push_native_restrictions(store, pat, var_preds) -> dict:
-    """Move the conjuncts the native layer decides (see
+    """Move the conjuncts the native layer answers with a keep (see
     :func:`filters.native_restriction`) into the pattern's native keep, at
     every position their variable takes; returns the residual conjuncts per
-    variable, for the Python routes.
+    variable, to be evaluated over candidate codes
+    (:func:`filters.evaluate_column`): vortex-rdf decides those with a native
+    shape first, and only the codes it leaves undecided go to the Python
+    routes.
 
     The keep is exact, so it may narrow a variable the relation will already
     bind when the pattern joins: the rows it drops could not have joined.
@@ -2708,6 +2711,20 @@ def _distinct_codes(col) -> list:
     return memoryview(_native_column(col).distinct()).cast("Q").tolist()
 
 
+def _restriction_counts(conjuncts) -> dict:
+    """The trace fields that say how a variable's conjuncts are decided: how
+    many there are, and how many have a native predicate (sent to vortex-rdf),
+    a fast route, a fast route over term kinds only, or rdflib's evaluator
+    alone."""
+    return {
+        "predicate_count": len(conjuncts),
+        "native_predicate_count": sum(c.native is not None and not c.kind_only for c in conjuncts),
+        "fast_predicate_count": sum(c.fast is not None for c in conjuncts),
+        "kind_only_predicate_count": sum(c.kind_only for c in conjuncts),
+        "generic_only_predicate_count": sum(c.fast is None for c in conjuncts),
+    }
+
+
 def _restrict_pattern(store, pat, var_preds) -> None:
     """Evaluate per-variable conjuncts over the distinct codes of a matched
     pattern's columns (:func:`filters.evaluate_column`: vortex-rdf answers the
@@ -2738,13 +2755,7 @@ def _restrict_pattern(store, pat, var_preds) -> None:
                 {
                     "variable": str(var),
                     "mode": "match",
-                    "predicate_count": len(conjuncts),
-                    "native_predicate_count": sum(
-                        c.native is not None and not c.kind_only for c in conjuncts
-                    ),
-                    "fast_predicate_count": sum(c.fast is not None for c in conjuncts),
-                    "kind_only_predicate_count": sum(c.kind_only for c in conjuncts),
-                    "generic_only_predicate_count": sum(c.fast is None for c in conjuncts),
+                    **_restriction_counts(conjuncts),
                     "distinct_binding_count": distinct_binding_count,
                     "allowed_binding_count": len(allowed),
                     "elapsed_ns": time.perf_counter_ns() - started,
@@ -2764,11 +2775,13 @@ def _restrict_pattern(store, pat, var_preds) -> None:
 
 def _compact_pattern(pat, keep: dict[Variable, set[int]]) -> None:
     """Keep only the matched rows whose code at each variable of ``keep`` is
-    in that variable's allowed set, with the native kernels: the allowed codes
-    as an ascending column, ``join_indices`` for the rows holding one (in row
-    order: each row matches at most one code of a unique column) and ``take``
-    for every column a variable reads. A repeated variable is tested at its
-    first position, as ``_materialize`` reads it."""
+    in that variable's allowed set, with the native kernels: ``join_indices``
+    pairs the variable's column with the allowed codes, an ascending column of
+    unique codes, so a row appears at most once and the rows come in the
+    nested-loop order of the join, which is row order; ``take`` then gathers
+    every column a variable reads by those rows. A repeated variable is tested
+    at its first position, as ``_materialize`` reads it. The columns of
+    constant positions are dropped (``None``): nothing reads them."""
     varpos = pat["varpos"]
     positions = sorted({idx for pos in varpos.values() for idx in pos})
     if not positions:
@@ -2825,8 +2838,6 @@ def _materialize(pat):
         # Fully ground pattern: no bindings, one (empty) row per match, so a
         # non-matching ground pattern still eliminates all solutions.
         return (), [()] * pat["nrows"]
-    if "rows" in pat:
-        return schema, pat["rows"]
 
     needed = sorted({idx for pos in varpos.values() for idx in pos})
     views = {idx: memoryview(pat["cols"][idx]).cast("Q").tolist() for idx in needed}
@@ -2851,7 +2862,6 @@ def _pattern_body(pat) -> tuple:
     if (
         pat["nrows"]
         and varpos
-        and "rows" not in pat
         and not pat.get("keep")
         and all(len(pos) == 1 for pos in varpos.values())
     ):
@@ -3020,10 +3030,7 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
                 mode="probe",
                 input_rows=restriction_input_rows,
                 output_rows=len(out),
-                predicate_count=len(conjuncts),
-                fast_predicate_count=sum(c.fast is not None for c in conjuncts),
-                kind_only_predicate_count=sum(c.kind_only for c in conjuncts),
-                generic_only_predicate_count=sum(c.fast is None for c in conjuncts),
+                **_restriction_counts(conjuncts),
                 distinct_binding_count=len(values),
                 allowed_binding_count=len(allowed),
                 elapsed_ns=elapsed_ns,

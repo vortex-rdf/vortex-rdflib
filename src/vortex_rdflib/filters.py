@@ -1057,6 +1057,28 @@ def analyze_filter(node, block_vars, ctx) -> FilterPlan:
     return analyze_expr(node.expr, block_vars, ctx, visible)
 
 
+def _compile_conjunct(
+    expr, variables: tuple, consts: dict, ctx, native: NativeShape | None
+) -> Conjunct:
+    """``expr`` as a conjunct of ``variables``, every other variable it reads
+    fixed to the term ``consts`` gives it: its fast route compiled over those
+    constants (none when the fast routes are off, a constant has no term view
+    or the expression is outside the whitelist), kind-only when it reads
+    nothing but term kinds. ``native`` is the predicate vortex-rdf decides it
+    by, if any."""
+    fast = None
+    if _FAST_ENABLED:
+        try:
+            const_views = {v: view_of_node(term) for v, term in consts.items()}
+        except _NotFast:
+            const_views = None
+        if const_views is not None:
+            fast = compile_fast(expr, variables, const_views)
+    return Conjunct(
+        expr, variables, fast, fast is not None and is_kind_only(expr), consts, ctx, native
+    )
+
+
 def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
     """Route the conjuncts of a boolean expression over ``block_vars``;
     ``visible`` maps the context-bound variables the expression may see to
@@ -1070,20 +1092,10 @@ def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
         referenced = expr_vars(expr)
         variables = tuple(v for v in referenced if v in block_set)
         consts = {v: visible[v] for v in referenced if v in visible and v not in block_set}
-        fast = None
-        if _FAST_ENABLED:
-            try:
-                const_views = {v: view_of_node(term) for v, term in consts.items()}
-            except _NotFast:
-                const_views = None
-            if const_views is not None:
-                fast = compile_fast(expr, variables, const_views)
         native = None
         if len(variables) == 1 and _FAST_ENABLED and _NATIVE_ENABLED:
             native = native_shape(expr, variables[0], consts)
-        conjunct = Conjunct(
-            expr, variables, fast, fast is not None and is_kind_only(expr), consts, ctx, native
-        )
+        conjunct = _compile_conjunct(expr, variables, consts, ctx, native)
         shape = exists_shape(expr)
         if shape is not None:
             plan.exists.append(ExistsConjunct(conjunct, *shape))
@@ -1106,16 +1118,7 @@ def specialize(conjunct: Conjunct, var, consts: dict) -> Conjunct | None:
     shape = native_shape(conjunct.expr, var, consts)
     if shape is None:
         return None
-    fast = None
-    if _FAST_ENABLED:
-        try:
-            views = {v: view_of_node(term) for v, term in consts.items()}
-        except _NotFast:
-            views = None
-        if views is not None:
-            fast = compile_fast(conjunct.expr, (var,), views)
-    kind_only = fast is not None and is_kind_only(conjunct.expr)
-    return Conjunct(conjunct.expr, (var,), fast, kind_only, consts, conjunct.ctx, shape)
+    return _compile_conjunct(conjunct.expr, (var,), consts, conjunct.ctx, shape)
 
 
 # --- evaluation ----------------------------------------------------------------
