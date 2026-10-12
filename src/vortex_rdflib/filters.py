@@ -27,7 +27,9 @@ lists them) also carries that predicate (``Conjunct.native``, a
 :class:`~vortex_rdflib.candidates.NativeShape`). A kind test is its kind's
 code range and an IRI equality its IRIs' codes, which the pushdown turns into
 a ``keep`` on the native match (:func:`native_restriction`), so the rows that
-fail never cross into Python.
+fail never cross into Python; on a file-backed store a set of 33 to 4,096
+codes is the exception: the scan gets its bounding range, and Python tests its
+codes on the rows that range admits (``pushdown._split_keeps``).
 Every other native shape is answered by vortex-rdf over the distinct codes a
 query produced (:func:`candidates.evaluate`, called from
 :func:`evaluate_column`), never over the whole dictionary, and only the codes
@@ -57,9 +59,9 @@ from .terms import BLANK, IRI, LITERAL, TermView, canonical_spelling, kind_of, p
 # equivalence tests run the matrix both ways.
 _FAST_ENABLED: bool = True
 # Decide the conjuncts that have a native shape inside vortex-rdf: kind tests
-# as code ranges, the others over the codes a query produced
-# (VORTEX_RDF_NATIVE_FILTERS=0 keeps them on the Python routes, for A/B
-# measurements; the generic route above disables them too).
+# as code ranges, IRI equalities as code sets, the others over the codes a
+# query produced (VORTEX_RDF_NATIVE_FILTERS=0 keeps them on the Python
+# routes, for A/B measurements; the generic route above disables them too).
 _NATIVE_ENABLED: bool = True
 
 

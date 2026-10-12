@@ -1728,6 +1728,71 @@ def test_init_bindings_are_visible_to_filters(graph):
     assert with_pushdown == without_pushdown == [(Literal(42),)]
 
 
+#: Per path of an IRI keep, a query whose answer changes if the path breaks:
+#: ``(query, IRIs bound through initBindings, rows rdflib answers)``.
+IRI_KEEP_PATHS = {
+    "column-tested-on-probed-rows": (
+        """SELECT * WHERE {
+            <http://ex.org/alice> <http://ex.org/knows> ?v . ?v <http://ex.org/knows> ?w
+            FILTER(?w IN (<http://ex.org/bob>, <http://ex.org/carol>)) }""",
+        None,
+        1,
+    ),
+    "columns-matched-apart": (
+        """SELECT * WHERE { ?a ?p ?x . ?b ?q ?y
+            FILTER(?x IN (<http://ex.org/bob>)) FILTER(?y IN (<http://ex.org/carol>)) }""",
+        None,
+        8,
+    ),
+    "columns-intersect": (
+        """SELECT ?s ?o WHERE { ?s ?p ?o
+            FILTER(?o IN (<http://ex.org/bob>, <http://ex.org/carol>)
+                && ?o IN (<http://ex.org/carol>, <http://ex.org/dave>)) }""",
+        None,
+        4,
+    ),
+    "columns-intersect-to-nothing": (
+        """SELECT ?s ?o WHERE { ?s ?p ?o
+            FILTER(?o IN (<http://ex.org/bob>) && ?o IN (<http://ex.org/carol>)) }""",
+        None,
+        0,
+    ),
+    "iri-that-is-no-iriref": (
+        "SELECT ?s ?o WHERE { ?s ?p ?o FILTER(?o = ?y) }",
+        {"y": "http://ex.org/bob>"},
+        0,
+    ),
+}
+
+
+@pytest.mark.parametrize("fanout", [100, 0])
+@pytest.mark.parametrize(
+    ("sparql", "init", "expected"), list(IRI_KEEP_PATHS.values()), ids=list(IRI_KEEP_PATHS)
+)
+def test_iri_keep_paths_agree_with_rdflib(file_graph, monkeypatch, fanout, sparql, init, expected):
+    """The paths an IRI keep takes, each with a query whose answer changes if
+    the path breaks, hash-joined (``_PROBE_FANOUT`` 100) and probed (0):
+
+    - a probed pattern's free variable tests the keep's codes on the rows each
+      probe returns (``keep_member``);
+    - two patterns narrowed by different code sets at one position are two
+      matches, not one (``_pattern_key``);
+    - code sets on one variable intersect (``intersect_keeps``);
+    - an IRI that is no N-Triples IRIREF makes no keep (``_SPELLABLE_IRI``):
+      a bound variable's here, which ``encode_many`` would read as another
+      IRI."""
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+    bindings = None if init is None else {name: URIRef(iri) for name, iri in init.items()}
+
+    def answer(graph, sparql):
+        rows = graph.query(sparql, initBindings=bindings)
+        return sorted((tuple(row) for row in rows), key=_row_key)
+
+    with_pushdown, without_pushdown = both_ways(file_graph, sparql, answer)
+    assert with_pushdown == without_pushdown
+    assert len(without_pushdown) == expected
+
+
 def test_distinct_and_count_are_answered_in_code_space(graph, monkeypatch):
     distincts, aggregates = [], []
     original_distinct = pd._eval_distinct

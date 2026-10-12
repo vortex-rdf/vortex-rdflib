@@ -12,8 +12,8 @@ from vortex_rdf import U64Column, serialize_rdf
 import vortex_rdflib.pushdown as pd
 from test_filters import CTX, V, W, filter_expr, typed
 from test_native_filters import _Recording
-from test_native_primitives import _native_calls, _products, _spy, _trace
-from test_pushdown import both_ways, run
+from test_native_primitives import _native_calls, _products, _spy, _store_file, _trace
+from test_pushdown import FIXTURE_NT, both_ways, run
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 from vortex_rdflib.terms import parse_spelling
 
@@ -226,6 +226,39 @@ def test_band_around_an_anchor_is_evaluated_over_the_price_codes(
     store._dict = spy._inner
     with_pushdown, without_pushdown = both_ways(graph, BAND)
     assert with_pushdown == without_pushdown
+
+
+def test_iri_equality_between_two_variables_is_evaluated_over_the_codes_it_reaches(
+    tmp_path, monkeypatch, capsys
+):
+    """Once an anchor binds ?y to one IRI, ``?y = ?w`` is a test of ?w alone:
+    the conjunct is specialized to the ``iri_in`` shape of that IRI, which
+    vortex-rdf decides over the codes the pattern binding ?w brings — the
+    literal "Carol" is no IRI — and the FILTER above evaluates nothing."""
+    graph = Graph(store=VortexRdflibStore(_store_file(tmp_path, [FIXTURE_NT]), in_memory=True))
+    built = []
+    original = filters.tuple_predicate
+    monkeypatch.setattr(
+        filters, "tuple_predicate", lambda *a, **k: built.append(a[1]) or original(*a, **k)
+    )
+    register_sparql_pushdown()
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    sparql = """SELECT ?x ?w WHERE {
+        <http://ex.org/carol> <http://ex.org/likes> ?y . ?x ?p ?w FILTER(?y = ?w) }"""
+    rows = run(graph, sparql)
+    trace = _trace(capsys)
+    assert len(rows) == 4 and {row[1] for row in rows} == {URIRef("http://ex.org/carol")}
+    specialized = [e for e in trace if e["event"] == "bgp_tuple_specialized"]
+    assert [(e["variable"], e["native_predicate"]) for e in specialized] == [("w", "iri_in")]
+    restriction = next(
+        e for e in trace if e["event"] == "bgp_restriction_complete" and e["variable"] == "w"
+    )
+    assert restriction["output_rows"] == 4 < restriction["input_rows"]
+    assert built == []
+    monkeypatch.delenv("VORTEX_RDF_TRACE_QUERY")
+    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    assert rows == with_pushdown == without_pushdown
 
 
 def test_both_restriction_modes_trace_the_same_fields(tmp_path, monkeypatch, capsys):

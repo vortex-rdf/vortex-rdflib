@@ -21,12 +21,15 @@ What runs in code space:
   pattern that counts to nothing empties the block before anything is
   matched, and the join itself never decodes a term;
 - a ``Filter`` over a block is split into conjuncts (:mod:`.filters`):
-  those over one variable that are a kind test become a ``keep`` on the
-  match of every pattern binding the variable, so the rows that fail never
-  leave it; the others over one variable are evaluated once per distinct
-  code of the variable, on the pattern that binds it — over the pattern's
-  whole column when it is matched, over the codes the probes reach when it
-  is probed — by vortex-rdf when they have a native shape
+  those over one variable that are a kind test or an IRI equality (``=``,
+  ``sameTerm``, ``IN``) become a ``keep`` on the match of every pattern
+  binding the variable, so the rows that fail never leave it (a file-backed
+  store's set of 33 to 4,096 codes goes to the scan as its bounding range,
+  and its codes are tested on the rows that range admits); the others over
+  one variable are evaluated once per distinct code of the variable, on the
+  pattern that binds it — over the pattern's whole column when it is
+  matched, over the codes the probes reach when it is probed — by
+  vortex-rdf when they have a native shape
   (``TermDict.filter_codes`` over exactly those codes, :mod:`.candidates`),
   and the match is compacted natively to the rows that pass; the rest per
   distinct code tuple, after the join (mid-join when that lets a later
@@ -2440,7 +2443,8 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
     traced = _TRACE.get() is not None
     then = time.perf_counter_ns() if traced else 0
     if any(pat["unsatisfiable"] for pat in patterns):
-        # A literal bound into subject or predicate position: the block is
+        # A literal bound into subject or predicate position, or a keep that
+        # is an empty code column (IRIs the dictionary lacks): the block is
         # empty whatever the other patterns count.
         for pat in patterns:
             pat["estimate"] = 0
@@ -2817,7 +2821,7 @@ def _push_native_restrictions(store, pat, var_preds) -> dict:
 
     The keep is exact, so it may narrow a variable the relation will already
     bind when the pattern joins: the rows it drops could not have joined. A
-    keep left with no code (IRIs the dictionary lacks) makes the pattern
+    code column left empty (IRIs the dictionary lacks) makes the pattern
     unsatisfiable, so nothing is counted or matched for it.
     """
     residual: dict = {}
