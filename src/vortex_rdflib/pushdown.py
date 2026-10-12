@@ -2531,9 +2531,9 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
     The patterns are counted before anything is matched, in static rank
     order up to the first zero — the scans together, in one concurrent
     native batch, when there are enough of them (:func:`_count_patterns`) —
-    so a pattern that selects nothing ends the block before any match. A
-    pattern sharing a variable with one of at most ``_PROBE_FANOUT`` rows is
-    left uncounted until its step, where it is counted only up to
+    so a counted pattern that selects nothing ends the block before any
+    match. A pattern sharing a variable with one of at most ``_PROBE_FANOUT``
+    rows is left uncounted until its step, where it is counted only up to
     ``running * _PROBE_FANOUT + 1`` rows: a count that reaches the cap is
     large, and probes. The smallest counted pattern is matched and is the
     seed. Each further step takes the smallest pattern sharing a variable

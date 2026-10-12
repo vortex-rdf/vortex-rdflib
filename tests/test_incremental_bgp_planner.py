@@ -337,6 +337,28 @@ def test_a_decision_count_under_its_cap_matches_and_hash_joins(tmp_path, monkeyp
     assert (step["estimated_rows"], step["estimate_limit"]) == (300, 5001)
 
 
+def test_a_scan_next_to_a_small_point_pattern_is_not_counted_when_planned(tmp_path):
+    """Without an index, the bound-subject name pattern is the one point
+    pattern and counts 1 row. The scan sharing ?n with it leaves the scan
+    batch: it is counted at its step, capped at 1 x 100 + 1 rows, and the
+    other scan is counted on its own, not as a batch of one."""
+    graph = graph_of(tmp_path, in_memory=False)
+    counting = _counting_native(graph)
+    register_sparql_pushdown()
+    query = """SELECT ?x ?n ?t WHERE {
+        <http://ex/s5> <http://ex/name> ?n . ?x <http://ex/name> ?n . ?x <http://ex/tag> ?t }"""
+    rows = list(graph.query(query))
+    assert len(rows) == 1
+    assert [(args[0], args[1], limit) for args, limit in counting.count_calls] == [
+        ("<http://ex/s5>", "<http://ex/name>", None),
+        (None, "<http://ex/tag>", None),
+        (None, "<http://ex/name>", 101),
+    ]
+    assert counting.batches == 0
+    with_pushdown, without_pushdown = both_ways(graph, query)
+    assert with_pushdown == without_pushdown
+
+
 def test_a_zero_point_count_still_ends_the_block_first(tmp_path):
     graph = indexed_graph_of(tmp_path)
     counting = _counting_native(graph)
