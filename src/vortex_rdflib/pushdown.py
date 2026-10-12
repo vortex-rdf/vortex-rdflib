@@ -69,9 +69,11 @@ than matching anything itself. A bound name restricts every pattern to that
 graph (as does the graph the context is active in, for a block under no
 ``GRAPH`` at all); an unbound ``GRAPH ?g`` binds the graph from the match's
 fourth column instead, so ``?g`` is an ordinary variable of the relation and
-one match answers what rdflib would walk the store's graphs for. The rows of
-the default graph are dropped from a variable's match, which is what makes
-``GRAPH`` range over the named graphs only.
+one match answers what rdflib would walk the store's graphs for. A FILTER in
+the block still reads ``?g`` unbound unless a pattern of its group binds it:
+rdflib joins the graph in after the group is solved. The rows of the default
+graph are dropped from a variable's match, which is what makes ``GRAPH``
+range over the named graphs only.
 
 rdflib only catches ``NotImplementedError`` at hook-call time, so every
 capability check and every native call happens before a generator is handed
@@ -613,9 +615,11 @@ def _check_block(node) -> None:
     raise NotImplementedError
 
 
-def _node_vars(node, out: list | None = None) -> list:
+def _node_vars(node, out: list | None = None, *, bound: bool = False) -> list:
     """Every variable-like term a block mentions, in first-seen order
-    (static: what rdflib's ``_vars`` is made of)."""
+    (static: what rdflib's ``_vars`` is made of). With ``bound``, only those
+    its solutions can bind: a MINUS's right side removes rows, it binds
+    nothing."""
     if out is None:
         out = []
     name = node.name
@@ -625,7 +629,7 @@ def _node_vars(node, out: list | None = None) -> list:
                 if isinstance(term, _VAR_LIKE) and term not in out:
                     out.append(term)
     elif name == "Filter":
-        _node_vars(node.p, out)
+        _node_vars(node.p, out, bound=bound)
     elif name == "ToMultiSet":
         for row in node.p.res:
             for term in row:
@@ -634,12 +638,13 @@ def _node_vars(node, out: list | None = None) -> list:
     elif name == "Graph":
         # The graph term binds in every row of the block below it, and comes
         # last, as it does in a matched pattern's schema.
-        _node_vars(node.p, out)
+        _node_vars(node.p, out, bound=bound)
         if isinstance(node.term, _VAR_LIKE) and node.term not in out:
             out.append(node.term)
     else:
-        _node_vars(node.p1, out)
-        _node_vars(node.p2, out)
+        _node_vars(node.p1, out, bound=bound)
+        if not (bound and name == "Minus"):
+            _node_vars(node.p2, out, bound=bound)
     return out
 
 
@@ -660,7 +665,7 @@ def _block_vars(ctx, node, scope: _GraphScope) -> list:
 
 def _block_nullable(node) -> frozenset:
     """The variables a block may leave unbound: those an OPTIONAL side
-    introduces.
+    introduces, every one its left side does not bind.
 
     A graph variable is never among them: a ``GRAPH ?g`` binds it in every row
     of the block below, and when both sides of an OPTIONAL are under the same
@@ -682,7 +687,7 @@ def _block_nullable(node) -> frozenset:
         return _block_nullable(node.p1)
     nullable = _block_nullable(node.p1) | _block_nullable(node.p2)
     if name == "LeftJoin":
-        nullable |= frozenset(_node_vars(node.p2)) - frozenset(_node_vars(node.p1))
+        nullable |= frozenset(_node_vars(node.p2)) - frozenset(_node_vars(node.p1, bound=True))
     return nullable
 
 
@@ -1385,10 +1390,17 @@ def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None) -> Relati
     before anything is matched, single-variable conjuncts over variables the
     block always binds restrict the pattern scans, the rest filters the
     solved rows. A ``limit`` reaches the block only when nothing is left to
-    filter above it."""
+    filter above it.
+
+    The expression's block variables are those its group binds (see
+    :func:`filters.analyze_filter` for the rest of its scope): none from a
+    MINUS's right side, and the graph variable of an enclosing ``GRAPH ?g``
+    only where a pattern of the group names it — rdflib's ``evalGraph`` joins
+    the graph in after the group is solved."""
     inner = node.p
     block_vars = _block_vars(ctx, inner, scope)
-    plan = filters.analyze_filter(node, block_vars, ctx)
+    group_vars = [var for var in _node_vars(inner, bound=True) if ctx[var] is None]
+    plan = filters.analyze_filter(node, group_vars, ctx)
     if plan.exists and scope.var is not None:
         # rdflib evaluates an EXISTS body against the *active* graph. Under a
         # graph variable there is no single active graph — the row's graph is
@@ -1680,7 +1692,10 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
             return ()
         init = set(ctx.initBindings or ())
         visible = {v: term for v, term in outer.items() if v in init}
-        plan = filters.analyze_expr(condition, list(schema), ctx, visible)
+        # What either side binds: an enclosing GRAPH ?g's variable only where
+        # a pattern names it (see _solve_filter).
+        sides = set(_node_vars(p1, bound=True) + _node_vars(p2, bound=True))
+        plan = filters.analyze_expr(condition, [v for v in schema if v in sides], ctx, visible)
         if plan.exists:
             # An OPTIONAL's condition can carry (NOT) EXISTS; a semi-join over
             # the padded rows is not what rdflib computes, so the whole
