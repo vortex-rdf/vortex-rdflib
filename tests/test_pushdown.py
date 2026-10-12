@@ -1079,6 +1079,153 @@ def test_probe_join_pads_rows_when_the_pattern_shares_no_variable(graph):
     assert rows == [(0, None, None), (1, None, None)]
 
 
+#: Quads under `http://ex/` for the probe joins' multiplicity. `s1` holds `q`
+#: and `p` in both g1 and g2, so the union default graph has two quads of each;
+#: `s2` holds only `p`, `s3` only `q`; `s4` holds both in the default graph and
+#: `p` in g1 too.
+PROBE_QUADS = """\
+<http://ex/s1> <http://ex/q> <http://ex/x> <http://ex/g1> .
+<http://ex/s1> <http://ex/p> <http://ex/o1> <http://ex/g1> .
+<http://ex/s1> <http://ex/p> <http://ex/o1> <http://ex/g2> .
+<http://ex/s2> <http://ex/p> <http://ex/o1> <http://ex/g1> .
+<http://ex/s1> <http://ex/q> <http://ex/x> <http://ex/g2> .
+<http://ex/s3> <http://ex/q> <http://ex/x> <http://ex/g1> .
+<http://ex/s4> <http://ex/q> <http://ex/x> .
+<http://ex/s4> <http://ex/p> <http://ex/o1> .
+<http://ex/s4> <http://ex/p> <http://ex/o1> <http://ex/g1> .
+"""
+
+_EX = "PREFIX : <http://ex/> "
+
+#: Per shape: whether the default graph is the union of the graphs, the query,
+#: the rows rdflib answers, the probe the pushdown takes when it probes, and
+#: the `limit` of the fully bound counts that probe makes.
+PROBE_MULTIPLICITY = {
+    # The union default graph: a triple several graphs hold is one solution per
+    # graph. `s1` joins 2 `q` quads with 2 `p` quads, `s4` 1 with 2.
+    "bgp-join": (True, _EX + "SELECT ?s WHERE { ?s :q :x . ?s :p :o1 }", 6, "_probe_join", None),
+    "group-join": (
+        True,
+        _EX + "SELECT ?s WHERE { { ?s :q :x } { ?s :p :o1 } }",
+        6,
+        "_probe_join",
+        None,
+    ),
+    # `s3` has no `p`: its row is padded, once.
+    "optional": (
+        True,
+        _EX + "SELECT ?s WHERE { ?s :q :x OPTIONAL { ?s :p :o1 } }",
+        7,
+        "_probe_join",
+        None,
+    ),
+    # The condition rejects `s1`: its 2 rows are padded, not repeated.
+    "optional-condition": (
+        True,
+        _EX + "SELECT ?s WHERE { ?s :q :x OPTIONAL { ?s :p :o1 FILTER(?s != :s1) } }",
+        5,
+        "_probe_join",
+        None,
+    ),
+    # A fixed graph holds at most one quad of a triple: `s1` and `s4` have the
+    # `p` triple in a second graph, which the probe does not read.
+    "graph-variable": (
+        True,
+        _EX + "SELECT ?g ?s WHERE { GRAPH ?g { ?s :q :x . ?s :p :o1 } }",
+        2,
+        "_probe_join",
+        1,
+    ),
+    "named-graph": (
+        True,
+        _EX + "SELECT ?s WHERE { GRAPH :g2 { ?s :q :x . ?s :p :o1 } }",
+        1,
+        "_probe_join",
+        1,
+    ),
+    "default-graph": (
+        False,
+        _EX + "SELECT ?s WHERE { ?s :q :x . ?s :p :o1 }",
+        1,
+        "_probe_join",
+        1,
+    ),
+    # EXISTS is boolean: the rows of the block, `s1` twice.
+    "exists": (
+        True,
+        _EX + "SELECT ?s WHERE { ?s :q :x FILTER EXISTS { ?s :p :o1 } }",
+        3,
+        "_probe_exists",
+        1,
+    ),
+}
+
+
+@pytest.fixture(scope="module")
+def probe_quads(tmp_path_factory):
+    d = tmp_path_factory.mktemp("pushdown-probe-quads")
+    nq = d / "probe.nq"
+    nq.write_text(PROBE_QUADS, encoding="utf-8")
+    out = d / "probe.vortex"
+    serialize_rdf(str(nq), str(out), layout="dictionary", format="nquads")
+    return out
+
+
+def _recording(calls, name):
+    """`pd.<name>`, appending its name to `calls` as it is called."""
+    original = getattr(pd, name)
+
+    def record(*args, **kwargs):
+        calls.append(name)
+        return original(*args, **kwargs)
+
+    return record
+
+
+def _probe_dataset(path, union: bool) -> Dataset:
+    """The probe quads, file-backed, with the union default graph or the default
+    graph alone."""
+    store = VortexRdflibStore(str(path), in_memory=False)
+    assert store._dict is not None and store._dict.file_backed
+    return Dataset(store=store, default_union=union)
+
+
+@pytest.mark.parametrize("fanout", [0, 100])
+@pytest.mark.parametrize("case", PROBE_MULTIPLICITY)
+def test_a_probe_join_keeps_the_multiplicity_rdflib_reads(probe_quads, monkeypatch, case, fanout):
+    """A pattern with subject, predicate and object bound is one solution per
+    quad it matches, probed per row (fanout 0) or hash-joined (fanout 100).
+    Where the graph is open, in the union default graph, that is one per graph
+    holding the triple; where it is fixed, at most one; an EXISTS test adds
+    none."""
+    union, sparql, rows, probed, _ = PROBE_MULTIPLICITY[case]
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+    probes = []
+    for name in ("_probe_join", "_probe_exists"):
+        monkeypatch.setattr(pd, name, _recording(probes, name))
+    with_pushdown, without_pushdown = both_ways(_probe_dataset(probe_quads, union), sparql)
+    assert with_pushdown == without_pushdown
+    assert len(without_pushdown) == rows
+    assert (probed in probes) == (fanout == 0)
+
+
+@pytest.mark.parametrize("case", PROBE_MULTIPLICITY)
+def test_an_existence_probe_asks_for_one_row_unless_the_graph_is_open(
+    probe_quads, monkeypatch, case
+):
+    """A fully bound probe counts every quad only in the union default graph.
+    A fixed graph holds at most one and an EXISTS test is boolean in any
+    graph, so both ask for one row."""
+    union, sparql, _, _, expected = PROBE_MULTIPLICITY[case]
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    dataset = _probe_dataset(probe_quads, union)
+    native = _counting_native(dataset)
+    register_sparql_pushdown()
+    run(dataset, sparql)
+    asked = [limit for args, limit in native.count_calls if None not in args[:3]]
+    assert asked and set(asked) == {expected}
+
+
 def test_hash_joined_bgp_keeps_a_columnar_body(graph, monkeypatch):
     """A hash-joined BGP's relation is columns, not row tuples — tuples
     appear only as rows are consumed."""

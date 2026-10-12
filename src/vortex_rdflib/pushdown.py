@@ -3242,9 +3242,13 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
     re-matching natively keeps the work proportional to the small side —
     it is what lets an anchored star beat rdflib's own nested loop instead
     of losing to it. The probes go to the native layer in batches
-    (``match_codes_many``, or ``count_quads_many`` capped at one row for an
-    existence probe): one call each, every probe of a batch running
-    concurrently — a file-backed store overlaps their reads. The pattern's
+    (``match_codes_many``, or ``count_quads_many`` for an existence probe, a
+    pattern with no free position): one call each, every probe of a batch
+    running concurrently — a file-backed store overlaps their reads. An
+    existence probe keeps its row once per quad it matches: a fixed graph (a
+    named graph, the default graph alone, a bound ``GRAPH ?g``) holds at
+    most one, so the count stops at one row; the union default graph holds a
+    triple once per graph that has it, so the count is whole. The pattern's
     native keep narrows each probe on the positions it leaves free (a code
     range inside the native match, a code column over the rows it returns),
     as do a ``keep`` restriction and ``row_preds`` over the extended row;
@@ -3268,13 +3272,21 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
             else:
                 tests.append((position, filters.keep_member(spec)))
     narrowing = _narrowing(probe_keep, limit=None if free else 1)
+    whole = _narrowing(probe_keep)
     patterns = _substituted_patterns(store, rows, pat, bound)
 
     pad = (None,) * len(free)
     out = []
     for start in range(0, len(rows), _PROBE_BATCH):
         batch = range(start, min(start + _PROBE_BATCH, len(rows)))
-        probes = [(patterns[i], narrowing) for i in batch if patterns[i] is not None]
+        # An existence probe counts whole where its graph position is open
+        # (the union default graph), capped where it is fixed — a `GRAPH ?g`
+        # the row binds is substituted, so it is fixed.
+        probes = [
+            (patterns[i], whole if patterns[i][3] is None else narrowing)
+            for i in batch
+            if patterns[i] is not None
+        ]
         answers = iter(_run_probes(store, probes, count=not free))
         for i in batch:
             row = rows[i]
@@ -3282,9 +3294,11 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
             if patterns[i] is None:
                 pass
             elif not free:
-                # Existence probe: a count capped at one row, no columns.
-                if next(answers) and all(pred(row) for pred in row_preds):
-                    out.append(row)
+                # Existence probe: a count, no columns; the row stands once
+                # per quad counted.
+                count = next(answers)
+                if count and all(pred(row) for pred in row_preds):
+                    out.extend([row] * count)
                     matched = True
             else:
                 cols = next(answers)
