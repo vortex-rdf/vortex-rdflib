@@ -25,8 +25,9 @@ short-circuits first (``false && ?`` is false, ``true || ?`` is true).
 A single-variable conjunct of a shape vortex-rdf evaluates (:func:`native_shape`
 lists them) also carries that predicate (``Conjunct.native``, a
 :class:`~vortex_rdflib.candidates.NativeShape`). A kind test is its kind's
-code range, which the pushdown turns into a ``keep`` on the native match
-(:func:`native_restriction`), so the rows that fail never cross into Python.
+code range and an IRI equality its IRIs' codes, which the pushdown turns into
+a ``keep`` on the native match (:func:`native_restriction`), so the rows that
+fail never cross into Python.
 Every other native shape is answered by vortex-rdf over the distinct codes a
 query produced (:func:`candidates.evaluate`, called from
 :func:`evaluate_column`), never over the whole dictionary, and only the codes
@@ -49,7 +50,7 @@ from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
 
 from . import candidates
-from .candidates import NativeShape
+from .candidates import IRI_IN, NativeShape
 from .terms import BLANK, IRI, LITERAL, TermView, canonical_spelling, kind_of, parse_spelling
 
 # Force the generic route everywhere (VORTEX_RDF_FILTER_FAST=0): the
@@ -869,6 +870,47 @@ def _regex_shape(expr, var, consts) -> NativeShape | None:
     return NativeShape("regex", str(pattern), flags=kept, case=case, as_str=as_str)
 
 
+#: IRIs ``canonical_spelling`` spells as an N-Triples IRIREF.
+_SPELLABLE_IRI = re.compile(r'[^\x00-\x20<>"{}|^`\\]*')
+
+
+def _iri_spelling(node, consts) -> str | None:
+    """The spelling of the IRI an operand without block variables evaluates
+    to, or ``None`` when it is not an IRI the dictionary could hold."""
+    iri = _constant_term(node, consts)
+    if not isinstance(iri, URIRef) or not _SPELLABLE_IRI.fullmatch(str(iri)):
+        return None
+    return canonical_spelling(iri)
+
+
+def _iri_equality(left, right, var, consts) -> NativeShape | None:
+    """``var = <iri>`` or ``<iri> = var`` (``=`` and ``sameTerm`` alike): true
+    for exactly that IRI — rdflib's ``eq`` and ``==`` are term equality for
+    an IRI, and no literal or blank node equals one."""
+    for side, other in ((left, right), (right, left)):
+        if isinstance(side, _VAR_LIKE) and side == var:
+            spelling = _iri_spelling(other, consts)
+            return None if spelling is None else NativeShape(IRI_IN, (spelling,))
+    return None
+
+
+def _iri_list(left, right, var, consts) -> NativeShape | None:
+    """``var IN (<iri>, ...)``: true for exactly those IRIs. rdflib's parser
+    spells an empty list as rdf:nil, which its evaluator reads back as the
+    empty list."""
+    if not (isinstance(left, _VAR_LIKE) and left == var):
+        return None
+    if not isinstance(right, list):
+        return NativeShape(IRI_IN, ()) if right == _RDF_NIL else None
+    spellings = []
+    for node in right:
+        spelling = _iri_spelling(node, consts)
+        if spelling is None:
+            return None
+        spellings.append(spelling)
+    return NativeShape(IRI_IN, tuple(dict.fromkeys(spellings)))
+
+
 def _constant_term(node, consts: dict):
     """The rdflib term an operand without block variables evaluates to: a
     constant, a visible ctx-bound variable, or an expression over those,
@@ -898,11 +940,12 @@ def native_shape(expr, var, consts: dict) -> NativeShape | None:
     ``langMatches(lang(var), "range")``; ``strstarts(str(var), "prefix")``;
     ``REGEX``, ``CONTAINS``, ``STRSTARTS`` and ``STRENDS`` of ``var`` or
     ``STR(var)``, either under ``LCASE``/``UCASE``, with a constant pattern or
-    string; and ``var`` compared with a well-formed numeric literal by any of
-    ``< <= > >= = !=`` (either way round). vortex-rdf answers each over the
-    codes a query produced with rdflib's own rules wherever it gives a
-    definite answer (``tests/test_native_filters.py`` pins that against
-    rdflib's evaluator) and leaves every other code undecided.
+    string; ``var = <iri>``, ``<iri> = var``, ``sameTerm`` of ``var`` and an
+    IRI, and ``var IN (<iri>, ...)``; and ``var`` compared with a well-formed
+    numeric literal by any of ``< <= > >= = !=`` (either way round). vortex-rdf
+    answers each over the codes a query produced with rdflib's own rules
+    wherever it gives a definite answer (``tests/test_native_filters.py`` pins
+    that against rdflib's evaluator) and leaves every other code undecided.
     """
     if not isinstance(expr, CompValue):
         return None
@@ -931,9 +974,15 @@ def native_shape(expr, var, consts: dict) -> NativeShape | None:
         return _string_function_shape(expr, var, consts)
     if name == "Builtin_REGEX":
         return _regex_shape(expr, var, consts)
-    if name != "RelationalExpression" or expr.other is None or isinstance(expr.other, list):
+    if name == "Builtin_sameTerm":
+        return _iri_equality(expr.arg1, expr.arg2, var, consts)
+    if name != "RelationalExpression" or expr.other is None:
         return None
     op, left, right = expr.op, expr.expr, expr.other
+    if op == "IN":
+        return _iri_list(left, right, var, consts)
+    if isinstance(right, list):
+        return None
     if op == "=":
         for call, other in ((left, right), (right, left)):
             if _call_on(call, "Builtin_DATATYPE", var):
@@ -944,6 +993,9 @@ def native_shape(expr, var, consts: dict) -> NativeShape | None:
             if _call_on(call, "Builtin_LANG", var):
                 tag = _constant_term(other, consts)
                 return NativeShape("lang", str(tag)) if _string_constant(tag) else None
+        iri = _iri_equality(left, right, var, consts)
+        if iri is not None:
+            return iri
     kind = _NUM_KINDS.get(op)
     if kind is None:
         return None

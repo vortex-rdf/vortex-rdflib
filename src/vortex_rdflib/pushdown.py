@@ -2809,16 +2809,16 @@ def _set_native_keep(pat, position: int, keep) -> None:
 
 
 def _push_native_restrictions(store, pat, var_preds) -> dict:
-    """Move the conjuncts the native layer answers with a keep (see
-    :func:`filters.native_restriction`) into the pattern's native keep, at
-    every position their variable takes; returns the residual conjuncts per
-    variable, to be evaluated over candidate codes
-    (:func:`filters.evaluate_column`): vortex-rdf decides those with a native
-    shape first, and only the codes it leaves undecided go to the Python
-    routes.
+    """Move the conjuncts vortex-rdf answers with a keep — kind tests and IRI
+    equality (:func:`filters.native_restriction`) — into the pattern's native
+    keep, at every position their variable takes; returns the residual
+    conjuncts per variable, evaluated over the codes the pattern brings
+    (:func:`_restrict_pattern`, :func:`_probe_join`).
 
     The keep is exact, so it may narrow a variable the relation will already
-    bind when the pattern joins: the rows it drops could not have joined.
+    bind when the pattern joins: the rows it drops could not have joined. A
+    keep left with no code (IRIs the dictionary lacks) makes the pattern
+    unsatisfiable, so nothing is counted or matched for it.
     """
     residual: dict = {}
     for var, positions in pat["varpos"].items():
@@ -2840,6 +2840,8 @@ def _push_native_restrictions(store, pat, var_preds) -> dict:
                 )
         if rest:
             residual[var] = rest
+    if any(not isinstance(k, tuple) and not len(k) for k in (pat.get("nkeep") or {}).values()):
+        pat["unsatisfiable"] = True
     return residual
 
 

@@ -7,12 +7,12 @@ natively to the rows that pass."""
 
 import pytest
 from rdflib import Graph, Literal, URIRef, Variable
-from vortex_rdf import U64Column
+from vortex_rdf import U64Column, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
 from test_filters import CTX, V, W, filter_expr, typed
 from test_native_filters import _Recording
-from test_native_primitives import _products, _spy, _trace
+from test_native_primitives import _native_calls, _products, _spy, _trace
 from test_pushdown import both_ways, run
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 from vortex_rdflib.terms import parse_spelling
@@ -373,3 +373,64 @@ def test_restricting_a_match_applies_the_codes_it_left_to_test(tmp_path, kept, s
     assert memoryview(pat["cols"][0]).cast("Q").tolist() == [subjects[i] for i in rows]
     assert memoryview(pat["cols"][2]).cast("Q").tolist() == [prices[i] for i in rows]
     assert pat["cols"][1] is None and pat["cols"][3] is None
+
+
+def test_iri_equality_is_a_keep_on_the_match(tmp_path, monkeypatch, capsys):
+    """?v IN (<iri>, ...) is the IRIs' codes — one encode_many — riding the
+    native match as a keep: no candidate is evaluated and only the matching
+    rows leave vortex-rdf."""
+    graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=True))
+    register_sparql_pushdown()
+    spy = _spy_filters(graph)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    rows = run(
+        graph,
+        """SELECT ?s WHERE { ?s <http://ex.org/type> ?t
+        FILTER(?s IN (<http://ex.org/p1>, <http://ex.org/p2>, <http://ex.org/nobody>)) }""",
+    )
+    trace = _trace(capsys)
+    assert rows == [(URIRef("http://ex.org/p1"),), (URIRef("http://ex.org/p2"),)]
+    assert spy.calls == []
+    pushed = next(e for e in trace if e["event"] == "bgp_native_restriction")
+    assert pushed["keep"] == {"0": {"codes": 2}}
+    match = _native_calls(trace, "match_codes")[0]
+    assert match["keep"] == {"0": {"codes": 2}} and match["returned_rows"] == 2
+
+
+def test_iri_constants_the_dictionary_lacks_match_nothing(tmp_path):
+    """An IRI equality whose constants are all absent keeps no code: the
+    pattern matches nothing, so nothing is counted or matched."""
+    graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=True))
+    register_sparql_pushdown()
+    native = _spy(graph)
+    assert run(graph, "SELECT ?s WHERE { ?s ?p ?o FILTER(?o = <http://ex.org/nobody>) }") == []
+    assert run(graph, "ASK { ?s ?p ?o FILTER(?o IN ()) }") is False
+    count = """SELECT (COUNT(*) AS ?n) WHERE {
+        ?s ?p ?o FILTER(sameTerm(?o, <http://ex.org/nobody>)) }"""
+    assert run(graph, count) == [(Literal(0),)]
+    assert [name for name in native.names() if name in ("match_codes", "count_quads")] == []
+
+
+def test_in_the_empty_list_is_false_even_for_rdf_nil(tmp_path, monkeypatch):
+    """rdflib spells `IN ()` as rdf:nil and reads it back as the empty list:
+    nothing is in it, rdf:nil included — as a keep and on the fast route."""
+    nil = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil"
+    nt = tmp_path / "list.nt"
+    nt.write_text(
+        f"<http://ex.org/l> <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <{nil}> .\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "list.vortex"
+    serialize_rdf(str(nt), str(out), layout="dictionary")
+    graph = Graph(store=VortexRdflibStore(str(out)))
+    cases = [
+        ("SELECT ?o WHERE { ?s ?p ?o FILTER(?o IN ()) }", []),
+        (f"SELECT ?o WHERE {{ ?s ?p ?o FILTER(?o IN (<{nil}>)) }}", [(URIRef(nil),)]),
+        ("SELECT ?o WHERE { ?s ?p ?o FILTER(?o NOT IN ()) }", [(URIRef(nil),)]),
+    ]
+    for native in (True, False):
+        monkeypatch.setattr(filters, "_NATIVE_ENABLED", native)
+        for query, expected in cases:
+            with_pushdown, without_pushdown = both_ways(graph, query)
+            assert with_pushdown == without_pushdown == expected, (native, query)

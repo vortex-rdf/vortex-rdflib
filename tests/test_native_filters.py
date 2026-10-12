@@ -11,6 +11,7 @@ import pytest
 from rdflib.term import Variable
 from vortex_rdf import serialize_rdf
 
+import vortex_rdflib.pushdown as pd
 from test_filters import SPELLINGS, filter_expr, rdflib_answer, typed
 from vortex_rdflib import VortexRdflibStore, candidates, filters, register_sparql_pushdown
 from vortex_rdflib.candidates import NativeShape
@@ -153,6 +154,22 @@ STRING_MAPPED = [
 ]
 MAPPED += STRING_MAPPED
 
+#: IRI equality: true for exactly the listed IRIs, a keep of their codes; an
+#: IRI the dictionary lacks contributes none.
+IRI_MAPPED = [
+    ("?v = <http://ex.org/x>", NativeShape("iri_in", ("<http://ex.org/x>",))),
+    ("<http://ex.org/x> = ?v", NativeShape("iri_in", ("<http://ex.org/x>",))),
+    ("sameTerm(?v, <http://ex.org/x>)", NativeShape("iri_in", ("<http://ex.org/x>",))),
+    ("sameTerm(<urn:x>, ?v)", NativeShape("iri_in", ("<urn:x>",))),
+    (
+        "?v IN (<http://ex.org/x>, <urn:x>, <http://ex.org/x>)",
+        NativeShape("iri_in", ("<http://ex.org/x>", "<urn:x>")),
+    ),
+    ("?v IN (<http://ex.org/absent>)", NativeShape("iri_in", ("<http://ex.org/absent>",))),
+    ("?v IN ()", NativeShape("iri_in", ())),
+]
+MAPPED += IRI_MAPPED
+
 #: Shapes the mapping must leave to the Python routes: the native layer
 #: would answer some of them differently from rdflib.
 UNMAPPED = [
@@ -188,6 +205,12 @@ UNMAPPED = [
     'strstarts(lcase(lcase(?v)), "a")',
     'contains(str(lcase(?v)), "a")',
     'contains(substr(?v, 1), "a")',
+    # IRI equality only: a literal constant compares by rdflib's term rules
+    '?v IN (<http://ex.org/x>, "x")',
+    'sameTerm(?v, "x")',
+    "?v != <http://ex.org/x>",
+    "?v NOT IN (<http://ex.org/x>)",
+    "?v = ?v",
 ]
 
 
@@ -450,3 +473,44 @@ def _outcome(graph, sparql):
         return run(graph, sparql)
     except Exception as error:  # noqa: BLE001 - the exception is the answer
         return type(error)
+
+
+def test_mid_size_code_set_goes_to_a_file_scan_as_a_range(tmp_path, monkeypatch, capsys):
+    """On a file-backed store a keep of 33 to 4,096 codes — here the 100 IRIs
+    of an IN list — goes to the scan as its bounding range, and its codes are
+    tested on the rows that range admits (`_split_keeps`)."""
+    import json
+
+    from rdflib import Graph
+
+    from test_pushdown import both_ways
+
+    nt = tmp_path / "iris.nt"
+    nt.write_text(
+        "".join(
+            f"<http://ex.org/s{i}> <http://ex.org/p> <http://ex.org/o{i}> .\n" for i in range(200)
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "iris.vortex"
+    serialize_rdf(str(nt), str(out), layout="dictionary")
+    graph = Graph(store=VortexRdflibStore(str(out), in_memory=False))
+    listed = ", ".join(f"<http://ex.org/o{i}>" for i in range(0, 200, 2))
+    query = f"SELECT ?s ?o WHERE {{ ?s <http://ex.org/p> ?o FILTER(?o IN ({listed})) }}"
+    register_sparql_pushdown()
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    with_pushdown, without_pushdown = both_ways(graph, query)
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == 100
+    trace = [
+        json.loads(line[len(pd._TRACE_PREFIX) :])
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith(pd._TRACE_PREFIX)
+    ]
+    pushed = next(e for e in trace if e["event"] == "bgp_native_restriction")
+    assert pushed["keep"] == {"2": {"codes": 100}}
+    match = next(
+        e for e in trace if e["event"] == "native_call_complete" and e["operation"] == "match_codes"
+    )
+    assert set(match["keep"]["2"]) == {"range"}

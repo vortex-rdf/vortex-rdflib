@@ -586,6 +586,21 @@ QUERIES += [
     'SELECT ?s ?o WHERE { ?s ?p ?o FILTER(strstarts(str(?o), "http://ex.org/c")) }',
 ]
 
+#: IRI equality as a keep: =, sameTerm and IN over IRIs only, constants the
+#: dictionary lacks, the empty list, the predicate position.
+QUERIES += [
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(?o IN (<http://ex.org/carol>, <http://ex.org/bob>)) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(sameTerm(?o, <http://ex.org/carol>)) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(<http://ex.org/carol> = ?o) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(?o IN (<http://ex.org/nobody>)) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(?o IN ()) }",
+    "SELECT ?s ?p WHERE { ?s ?p ?o FILTER(?p IN (<http://ex.org/knows>, <http://ex.org/likes>)) }",
+    "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o FILTER(?o = <http://ex.org/carol>) }",
+    "ASK { ?s ?p ?o FILTER(?o = <http://ex.org/nobody>) }",
+    """SELECT ?x ?n WHERE { ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?n
+        FILTER(?y IN (<http://ex.org/bob>, <http://ex.org/carol>)) }""",
+]
+
 #: Shapes that name a graph. rdflib evaluates the `Graph` node itself — a
 #: bound name scopes the block below, an unbound one fans out over the
 #: store's graphs — so what is under test here is that every pushed-down
