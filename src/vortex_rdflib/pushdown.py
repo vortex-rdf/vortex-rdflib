@@ -114,7 +114,6 @@ from typing import Any
 
 from rdflib.plugins.sparql import CUSTOM_EVALS
 from rdflib.plugins.sparql.evalutils import _val
-from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
@@ -1514,7 +1513,7 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
 
     def generic():
         conjunct = exists.conjunct
-        if _has_minus(body) and (
+        if filters.has_minus(body) and (
             not conjunct.vars or any(v in rel.nullable for v in conjunct.vars)
         ):
             # rdflib binds the whole row in the body, so a MINUS there always
@@ -1571,21 +1570,6 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
     keys = {tuple(row[i] for i in ib) for row in _code_rows(inner)}
     kept = [row for row in rows if (tuple(row[i] for i in ia) in keys) != negate]
     return Relation(rel.schema, None, kept, len(kept), rel.nullable, rel.foreign)
-
-
-def _has_minus(node) -> bool:
-    """Whether an algebra tree holds a MINUS, one in a nested EXISTS body
-    included (walked in its translated form, as :func:`filters.expr_vars`
-    does)."""
-    if isinstance(node, (list, tuple)):
-        return any(_has_minus(item) for item in node)
-    if not isinstance(node, CompValue):
-        return False
-    if node.name == "Minus":
-        return True
-    if node.name in ("Builtin_EXISTS", "Builtin_NOTEXISTS"):
-        return _has_minus(getattr(node, "graph", None))
-    return any(_has_minus(dict.__getitem__(node, key)) for key in node.keys() if key != "_vars")
 
 
 def _unwrap_empty_joins(node):

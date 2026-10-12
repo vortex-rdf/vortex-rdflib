@@ -472,6 +472,20 @@ GROUP_SHAPES = [
         id="graph-values-g-optional",
     ),
     pytest.param(
+        "SELECT ?g ?s WHERE { GRAPH ?g { VALUES ?g { UNDEF ex:g1 } ?s ex:p ?o } }",
+        id="graph-values-g-undef-joined",
+    ),
+    pytest.param(
+        """SELECT ?g ?s WHERE { GRAPH ?g { ?s ex:p ?o
+            OPTIONAL { VALUES ?g { UNDEF ex:g1 } } } }""",
+        id="graph-values-g-undef-optional",
+    ),
+    pytest.param(
+        """SELECT ?g ?s WHERE { GRAPH ?g { ?s ex:p ?o
+            MINUS { VALUES (?s ?g) { (ex:s1 UNDEF) (ex:s2 ex:g1) } } } }""",
+        id="graph-values-g-undef-minus",
+    ),
+    pytest.param(
         "SELECT ?g ?s WHERE { GRAPH ?g { VALUES ?s { ex:s1 ex:s2 } ?s ex:p ?o } }",
         id="graph-values-joined",
     ),
@@ -601,6 +615,48 @@ GROUP_SHAPES = [
         """SELECT * WHERE { ?s ex:p ?o OPTIONAL { ?s ex:zz ?k }
             FILTER NOT EXISTS { ?a ex:q ?k MINUS { ?c ex:r ?b } } }""",
         id="not-exists-unbound-key-minus-disjoint",
+    ),
+    # ... and an EXISTS under another operator.
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            FILTER (EXISTS { ?a ex:q ?x MINUS { ?c ex:r ?b } } || false) }""",
+        id="or-exists-minus-disjoint",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            FILTER (NOT EXISTS { ?a ex:q ?x MINUS { ?c ex:r ?b } } || false) }""",
+        id="or-not-exists-minus-disjoint",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            FILTER (COALESCE(EXISTS { ?a ex:q ?x MINUS { ?c ex:r ?b } }, false)) }""",
+        id="coalesce-exists-minus-disjoint",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o FILTER (EXISTS { ?a ex:q ?x MINUS { ?c ex:r ?b } } = true) }",
+        id="eq-exists-minus-disjoint",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            FILTER (IF(EXISTS { ?a ex:q ?x MINUS { ?c ex:r ?b } }, true, false)) }""",
+        id="if-exists-minus-disjoint",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o OPTIONAL { ?s ex:zz ?k }
+            FILTER (EXISTS { ?a ex:q ?k MINUS { ?c ex:r ?b } } || bound(?k)) }""",
+        id="or-exists-unbound-key-minus-disjoint",
+    ),
+    # A body whose relation lacks a key: a MINUS with an empty left side,
+    # whose right side names it only in its own MINUS.
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            FILTER EXISTS { ?s ex:zz ?x MINUS { ?x ex:r ?y MINUS { ?y ex:p ?o } } } }""",
+        id="exists-empty-minus-outer-var",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            FILTER NOT EXISTS { ?s ex:zz ?x MINUS { ?x ex:r ?y MINUS { ?y ex:p ?o } } } }""",
+        id="not-exists-empty-minus-outer-var",
     ),
     pytest.param(
         "SELECT * WHERE { ?s ex:p ?o FILTER EXISTS { ?s ex:q ?x MINUS { ?s ex:r ?y } } }",
@@ -743,6 +799,8 @@ NATIVE = [
         "minus-disjoint",
         "exists-minus-shared-outer-var",
         "not-exists-minus",
+        "exists-minus-outer-var",
+        "not-exists-minus-outer-var",
     )
 ]
 
@@ -768,23 +826,35 @@ def test_the_pushdown_answers_these_shapes_whole(
     )
 
 
+# The EXISTS shapes among those: a semi- or anti-join never asks rdflib's
+# evaluator; the generic route, for a body that reads the row's values, asks
+# it once per distinct tuple, without handing the FILTER to rdflib.
+EXISTS_ROUTES = [
+    pytest.param(str(_BY_ID[shape].values[0]), generic, id=shape)
+    for shape, generic in (
+        ("exists-minus-shared-outer-var", False),
+        ("not-exists-minus", False),
+        ("exists-minus-outer-var", True),
+        ("not-exists-minus-outer-var", True),
+    )
+]
+
+
 @pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
-@pytest.mark.parametrize("sparql", [shape for shape in NATIVE if "exists" in str(shape.id)])
-def test_an_exists_the_pushdown_answers_whole_is_a_semi_join(
-    quad_files, monkeypatch, in_memory, sparql
+@pytest.mark.parametrize(("sparql", "generic"), EXISTS_ROUTES)
+def test_an_exists_the_pushdown_answers_whole_keeps_its_route(
+    quad_files, monkeypatch, in_memory, sparql, generic
 ):
-    """rdflib's evaluator decides none of its rows, as it does those of an
-    EXISTS whose key the body may leave unbound."""
     dataset = Dataset(
         store=VortexRdflibStore(str(quad_files["copy"]), in_memory=in_memory), default_union=True
     )
     register_sparql_pushdown()
     calls = []
-    generic = filters.Conjunct.generic
+    original = filters.Conjunct.generic
     monkeypatch.setattr(
-        filters.Conjunct, "generic", lambda self, bound: calls.append(bound) or generic(self, bound)
+        filters.Conjunct,
+        "generic",
+        lambda self, bound: calls.append(bound) or original(self, bound),
     )
     run(dataset, PREFIX + sparql)
-    assert calls == []
-    run(dataset, PREFIX + str(_BY_ID["exists-values-undef"].values[0]))
-    assert calls
+    assert bool(calls) is generic

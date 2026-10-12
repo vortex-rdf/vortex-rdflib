@@ -969,6 +969,21 @@ def expr_vars(node, out: list | None = None) -> list:
     return out
 
 
+def has_minus(node) -> bool:
+    """Whether an algebra tree or an expression holds a MINUS, one in an
+    EXISTS body included (walked in its translated form, as
+    :func:`expr_vars` does)."""
+    if isinstance(node, (list, tuple)):
+        return any(has_minus(item) for item in node)
+    if not isinstance(node, CompValue):
+        return False
+    if node.name == "Minus":
+        return True
+    if node.name in ("Builtin_EXISTS", "Builtin_NOTEXISTS"):
+        return has_minus(getattr(node, "graph", None))
+    return any(has_minus(dict.__getitem__(node, key)) for key in node.keys() if key != "_vars")
+
+
 def _is_impure(node) -> bool:
     if isinstance(node, CompValue):
         if node.name in _IMPURE:
@@ -1084,12 +1099,20 @@ def _compile_conjunct(
 def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
     """Route the conjuncts of a boolean expression over ``block_vars``;
     ``visible`` maps the context-bound variables the expression may see to
-    their terms, every other non-block variable is unbound."""
+    their terms, every other non-block variable is unbound.
+
+    A conjunct holding an EXISTS under another operator, with a MINUS in its
+    body, is left to rdflib (``NotImplementedError``): it would be decided
+    with only the conjunct's variables bound, where rdflib binds the whole
+    row, which that MINUS then always shares."""
     block_set = set(block_vars)
     plan = FilterPlan([], {}, [], [])
     for conjunct_expr in _flatten_and(expr, []):
         expr = conjunct_expr
         if _is_impure(expr):
+            raise NotImplementedError
+        shape = exists_shape(expr)
+        if shape is None and has_minus(expr):
             raise NotImplementedError
         referenced = expr_vars(expr)
         variables = tuple(v for v in referenced if v in block_set)
@@ -1098,7 +1121,6 @@ def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
         if len(variables) == 1 and _FAST_ENABLED and _NATIVE_ENABLED:
             native = native_shape(expr, variables[0], consts)
         conjunct = _compile_conjunct(expr, variables, consts, ctx, native)
-        shape = exists_shape(expr)
         if shape is not None:
             plan.exists.append(ExistsConjunct(conjunct, *shape))
         elif not variables:
