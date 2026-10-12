@@ -507,6 +507,18 @@ GROUP_SHAPES = [
         id="optional-minus",
     ),
     pytest.param("SELECT * WHERE { ?s ex:p ?o MINUS { ?a ex:q ?x } }", id="minus-disjoint"),
+    # ... unless the row binds nothing: a padded OPTIONAL, or under GRAPH ?g
+    # only the graph, which rdflib does not bind.
+    pytest.param(
+        """SELECT * WHERE { { OPTIONAL { ?a ex:zz ?b } }
+            { ?s ex:q ?x MINUS { ?c ex:r ?d } } }""",
+        id="optional-row-minus-disjoint",
+    ),
+    pytest.param(
+        """SELECT ?g ?s WHERE { GRAPH ?g { ex:s1 ex:p "a"
+            { ?s ex:q ?x MINUS { ?c ex:r ?d } } } }""",
+        id="graph-ground-row-minus-disjoint",
+    ),
     # FILTER (NOT) EXISTS: rdflib solves the body once per row, with the row's
     # bindings; a key the body's solutions may leave unbound is the row's.
     pytest.param(
