@@ -512,10 +512,11 @@ combines them on their shared variables:
   join ([`_left_join_rows`](../src/vortex_rdflib/pushdown.py#L1735)). The
   optional group's `FILTER` is checked on each candidate pair. A left row with
   no passing match is kept, with the right side's variables unbound.
-- **`MINUS`** ([`_solve_minus`](../src/vortex_rdflib/pushdown.py#L1759)): an
-  anti-join. When the sides share no variable, it follows rdflib's rule: with
-  no outer bindings (the usual top-level case) nothing is removed; with outer
-  bindings, everything is removed if the right side has any row.
+- **`MINUS`** ([`_solve_minus`](../src/vortex_rdflib/pushdown.py#L1847)): an
+  anti-join. When the sides share no variable (under `GRAPH ?g`, the graph
+  column alone does not count), it follows rdflib's rule: with no outer
+  bindings (the usual top-level case) nothing is removed; with outer bindings,
+  everything is removed if the right side has any row.
 - **Group join** ([`_solve_join`](../src/vortex_rdflib/pushdown.py#L1573)): a
   hash join (`_join`). When rdflib would deduplicate the right side (a join it
   does not evaluate lazily), so does the hook.
@@ -539,7 +540,11 @@ matched once and hash-joined.
   filter);
 - a `FILTER` inside a side that, in rdflib, would see a binding from an
   enclosing join;
-- an `OPTIONAL` whose filter contains `EXISTS`.
+- an `OPTIONAL` whose filter contains `EXISTS`;
+- a `MINUS` that rdflib solves once per row of an enclosing lazy join,
+  `OPTIONAL` or `EXISTS`, when its right side binds a variable of that row
+  that its left side does not (rdflib matches it with the row's value), or
+  when its sides share no variable (whether the row binds anything decides).
 
 ## FILTER (NOT) EXISTS
 
@@ -574,10 +579,11 @@ body in a `Join` with an empty `BGP`, which the hook skips
 ([`_unwrap_empty_joins`](../src/vortex_rdflib/pushdown.py#L1486)).
 
 **Left to rdflib.** rdflib's evaluator decides the conjunct, once per distinct
-tuple of values, when a shared variable may be unbound, when the body is not a
-block, or when a `FILTER` in the body sees the block's bindings. The same goes
-for an `EXISTS` inside `||` or another operator. Under `GRAPH ?g`, the whole
-block goes to rdflib (see [Named graphs](#named-graphs)).
+tuple of values, when a shared variable may be unbound in the block or in the
+body's solutions, when the body is not a block, or when a `FILTER` in the body
+sees the block's bindings. The same goes for an `EXISTS` inside `||` or
+another operator. Under `GRAPH ?g`, the whole block goes to rdflib (see
+[Named graphs](#named-graphs)).
 
 ## ORDER BY
 
@@ -675,7 +681,15 @@ a named graph.
 - `FILTER (NOT) EXISTS` under `GRAPH ?g`: rdflib evaluates the body in the
   active graph, and under a graph variable there is no single active graph;
 - a `GRAPH` variable bound to something that cannot name a graph, such as a
-  literal.
+  literal;
+- a `GRAPH ?g` group none of whose patterns is matched in its scope (an empty
+  group, a `VALUES` table, a `GRAPH` of another graph), or with an `OPTIONAL`
+  or `MINUS` that has one on its right side only: rdflib repeats such a part
+  once per named graph, which a join with a part matched in the scope also
+  does here ([`_carries_graph`](../src/vortex_rdflib/pushdown.py#L678));
+- an `OPTIONAL` or `MINUS` under `GRAPH ?g` whose right side alone binds `?g`:
+  rdflib matches that `?g` against any term and joins the graph in only after
+  the group is solved.
 
 When rdflib evaluates a `Graph` node itself (with
 `VORTEX_RDF_PUSHDOWN_OPS=bgp`, for example), it changes `solution.ctx.graph`

@@ -71,9 +71,12 @@ graph (as does the graph the context is active in, for a block under no
 fourth column instead, so ``?g`` is an ordinary variable of the relation and
 one match answers what rdflib would walk the store's graphs for. A FILTER in
 the block still reads ``?g`` unbound unless a pattern of its group binds it:
-rdflib joins the graph in after the group is solved. The rows of the default
-graph are dropped from a variable's match, which is what makes ``GRAPH``
-range over the named graphs only.
+rdflib joins the graph in after the group is solved. Where no pattern of the
+group is matched in that scope, or an OPTIONAL or MINUS has one on its right
+side only, or binds ``?g`` there only, the ``Graph`` node is left to rdflib,
+which solves the group once per named graph. The rows of the default graph
+are dropped from a variable's match, which is what makes ``GRAPH`` range over
+the named graphs only.
 
 rdflib only catches ``NotImplementedError`` at hook-call time, so every
 capability check and every native call happens before a generator is handed
@@ -663,13 +666,52 @@ def _block_vars(ctx, node, scope: _GraphScope) -> list:
     return [term for term in _scoped_vars(node, scope) if ctx[term] is None]
 
 
+def _group_vars(ctx, node) -> list:
+    """The variables a block's own solutions bind in rdflib's evaluation: its
+    variable-like terms the context has not bound, none from a MINUS's right
+    side, and an enclosing ``GRAPH ?g``'s variable only where the block binds
+    it itself — rdflib's ``evalGraph`` joins the graph in after the group is
+    solved."""
+    return [var for var in _node_vars(node, bound=True) if ctx[var] is None]
+
+
+def _carries_graph(node, var) -> bool:
+    """Whether the rows of a block under ``GRAPH var`` carry its graph
+    column: a pattern of the block is matched in that scope, so the column
+    names the graph each row was solved in.
+
+    A part without the column (an empty group, a VALUES table, a ``GRAPH`` of
+    another graph) is the same in every named graph. A join with a part that
+    has it repeats it per graph, as rdflib does; an OPTIONAL or a MINUS whose
+    right side alone has it cannot, and raises ``NotImplementedError``.
+    """
+    name = node.name
+    if name == "BGP":
+        return bool(node.triples)
+    if name == "Filter":
+        return _carries_graph(node.p, var)
+    if name == "Graph":
+        return node.term == var and _carries_graph(node.p, var)
+    if name in ("Join", "LeftJoin", "Minus"):
+        left, right = _carries_graph(node.p1, var), _carries_graph(node.p2, var)
+        if name == "Join":
+            return left or right
+        if right and not left:
+            raise NotImplementedError
+        return left
+    return False
+
+
 def _block_nullable(node) -> frozenset:
     """The variables a block may leave unbound: those an OPTIONAL side
     introduces, every one its left side does not bind.
 
-    A graph variable is never among them: a ``GRAPH ?g`` binds it in every row
-    of the block below, and when both sides of an OPTIONAL are under the same
-    one, the join on it keeps them in the same graph.
+    A ``GRAPH ?g``'s variable is among them only where an OPTIONAL's right
+    side names it and its left side does not bind it, which the solver
+    leaves to rdflib (see :func:`_solve_left_join` and :func:`_solve_minus`).
+    Otherwise the graph column is bound in every row below the ``GRAPH``,
+    and when both sides of an OPTIONAL are under the same one, the join on it
+    keeps them in the same graph.
     """
     name = node.name
     if name == "BGP":
@@ -1309,7 +1351,10 @@ def _solve_block(
         elif name == "ToMultiSet":
             rel = _solve_values(ctx, store, node)
         elif name == "Graph":
-            rel = _solve_block(ctx, store, node.p, env, var_preds, _graph_scope(ctx, node), limit)
+            inner = _graph_scope(ctx, node)
+            if inner.var is not None and not _carries_graph(node.p, inner.var):
+                raise NotImplementedError
+            rel = _solve_block(ctx, store, node.p, env, var_preds, inner, limit)
         else:
             raise NotImplementedError
     finally:
@@ -1392,15 +1437,13 @@ def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None) -> Relati
     solved rows. A ``limit`` reaches the block only when nothing is left to
     filter above it.
 
-    The expression's block variables are those its group binds (see
-    :func:`filters.analyze_filter` for the rest of its scope): none from a
-    MINUS's right side, and the graph variable of an enclosing ``GRAPH ?g``
-    only where a pattern of the group names it — rdflib's ``evalGraph`` joins
-    the graph in after the group is solved."""
+    The expression's block variables are those its group binds
+    (:func:`_group_vars`; see :func:`filters.analyze_filter` for the rest of
+    its scope)."""
     inner = node.p
+    # The columns of the empty relation a false constant conjunct returns.
     block_vars = _block_vars(ctx, inner, scope)
-    group_vars = [var for var in _node_vars(inner, bound=True) if ctx[var] is None]
-    plan = filters.analyze_filter(node, group_vars, ctx)
+    plan = filters.analyze_filter(node, _group_vars(ctx, inner), ctx)
     if plan.exists and scope.var is not None:
         # rdflib evaluates an EXISTS body against the *active* graph. Under a
         # graph variable there is no single active graph — the row's graph is
@@ -1506,6 +1549,10 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
         else:
             inner = _solve_block(ctx, store, body, env, None, scope)
     except NotImplementedError:
+        return generic()
+    if any(v not in inner.schema or v in inner.nullable for v in shared):
+        # Where the body's solutions leave a key unbound, rdflib's body sees
+        # the row's own binding of it, which a semi-join cannot.
         return generic()
     ia = [rel.schema.index(v) for v in shared]
     ib = [inner.schema.index(v) for v in shared]
@@ -1656,6 +1703,15 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
     p1, p2, expr = node.p1, node.p2, node.expr
     vars1, vars2 = _scoped_vars(p1, scope), _scoped_vars(p2, scope)
     condition = expr if getattr(expr, "name", None) != "TrueFilter" else None
+    if (
+        scope.var is not None
+        and scope.var in _group_vars(ctx, p2)
+        and scope.var not in _group_vars(ctx, p1)
+    ):
+        # rdflib matches p2's ?g against any term and joins the graph in after
+        # the OPTIONAL: a left row whose matches all name another graph is
+        # dropped there, where the graph column would pad it.
+        raise NotImplementedError
     # rdflib re-evaluates an unmatched OPTIONAL with only p1's `_vars` bound
     # (its "cheated scope" check). That differs from the first pass when a
     # variable that pass drops — bound by the context, by an enclosing join,
@@ -1692,9 +1748,7 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
             return ()
         init = set(ctx.initBindings or ())
         visible = {v: term for v, term in outer.items() if v in init}
-        # What either side binds: an enclosing GRAPH ?g's variable only where
-        # a pattern names it (see _solve_filter).
-        sides = set(_node_vars(p1, bound=True) + _node_vars(p2, bound=True))
+        sides = set(_group_vars(ctx, node))
         plan = filters.analyze_expr(condition, [v for v in schema if v in sides], ctx, visible)
         if plan.exists:
             # An OPTIONAL's condition can carry (NOT) EXISTS; a semi-join over
@@ -1791,18 +1845,38 @@ def _left_join_rows(schema_a, rows_a, schema_b, rows_b, preds) -> list:
 
 
 def _solve_minus(ctx, store, node, env, var_preds, scope) -> Relation:
-    """MINUS: an anti-join on the shared variables. Without shared block
-    variables rdflib's compatibility test turns on the context's own
-    bindings, which every row of both sides carries: nothing is removed at
-    top level, everything is when the right side is non-empty otherwise."""
+    """MINUS: an anti-join on the shared variables.
+
+    rdflib removes a left row only where a compatible right row shares a
+    binding with it. Both sides' rows carry the context's bindings and, where
+    rdflib solves the MINUS once per row of an enclosing lazy join, OPTIONAL
+    or EXISTS (``env``), that row's, which the right side is also matched
+    with. With no variable both sides bind, nothing is removed at top level,
+    and everything is under a context binding when the right side is
+    non-empty. Under ``GRAPH ?g`` rdflib solves both sides in each named
+    graph with ``?g`` unbound: the graph column keeps the anti-join in one
+    graph but is a shared binding only where both sides bind ``?g``, and a
+    right side's own ``?g`` matches any term. The shapes that turn on the
+    enclosing row, or on that ``?g``, are left to rdflib."""
+    left_vars, right_vars = _group_vars(ctx, node.p1), _group_vars(ctx, node.p2)
+    common = any(v in left_vars for v in right_vars)
+    context = bool(dict(ctx.bindings.items()))
+    if env and not (common or context):
+        raise NotImplementedError  # whether the enclosing row binds anything decides
+    if any(v in env and v not in left_vars for v in right_vars):
+        raise NotImplementedError  # the right side reads the enclosing row's value
     left = _solve_block(ctx, store, node.p1, env, var_preds, scope)
+    if not (common or context):
+        return left
     left_rows = _rows_of(left)
     if not left_rows:
         return left
+    if scope.var in right_vars and scope.var not in left_vars:
+        raise NotImplementedError
     right = _solve_block(ctx, store, node.p2, env, None, scope)
     shared = [v for v in right.schema if v in left.schema]
     if not shared:
-        if dict(ctx.bindings.items()) and next(_code_rows(right), None) is not None:
+        if next(_code_rows(right), None) is not None:
             return Relation(left.schema, None, [], 0, left.nullable, left.foreign)
         return Relation(left.schema, None, left_rows, len(left_rows), left.nullable, left.foreign)
     _shared_key_ok(left, right, shared)

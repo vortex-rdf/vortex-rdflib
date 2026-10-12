@@ -947,7 +947,7 @@ def expr_vars(node, out: list | None = None) -> list:
     order. An EXISTS body is walked in its translated form (the instance
     attribute): rdflib pulls the body's FILTERs out of the parse tree it
     keeps under the key, so only the translation still names their
-    variables."""
+    variables, and a VALUES table in it names its own in each row's keys."""
     if out is None:
         out = []
     if isinstance(node, _VAR_LIKE):
@@ -961,6 +961,8 @@ def expr_vars(node, out: list | None = None) -> list:
         for key in node.keys():
             if key != "_vars":
                 expr_vars(dict.__getitem__(node, key), out)
+    elif isinstance(node, dict):
+        expr_vars(list(node), out)
     elif isinstance(node, (list, tuple)):
         for x in node:
             expr_vars(x, out)

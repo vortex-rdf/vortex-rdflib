@@ -1,10 +1,19 @@
-"""A FILTER sees the bindings of its own group only, as rdflib's evaluator
-does: a variable the group does not bind is unbound in the expression, even
-where an enclosing ``GRAPH ?g``, join or OPTIONAL binds it, and a MINUS's
-right side binds nothing in the group. A FILTER directly inside an OPTIONAL is
-that LeftJoin's condition and sees the left side's bindings as well. Where
-rdflib keeps an outer binding the expression names outside a comparison (the
-Filter node's ``_vars``), the pushdown gives rdflib's answer too."""
+"""A group's solutions carry the bindings of its own patterns only, as in
+rdflib's evaluator.
+
+A FILTER sees the bindings of its own group: a variable the group does not
+bind is unbound in the expression, even where an enclosing ``GRAPH ?g``, join
+or OPTIONAL binds it, and a MINUS's right side binds nothing in the group. A
+FILTER directly inside an OPTIONAL is that LeftJoin's condition and sees the
+left side's bindings as well. Where rdflib keeps an outer binding the
+expression names outside a comparison (the Filter node's ``_vars``), the
+pushdown gives rdflib's answer too.
+
+``GRAPH ?g`` solves its group once per named graph and joins ``?g`` in after
+it. rdflib solves the right side of a lazy join or an OPTIONAL, and an EXISTS
+body, once per row with that row's bindings: a MINUS there reads them on its
+right side and always shares them between its sides, and an EXISTS key the
+body leaves unbound is the row's."""
 
 import pytest
 from rdflib import Dataset
@@ -78,10 +87,25 @@ SHAPES = [
         "SELECT ?s WHERE { GRAPH ?g { ?s ?p ?o FILTER(!bound(?g)) } } ORDER BY ?s LIMIT 2",
         id="graph-limit",
     ),
-    # ... where the group's own pattern binds ?g, or the FILTER follows the
-    # group, or reads only what the group binds: the FILTER sees it.
+    # ... where the group's own pattern, VALUES table or GRAPH ?g binds ?g, or
+    # the FILTER follows the group, or reads only what the group binds: the
+    # FILTER sees it.
     pytest.param(
         "SELECT ?g ?o WHERE { GRAPH ?g { ?g ?p ?o FILTER(isIRI(?g)) } }", id="graph-pattern-binds"
+    ),
+    pytest.param(
+        "SELECT ?s ?g WHERE { GRAPH ?g { VALUES ?g { ex:g2 } ?s ex:p ?o FILTER(?g = ex:g2) } }",
+        id="graph-values-binds",
+    ),
+    pytest.param(
+        """SELECT ?s ?g WHERE { GRAPH ?g {
+            VALUES ?g { ex:g1 ex:g2 } ?s ex:p ?o FILTER(isIRI(?g)) } }""",
+        id="graph-values-binds-isiri",
+    ),
+    pytest.param(
+        """SELECT ?s ?g WHERE { GRAPH ?g {
+            ?s ex:p ?o GRAPH ?g { ?s ex:q ?x } FILTER(?g = ex:g2) } }""",
+        id="graph-same-var-binds",
     ),
     pytest.param(
         'SELECT ?s ?g WHERE { GRAPH ?g { ?s ?p ?o } FILTER(strstarts(str(?g), "http://ex/g2")) }',
@@ -138,6 +162,17 @@ SHAPES = [
         """SELECT ?s ?g ?x WHERE { GRAPH ?g { ?s ex:p ?o
             OPTIONAL { ?s ex:q ?x FILTER(?o = "a") } } }""",
         id="graph-optional-own-var",
+    ),
+    # A FILTER in a group nested inside an OPTIONAL under GRAPH ?g.
+    pytest.param(
+        """SELECT ?s ?g ?x ?y WHERE { GRAPH ?g { ?s ex:p ?o
+            OPTIONAL { ?s ex:q ?x { ?x ex:r ?y FILTER(?g = ex:g2) } } } }""",
+        id="graph-optional-nested-eq",
+    ),
+    pytest.param(
+        """SELECT ?s ?g ?x ?y WHERE { GRAPH ?g { ?s ex:p ?o
+            OPTIONAL { ?s ex:q ?x { ?x ex:r ?y FILTER(isIRI(?g)) } } } }""",
+        id="graph-optional-nested-isiri",
     ),
     # A MINUS's right side and the UNION branches inside GRAPH ?g.
     pytest.param(
@@ -303,6 +338,219 @@ SHAPES = [
     ),
 ]
 
+GROUP_SHAPES = [
+    # A MINUS under GRAPH ?g: the two sides share the graph only where both
+    # name ?g, and only rows that share a binding (an enclosing row's
+    # included) are removed.
+    pytest.param(
+        "SELECT ?s ?g WHERE { GRAPH ?g { ?s ex:p ?o MINUS { ?x ex:q ?y } } }",
+        id="graph-minus-disjoint",
+    ),
+    pytest.param(
+        "SELECT ?o ?g WHERE { GRAPH ?g { ?g ex:p ?o MINUS { ?x ex:q ?y } } }",
+        id="graph-minus-disjoint-left-names-g",
+    ),
+    pytest.param(
+        "SELECT ?s ?g WHERE { GRAPH ?g { ?s ex:p ?o MINUS { ?g ex:q ?y } } }",
+        id="graph-minus-disjoint-right-names-g",
+    ),
+    pytest.param(
+        "SELECT ?s ?g WHERE { GRAPH ?g { ?s ex:p ?o MINUS { ?s ex:q ?g } } }",
+        id="graph-minus-right-names-g",
+    ),
+    pytest.param(
+        "SELECT ?o ?g WHERE { GRAPH ?g { ?g ex:p ?o MINUS { ?g ex:q ?y } } }",
+        id="graph-minus-both-name-g",
+    ),
+    pytest.param(
+        "SELECT ?s ?g WHERE { GRAPH ?g { ?s ex:p ?o MINUS { ?s ex:q ?x } } }",
+        id="graph-minus-shared",
+    ),
+    pytest.param(
+        """SELECT ?z ?g ?s WHERE { ?z ex:in ?g .
+            GRAPH ?g { ?s ex:p ?o MINUS { ?x ex:q ?y } } }""",
+        id="graph-joined-minus-disjoint",
+    ),
+    pytest.param(
+        """SELECT ?s ?g ?x WHERE { GRAPH ?g {
+            ?s ex:p ?o { ?s ex:q ?x MINUS { ?a ex:r ?b } } } }""",
+        id="graph-nested-minus-disjoint",
+    ),
+    # An OPTIONAL under GRAPH ?g whose right side alone names ?g: rdflib
+    # matches it with any ?g, and the graph join drops a row whose ?g is not
+    # the graph instead of padding it.
+    pytest.param(
+        "SELECT ?s ?g ?x WHERE { GRAPH ?g { ?s ex:p ?o OPTIONAL { ?g ex:p ?x } } }",
+        id="graph-optional-names-g",
+    ),
+    pytest.param(
+        """SELECT ?s ?g ?x WHERE { GRAPH ?g { ?s ex:p ?o
+            OPTIONAL { ?g ex:p ?x } FILTER(bound(?g)) } }""",
+        id="graph-optional-names-g-bound",
+    ),
+    pytest.param(
+        "SELECT ?s ?g WHERE { GRAPH ?g { ?s ex:p ?o OPTIONAL { ?s ex:q ?g } } }",
+        id="graph-optional-names-g-shared",
+    ),
+    pytest.param(
+        """SELECT ?s ?g ?x WHERE { GRAPH ?g { ?s ex:p ?o
+            OPTIONAL { ?s ex:q ?y OPTIONAL { ?g ex:p ?x } } } }""",
+        id="graph-optional-nested-names-g",
+    ),
+    pytest.param(
+        """SELECT ?s ?g ?x WHERE { GRAPH ?g { ?s ex:p ?o
+            OPTIONAL { ?s ex:q ?x MINUS { ?g ex:p ?y } } } }""",
+        id="graph-optional-minus-names-g",
+    ),
+    pytest.param(
+        "SELECT ?g ?o ?x WHERE { GRAPH ?g { ?g ex:p ?o OPTIONAL { ?g ex:q ?x } } }",
+        id="graph-optional-both-name-g",
+    ),
+    # A part of a GRAPH ?g group matched in another graph, or in none: rdflib
+    # repeats it once per named graph.
+    pytest.param(
+        "SELECT ?g ?s WHERE { GRAPH ?g { GRAPH ex:g1 { ?s ex:p ?o } } }", id="graph-in-graph"
+    ),
+    pytest.param(
+        "SELECT ?g ?s WHERE { GRAPH ?g { GRAPH ex:g1 { ?s ex:p ?o } FILTER(bound(?g)) } }",
+        id="graph-in-graph-bound",
+    ),
+    pytest.param(
+        "SELECT ?g ?s WHERE { GRAPH ?g { GRAPH ex:g1 { ?s ex:p ?o } FILTER(!bound(?g)) } }",
+        id="graph-in-graph-not-bound",
+    ),
+    pytest.param(
+        "SELECT ?g ?o WHERE { GRAPH ?g { GRAPH ex:g1 { ?g ex:p ?o } } }",
+        id="graph-in-graph-names-g",
+    ),
+    pytest.param(
+        """SELECT ?g ?s ?x WHERE { GRAPH ?g {
+            GRAPH ex:g1 { ?s ex:p ?o } OPTIONAL { ?s ex:q ?x } } }""",
+        id="graph-in-graph-optional",
+    ),
+    pytest.param(
+        """SELECT ?g ?s WHERE { GRAPH ?g {
+            GRAPH ex:g1 { ?s ex:p ?o } MINUS { ?s ex:q ?x } } }""",
+        id="graph-in-graph-minus",
+    ),
+    pytest.param(
+        "SELECT ?g ?s ?x WHERE { GRAPH ?g { ?s ex:q ?x GRAPH ex:g1 { ?s ex:p ?o } } }",
+        id="graph-in-graph-joined",
+    ),
+    pytest.param(
+        """SELECT ?g ?s ?x WHERE { GRAPH ?g { ?z ex:p ?w {
+            GRAPH ex:g1 { ?s ex:p ?o } OPTIONAL { ?s ex:q ?x } } } }""",
+        id="graph-in-graph-optional-joined",
+    ),
+    pytest.param(
+        """SELECT ?g ?s WHERE { GRAPH ?g { ?z ex:p ?w {
+            GRAPH ex:g1 { ?s ex:p ?o } MINUS { ?s ex:q ?x } } } }""",
+        id="graph-in-graph-minus-joined",
+    ),
+    pytest.param(
+        "SELECT ?g ?h ?s WHERE { GRAPH ?g { GRAPH ?h { ?s ex:p ?o } } }", id="graph-var-in-graph"
+    ),
+    pytest.param(
+        "SELECT ?g ?s WHERE { GRAPH ?g { GRAPH ?g { ?s ex:p ?o } } }", id="graph-same-var-in-graph"
+    ),
+    pytest.param("SELECT ?g ?x WHERE { GRAPH ?g { VALUES ?x { ex:a } } }", id="graph-values"),
+    pytest.param("SELECT ?g WHERE { GRAPH ?g { VALUES ?g { ex:g1 ex:zz } } }", id="graph-values-g"),
+    pytest.param(
+        """SELECT ?g ?s WHERE { GRAPH ?g {
+            VALUES ?g { ex:g1 ex:zz } OPTIONAL { ?s ex:p ?o } } }""",
+        id="graph-values-g-optional",
+    ),
+    pytest.param(
+        "SELECT ?g ?s WHERE { GRAPH ?g { VALUES ?s { ex:s1 ex:s2 } ?s ex:p ?o } }",
+        id="graph-values-joined",
+    ),
+    pytest.param("SELECT ?g WHERE { GRAPH ?g { } }", id="graph-empty"),
+    pytest.param("SELECT ?g WHERE { GRAPH ?g { } FILTER(bound(?g)) }", id="graph-empty-bound"),
+    pytest.param("SELECT DISTINCT ?g WHERE { GRAPH ?g { } }", id="graph-empty-distinct"),
+    pytest.param("SELECT (COUNT(*) AS ?n) WHERE { GRAPH ?g { } }", id="graph-empty-count"),
+    pytest.param("ASK { GRAPH ?g { } }", id="graph-empty-ask"),
+    pytest.param(
+        "SELECT ?g ?s WHERE { GRAPH ?g { OPTIONAL { ?s ex:in ?x } } }", id="graph-empty-optional"
+    ),
+    # A MINUS rdflib solves once per row of a lazy join, an OPTIONAL or a
+    # VALUES table to its left: its right side reads the row's bindings, and
+    # its two sides always share them.
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o { ?s ex:q ?x MINUS { ?x ex:r ?o } } }",
+        id="nested-minus-outer-var",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o { ?s ex:q ?x MINUS { ?a ex:r ?b } } }",
+        id="nested-minus-disjoint",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o OPTIONAL { ?s ex:q ?x MINUS { ?x ex:r ?o } } }",
+        id="optional-minus-outer-var",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o OPTIONAL { ?s ex:q ?x MINUS { ?a ex:r ?b } } }",
+        id="optional-minus-disjoint",
+    ),
+    pytest.param(
+        'SELECT * WHERE { VALUES ?o { "y1" } { ?x ex:r ?y MINUS { ?x ex:r ?o } } }',
+        id="values-minus-outer-var",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o { ?s ex:q ?x MINUS { ?s ex:r ?y } } }",
+        id="nested-minus-shared-outer-var",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o { ?s ex:q ?x MINUS { ?x ex:r ?y } } }", id="nested-minus"
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o OPTIONAL { ?s ex:q ?x MINUS { ?x ex:r ?y } } }",
+        id="optional-minus",
+    ),
+    pytest.param("SELECT * WHERE { ?s ex:p ?o MINUS { ?a ex:q ?x } }", id="minus-disjoint"),
+    # FILTER (NOT) EXISTS: rdflib solves the body once per row, with the row's
+    # bindings; a key the body's solutions may leave unbound is the row's.
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o FILTER EXISTS { ?s ex:q ?x MINUS { ?x ex:r ?o } } }",
+        id="exists-minus-outer-var",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o FILTER NOT EXISTS { ?s ex:q ?x MINUS { ?x ex:r ?o } } }",
+        id="not-exists-minus-outer-var",
+    ),
+    pytest.param(
+        """SELECT * WHERE { ?s ex:p ?o
+            FILTER EXISTS { ?s ex:q ?x { ?x ex:r ?y MINUS { ?y ex:p ?o } } } }""",
+        id="exists-nested-minus-outer-var",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o FILTER EXISTS { ?s ex:q ?x MINUS { ?a ex:r ?b } } }",
+        id="exists-minus-disjoint",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:in ?h FILTER EXISTS { GRAPH ?h { GRAPH ex:g1 { ?s ex:p ?o } } } }",
+        id="exists-graph-in-graph",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:in ?h FILTER EXISTS { GRAPH ?h { } } }", id="exists-graph-empty"
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o FILTER EXISTS { ?s ex:q ?x VALUES ?o { UNDEF } } }",
+        id="exists-values-undef",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o FILTER EXISTS { VALUES (?s ?o) { (ex:s1 UNDEF) } } }",
+        id="exists-values-undef-pair",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o FILTER EXISTS { ?s ex:q ?x MINUS { ?s ex:r ?y } } }",
+        id="exists-minus-shared-outer-var",
+    ),
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o FILTER NOT EXISTS { ?s ex:q ?x MINUS { ?x ex:r ?y } } }",
+        id="not-exists-minus",
+    ),
+]
+
 
 @pytest.fixture(scope="module")
 def quad_files(tmp_path_factory):
@@ -369,3 +617,90 @@ def test_a_filter_on_a_variable_the_graph_group_binds_stays_native(
         ]
         assert rows == both_ways(dataset, query)[1]
         assert len(rows) == 2
+
+
+@pytest.mark.parametrize("sparql", GROUP_SHAPES)
+def test_graph_minus_and_exists_answer_as_rdflib_does(dataset, route, sparql):
+    with_pushdown, without_pushdown = both_ways(dataset, PREFIX + sparql)
+    assert with_pushdown == without_pushdown
+
+
+_BY_ID = {param.id: param for param in SHAPES + GROUP_SHAPES}
+
+# Shapes the pushdown answers whole, with no block node handed to rdflib.
+NATIVE = [
+    _BY_ID[shape]
+    for shape in (
+        "graph-strstarts",
+        "graph-eq",
+        "graph-isiri",
+        "graph-bound",
+        "graph-not-bound",
+        "graph-tuple",
+        "graph-or",
+        "graph-and",
+        "graph-one-pattern",
+        "graph-ask-eq",
+        "graph-ask-not-bound",
+        "graph-count-eq",
+        "graph-count-not-bound",
+        "graph-limit",
+        "graph-nested-eq",
+        "graph-nested-outer-pattern-binds",
+        "graph-optional-eq",
+        "graph-optional-bound",
+        "graph-optional-not-bound",
+        "graph-optional-tuple",
+        "graph-optional-two-patterns",
+        "graph-minus-eq",
+        "graph-minus-bound",
+        "graph-joined-eq",
+        "graph-values-eq",
+        "minus-var-bound",
+        "minus-var-isiri",
+        "minus-var-tuple",
+        "minus-var-or",
+        "minus-var-ask",
+        "nested-minus-var",
+        "graph-minus-var",
+        "optional-minus-var",
+        "graph-optional-condition-minus-var",
+        "optional-over-minus-isiri",
+        "optional-over-minus-bound",
+        "graph-minus-disjoint",
+        "graph-minus-disjoint-left-names-g",
+        "graph-minus-disjoint-right-names-g",
+        "graph-minus-both-name-g",
+        "graph-minus-shared",
+        "graph-optional-both-name-g",
+        "graph-in-graph-joined",
+        "graph-same-var-in-graph",
+        "graph-values-joined",
+        "nested-minus-shared-outer-var",
+        "nested-minus",
+        "optional-minus",
+        "minus-disjoint",
+        "exists-minus-shared-outer-var",
+        "not-exists-minus",
+    )
+]
+
+_BLOCK_NODES = frozenset({"BGP", "Filter", "Join", "LeftJoin", "Minus", "ToMultiSet", "Graph"})
+
+
+@pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
+@pytest.mark.parametrize("sparql", NATIVE)
+def test_the_pushdown_answers_these_shapes_whole(
+    quad_files, monkeypatch, capsys, in_memory, sparql
+):
+    dataset = Dataset(
+        store=VortexRdflibStore(str(quad_files["copy"]), in_memory=in_memory), default_union=True
+    )
+    register_sparql_pushdown()
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    run(dataset, PREFIX + sparql)
+    events = _trace(capsys)
+    assert {e["algebra_node"] for e in events if e["event"] == "eval_part_fallback"}.isdisjoint(
+        _BLOCK_NODES
+    )
