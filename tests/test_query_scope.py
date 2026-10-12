@@ -5,14 +5,17 @@ lazy iteration of its results and is dropped with them; the store itself
 keeps fixed-size structure only."""
 
 import gc
+import itertools
 import weakref
 
 import pytest
+import rdflib.plugins.sparql.evaluate as rdflib_evaluate
 from rdflib import Graph, URIRef
+from rdflib.plugins.sparql import CUSTOM_EVALS
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_pushdown import _counting_term_dict, both_ways, is_graph_name_check, run
+from test_pushdown import _counting_term_dict, _row_key, both_ways, is_graph_name_check, run
 from vortex_rdflib import VortexRdflibStore, query_scope, register_sparql_pushdown
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
@@ -192,3 +195,218 @@ def test_graph_names_the_file_lacks_leave_no_state(tmp_path):
         view = Graph(store=store, identifier=URIRef(f"http://ex.org/absent{i}"))
         assert list(view.triples((None, None, None))) == []
     assert _footprint(store) == before
+
+
+def test_later_custom_evaluators_are_offered_the_query_node(tmp_path):
+    """The hook opens the query's scope at the query node and hands the node
+    back to rdflib's evalPart, where it declines it: a CUSTOM_EVALS entry
+    registered after the hook is offered SelectQuery and ConstructQuery once
+    each, inside the scope."""
+    graph = Graph(store=_store(tmp_path))
+    register_sparql_pushdown()
+    offered = []
+
+    def record(ctx, part):
+        offered.append((part.name, query_scope.current() is not None))
+        raise NotImplementedError
+
+    CUSTOM_EVALS["test_query_scope_recorder"] = record
+    try:
+        order = list(CUSTOM_EVALS)
+        assert order.index(pd._EVAL_KEY) < order.index("test_query_scope_recorder")
+        assert len(run(graph, "SELECT ?s WHERE { ?s <http://ex.org/knows> ?o }")) == 50
+        built = graph.query(
+            "CONSTRUCT { ?o <http://ex.org/known> ?s } WHERE { ?s <http://ex.org/knows> ?o }"
+        )
+        assert len(built.graph) == 50
+    finally:
+        CUSTOM_EVALS.pop("test_query_scope_recorder", None)
+    names = [name for name, _ in offered]
+    assert names.count("SelectQuery") == 1 and names.count("ConstructQuery") == 1
+    assert all(scoped for _, scoped in offered)
+
+
+@pytest.fixture
+def tracked(monkeypatch) -> list:
+    """Weak references to every query scope and term state the test opens."""
+    refs = []
+
+    class _Scope(query_scope.QueryScope):
+        __slots__ = ()
+
+        def __init__(self):
+            super().__init__()
+            refs.append(weakref.ref(self))
+
+    class _Terms(query_scope.QueryTerms):
+        __slots__ = ("__weakref__",)
+
+        def __init__(self):
+            super().__init__()
+            refs.append(weakref.ref(self))
+
+    monkeypatch.setattr(query_scope, "QueryScope", _Scope)
+    monkeypatch.setattr(query_scope, "QueryTerms", _Terms)
+    return refs
+
+
+def _assert_released(store, before: dict, tracked: list) -> None:
+    """No scope is current, every scope and term state the test opened is
+    gone, and the store holds what it held before the case: its
+    store-lifetime structure."""
+    gc.collect()
+    assert query_scope.current() is None
+    assert tracked and all(ref() is None for ref in tracked)
+    assert _footprint(store) == before
+
+
+class _FailingDecodes:
+    """The store's TermDict, but decode_many fails from its second call on:
+    a query's first chunk of rows decodes, the next one raises."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls = 0
+
+    def decode_many(self, codes):
+        self.calls += 1
+        if self.calls > 1:
+            raise RuntimeError("decode_many failed part-way")
+        return self._inner.decode_many(codes)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_a_query_failing_mid_iteration_releases_its_scope(tmp_path, tracked):
+    store = _store(tmp_path)
+    graph = Graph(store=store)
+    register_sparql_pushdown()
+    query = "SELECT ?s ?p ?o WHERE { ?s ?p ?o }"
+    assert len(run(graph, query)) == 150
+    before = _footprint(store)
+    store._dict = _FailingDecodes(store._dict)  # ty: ignore[invalid-assignment]
+    rows = []
+    with pytest.raises(RuntimeError, match="part-way"):
+        for row in graph.query(query):
+            rows.append(row)
+    assert len(rows) == pd._CHUNK_START
+    _assert_released(store, before, tracked)
+
+
+def test_rdflibs_own_limit_releases_the_scope(tmp_path, tracked, monkeypatch):
+    """A LIMIT the hook leaves to rdflib is an islice over the rows below it:
+    the scope goes when the islice ends, those rows left unread."""
+    store = _store(tmp_path)
+    graph = Graph(store=store)
+    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
+    register_sparql_pushdown()
+    sliced = []
+    original = rdflib_evaluate.evalSlice
+
+    def spy(ctx, part):
+        result = original(ctx, part)
+        sliced.append(type(result))
+        return result
+
+    monkeypatch.setattr(rdflib_evaluate, "evalSlice", spy)
+    query = "SELECT ?s WHERE { ?s <http://ex.org/knows> ?o } LIMIT 3"
+    assert len(run(graph, query)) == 3
+    before = _footprint(store)
+    assert len(run(graph, query)) == 3
+    assert sliced == [itertools.islice, itertools.islice]
+    _assert_released(store, before, tracked)
+
+
+@pytest.mark.parametrize(
+    ("query", "answer", "rdflib_asks"),
+    [
+        ("ASK { ?s <http://ex.org/knows> ?o }", True, 0),
+        (
+            """ASK { { ?s <http://ex.org/knows> <http://ex.org/nobody> }
+                UNION { ?s <http://ex.org/name> ?n } }""",
+            True,
+            1,
+        ),
+        ("CONSTRUCT { ?o <http://ex.org/known> ?s } WHERE { ?s <http://ex.org/knows> ?o }", 50, 0),
+    ],
+    ids=["ask-by-the-hook", "ask-by-rdflib", "construct"],
+)
+def test_ask_and_construct_release_their_scope(
+    tmp_path, tracked, monkeypatch, query, answer, rdflib_asks
+):
+    """An ASK, answered by the hook's count or by rdflib's evaluator (which
+    stops at the first row and drops the rest), and a CONSTRUCT are answered
+    before the query returns; the scope goes with the answer."""
+    store = _store(tmp_path)
+    graph = Graph(store=store)
+    register_sparql_pushdown()
+    asks = []
+    original = rdflib_evaluate.evalAskQuery
+
+    def counting(ctx, part):
+        asks.append(part.name)
+        return original(ctx, part)
+
+    monkeypatch.setattr(rdflib_evaluate, "evalAskQuery", counting)
+
+    def answered():
+        result = graph.query(query)
+        return result.askAnswer if result.type == "ASK" else len(result.graph)
+
+    assert answered() == answer
+    before = _footprint(store)
+    assert answered() == answer
+    assert len(asks) == 2 * rdflib_asks
+    _assert_released(store, before, tracked)
+
+
+#: A VALUES table crossed with a pattern it shares no variable with: every
+#: row of the table, the IRIs the dictionary lacks included, is an answer.
+_INTERLEAVED = [
+    """SELECT ?x ?o WHERE {
+        VALUES ?x { <http://ex.org/a1> <http://ex.org/a2> <http://ex.org/s1> }
+        <http://ex.org/s0> <http://ex.org/knows> ?o }""",
+    """SELECT ?x ?o WHERE {
+        VALUES ?x { <http://ex.org/b1> <http://ex.org/b2> <http://ex.org/s2> }
+        <http://ex.org/s5> <http://ex.org/knows> ?o }""",
+]
+
+
+def test_interleaved_queries_keep_their_own_foreign_codes(tmp_path, tracked, monkeypatch):
+    """Two queries read in turns, a row at a time, whose constants outside
+    the dictionary get the same negative codes: both are planned before
+    either is read, and each answers as it does alone."""
+    store = _store(tmp_path)
+    graph = Graph(store=store)
+    register_sparql_pushdown()
+    alone = [run(graph, query) for query in _INTERLEAVED]
+    assert [sorted(str(row[0]) for row in answer) for answer in alone] == [
+        ["http://ex.org/a1", "http://ex.org/a2", "http://ex.org/s1"],
+        ["http://ex.org/b1", "http://ex.org/b2", "http://ex.org/s2"],
+    ]
+    before = _footprint(store)
+    given = []
+    original = store._foreign_code
+
+    def spy(term):
+        code = original(term)
+        given.append((code, term))
+        return code
+
+    monkeypatch.setattr(store, "_foreign_code", spy)
+    results = [iter(graph.query(query)) for query in _INTERLEAVED]
+    rows: list[list] = [[] for _ in results]
+    pending = list(range(len(results)))
+    while pending:
+        for i in list(pending):
+            row = next(results[i], None)
+            if row is None:
+                pending.remove(i)
+            else:
+                rows[i].append(tuple(row))
+    del results
+    assert [sorted(answer, key=_row_key) for answer in rows] == alone
+    # a1 and b1 share one negative code, a2 and b2 another.
+    assert len({term for _, term in given}) == 4 and len({code for code, _ in given}) == 2
+    _assert_released(store, before, tracked)

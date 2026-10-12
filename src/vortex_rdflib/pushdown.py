@@ -117,12 +117,7 @@ from operator import itemgetter
 from typing import Any
 
 from rdflib.plugins.sparql import CUSTOM_EVALS
-from rdflib.plugins.sparql.evaluate import (
-    evalAskQuery,
-    evalConstructQuery,
-    evalDescribeQuery,
-    evalSelectQuery,
-)
+from rdflib.plugins.sparql.evaluate import evalPart
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
@@ -459,26 +454,18 @@ def _eval_part(ctx, part):
     return result
 
 
-#: rdflib's evaluators of the query nodes it offers to the hook first: the
-#: hook opens the query's scope there and hands the node back to them.
-_QUERY_EVALUATORS = {
-    "SelectQuery": evalSelectQuery,
-    "AskQuery": evalAskQuery,
-    "ConstructQuery": evalConstructQuery,
-    "DescribeQuery": evalDescribeQuery,
-}
-
-
 def _eval_scoped(ctx, part):
     """Evaluate ``part`` in a query scope of its own (:mod:`.query_scope`).
 
     That is the top of a query — rdflib offers the query node first — or a
-    node reached outside any query (a SPARQL Update's WHERE clause). The query
-    node goes to the hook's own handler when it has one (``AskQuery``) and to
-    rdflib's evaluator otherwise, inside the scope, so every node below runs
-    in it; a lazy result keeps it current around each step and clears it at
-    the end (:func:`_scoped_iterator`). A graph whose store is not a
-    VortexRdflibStore is left alone.
+    node reached outside any query (a SPARQL Update's WHERE clause). Inside
+    the scope the node goes back to rdflib's ``evalPart``, which offers it to
+    every ``CUSTOM_EVALS`` entry again — with a scope current, this hook
+    answers it only through a handler for it (``AskQuery`` has one,
+    ``SelectQuery`` none) — and evaluates it itself when no entry answers,
+    so every node below runs in the scope; a lazy result keeps it current
+    around each step and clears it at the end (:func:`_scoped_iterator`). A
+    graph whose store is not a VortexRdflibStore is left alone.
     """
     from .store import VortexRdflibStore
 
@@ -488,13 +475,7 @@ def _eval_scoped(ctx, part):
     opened = query_scope.QueryScope()
     token = query_scope.enter(opened)
     try:
-        try:
-            result = _eval_part(ctx, part)
-        except NotImplementedError:
-            evaluate = _QUERY_EVALUATORS.get(part.name)
-            if evaluate is None:
-                raise
-            result = evaluate(ctx, part)
+        result = evalPart(ctx, part)
     finally:
         query_scope.leave(token)
     if hasattr(result, "__next__"):
