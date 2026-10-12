@@ -713,6 +713,13 @@ def graph(dict_vortex, request):
     return Graph(store=VortexRdflibStore(str(dict_vortex), in_memory=request.param))
 
 
+# One param, so the node ids keep their file- prefix.
+@pytest.fixture(params=["file"])
+def file_graph(dict_vortex):
+    """The fixture store, file-backed only: the other routes; the default route runs both modes."""
+    return Graph(store=VortexRdflibStore(str(dict_vortex), in_memory=False))
+
+
 @pytest.fixture(scope="module")
 def dict_vortex_quads(tmp_path_factory):
     d = tmp_path_factory.mktemp("pushdown-quads")
@@ -730,6 +737,15 @@ def dataset(dict_vortex_quads, request):
     the same questions with the graph column in play."""
     return Dataset(
         store=VortexRdflibStore(str(dict_vortex_quads), in_memory=request.param), default_union=True
+    )
+
+
+# One param, so the node ids keep their file- prefix.
+@pytest.fixture(params=["file"])
+def file_dataset(dict_vortex_quads):
+    """The quad store, file-backed only: the other routes; the default route runs both modes."""
+    return Dataset(
+        store=VortexRdflibStore(str(dict_vortex_quads), in_memory=False), default_union=True
     )
 
 
@@ -810,11 +826,11 @@ def test_pushdown_equals_default_evaluator(graph, sparql):
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
-def test_pushdown_equals_default_evaluator_over_quads(dataset, sparql):
+def test_pushdown_equals_default_evaluator_over_quads(file_dataset, sparql):
     """The same shapes over the union default graph of a quad store: the
     pushdown must scope every native match to the graph rdflib would have
     asked, duplicates across graphs included."""
-    with_pushdown, without_pushdown = both_ways(dataset, sparql)
+    with_pushdown, without_pushdown = both_ways(file_dataset, sparql)
     assert with_pushdown == without_pushdown
 
 
@@ -844,27 +860,27 @@ def test_graph_pattern_equals_default_evaluator(dataset, sparql):
 
 
 @pytest.mark.parametrize("sparql", GRAPH_QUERIES)
-def test_graph_pattern_probe_path_equals_default_evaluator(dataset, monkeypatch, sparql):
+def test_graph_pattern_probe_path_equals_default_evaluator(file_dataset, monkeypatch, sparql):
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    with_probe, without_pushdown = both_ways(dataset, sparql)
+    with_probe, without_pushdown = both_ways(file_dataset, sparql)
     assert with_probe == without_pushdown
 
 
 @pytest.mark.parametrize("sparql", GRAPH_QUERIES)
-def test_graph_pattern_bgp_only_equals_default_evaluator(dataset, monkeypatch, sparql):
+def test_graph_pattern_bgp_only_equals_default_evaluator(file_dataset, monkeypatch, sparql):
     """With only BGPs intercepted, rdflib evaluates the `Graph` node itself
     and walks the store's graphs — so each block is pushed down under a
     *constant* scope instead of binding the graph from the column. Both
     routes must answer identically."""
     monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
-    bgp_only, without_pushdown = both_ways(dataset, sparql)
+    bgp_only, without_pushdown = both_ways(file_dataset, sparql)
     assert bgp_only == without_pushdown
 
 
 @pytest.mark.parametrize("sparql", GRAPH_QUERIES)
-def test_graph_pattern_generic_filter_equals_default_evaluator(dataset, monkeypatch, sparql):
+def test_graph_pattern_generic_filter_equals_default_evaluator(file_dataset, monkeypatch, sparql):
     monkeypatch.setattr(filters, "_FAST_ENABLED", False)
-    generic, without_pushdown = both_ways(dataset, sparql)
+    generic, without_pushdown = both_ways(file_dataset, sparql)
     assert generic == without_pushdown
 
 
@@ -945,35 +961,35 @@ def test_order_by_sequence_equals_default_evaluator(graph, sparql):
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
-def test_probe_join_path_equals_default_evaluator(graph, monkeypatch, sparql):
+def test_probe_join_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
     """Same A/B matrix with the probe threshold forced to zero, so every
     shared-variable join takes the per-binding probe path instead of the
     hash join — both strategies must be observationally identical."""
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    with_probe, without_pushdown = both_ways(graph, sparql)
+    with_probe, without_pushdown = both_ways(file_graph, sparql)
     assert with_probe == without_pushdown
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
-def test_bgp_only_mode_equals_default_evaluator(graph, monkeypatch, sparql):
+def test_bgp_only_mode_equals_default_evaluator(file_graph, monkeypatch, sparql):
     """``VORTEX_RDF_PUSHDOWN_OPS=bgp``: only basic graph patterns are solved
     here, every head is rdflib's own operator over the rows we hand back."""
     monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
-    bgp_only, without_pushdown = both_ways(graph, sparql)
+    bgp_only, without_pushdown = both_ways(file_graph, sparql)
     assert bgp_only == without_pushdown
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
-def test_python_filter_routes_equal_default_evaluator(graph, monkeypatch, sparql):
+def test_python_filter_routes_equal_default_evaluator(file_graph, monkeypatch, sparql):
     """With the native term predicates off, every conjunct the native layer
     would decide runs on the Python fast route instead."""
     monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
-    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    with_pushdown, without_pushdown = both_ways(file_graph, sparql)
     assert with_pushdown == without_pushdown
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
-def test_batched_probe_path_equals_default_evaluator(graph, monkeypatch, sparql):
+def test_batched_probe_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
     """Every probe through the native batch calls, in batches of three —
     a lone probe included."""
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
@@ -981,7 +997,7 @@ def test_batched_probe_path_equals_default_evaluator(graph, monkeypatch, sparql)
     monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
     monkeypatch.setattr(pd, "_SCAN_BATCH_MIN", 1)
     monkeypatch.setattr(pd, "_MEMORY_SCAN_BATCH_MIN", 1)
-    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    with_pushdown, without_pushdown = both_ways(file_graph, sparql)
     assert with_pushdown == without_pushdown
 
 
@@ -995,11 +1011,11 @@ def test_grouped_counts_over_pairs_equal_default_evaluator(dataset, monkeypatch,
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
-def test_generic_filter_route_equals_default_evaluator(graph, monkeypatch, sparql):
+def test_generic_filter_route_equals_default_evaluator(file_graph, monkeypatch, sparql):
     """``VORTEX_RDF_FILTER_FAST=0``: every FILTER value goes through rdflib's
     own expression evaluator, once per distinct value."""
     monkeypatch.setattr(filters, "_FAST_ENABLED", False)
-    generic, without_pushdown = both_ways(graph, sparql)
+    generic, without_pushdown = both_ways(file_graph, sparql)
     assert generic == without_pushdown
 
 
