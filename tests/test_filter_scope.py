@@ -1082,14 +1082,28 @@ def union():
     return True
 
 
+def _open(quad_files, layout, in_memory, union):
+    store = VortexRdflibStore(str(quad_files[layout]), in_memory=in_memory)
+    return Dataset(store=store, default_union=union)
+
+
+@pytest.fixture
+def dataset(quad_files, union):
+    """The quads file-backed, with the copy layout's index: each shape runs
+    once, on the default route, and one shape per family runs in every
+    storage configuration and route (``SMOKE``)."""
+    return _open(quad_files, "copy", False, union)
+
+
 @pytest.fixture(
     params=[("copy", True), ("copy", False), ("reference", True), ("reference", False)],
     ids=["copy-mem", "copy-file", "reference-mem", "reference-file"],
 )
-def dataset(quad_files, request, union):
+def any_dataset(quad_files, request, union):
+    """The quads in every storage configuration: either index layout, in
+    memory or file-backed."""
     layout, in_memory = request.param
-    store = VortexRdflibStore(str(quad_files[layout]), in_memory=in_memory)
-    return Dataset(store=store, default_union=union)
+    return _open(quad_files, layout, in_memory, union)
 
 
 @pytest.fixture(params=["default", "probe", "generic"])
@@ -1104,7 +1118,7 @@ def route(request, monkeypatch):
 
 
 @pytest.mark.parametrize("sparql", SHAPES)
-def test_a_filter_sees_only_its_own_groups_bindings(dataset, route, sparql):
+def test_a_filter_sees_only_its_own_groups_bindings(dataset, sparql):
     with_pushdown, without_pushdown = both_ways(dataset, PREFIX + sparql)
     assert with_pushdown == without_pushdown
 
@@ -1135,25 +1149,55 @@ def test_a_filter_on_a_variable_the_graph_group_binds_stays_native(
 
 
 @pytest.mark.parametrize("sparql", GROUP_SHAPES)
-def test_graph_minus_and_exists_answer_as_rdflib_does(dataset, route, sparql):
+def test_graph_minus_and_exists_answer_as_rdflib_does(dataset, sparql):
     with_pushdown, without_pushdown = both_ways(dataset, PREFIX + sparql)
     assert with_pushdown == without_pushdown
 
 
 @pytest.mark.parametrize("union", [True, False], ids=["union", "default-graph"])
 @pytest.mark.parametrize("sparql", REENTRY_SHAPES)
-def test_an_exists_re_entered_with_a_row_sees_only_its_filters_bindings(dataset, route, sparql):
+def test_an_exists_re_entered_with_a_row_sees_only_its_filters_bindings(dataset, sparql):
     with_pushdown, without_pushdown = both_ways(dataset, PREFIX + sparql)
     assert with_pushdown == without_pushdown
 
 
 @pytest.mark.parametrize("sparql", VALUES_SHAPES)
-def test_a_filter_on_a_values_variable_answers_as_rdflib_does(dataset, route, sparql):
+def test_a_filter_on_a_values_variable_answers_as_rdflib_does(dataset, sparql):
     with_pushdown, without_pushdown = both_ways(dataset, PREFIX + sparql)
     assert with_pushdown == without_pushdown
 
 
-_BY_ID = {param.id: param for param in SHAPES + GROUP_SHAPES + VALUES_SHAPES}
+_BY_ID = {param.id: param for param in SHAPES + GROUP_SHAPES + REENTRY_SHAPES + VALUES_SHAPES}
+
+# One shape per family: a FILTER under GRAPH ?g, under a constant GRAPH, in a
+# nested group, as an OPTIONAL's condition and in a group in an OPTIONAL; a
+# MINUS; an EXISTS semi-join and an EXISTS rdflib's evaluator decides; a
+# re-entered EXISTS, over both datasets; VALUES ahead of a pattern and in a
+# group a row re-enters.
+SMOKE = [
+    pytest.param(str(_BY_ID[shape].values[0]), union, id=shape + suffix)
+    for shape, union, suffix in (
+        ("graph-eq", True, ""),
+        ("named-graph-eq", True, ""),
+        ("nested-shared-eq", True, ""),
+        ("optional-condition-eq", True, ""),
+        ("optional-nested-eq", True, ""),
+        ("nested-minus", True, ""),
+        ("named-graph-exists", True, ""),
+        ("or-exists", True, ""),
+        ("reentry-exists-filter-coalesce", True, "-union"),
+        ("reentry-exists-filter-coalesce", False, "-default-graph"),
+        ("values-first-pattern-eq", True, ""),
+        ("row-values-coalesce-eq", True, ""),
+    )
+]
+
+
+@pytest.mark.parametrize(("sparql", "union"), SMOKE)
+def test_each_family_answers_as_rdflib_does_in_every_configuration(any_dataset, route, sparql):
+    with_pushdown, without_pushdown = both_ways(any_dataset, PREFIX + sparql)
+    assert with_pushdown == without_pushdown
+
 
 # Shapes the pushdown answers whole, with no block node handed to rdflib.
 NATIVE = [
