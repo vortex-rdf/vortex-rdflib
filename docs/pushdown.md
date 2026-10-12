@@ -611,10 +611,12 @@ SELECT ?s ?v WHERE { ?s <p> ?v } ORDER BY DESC(?v) LIMIT 10
 
 1. Each sort variable's distinct codes are ranked once
    ([`_rank_codes`](../src/vortex_rdflib/pushdown.py#L764)), in rdflib's order:
-   unbound first, then blank nodes, then IRIs, then literals. Blank nodes and
-   IRIs sort like their spellings, so their codes are already in order.
-   Literals are decoded and sorted with rdflib's own comparison; literals that
-   compare equal share a rank.
+   unbound first, then blank nodes, then IRIs, then literals. Blank nodes rank
+   by code: the spelling `_:label` sorts as the label. IRIs and literals are
+   decoded once per query, in one batch, and ranked by rdflib's comparison: an
+   IRI by its string, a literal by rdflib's own comparator. An IRI's spelling
+   `<iri>` does not sort as the IRI: the closing `>` puts `<…/a>` after
+   `<…/a/b>`. Terms that compare equal share a rank.
 2. A row's sort key is its tuple of ranks, negated for `DESC`. One stable sort
    gives the same order as rdflib.
 3. With a `LIMIT` and no `DISTINCT`, only the top k rows are kept

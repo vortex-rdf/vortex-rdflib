@@ -54,9 +54,10 @@ What runs in code space:
   the rows that are actually consumed are ever decoded — a ``LIMIT 10``
   decodes a few dozen codes, an ASK none, a ``DISTINCT ?p`` over the whole
   store only its distinct predicates (found by the native ``distinct``); an
-  ORDER BY ranks each distinct code once (blank nodes and IRIs by code
-  order, literals through rdflib's own comparator) and sorts the code rows,
-  a top-k when a LIMIT follows;
+  ORDER BY ranks each distinct code once (blank nodes by code, as the
+  spelling ``_:label`` sorts as the label; IRIs and literals decoded once
+  per query and ranked by rdflib's comparison) and sorts the code rows, a
+  top-k when a LIMIT follows;
 - ``COUNT`` aggregates (``COUNT(*)``, ``COUNT(?v)``, ``COUNT(DISTINCT ?v)``,
   with or without ``GROUP BY`` variables) are computed over the code
   columns — a column at a time by the native ``value_counts`` and
@@ -896,11 +897,16 @@ def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
 
 def _rank_codes(store, foreign: dict, codes) -> dict:
     """Ranks reproducing rdflib's ORDER BY comparison (``_val``): unbound
-    first, then blank nodes, IRIs and literals. Blank nodes and IRIs order
-    as their spellings, so their codes already are their ranks; literals are
-    decoded and sorted with rdflib's own comparator, adjacent terms that
-    compare equal sharing a rank so the stable sort keeps their input
-    order."""
+    first, then blank nodes, IRIs and literals.
+
+    A blank node is spelled ``_:label``, which sorts as its label, so blank
+    nodes rank in code order. An IRI is spelled ``<iri>``, and the closing
+    ``>`` sorts it after the IRIs it is a prefix of whenever the next
+    character is below ``>`` (``<…/a>`` after ``<…/a/b>``), so IRIs are
+    decoded and sorted as their strings. Literals are decoded and sorted with
+    rdflib's own comparator. IRIs and literals are decoded in one batch
+    through the query's term cache; adjacent terms that compare equal share
+    a rank, so the stable sort keeps their input order."""
     started = time.perf_counter_ns() if _TRACE.get() is not None else 0
     codes = set(codes)
     cache_before = set(store._terms().decode) if _TRACE.get() is not None else set()
@@ -918,21 +924,17 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
         else:
             others.append(code)
     rank = 0
-    for code in sorted(blanks) + sorted(iris):
+    for code in sorted(blanks):
         ranks[code] = rank
         rank += 1
-    if others:
-        cached = store._prime_decode_cache([code for code in others if code >= 0])
-        terms = [(_val(cached[c] if c >= 0 else foreign[c]), c) for c in others]
-        terms.sort(key=lambda item: item[0])
-        previous = None
-        for key, code in terms:
-            if previous is not None and previous < key:
-                rank += 1
-            ranks[code] = rank
-            previous = key
+    local = iris + [code for code in others if code >= 0]
+    if iris or others:
+        cached = store._prime_decode_cache(local)
+        rank = _rank_keyed(ranks, [(str(cached[code]), code) for code in iris], rank)
+        keyed = [(_val(cached[code] if code >= 0 else foreign[code]), code) for code in others]
+        _rank_keyed(ranks, keyed, rank)
     if _TRACE.get() is not None:
-        nonnegative_others = {code for code in others if code >= 0}
+        decoded = set(local)
         _trace_event(
             "rank_codes_complete",
             input_codes=len(codes),
@@ -942,12 +944,26 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
             iri_codes=len(iris),
             other_codes=len(others),
             foreign_codes=sum(code < 0 for code in others),
-            decoded_codes=len(nonnegative_others),
-            decode_cache_hits=len(nonnegative_others & cache_before),
-            decode_cache_misses=len(nonnegative_others - cache_before),
+            decoded_codes=len(decoded),
+            decode_cache_hits=len(decoded & cache_before),
+            decode_cache_misses=len(decoded - cache_before),
             elapsed_ns=time.perf_counter_ns() - started,
         )
     return ranks
+
+
+def _rank_keyed(ranks: dict, keyed: list, rank: int) -> int:
+    """Rank the codes of ``keyed``, ``(key, code)`` pairs, in key order from
+    ``rank`` on, adjacent keys that compare equal sharing a rank; return the
+    first rank above them."""
+    keyed.sort(key=itemgetter(0))
+    previous = None
+    for key, code in keyed:
+        if previous is not None and previous < key:
+            rank += 1
+        ranks[code] = rank
+        previous = key
+    return rank + 1
 
 
 def _eval_distinct(ctx, store, rel: Relation, head: _Head):
