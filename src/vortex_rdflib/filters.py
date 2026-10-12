@@ -1355,8 +1355,10 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
                     unknown.append(code)
         if unknown:
             var = conjunct.vars[0]
+            # One decode_many; the loop reads the terms it returns.
+            terms = store._prime_decode_cache(unknown)
             for code in unknown:
-                if conjunct.generic({var: store._decode_term(code)}):
+                if conjunct.generic({var: terms[code]}):
                     passed.add(code)
         remaining = passed
     return remaining

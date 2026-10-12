@@ -467,3 +467,30 @@ def test_in_the_empty_list_is_false_even_for_rdf_nil(tmp_path, monkeypatch):
         for query, expected in cases:
             with_pushdown, without_pushdown = both_ways(graph, query)
             assert with_pushdown == without_pushdown == expected, (native, query)
+
+
+def test_values_only_rdflib_answers_are_decoded_in_one_batch(tmp_path, monkeypatch):
+    """A conjunct rdflib's evaluator answers decodes the values it reads in
+    one decode_many, not one decode per value."""
+    graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=True))
+    monkeypatch.setattr(filters, "_FAST_ENABLED", False)
+    register_sparql_pushdown()
+    inner = graph.store._dict  # ty: ignore[unresolved-attribute]
+    calls: list[str] = []
+
+    class _Calls:
+        def decode(self, code):
+            calls.append("decode")
+            return inner.decode(code)
+
+        def decode_many(self, codes):
+            calls.append("decode_many")
+            return inner.decode_many(codes)
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+    graph.store._dict = _Calls()  # ty: ignore[unresolved-attribute]
+    query = "SELECT ?s WHERE { ?s <http://ex.org/label> ?l FILTER(strlen(?l) > 10) }"
+    assert len(run(graph, query)) == sum(1 for i in range(200) if len(f"product {i}") > 10)
+    assert "decode" not in calls
