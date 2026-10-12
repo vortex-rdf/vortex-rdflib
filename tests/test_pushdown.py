@@ -1185,6 +1185,19 @@ def _counting_term_dict(graph) -> _CountingTermDict:
     return counting
 
 
+def is_graph_name_check(args) -> bool:
+    """Whether a native count is the store's own question whether a bare
+    Graph's blank-node label names a graph of the file
+    (`VortexRdflibStore._blank_graph_n3`, once per query): bookkeeping, not
+    what a query plan costs."""
+    return (
+        len(args) == 4
+        and args[:3] == (None, None, None)
+        and isinstance(args[3], str)
+        and args[3].startswith("_:")
+    )
+
+
 @pytest.mark.parametrize(
     "extra_pattern", ["", "?s <http://ex.org/r> ?c ."], ids=["two-patterns", "three-patterns"]
 )
@@ -1554,9 +1567,10 @@ def test_limit_decodes_only_the_first_chunk(tmp_path):
     store = VortexRdflibStore(str(out), in_memory=True)
     graph = Graph(store=store)
     register_sparql_pushdown()
+    counting = _counting_term_dict(graph)
     rows = run(graph, "SELECT * WHERE { ?s ?p ?o } LIMIT 10")
     assert len(rows) == 10
-    assert len(store._decode_cache) <= 3 * pd._CHUNK_START
+    assert counting.decoded <= 3 * pd._CHUNK_START
 
 
 class _CountingNative:
@@ -1570,7 +1584,8 @@ class _CountingNative:
         self.batches = 0
 
     def count_quads(self, *args, **kwargs):
-        self.counts += 1
+        if not is_graph_name_check(args):
+            self.counts += 1
         return self._inner.count_quads(*args, **kwargs)
 
     def match_codes(self, *args, **kwargs):
@@ -1592,14 +1607,8 @@ class _CountingNative:
 
 
 def _counting_native(graph) -> _CountingNative:
-    """Install the counter, with the store's own bookkeeping already done.
-
-    Resolving the graph's identifier costs one `count_quads` (a bare `Graph`
-    is blank-node labelled, and only the store can say whether that names a
-    graph of the file) — once per store, cached. Warming it here keeps the
-    assertions below about what a *query* costs.
-    """
-    graph.store._graph_n3(graph)
+    """Install the counter. The store's own graph-name check is not counted
+    (`is_graph_name_check`): it is not what a query plan costs."""
     native = _CountingNative(graph.store._store())
     graph.store._native = native
     return native
@@ -1824,20 +1833,21 @@ _ALIAS_QUERIES = [
 
 
 @pytest.mark.parametrize("order", [1, -1], ids=["forward", "reverse"])
-def test_term_aliases_are_classified_once_per_store(graph, order):
+def test_term_aliases_are_classified_within_each_query(graph, order):
     """Which codes alias ("042" and "42" are one integer, and so is a query's
-    "0042" the dictionary lacks) is the store's to remember: whatever query
-    classifies a code first, every later one — on the same store, in either
-    order — answers as rdflib does, and the classification is not redone."""
-    store = graph.store
+    "0042" the dictionary lacks) is classified per query: whatever query runs
+    first, each answers as rdflib does, and a query run again decodes exactly
+    what it did the first time — nothing carried over from earlier queries."""
     for sparql in _ALIAS_QUERIES[::order]:
         with_pushdown, without_pushdown = both_ways(graph, sparql)
         assert with_pushdown == without_pushdown, sparql
-    assert store._alias_reps, "the fixture's two spellings of 42 alias"
-    classified = len(store._alias_classified)
-    for sparql in _ALIAS_QUERIES:
-        run(graph, sparql)
-    assert len(store._alias_classified) == classified
+    counting = _counting_term_dict(graph)
+    decoded = []
+    for _ in range(2):
+        before = counting.decoded
+        run(graph, _ALIAS_QUERIES[0])
+        decoded.append(counting.decoded - before)
+    assert decoded[0] == decoded[1] > 0
 
 
 def test_count_over_one_pattern_counts_instead_of_matching(graph):
@@ -1865,9 +1875,10 @@ def test_distinct_decodes_only_the_survivors(tmp_path):
     store = VortexRdflibStore(str(out), in_memory=True)
     graph = Graph(store=store)
     register_sparql_pushdown()
+    counting = _counting_term_dict(graph)
     rows = run(graph, "SELECT DISTINCT ?p WHERE { ?s ?p ?o }")
     assert len(rows) == 7
-    assert len(store._decode_cache) == 7
+    assert counting.decoded == 7
 
 
 def test_left_join_probe_and_hash_paths_are_ours(graph, monkeypatch):

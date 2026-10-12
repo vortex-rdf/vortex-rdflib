@@ -10,7 +10,7 @@ from rdflib import Graph, Literal, URIRef
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_pushdown import both_ways, run
+from test_pushdown import both_ways, is_graph_name_check, run
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
@@ -65,8 +65,9 @@ class _Spy:
             return attribute
 
         def call(*args, **kwargs):
-            self.calls.append((name, kwargs))
-            self.args.append(args)
+            if not (name == "count_quads" and is_graph_name_check(args)):
+                self.calls.append((name, kwargs))
+                self.args.append(args)
             return attribute(*args, **kwargs)
 
         return call
@@ -76,7 +77,6 @@ class _Spy:
 
 
 def _spy(graph) -> _Spy:
-    graph.store._graph_n3(graph)  # the store's own bookkeeping, once
     spy = _Spy(graph.store._store())
     graph.store._native = spy
     return spy

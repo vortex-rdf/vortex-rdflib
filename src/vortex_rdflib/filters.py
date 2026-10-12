@@ -1365,13 +1365,13 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
 def _fast_route(store, fast, views: dict) -> Callable[[tuple], Any]:
     """``fast`` over a code tuple: each code parsed into a view once, through
     ``views``, a dictionary code decoded and a negative (query-constant) one
-    taken from the store's foreign terms; an unbound ``None`` stays unbound."""
+    taken from the query's foreign terms; an unbound ``None`` stays unbound."""
 
     def view_of(code):
         view = views.get(code)
         if view is None:
             if code < 0:
-                view = views[code] = view_of_node(store._foreign[code])
+                view = views[code] = view_of_node(store._terms().foreign[code])
             else:
                 spelling = store._dict.decode(code)
                 if spelling is None:

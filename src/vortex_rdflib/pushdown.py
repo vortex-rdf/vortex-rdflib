@@ -64,8 +64,9 @@ What runs in code space:
   and a ``COUNT(*)`` over one pattern (under a FILTER the native match
   decides, too) is answered by ``count_quads`` without matching a row;
 - solutions are decoded lazily in growing chunks, each distinct code once
-  through the store's decode cache, and built directly as
-  ``FrozenBindings``, the row shape every rdflib operator above expects.
+  per query through the query's term cache (:mod:`.query_scope`), and built
+  directly as ``FrozenBindings``, the row shape every rdflib operator above
+  expects.
 
 Named graphs: a ``Graph`` node sets the scope of the block below it rather
 than matching anything itself. A bound name restricts every pattern to that
@@ -116,12 +117,18 @@ from operator import itemgetter
 from typing import Any
 
 from rdflib.plugins.sparql import CUSTOM_EVALS
+from rdflib.plugins.sparql.evaluate import (
+    evalAskQuery,
+    evalConstructQuery,
+    evalDescribeQuery,
+    evalSelectQuery,
+)
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
 
-from . import candidates, filters
+from . import candidates, filters, query_scope
 from .terms import canonical_spelling
 
 _EVAL_KEY = "vortex_rdflib_bgp"
@@ -400,6 +407,8 @@ def _parse_ops(spec: str) -> frozenset[str]:
 
 
 def _eval_part(ctx, part):
+    if query_scope.current() is None:
+        return _eval_scoped(ctx, part)
     handler = _HANDLER_NAMES.get(part.name)
     if handler is None or part.name not in _ENABLED_OPS:
         raise NotImplementedError
@@ -448,6 +457,78 @@ def _eval_part(ctx, part):
         else:
             _TRACE.reset(token)
     return result
+
+
+#: rdflib's evaluators of the query nodes it offers to the hook first: the
+#: hook opens the query's scope there and hands the node back to them.
+_QUERY_EVALUATORS = {
+    "SelectQuery": evalSelectQuery,
+    "AskQuery": evalAskQuery,
+    "ConstructQuery": evalConstructQuery,
+    "DescribeQuery": evalDescribeQuery,
+}
+
+
+def _eval_scoped(ctx, part):
+    """Evaluate ``part`` in a query scope of its own (:mod:`.query_scope`).
+
+    That is the top of a query — rdflib offers the query node first — or a
+    node reached outside any query (a SPARQL Update's WHERE clause). The query
+    node goes to the hook's own handler when it has one (``AskQuery``) and to
+    rdflib's evaluator otherwise, inside the scope, so every node below runs
+    in it; a lazy result keeps it current around each step and clears it at
+    the end (:func:`_scoped_iterator`). A graph whose store is not a
+    VortexRdflibStore is left alone.
+    """
+    from .store import VortexRdflibStore
+
+    store = getattr(getattr(ctx, "graph", None), "store", None)
+    if not isinstance(store, VortexRdflibStore):
+        raise NotImplementedError
+    opened = query_scope.QueryScope()
+    token = query_scope.enter(opened)
+    try:
+        try:
+            result = _eval_part(ctx, part)
+        except NotImplementedError:
+            evaluate = _QUERY_EVALUATORS.get(part.name)
+            if evaluate is None:
+                raise
+            result = evaluate(ctx, part)
+    finally:
+        query_scope.leave(token)
+    if hasattr(result, "__next__"):
+        return _scoped_iterator(result, opened)
+    bindings = result.get("bindings") if isinstance(result, dict) else None
+    if hasattr(bindings, "__next__"):
+        result = {**result, "bindings": _scoped_iterator(bindings, opened)}
+    else:
+        opened.clear()
+    return result
+
+
+def _scoped_iterator(iterator, opened):
+    """``iterator`` with the query's scope current around each step; the
+    scope is cleared when the iterator ends, fails or is closed."""
+    try:
+        while True:
+            token = query_scope.enter(opened)
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
+            finally:
+                query_scope.leave(token)
+            yield item
+    finally:
+        close = getattr(iterator, "close", None)
+        if close is not None:
+            token = query_scope.enter(opened)
+            try:
+                close()
+            finally:
+                query_scope.leave(token)
+        opened.clear()
 
 
 def _trace_generator(iterator, trace: _QueryTrace, token):
@@ -841,7 +922,7 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
     order."""
     started = time.perf_counter_ns() if _TRACE.get() is not None else 0
     codes = set(codes)
-    cache_before = set(store._decode_cache) if _TRACE.get() is not None else set()
+    cache_before = set(store._terms().decode) if _TRACE.get() is not None else set()
     ranks = {None: -1}
     literal_lo, iri_lo, blank_lo = store._term_kind_bounds()
     blanks, iris, others = [], [], []
@@ -860,8 +941,7 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
         ranks[code] = rank
         rank += 1
     if others:
-        store._prime_decode_cache([code for code in others if code >= 0])
-        cached = store._decode_cache
+        cached = store._prime_decode_cache([code for code in others if code >= 0])
         terms = [(_val(cached[c] if c >= 0 else foreign[c]), c) for c in others]
         terms.sort(key=lambda item: item[0])
         previous = None
@@ -949,15 +1029,16 @@ def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
 
     IRIs, blank nodes and untyped literals are one term per spelling, so
     only typed literals can alias, and whether one does is a property of the
-    store, not of the query: each literal code is classified once for the
-    store's lifetime — its spelling decoded, a typed literal's term
-    registered under the first code that carried it — and later queries only
-    look their codes up. A query constant outside the dictionary (a negative
-    code, stable for the store too) takes part through its own term. For
+    store, not of the query: each literal code is classified once per
+    query — its spelling decoded, a typed literal's term registered under
+    the first code that carried it — and later calls in the query only look
+    their codes up. A query constant outside the dictionary (a negative
+    code, stable for the query too) takes part through its own term. For
     most stores no code aliases another and ``aliases`` stays empty.
     """
     literal_lo, iri_lo, _ = store._term_kind_bounds()
-    classified = store._alias_classified
+    terms = store._terms()
+    classified = terms.alias_classified
     pending = [
         c
         for c in codes
@@ -967,7 +1048,7 @@ def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
         typed = []
         local = [c for c in pending if c >= 0]
         if local:
-            cache = store._decode_cache
+            cache = terms.decode
             for code, spelling in zip(local, store._dict.decode_many(local), strict=True):
                 if spelling is None:
                     raise ValueError(f"term code {code} is not in the store dictionary")
@@ -981,13 +1062,13 @@ def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
                 term = foreign[code]
                 if isinstance(term, Literal) and term.datatype is not None:
                     typed.append((code, term))
-        firsts, reps = store._alias_firsts, store._alias_reps
+        firsts, reps = terms.alias_firsts, terms.alias_reps
         for code, term in typed:
             representative = firsts.setdefault(term, code)
             if representative != code:
                 reps[code] = representative
         classified.update(pending)
-    reps = store._alias_reps
+    reps = terms.alias_reps
     if reps:
         for code in codes:
             representative = reps.get(code)
@@ -1143,10 +1224,9 @@ def _aggregate_rows(ctx, store, rel: Relation, group_vars, counts, samples, impl
             base.sets[j] |= group.sets[j]
 
     key_index = {v: i for i, v in enumerate(v for v in group_vars if v in col)}
-    store._prime_decode_cache(
+    cached = store._prime_decode_cache(
         [c for key, _ in merged.values() for c in key if c is not None and c >= 0]
     )
-    cached = store._decode_cache
 
     def solutions():
         for key, group in merged.values():
@@ -1409,7 +1489,7 @@ def _solve_values(ctx, store, node, var_preds=None) -> Relation:
         for row in rows_in
     ]
     nullable = frozenset(v for i, v in enumerate(schema) if any(row[i] is None for row in rows))
-    return Relation(schema, None, rows, len(rows), nullable, store._foreign)
+    return Relation(schema, None, rows, len(rows), nullable, store._terms().foreign)
 
 
 def _constant_codes(store, terms: list) -> list:
@@ -1493,7 +1573,7 @@ def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None) -> Relati
         views = pushed.views
         if rel.rows is not None:
             # Only the fast route reads parsed terms; a generic-only conjunct
-            # decodes through the store's own term cache.
+            # decodes through the query's term cache.
             columns = {
                 index
                 for conjunct, indexes in zip(residual, positions, strict=True)
@@ -3201,7 +3281,8 @@ def _probe_spellings(store, rows, bound) -> dict:
     constant outside the dictionary (which then matches nothing)."""
     distinct = {row[row_idx] for row in rows for row_idx, _ in bound}
     codes = [code for code in distinct if code >= 0]
-    n3_cache: dict[int, str] = {code: store._foreign[code].n3() for code in distinct if code < 0}
+    foreign = store._terms().foreign
+    n3_cache: dict[int, str] = {code: foreign[code].n3() for code in distinct if code < 0}
     for code, term in zip(codes, store._dict.decode_many(codes), strict=True):
         if term is None:
             raise ValueError(f"term code {code} is not in the store dictionary")
@@ -3297,7 +3378,7 @@ def _yield_solutions(ctx, store, rel: Relation, project=None, start=0, stop=None
     """Decode a relation's rows into rdflib solutions, lazily.
 
     Rows are decoded in growing chunks, one ``decode_many`` per chunk for the
-    codes the store's cache does not hold yet. Without ``project`` a row
+    codes the query's term cache does not hold yet. Without ``project`` a row
     carries every schema variable plus the context's own bindings (what
     rdflib's BGP rows contain); with it only the projected variables, the
     way ``Project`` would have narrowed them.
@@ -3334,7 +3415,6 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, sta
         idx = [schema.index(v) for v in keys]
         base = {v: outer[v] for v in project if v not in schema and v in outer}
     rows = islice(rows, start, stop)
-    cached = store._decode_cache
     size = _CHUNK_START
     traced = _TRACE.get() is not None
     started = time.perf_counter_ns() if traced else 0
@@ -3348,7 +3428,7 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, sta
             if traced:
                 chunks += 1
                 submitted += len(codes)
-            store._prime_decode_cache(codes)
+            cached = store._prime_decode_cache(codes)
             for row in chunk:
                 solution = dict(base)
                 for v, i in zip(keys, idx, strict=True):

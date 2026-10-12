@@ -4,6 +4,7 @@ from rdflib import Graph, URIRef
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
+from test_pushdown import is_graph_name_check
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
 
 PREFIX = "VORTEX_RDF_QUERY_TRACE "
@@ -33,10 +34,6 @@ def _events(captured):
 
 def test_probe_optional_counts_before_match_and_skips_complete_match(tmp_path, monkeypatch, capsys):
     graph = _graph(tmp_path)
-    # A bare Graph has a blank-node identifier. Resolve and cache its graph
-    # scope before counting query-planner calls. That lookup uses count_quads
-    # but is not part of OPTIONAL planning.
-    graph.store._graph_n3(graph)
     native = graph.store._store()
     matches = []
     counts = []
@@ -47,7 +44,8 @@ def test_probe_optional_counts_before_match_and_skips_complete_match(tmp_path, m
             return native.match_codes(*args, **kwargs)
 
         def count_quads(self, *args, **kwargs):
-            counts.append(args)
+            if not is_graph_name_check(args):
+                counts.append((args, kwargs))
             return native.count_quads(*args, **kwargs)
 
         def __getattr__(self, name):
@@ -83,7 +81,6 @@ def test_lazy_join_counts_before_match_and_probes(tmp_path, monkeypatch, capsys)
     """A nested group's lazy join takes the same count-first route as an
     OPTIONAL: the 300-row right pattern is counted, never matched whole."""
     graph = _graph(tmp_path)
-    graph.store._graph_n3(graph)
     native = graph.store._store()
     matches = []
     counts = []
@@ -94,7 +91,8 @@ def test_lazy_join_counts_before_match_and_probes(tmp_path, monkeypatch, capsys)
             return native.match_codes(*args, **kwargs)
 
         def count_quads(self, *args, **kwargs):
-            counts.append(args)
+            if not is_graph_name_check(args):
+                counts.append((args, kwargs))
             return native.count_quads(*args, **kwargs)
 
         def __getattr__(self, name):
