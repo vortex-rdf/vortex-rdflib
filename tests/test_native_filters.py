@@ -50,11 +50,28 @@ EXTRA_SPELLINGS = [
     "<http://ex.org/x/y>",
     "<urn:x>",
     "_:abc",
+    # string-function texts: trailing newlines, case pairs, case folding
+    # outside ASCII (ß, ſ, the Kelvin sign), a control character, and typed
+    # literals whose rdflib lexical form is not the stored one ("042" -> "42")
+    '"line\\n"',
+    '"ab\\n"',
+    '"Ab\\nc\\n"@en',
+    '"école"@fr',
+    '"ÉCOLE"',
+    '"straße"',
+    '"STRASSE"',
+    '"ſ"',
+    '"K"',
+    '"a\\u0001b"',
+    '"word in a sentence"',
+    '"ABC"@en-gb',
+    typed("042", "integer"),
+    typed("1.50", "decimal"),
 ]
 ALL_SPELLINGS = [s for s in SPELLINGS + EXTRA_SPELLINGS if s is not None]
 
 #: Expressions the mapping must take, each with the predicate it maps to.
-MAPPED = [
+MAPPED: list[tuple[str, tuple]] = [
     ("isIRI(?v)", ("is_iri", "")),
     ("isURI(?v)", ("is_iri", "")),
     ("isBlank(?v)", ("is_blank", "")),
@@ -97,6 +114,45 @@ for _constant, _spelled in [
     MAPPED.append((f"?v >= {_constant}", ("num_ge", _spelled)))
     MAPPED.append((f"{_constant} = ?v", ("num_eq", _spelled)))
 
+#: The string functions, each with the native shape it maps to:
+#: REGEX, CONTAINS, STRSTARTS and STRENDS over ?v or STR(?v), either under
+#: LCASE/UCASE. Only the flags rdflib maps (i, s, m) reach vortex-rdf.
+STRING_MAPPED = [
+    ('regex(?v, "^a")', NativeShape("regex", "^a")),
+    ('regex(?v, "b$")', NativeShape("regex", "b$")),
+    ('regex(?v, "c$", "m")', NativeShape("regex", "c$", "m")),
+    ('regex(?v, "a.b", "s")', NativeShape("regex", "a.b", "s")),
+    ('regex(?v, "^AB", "i")', NativeShape("regex", "^AB", "i")),
+    ('regex(?v, "s", "i")', NativeShape("regex", "s", "i")),
+    ('regex(?v, "ſ", "i")', NativeShape("regex", "ſ", "i")),
+    ('regex(?v, "\\\\w+ \\\\w+")', NativeShape("regex", "\\w+ \\w+")),
+    ('regex(?v, "^[a-c]{2}", "xq")', NativeShape("regex", "^[a-c]{2}")),
+    ('regex(?v, "^[^a-z]")', NativeShape("regex", "^[^a-z]")),
+    ('regex(str(?v), "^ab")', NativeShape("regex", "^ab", as_str=True)),
+    ('regex(str(?v), "^4")', NativeShape("regex", "^4", as_str=True)),
+    ('regex(lcase(?v), "^abc$")', NativeShape("regex", "^abc$", case="lower")),
+    (
+        'regex(ucase(str(?v)), "STRASSE")',
+        NativeShape("regex", "STRASSE", case="upper", as_str=True),
+    ),
+    ('contains(?v, "b")', NativeShape("contains", '"b"')),
+    ('contains(?v, "b"@en)', NativeShape("contains", '"b"@en')),
+    ('contains(?v, "x"^^xsd:string)', NativeShape("contains", '"x"')),
+    ('contains(str(?v), "+")', NativeShape("contains", '"+"', as_str=True)),
+    ('contains(lcase(?v), "école")', NativeShape("contains", '"école"', case="lower")),
+    ('strstarts(?v, "a")', NativeShape("strstarts", '"a"')),
+    ('strstarts(?v, "a"@en)', NativeShape("strstarts", '"a"@en')),
+    ('strstarts(ucase(?v), "AB")', NativeShape("strstarts", '"AB"', case="upper")),
+    (
+        'strstarts(lcase(str(?v)), "http")',
+        NativeShape("strstarts", '"http"', case="lower", as_str=True),
+    ),
+    ('strends(?v, "\\n")', NativeShape("strends", '"\\n"')),
+    ('strends(str(?v), ".0")', NativeShape("strends", '".0"', as_str=True)),
+    ('strends(lcase(str(?v)), "e")', NativeShape("strends", '"e"', case="lower", as_str=True)),
+]
+MAPPED += STRING_MAPPED
+
 #: Shapes the mapping must leave to the Python routes: the native layer
 #: would answer some of them differently from rdflib.
 UNMAPPED = [
@@ -108,8 +164,6 @@ UNMAPPED = [
     'langMatches(lang(?v), "")',
     # a language-tagged prefix makes strstarts an error for every value
     'strstarts(str(?v), "a"@en)',
-    # strstarts without str() is an error on IRIs, which str_prefix answers
-    'strstarts(?v, "a")',
     'lang(?v) = "en"@fr',
     # constants rdflib compares by its own rules
     '?v < "abc"^^xsd:integer',
@@ -120,6 +174,20 @@ UNMAPPED = [
     "datatype(?v) != xsd:integer",
     "?v + 1 > 3",
     "!isIRI(?v)",
+    # rdflib compares language tags as written and the dictionary stores
+    # them lower-cased: an upper-case tag stays with the Python routes
+    'contains(?v, "a"@EN)',
+    # STR() drops the tag, so a tagged constant is an error for every value
+    'contains(str(?v), "a"@en)',
+    # a pattern Python cannot compile: rdflib raises, so must the query
+    'regex(?v, "a{2,1}")',
+    # not a constant pattern, or flags that are not a string
+    "regex(?v, str(?v))",
+    'regex(?v, "a", 1)',
+    # texts outside the grammar
+    'strstarts(lcase(lcase(?v)), "a")',
+    'contains(str(lcase(?v)), "a")',
+    'contains(substr(?v, 1), "a")',
 ]
 
 
@@ -343,6 +411,7 @@ QUERY_CONJUNCTS = [m[0] for m in MAPPED] + [
     "datatype(?v) = xsd:integer && ?v < 5 && ?v > -5",
     'lang(?v) = "en" && langMatches(lang(?v), "en")',
     "?v < 5 && ?v > 1e100",
+    'regex(?v, "a{2,1}")',
 ]
 
 

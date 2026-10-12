@@ -567,6 +567,25 @@ QUERIES += [
         FILTER(?a < ?s) }""",
 ]
 
+#: The string shapes vortex-rdf evaluates over candidate codes:
+#: lowered and upper-cased texts, STR() over IRIs, blank nodes and typed
+#: literals, tagged constants (an upper-case tag never matches a stored one),
+#: and REGEX over texts with newlines.
+QUERIES += [
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(regex(lcase(?n), "^bo")) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(contains(ucase(str(?n)), "OB")) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(strstarts(?n, "B"@en-us)) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(contains(?n, "o"@EN)) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(strends(lcase(?n), "b")) }',
+    'SELECT ?x ?n WHERE { ?x <http://ex.org/note> ?n FILTER(regex(?n, "k$")) }',
+    'SELECT ?x ?n WHERE { ?x <http://ex.org/note> ?n FILTER(regex(?n, "^line$", "m")) }',
+    'SELECT ?x ?n WHERE { ?x <http://ex.org/note> ?n FILTER(regex(str(?n), "\\\\w+", "i")) }',
+    'SELECT ?x ?n WHERE { ?x <http://ex.org/note> ?n FILTER(contains(lcase(?n), "ün")) }',
+    'SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(strstarts(str(?a), "4")) }',
+    'SELECT ?s WHERE { ?s ?p ?o FILTER(regex(str(?s), "^b")) }',
+    'SELECT ?s ?o WHERE { ?s ?p ?o FILTER(strstarts(str(?o), "http://ex.org/c")) }',
+]
+
 #: Shapes that name a graph. rdflib evaluates the `Graph` node itself — a
 #: bound name scopes the block below, an unbound one fans out over the
 #: store's graphs — so what is under test here is that every pushed-down

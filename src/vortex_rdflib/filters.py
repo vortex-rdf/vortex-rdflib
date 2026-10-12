@@ -782,6 +782,83 @@ def _string_constant(term) -> bool:
     )
 
 
+#: The string functions with a native kind, by rdflib's builtin name.
+_STRING_FUNCTIONS = {
+    "Builtin_CONTAINS": "contains",
+    "Builtin_STRSTARTS": "strstarts",
+    "Builtin_STRENDS": "strends",
+}
+#: The case wrappers a native string kind takes as its ``case``.
+_CASE_WRAPPERS = {"Builtin_LCASE": "lower", "Builtin_UCASE": "upper"}
+
+
+def _string_literal(term) -> bool:
+    """rdflib's ``string()``: a plain, ``xsd:string`` or language-tagged
+    literal."""
+    return isinstance(term, Literal) and (
+        term.datatype is None or str(term.datatype) == _XSD_STRING
+    )
+
+
+def _text_shape(node, var) -> tuple[str | None, bool] | None:
+    """How a string function's text reads ``var``: ``(case, as_str)`` for
+    ``var``, ``STR(var)`` and ``LCASE``/``UCASE`` of either — ``None`` for
+    anything else."""
+    case = None
+    if isinstance(node, CompValue) and node.name in _CASE_WRAPPERS:
+        case, node = _CASE_WRAPPERS[node.name], node.arg
+    if isinstance(node, _VAR_LIKE) and node == var:
+        return case, False
+    if _call_on(node, "Builtin_STR", var):
+        return case, True
+    return None
+
+
+def _string_function_shape(expr, var, consts) -> NativeShape | None:
+    """CONTAINS, STRSTARTS or STRENDS of ``var``'s text and a string constant.
+
+    rdflib's ``_compatibleStrings`` makes a tagged constant demand the text's
+    own tag, compared as written: ``STR()`` text has none (an error for every
+    value) and a stored tag is lower-case, so a tag that is not lower-case
+    never matches either. Both stay with the Python routes."""
+    text = _text_shape(expr.arg1, var)
+    constant = _constant_term(expr.arg2, consts)
+    if text is None or not _string_literal(constant):
+        return None
+    case, as_str = text
+    language = constant.language
+    if language is not None and (as_str or language != language.lower()):
+        return None
+    kind = _STRING_FUNCTIONS[expr.name]
+    return NativeShape(kind, canonical_spelling(constant), case=case, as_str=as_str)
+
+
+def _regex_shape(expr, var, consts) -> NativeShape | None:
+    """REGEX of ``var``'s text with a constant string pattern and flags.
+
+    rdflib compiles the pattern with Python's ``re`` and raises for every
+    string text when that fails, so such a pattern stays with rdflib. Only
+    the flags rdflib maps (``i``, ``s``, ``m``) are kept; it ignores the
+    rest."""
+    text = _text_shape(expr.text, var)
+    pattern = _constant_term(expr.pattern, consts)
+    flags = None if expr.flags is None else _constant_term(expr.flags, consts)
+    if text is None or not _string_literal(pattern):
+        return None
+    if expr.flags is not None and not _string_literal(flags):
+        return None
+    kept = "".join(flag for flag in ("" if flags is None else str(flags)) if flag in _REGEX_FLAGS)
+    compile_flags = 0
+    for flag in kept:
+        compile_flags |= _REGEX_FLAGS[flag]
+    try:
+        re.compile(str(pattern), compile_flags)
+    except re.error:
+        return None
+    case, as_str = text
+    return NativeShape("regex", str(pattern), flags=kept, case=case, as_str=as_str)
+
+
 def _constant_term(node, consts: dict):
     """The rdflib term an operand without block variables evaluates to: a
     constant, a visible ctx-bound variable, or an expression over those,
@@ -809,7 +886,9 @@ def native_shape(expr, var, consts: dict) -> NativeShape | None:
     The shapes: ``isIRI``/``isURI``/``isBlank``/``isLiteral`` of ``var``;
     ``datatype(var) = <iri>`` and ``lang(var) = "tag"`` (either way round);
     ``langMatches(lang(var), "range")``; ``strstarts(str(var), "prefix")``;
-    and ``var`` compared with a well-formed numeric literal by any of
+    ``REGEX``, ``CONTAINS``, ``STRSTARTS`` and ``STRENDS`` of ``var`` or
+    ``STR(var)``, either under ``LCASE``/``UCASE``, with a constant pattern or
+    string; and ``var`` compared with a well-formed numeric literal by any of
     ``< <= > >= = !=`` (either way round). vortex-rdf answers each over the
     codes a query produced with rdflib's own rules wherever it gives a
     definite answer (``tests/test_native_filters.py`` pins that against
@@ -836,11 +915,14 @@ def native_shape(expr, var, consts: dict) -> NativeShape | None:
         ):
             return None
         return NativeShape("lang_matches", str(rng)) if _LANG_RANGE.fullmatch(str(rng)) else None
-    if name == "Builtin_STRSTARTS":
-        if not _call_on(expr.arg1, "Builtin_STR", var):
-            return None
+    if name == "Builtin_STRSTARTS" and _call_on(expr.arg1, "Builtin_STR", var):
         prefix = _constant_term(expr.arg2, consts)
-        return NativeShape("str_prefix", str(prefix)) if _string_constant(prefix) else None
+        if _string_constant(prefix):
+            return NativeShape("str_prefix", str(prefix))
+    if name in _STRING_FUNCTIONS:
+        return _string_function_shape(expr, var, consts)
+    if name == "Builtin_REGEX":
+        return _regex_shape(expr, var, consts)
     if name != "RelationalExpression" or expr.other is None or isinstance(expr.other, list):
         return None
     op, left, right = expr.op, expr.expr, expr.other
