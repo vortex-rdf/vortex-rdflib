@@ -1233,11 +1233,11 @@ def _compile_conjunct(
     expr, variables: tuple, consts: dict, ctx, native: NativeShape | None
 ) -> Conjunct:
     """``expr`` as a conjunct of ``variables``, every other variable it reads
-    fixed to the term ``consts`` gives it: its fast route compiled over those
-    constants (none when the fast routes are off, a constant has no term view
-    or the expression is outside the whitelist), kind-only when it reads
-    nothing but term kinds. ``native`` is the predicate vortex-rdf decides it
-    by, if any."""
+    fixed to the term ``consts`` gives it, or unbound: its fast route compiled
+    over those constants (none when the fast routes are off, a constant has no
+    term view or the expression is outside the whitelist), kind-only when it
+    reads nothing but term kinds. ``native`` is the predicate vortex-rdf
+    decides it by, if any."""
     fast = None
     if _FAST_ENABLED:
         try:
@@ -1314,7 +1314,7 @@ def evaluate_constant(conjunct: Conjunct) -> bool:
 
 def evaluate_column(store, conjuncts: list, codes) -> set:
     """The subset of ``codes`` (distinct codes of one variable) passing every
-    conjunct — ``codes`` itself when it is a set that no conjunct narrows.
+    conjunct — ``codes`` itself when it is a set and no conjunct runs.
     Kind-only predicates never decode; a conjunct with a native shape is
     answered by vortex-rdf over the codes still in play
     (:func:`candidates.evaluate`), and only the codes it leaves undecided go
