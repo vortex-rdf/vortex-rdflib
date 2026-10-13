@@ -9,7 +9,7 @@ from rdflib.term import BNode, IdentifiedNode, Literal, Node, URIRef, _is_valid_
 from vortex_rdf import VortexRdfStore
 
 from . import query_scope
-from .pushdown import register_sparql_pushdown
+from .pushdown import _CHUNK_MAX, _CHUNK_START, register_sparql_pushdown
 from .query_scope import QueryTerms
 from .terms import (
     BLANK,
@@ -446,7 +446,8 @@ class VortexRdflibStore(Store):
         yielded once per graph; a context that names no graph the file can
         hold yields nothing. The store streams the quads it holds rather than
         building the RDF merge of the union, which would mean a set the size
-        of the result.
+        of the result, and decodes them a chunk at a time, so a consumer that
+        stops early decodes the rows it read.
         """
         if self.path is None:
             return
@@ -516,38 +517,54 @@ class VortexRdflibStore(Store):
         if self._dict is not None:
             cols = store.match_codes(s_n3, p_n3, o_n3, g_n3)
             if cols is not None:
-                # Zero-copy u64 views over the Rust column buffers; every
-                # distinct code the query's term cache (outside a query, this
-                # call's) lacks is decoded in one GIL-released decode_many call.
-                s_codes = memoryview(cols[0]).cast("Q").tolist()
-                p_codes = memoryview(cols[1]).cast("Q").tolist()
-                o_codes = memoryview(cols[2]).cast("Q").tolist()
-                cached = self._prime_decode_cache(s_codes, p_codes, o_codes)
-                # strict: the columns come from one native match and must be
-                # equally long; truncation would hide a native bug.
+                rows = len(cols[0])
+                if not rows:
+                    return
                 if g_n3 is not None:
-                    if not s_codes:
-                        return
                     fixed = self._context_tuple(g_n3)
-                else:
-                    # Union: the fourth column names each row's graph. Its
-                    # distinct codes resolve to contexts before the loop; a
-                    # match whose rows all live in one graph — every match on
-                    # a single-graph file — takes the fixed-context loop
-                    # below and never pays a per-row lookup.
-                    g_codes = memoryview(cols[3]).cast("Q").tolist()
-                    contexts = {code: self._context_of_code(code) for code in set(g_codes)}
-                    if len(contexts) == 1:
-                        fixed = next(iter(contexts.values()))
-                    else:
-                        for row in zip(s_codes, p_codes, o_codes, g_codes, strict=True):
-                            yield (
-                                (cached[row[0]], cached[row[1]], cached[row[2]]),
-                                contexts[row[3]],
-                            )
-                        return
-                for row in zip(s_codes, p_codes, o_codes, strict=True):
-                    yield (cached[row[0]], cached[row[1]], cached[row[2]]), fixed
+                # Zero-copy u64 views over the Rust column buffers, read a
+                # chunk at a time: 64 rows, then four times more, 4096 at
+                # most. Each chunk's codes become Python ints, and those the
+                # call's term cache (the query's, inside one) lacks are
+                # decoded in one GIL-released decode_many call, so a consumer
+                # that stops early (rdflib's LIMIT, ASK) decodes what it read.
+                views = [memoryview(column).cast("Q") for column in cols]
+                cache = self._terms().decode
+                contexts: dict[int, tuple] = {}
+                start, size = 0, _CHUNK_START
+                while start < rows:
+                    stop = min(start + size, rows)
+                    # A match that is one chunk is read from the views whole.
+                    chunk = views if stop - start == rows else [v[start:stop] for v in views]
+                    s_codes = chunk[0].tolist()
+                    p_codes = chunk[1].tolist()
+                    o_codes = chunk[2].tolist()
+                    self._decode_into(cache, (s_codes, p_codes, o_codes))
+                    shared = fixed
+                    if shared is None:
+                        # Union: the fourth column names each row's graph. A
+                        # chunk whose rows all live in one graph — every chunk
+                        # of a single-graph file — shares that graph's context
+                        # and pays no per-row lookup.
+                        g_codes = chunk[3].tolist()
+                        graphs = set(g_codes)
+                        for code in graphs.difference(contexts):
+                            contexts[code] = self._context_of_code(code)
+                        if len(graphs) == 1:
+                            shared = contexts[g_codes[0]]
+                        else:
+                            # strict: the columns come from one native match
+                            # and must be equally long; truncation would hide a
+                            # native bug.
+                            for row in zip(s_codes, p_codes, o_codes, g_codes, strict=True):
+                                yield (
+                                    (cache[row[0]], cache[row[1]], cache[row[2]]),
+                                    contexts[row[3]],
+                                )
+                    if shared is not None:
+                        for row in zip(s_codes, p_codes, o_codes, strict=True):
+                            yield (cache[row[0]], cache[row[1]], cache[row[2]]), shared
+                    start, size = stop, min(size * 4, _CHUNK_MAX)
                 return
 
         # String fallback (non-dictionary layouts, code path disabled):
@@ -613,26 +630,38 @@ class VortexRdflibStore(Store):
         return query_scope.terms_for(self)
 
     def _prime_decode_cache(self, *code_columns) -> dict:
-        """Decode every code the query's term cache lacks in one native call,
-        and return that cache (code -> term).
+        """Decode every code the query's term cache lacks in one native call
+        (:meth:`_decode_into`), and return that cache (code -> term)."""
+        cache = self._terms().decode
+        self._decode_into(cache, code_columns)
+        return cache
+
+    def _decode_into(self, cache: dict, code_columns) -> None:
+        """Decode into ``cache`` every code of ``code_columns`` it lacks.
 
         ``decode_many`` releases the GIL for the whole batch and returns one
         shared string per distinct code, so the per-term cost collapses from
-        one FFI round trip each to one bulk call per match.
+        one FFI round trip each to one bulk call per batch.
         """
         if self._dict is None:
             raise ValueError("store has no term dictionary (code path inactive)")
-        cache = self._terms().decode
         distinct: set[int] = set()
         for column in code_columns:
             distinct.update(column)
-        missing = list(distinct.difference(cache))
+        # The difference walks the smaller side: a cache holding fewer codes
+        # than the batch (the first chunks of a call outside a query) is
+        # walked once, rather than each code looked up in it.
+        if len(cache) < len(distinct):
+            distinct.difference_update(cache)
+            missing = list(distinct)
+        else:
+            missing = list(distinct.difference(cache))
         if missing:
+            build = self._from_n3_safe
             for code, raw in zip(missing, self._dict.decode_many(missing), strict=True):
                 if raw is None:
                     raise ValueError(f"term code {code} is not in the store dictionary")
-                cache[code] = self._from_n3_safe(raw)
-        return cache
+                cache[code] = build(raw)
 
     def _default_graph_code(self) -> int | None:
         """The dictionary code of the default graph's empty name, or ``None``

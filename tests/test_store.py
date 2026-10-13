@@ -9,10 +9,11 @@ from rdflib.plugins.parsers import ntriples
 from rdflib.term import Node
 from vortex_rdf import serialize_rdf
 
+import vortex_rdflib.pushdown as pd
 import vortex_rdflib.store as store_mod
 from conftest import GRAPH_1, GRAPH_2, LAYOUTS
-from test_pushdown import both_ways
-from vortex_rdflib import VortexRdflibStore
+from test_pushdown import _counting_term_dict, both_ways
+from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
 from vortex_rdflib.terms import escape, parse_spelling
 
 FOAF_NAME = URIRef("http://xmlns.com/foaf/0.1/name")
@@ -493,3 +494,129 @@ def test_no_path_store():
     store = VortexRdflibStore()
     assert len(store) == 0
     assert list(store.triples((None, None, None))) == []
+
+
+# ─── triples() decodes a chunk at a time ────────────────────────────────────
+
+_CHUNKED_GRAPHS = ("<http://ex.org/g/1>", "<http://ex.org/g/2>", "<http://ex.org/g/3>", "")
+P0 = URIRef("http://ex.org/p0")
+P9 = URIRef("http://ex.org/p9")
+S0 = URIRef("http://ex.org/s/0")
+EVERYWHERE = URIRef("http://ex.org/everywhere")
+
+
+@pytest.fixture(scope="module")
+def chunked_quads(tmp_path_factory):
+    """Quads whose matches span several decode chunks: 400 subjects in one
+    graph first (whole chunks in one graph), then 2,600 spread over three
+    named graphs and the default graph (chunks mixing graphs), two
+    predicates each, and one triple every graph holds."""
+    rng = random.Random(11)
+
+    def quad(s: str, p: str, o: str, g: str) -> str:
+        return f"{s} {p} {o} {g} .\n" if g else f"{s} {p} {o} .\n"
+
+    def obj(i: int) -> str:
+        return rng.choice(
+            (
+                f"<http://ex.org/o{i % 300}>",
+                f'"v{i % 500}"',
+                f'"w{i}"@en',
+                f'"{i % 200}"^^{INTEGER}',
+            )
+        )
+
+    lines = []
+    for i in range(400):
+        for p in range(2):
+            lines.append(
+                quad(f"<http://ex.org/a/{i}>", f"<http://ex.org/p{p}>", obj(i), _CHUNKED_GRAPHS[0])
+            )
+    for i in range(2600):
+        graph = rng.choice(_CHUNKED_GRAPHS)
+        for p in range(2):
+            lines.append(quad(f"<http://ex.org/s/{i}>", f"<http://ex.org/p{p}>", obj(i), graph))
+    for graph in _CHUNKED_GRAPHS:
+        lines.append(quad(f"<{S0}>", f"<{P9}>", f"<{EVERYWHERE}>", graph))
+    d = tmp_path_factory.mktemp("chunked")
+    nq = d / "chunked.nq"
+    nq.write_text("".join(lines), encoding="utf-8")
+    out = d / "chunked.vortex"
+    serialize_rdf(str(nq), str(out), layout="dictionary", format="nquads")
+    return out
+
+
+def _chunk_bounds(rows: int) -> list[tuple[int, int]]:
+    bounds, start, size = [], 0, pd._CHUNK_START
+    while start < rows:
+        bounds.append((start, min(start + size, rows)))
+        start, size = bounds[-1][1], min(size * 4, pd._CHUNK_MAX)
+    return bounds
+
+
+@pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
+def test_triples_yield_the_rows_and_contexts_of_the_match(chunked_quads, monkeypatch, in_memory):
+    """Decoded a chunk at a time, triples() yields what the string path
+    yields, in its order, each row with its graph's one context tuple: over
+    the union (chunks in one graph and chunks across graphs), in a named
+    graph, in the default graph, and for ground patterns."""
+    store = VortexRdflibStore(str(chunked_quads), in_memory=in_memory)
+    monkeypatch.setenv("VORTEX_RDF_DISABLE_CODE_PATH", "1")
+    oracle = VortexRdflibStore(str(chunked_quads), in_memory=in_memory)
+    assert store._dict is not None and oracle._dict is None
+    contexts = {
+        "none": lambda s: None,
+        "bare-graph": lambda s: Graph(store=s),
+        "union-dataset": lambda s: Dataset(store=s, default_union=True),
+        "named": lambda s: Graph(store=s, identifier=URIRef("http://ex.org/g/2")),
+        "default": lambda s: Graph(store=s, identifier=DATASET_DEFAULT_GRAPH_ID),
+    }
+    patterns = [
+        (None, None, None),
+        (None, P0, None),
+        (S0, None, None),
+        (None, None, Literal("v7")),
+        (S0, P9, EVERYWHERE),
+        (S0, P9, URIRef("http://ex.org/nowhere")),
+    ]
+    for name, context in contexts.items():
+        for pattern in patterns:
+            got = list(store.triples(pattern, context(store)))
+            want = list(oracle.triples(pattern, context(oracle)))
+            rows = [(triple, ctx[0].identifier) for triple, ctx in got]
+            assert rows == [(triple, ctx[0].identifier) for triple, ctx in want], (name, pattern)
+            shared: dict = {}
+            assert all(shared.setdefault(ctx[0].identifier, ctx) is ctx for _, ctx in got)
+    union = [ctx[0].identifier for _, ctx in store.triples((None, None, None))]
+    graphs_per_chunk = [len(set(union[i:j])) for i, j in _chunk_bounds(len(union))]
+    assert len(union) == 6004 and len(graphs_per_chunk) == 5
+    assert 1 in graphs_per_chunk and max(graphs_per_chunk) == 4
+
+
+def test_an_early_stop_decodes_a_chunk_not_the_match(chunked_quads):
+    """rdflib's own evaluator stops after a LIMIT's rows or at an ASK's first
+    row; triples() has decoded the codes of the first chunk, not those of
+    the whole match."""
+    graph = Graph(store=VortexRdflibStore(str(chunked_quads)))
+    list(graph.store.contexts())  # one context per graph: store state, decoded once
+    counting = _counting_term_dict(graph)
+    queries = [
+        ("SELECT ?s ?o WHERE { ?s <http://ex.org/p0> ?o } LIMIT 3", 3),
+        ("SELECT * WHERE { ?s ?p ?o } LIMIT 10", 10),
+        ("ASK { ?s <http://ex.org/p0> ?o }", True),
+    ]
+    unregister_sparql_pushdown()
+    try:
+        for sparql, answer in queries:
+            before = counting.decoded
+            result = graph.query(sparql)
+            assert (result.askAnswer if result.type == "ASK" else len(list(result))) == answer
+            assert counting.decoded - before <= 3 * pd._CHUNK_START, sparql
+    finally:
+        register_sparql_pushdown()
+    before = counting.decoded
+    rows = graph.store.triples((None, P0, None))
+    next(rows)
+    assert counting.decoded - before <= 3 * pd._CHUNK_START
+    assert sum(1 for _ in rows) == 2999
+    assert counting.decoded - before > 3000  # the whole match's distinct codes
