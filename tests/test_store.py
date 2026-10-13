@@ -430,10 +430,11 @@ def _spy_on_constructors(monkeypatch) -> list:
 
 
 def test_terms_built_directly_are_rdflibs(monkeypatch, caplog):
-    """IRIs, and plain, language-tagged and xsd:integer literals without
-    escapes (an integer that int() reads) are built without rdflib's
-    constructors; over generated spellings of every kind, each term is the
-    one the constructors make, in everything rdflib exposes."""
+    """IRIs, blank nodes, and plain, language-tagged and xsd:integer
+    literals without escapes (an integer that int() reads) are built
+    without rdflib's constructors; over generated spellings of every kind,
+    each term is the one the constructors make, in everything rdflib
+    exposes."""
     caplog.set_level(logging.ERROR, logger="rdflib.term")  # "abc"^^xsd:integer logs a warning
     # The import-time check passes on the rdflib this package pins.
     assert VortexRdflibStore._from_n3_safe is terms_mod._term_built_directly
@@ -472,7 +473,7 @@ def test_a_failed_self_check_leaves_every_term_to_rdflibs_constructors(monkeypat
     terms differ, or the direct build fails — as after an rdflib release
     that changes what ``Literal`` sets — or rdflib has no language-tag check
     to call, every term goes through rdflib's constructors."""
-    spellings = ["<http://ex.org/a>", '"plain"', '"x"@en', f'"42"^^{INTEGER}']
+    spellings = ["<http://ex.org/a>", "_:b1", '"plain"', '"x"@en', f'"42"^^{INTEGER}']
     constructed = _spy_on_constructors(monkeypatch)
     assert terms_mod._term_builder() is terms_mod._term_built_directly
     constructed.clear()

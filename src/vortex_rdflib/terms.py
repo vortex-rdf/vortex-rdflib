@@ -221,18 +221,19 @@ def _term_built_directly(value: str) -> Node:
     """`_term_by_constructors`, except for the terms whose every attribute
     the spelling gives, made directly with ``str.__new__`` and the slots
     ``Literal.__new__`` sets: an IRI (``URIRef`` only adds a warning about
-    characters vortex-rdf's parser never lets into an IRI), a plain or
-    language-tagged literal without escapes (``Literal`` normalizes nothing
-    in it), and an xsd:integer literal without escapes that ``int()`` reads
-    (``Literal`` takes that int as its value and spells it as the int).
+    characters vortex-rdf's parser never lets into an IRI), a blank node
+    (``BNode`` adds nothing to a label), a plain or language-tagged literal
+    without escapes (``Literal`` normalizes nothing in it), and an
+    xsd:integer literal without escapes that ``int()`` reads (``Literal``
+    takes that int as its value and spells it as the int).
     Every other spelling goes to the constructors split once, so no kind
     builds slower than through `_term_by_constructors`. Assumes rdflib's own
     xsd:integer binding (``int``), as the native filters do."""
-    if value.startswith("_:"):
-        return BNode(value[2:])
     first = value[:1]
     if first == "<" and value[-1:] == ">":
         return _new_str(URIRef, value[1:-1])
+    if first == "_" and value[1:2] == ":":
+        return _new_str(BNode, value[2:])
     end = value.rfind('"') if first == '"' else 0
     if end <= 0:
         return _term_by_constructors(value)  # no term spelling: its error
