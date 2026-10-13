@@ -11,9 +11,6 @@ from .pushdown import register_sparql_pushdown
 from .query_scope import QueryTerms
 from .terms import BLANK, IRI, LITERAL, canonical_spelling, kind_bounds, unescape
 
-# The cottas-bench branch's layout names are accepted as aliases so its
-# benchmark scripts keep working. The layout is only a label here: VortexRdfStore
-# auto-detects the actual layout from the file.
 #: Sentinel for a cached lookup whose answer may legitimately be ``None``.
 _UNRESOLVED = object()
 
@@ -22,6 +19,10 @@ _UNRESOLVED = object()
 #: selects those rows — ``None`` being the wildcard over every graph.
 DEFAULT_GRAPH = ""
 
+#: The layout names the constructor accepts: the layouts' own, ``typed_object``
+#: and the ``cottas-native*`` names of COTTAS benchmark scripts. The layout is
+#: only a label here: VortexRdfStore auto-detects the actual layout from the
+#: file.
 _LAYOUT_ALIASES = {
     "default": "default",
     "cottas-native-strings": "default",

@@ -448,7 +448,7 @@ def _eval_part(ctx, part):
         elapsed_ns=time.perf_counter_ns() - started if active is not None else 0,
     )
     if active is not None:
-        active.flush()  # the planning is over: nothing below is timed any more
+        active.flush()  # the planning is over: nothing below is timed
     if token is not None:
         # Generators keep the trace object explicitly through _yield_rows.
         if hasattr(result, "__next__"):
@@ -2061,10 +2061,10 @@ def _filter_relation(rel: Relation, preds) -> Relation:
 
 
 # Probing beats hash-joining when the running relation is at least this many
-# times smaller than the next pattern's match. Measured on the in-memory
-# dictionary layout: one native match costs ~70 µs regardless of selectivity,
-# while materializing a matched row into Python costs ~0.7 µs — so one probe
-# is worth skipping the materialization of ~100 rows.
+# times smaller than the next pattern's match. The value trades the fixed cost
+# of a native match, which does not depend on how selective it is, against the
+# cost of materializing a matched row into Python: one probe is worth skipping
+# that for this many rows.
 _PROBE_FANOUT = 100
 
 
@@ -2359,21 +2359,19 @@ def _narrowing(keep=None, limit=None) -> dict:
     return narrowing
 
 
-#: A batch call (``count_quads_many``/``match_codes_many``) costs a fixed
-#: ~60–150 µs of native task scheduling before its probes run concurrently —
-#: the upper end once the runtime's worker threads have parked, as they do
-#: between the steps of a query. That pays off for probes that scan the
-#: store — several times over — but not for a handful of cheap point probes,
-#: which the calls in a loop answer in a few µs each. A probe is cheap when
-#: its subject is bound (a binary search in the subject-ordered base) or a
-#: secondary index serves its predicate or object. Cheap probes are batched
-#: only on a file-backed store and from this many on, where overlapping
-#: their reads wins.
+#: A batch call (``count_quads_many``/``match_codes_many``) pays a fixed cost
+#: of native task scheduling before its probes run concurrently. That pays
+#: off for probes that scan the store, but not for a handful of cheap point
+#: probes, which plain calls in a loop answer in less time than the batch
+#: costs. A probe is cheap when its subject is bound (a binary search in the
+#: subject-ordered base) or a secondary index serves its predicate or object.
+#: Cheap probes are batched only on a file-backed store and from this many on,
+#: where overlapping their reads wins.
 _CHEAP_BATCH_MIN = 256
 
 #: Scanning probes batch from two on a file-backed store, whose scans
-#: overlap their reads (two predicate scans: ~1.3x). An in-memory scan is
-#: pure CPU, and two of them overlap by no more than the batch costs.
+#: overlap their reads. An in-memory scan is pure CPU, so overlapping two of
+#: them gains less than the batch costs; they batch from three on.
 _SCAN_BATCH_MIN = 2
 _MEMORY_SCAN_BATCH_MIN = 3
 
@@ -2706,10 +2704,10 @@ def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) 
 
     A pending conjunct whose variables the relation binds — all but one,
     which ``pat`` binds — is a test of that one variable once each of the
-    others holds a single value in every row: BSBM Explore Q5's band
-    ``?v < ?ref + N && ?v > ?ref - N`` after the anchor has bound ``?ref``.
-    With those values substituted (rdflib's own evaluator computes the
-    constant side, ``?ref + N``), a shape vortex-rdf decides
+    others holds a single value in every row: a band
+    ``?v < ?ref + N && ?v > ?ref - N`` once an anchor pattern has bound
+    ``?ref``. With those values substituted (rdflib's own evaluator computes
+    the constant side, ``?ref + N``), a shape vortex-rdf decides
     (:func:`filters.specialize`) joins ``pat``'s deferred restrictions and is
     evaluated over the codes ``pat`` brings — the rows its match returns, or
     the rows its probes reach. Every row the BGP then yields passes the
@@ -2763,13 +2761,13 @@ def _single_code(cols, rows, index: int) -> int | None:
 
 def _prune_early(store, schema, cols, rows, pending, remaining, views):
     """Prune a BGP's running relation with the pending tuple conjuncts its
-    schema now covers, when that pays. A conjunct costs a few µs a row to
-    evaluate, far more than a join step spends on the row, so pruning pays
-    only by letting a remaining pattern be probed instead of matched whole —
-    the planner's own test, `survivors * _PROBE_FANOUT < estimate`. The rows
-    stream, evaluation stops once too many survive for that, and the
-    conjunct is left to the FILTER above the BGP, which streams it over a
-    columnar body, so a LIMIT stops it early.
+    schema covers, when that pays. Evaluating a conjunct costs more per row
+    than a join step spends on the row, so pruning pays only by letting a
+    remaining pattern be probed instead of matched whole — the planner's own
+    test, `survivors * _PROBE_FANOUT < estimate`. The rows stream, evaluation
+    stops once too many survive for that, and the conjunct is left to the
+    FILTER above the BGP, which streams it over a columnar body, so a LIMIT
+    stops it early.
 
     ``views`` is the parsed-term cache it shares with that FILTER. Returns
     ``(cols, rows, pending)``: the body, pruned or as it was, and the
@@ -3217,21 +3215,19 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
     smaller than the pattern's match (``_PROBE_FANOUT``), materializing
     thousands of pattern rows to hash-join against a handful is the wrong
     trade. Substituting each relation row's codes into the pattern and
-    re-matching natively keeps the work proportional to the small side —
-    it is what lets an anchored star beat rdflib's own nested loop instead
-    of losing to it. The probes go to the native layer in batches
-    (``match_codes_many``, or ``count_quads_many`` for an existence probe, a
-    pattern with no free position): one call each, every probe of a batch
-    running concurrently — a file-backed store overlaps their reads. An
-    existence probe keeps its row once per quad it matches: a fixed graph (a
-    named graph, the default graph alone, a bound ``GRAPH ?g``) holds at
-    most one, so the count stops at one row; the union default graph holds a
-    triple once per graph that has it, so the count is whole. The pattern's
-    native keep narrows each probe on the positions it leaves free (a code
-    range inside the native match, a code column over the rows it returns),
-    as do a ``keep`` restriction and ``row_preds`` over the extended row;
-    with ``keep_unmatched`` a row without a continuation is kept, padded
-    with None (a left join).
+    re-matching natively keeps the work proportional to the small side. The
+    probes go to the native layer in batches (``match_codes_many``, or
+    ``count_quads_many`` for an existence probe, a pattern with no free
+    position): one call each, every probe of a batch running concurrently — a
+    file-backed store overlaps their reads. An existence probe keeps its row
+    once per quad it matches: a fixed graph (a named graph, the default graph
+    alone, a bound ``GRAPH ?g``) holds at most one, so the count stops at one
+    row; the union default graph holds a triple once per graph that has it,
+    so the count is whole. The pattern's native keep narrows each probe on the
+    positions it leaves free (a code range inside the native match, a code
+    column over the rows it returns), as do a ``keep`` restriction and
+    ``row_preds`` over the extended row; with ``keep_unmatched`` a row without
+    a continuation is kept, padded with None (a left join).
     """
     bound = [(schema.index(v), pos) for v, pos in pat["varpos"].items() if v in schema]
     free = {v: pos for v, pos in pat["varpos"].items() if v not in schema}

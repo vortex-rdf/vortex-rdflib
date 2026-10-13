@@ -281,7 +281,7 @@ def test_in_memory_graph_equality(vortex_files):
 
 
 def test_layout_alias_and_detection(vortex_files):
-    # Branch-era labels are accepted; the detected layout wins.
+    # The aliased layout names are accepted as labels; the detected layout wins.
     store = VortexRdflibStore(str(vortex_files["dictionary"]), layout="cottas-native-ids")
     assert store.layout == "dictionary"
     store = VortexRdflibStore(str(vortex_files["default"]), layout="cottas-native-strings")

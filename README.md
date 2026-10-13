@@ -45,7 +45,7 @@ for row in graph.query("""
 ```
 
 SPARQL evaluation is rdflib's engine; the store serves quad patterns from
-the Vortex file. The store is read-only so far; mutation support is on the roadmap.
+the Vortex file. The store is read-only; mutation support is on the roadmap.
 
 A `.vortex` file holds quads, so the store is context-aware. A `Dataset` gives
 the named graphs, and `GRAPH` works in SPARQL:
@@ -123,12 +123,11 @@ loads the whole store into memory up front instead.
 
 **Secondary indexes.** `serialize_rdf(..., indexes=["secondary-by-copy"])`
 (or `"secondary-by-reference"`) writes index components into the `.vortex`
-file, for a modest increase in build time and file size. They pay off on
-file-backed stores answering single-pattern lookups, where they largely erase
-the file-backed penalty for object and predicate-object lookups. On an
-in-memory store they change nothing measurable, since the rows are in memory
-already, and on multi-pattern joins the run-to-run spread is wider than any
-effect they have. Enable them for lookup-heavy file-backed workloads.
+file, for a modest increase in build time and file size. They give a pattern
+with a bound predicate or object a sorted access path, so on a file-backed
+store a single-pattern lookup reads only the rows it selects instead of
+scanning the file. An in-memory store has its rows in memory already. Enable
+them for lookup-heavy file-backed workloads.
 
 **Memory.** A file-backed store keeps no copy of its data except a bounded
 cache of the dictionary windows vortex-rdf reads. The mapped pages queries read

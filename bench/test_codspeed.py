@@ -146,7 +146,8 @@ FILES: dict[str, dict] = {
 #: anchored OPTIONAL (the right pattern counted, then probed, never matched
 #: whole) and the anchored join under a language FILTER (the filter
 #: evaluated over the probed rows only). `filter-band-probe` is left out:
-#: rdflib's own evaluator takes ~0.9 s on it here, 30x any query above.
+#: `test_query_no_pushdown` runs this group under rdflib's own evaluator, on
+#: which that query is too slow to benchmark.
 JOIN_QUERIES = ("star-2", "star-3", "chain-2", "optional", "filter-probe")
 
 #: Queries whose cost is dominated by evaluating a numeric FILTER: a typed
