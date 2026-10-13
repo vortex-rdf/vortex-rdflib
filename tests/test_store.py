@@ -520,6 +520,22 @@ def test_a_failed_self_check_leaves_every_term_to_rdflibs_constructors(monkeypat
         assert type(term) in constructed and term == _by_rdflib(spelling)
 
 
+def test_the_self_check_catches_an_xsd_strict_integer_converter(monkeypatch, caplog):
+    """The direct path reads an xsd:integer with ``int()``, which accepts
+    more than XSD: ``_`` separators, non-ASCII digits and spaces. Under an
+    rdflib whose converter keeps to XSD, the import-time check sees the
+    difference and leaves every term to the constructors."""
+    caplog.set_level(logging.ERROR, logger="rdflib.term")  # rejected forms log a warning
+
+    def xsd_integer(lexical):
+        if re.fullmatch(r"[+-]?[0-9]+", lexical.strip(" \t\n\r")) is None:
+            raise ValueError(lexical)
+        return int(lexical)
+
+    monkeypatch.setitem(rdflib.term._toPythonMapping, terms_mod.XSD_INTEGER, xsd_integer)
+    assert terms_mod._term_builder() is terms_mod._term_by_constructors
+
+
 def test_an_rdflib_without_the_private_names_still_imports():
     """``rdflib.term._is_valid_langtag`` and ``_toPythonMapping`` are looked
     up, not imported: with both gone the package imports, the store builds

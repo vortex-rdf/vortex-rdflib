@@ -83,7 +83,7 @@ dictionary.
   with the attributes those set; every other spelling reaches the
   constructors split once. At import, a fixed sample is built both ways, and
   if any term differs the constructors build every term
-  ([`_term_builder`](../src/vortex_rdflib/terms.py#L345)).
+  ([`_term_builder`](../src/vortex_rdflib/terms.py#L348)).
 
 Codes follow the byte order of the term spellings, so each kind of term fills
 one contiguous range of codes: first the default graph's empty name, then
