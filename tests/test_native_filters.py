@@ -9,7 +9,7 @@ value model treats specially: decimals against doubles, integers past 2^53,
 
 import pytest
 from rdflib.term import Variable
-from vortex_rdf import U64Column, serialize_rdf
+from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
 from test_filters import SPELLINGS, filter_expr, rdflib_answer, typed
@@ -476,9 +476,8 @@ def _outcome(graph, sparql):
 
 
 def test_a_mid_size_code_set_goes_to_the_native_layer_whole(tmp_path, monkeypatch, capsys):
-    """On a file-backed store a keep of 33 to 4,096 codes — here the 100 IRIs
-    of an IN list — reaches the native match as the exact code set, and no
-    set is left to test on the rows it returns (`_split_keeps`)."""
+    """On a file-backed store the 100 IRIs of an IN list reach the native
+    match as the exact code set, and the answer is rdflib's."""
     import json
 
     from rdflib import Graph
@@ -495,8 +494,6 @@ def test_a_mid_size_code_set_goes_to_the_native_layer_whole(tmp_path, monkeypatc
     out = tmp_path / "s.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
     store = VortexRdflibStore(str(out), in_memory=False)
-    keep = {0: U64Column(list(range(1, 101)))}
-    assert pd._split_keeps(store, keep) == (keep, {})
     subjects = ", ".join(f"<http://ex.org/s{i}>" for i in range(0, 200, 2))
     query = f"SELECT ?s WHERE {{ ?s <http://ex.org/p> ?o FILTER(?s IN ({subjects})) }}"
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")

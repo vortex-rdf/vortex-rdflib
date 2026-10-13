@@ -1381,8 +1381,6 @@ def _single_pattern(ctx, store, block, scope) -> dict | None:
     pat = _pattern_terms(ctx, store, *block.triples[0], scope=scope)
     if var_preds and _push_native_restrictions(store, pat, var_preds):
         return None  # a conjunct the native match cannot decide
-    if _split_keeps(store, pat.get("nkeep"))[1]:
-        return None  # a set the native layer would not count exactly
     return pat
 
 
@@ -1659,12 +1657,8 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
             repeated_free = any(
                 len(pos) > 1 for v, pos in pat["varpos"].items() if v not in rel.schema
             )
-            exact = not _split_keeps(store, pat.get("nkeep"))[1]
-            if (
-                exact
-                and not repeated_free
-                and len(rows) * _PROBE_FANOUT
-                < _count_pattern(store, pat, {}, limit=len(rows) * _PROBE_FANOUT + 1)
+            if not repeated_free and len(rows) * _PROBE_FANOUT < _count_pattern(
+                store, pat, {}, limit=len(rows) * _PROBE_FANOUT + 1
             ):
                 flags = _probe_exists(store, rel.schema, rows, pat)
                 kept = [row for row, found in zip(rows, flags, strict=True) if found != negate]
@@ -2271,8 +2265,7 @@ def _count_pattern(store, pat, counts: dict, exact: bool = False, limit: int | N
     key = _pattern_key(pat) if nkeep else tuple(pat["n3"])
     n = counts.get(key)
     if n is None:
-        keep = _split_keeps(store, nkeep)[0] if nkeep else None
-        n = _native(store).count_quads(*pat["n3"], **_narrowing(keep, limit))
+        n = _native(store).count_quads(*pat["n3"], **_narrowing(nkeep, limit))
         if limit is None or n < limit:
             counts[key] = n
     return n
@@ -2340,12 +2333,6 @@ def _count_patterns(store, patterns, counts: dict) -> int:
             if pat["estimate"] == 0:
                 return len(counts) - before
     return len(counts) - before
-
-
-def _split_keeps(store, nkeep) -> tuple[dict, dict]:
-    """A pattern's native keep, and the code sets Python tests on the rows it
-    returns: every keep goes natively, so nothing is left to test."""
-    return nkeep or {}, {}
 
 
 def _narrowing(keep=None, limit=None) -> dict:
@@ -2442,9 +2429,9 @@ def _match_resolved_pattern(store, pat, memo=None, limit=None) -> tuple[int, int
     match, in the order an unlimited match returns them (see
     :func:`_limit_reaches_match`).
 
-    Only the columns are shared through the memo, and they are read-only
-    views; ``varpos`` and the ``keep`` sets built from it stay per pattern,
-    since two triples matching the same rows still bind different variables.
+    Only the columns are shared through the memo, as read-only views;
+    ``varpos`` stays per pattern, since two triples matching the same rows
+    still bind different variables.
     """
     then = time.perf_counter_ns() if _TRACE.get() is not None else 0
     if pat["unsatisfiable"]:
@@ -2454,11 +2441,10 @@ def _match_resolved_pattern(store, pat, memo=None, limit=None) -> tuple[int, int
     key = _pattern_key(pat) if nkeep else tuple(pat["n3"])
     cols = memo.get(key) if memo is not None and limit is None else None
     calls = 0
-    keep, tested = _split_keeps(store, nkeep) if nkeep else (None, None)
     if cols is None:
         native = _native(store)
-        if keep or limit is not None:
-            cols = native.match_codes(*pat["n3"], **_narrowing(keep, limit))
+        if nkeep or limit is not None:
+            cols = native.match_codes(*pat["n3"], **_narrowing(nkeep, limit))
         else:
             cols = native.match_codes(*pat["n3"])
         if cols is None:
@@ -2467,16 +2453,6 @@ def _match_resolved_pattern(store, pat, memo=None, limit=None) -> tuple[int, int
             memo[key] = cols
         calls = 1
     pat["cols"], pat["nrows"] = cols, len(cols[0])
-    if tested:
-        # The sets the scan took as ranges: tested on the rows, as the
-        # per-variable ``keep`` the row paths apply.
-        allowed_by_var = pat.setdefault("keep", {})
-        for var, positions in pat["varpos"].items():
-            for position in positions:
-                if position in tested:
-                    allowed = set(memoryview(tested[position]).cast("Q"))
-                    previous = allowed_by_var.get(var)
-                    allowed_by_var[var] = allowed if previous is None else previous & allowed
     return calls, time.perf_counter_ns() - then if then else 0
 
 
@@ -2493,7 +2469,6 @@ def _limit_reaches_match(store, pat, residual) -> bool:
     return (
         not residual
         and not store._indexes
-        and not (pat.get("nkeep") and _split_keeps(store, pat["nkeep"])[1])
         and all(len(positions) == 1 for positions in pat["varpos"].values())
     )
 
@@ -3006,7 +2981,7 @@ def _restrict_pattern(store, pat, var_preds) -> None:
     if pat["nrows"] == 0:
         return
     traced = _TRACE.get() is not None
-    keep = pat.pop("keep", None) or {}
+    keep: dict = {}
     input_rows = pat["nrows"]
     records = []
     for var, positions in pat["varpos"].items():
@@ -3014,13 +2989,10 @@ def _restrict_pattern(store, pat, var_preds) -> None:
         if not conjuncts:
             continue
         started = time.perf_counter_ns() if traced else 0
-        tested = var in keep
         values = set(_distinct_codes(pat["cols"][positions[0]]))
-        if tested:
-            values &= keep[var]
         distinct_binding_count = len(values)
         allowed = filters.evaluate_column(store, conjuncts, values)
-        if tested or len(allowed) < distinct_binding_count:
+        if len(allowed) < distinct_binding_count:
             keep[var] = allowed
         if traced:
             records.append(
@@ -3073,8 +3045,7 @@ def _compact_pattern(pat, keep: dict[Variable, set[int]]) -> None:
 def _rel_from_pattern(pat) -> Relation:
     """A single matched pattern as a relation — columnar when it can be.
 
-    The zero-copy views are kept as the body and a code set the match left to
-    test becomes a streamed row predicate; nothing is copied into Python
+    The zero-copy views are kept as the body; nothing is copied into Python
     objects until rows are consumed. Repeated variables (``?x :p ?x``) and
     ground patterns go through ``_materialize`` instead.
     """
@@ -3083,24 +3054,15 @@ def _rel_from_pattern(pat) -> Relation:
         return Relation.from_rows(*_materialize(pat))
     schema = tuple(varpos)
     cols = tuple(memoryview(pat["cols"][pos[0]]).cast("Q") for pos in varpos.values())
-    preds = tuple(
-        _member_predicate(schema.index(var), allowed)
-        for var, allowed in (pat.get("keep") or {}).items()
-    )
-    return Relation(schema, cols, None, pat["nrows"], preds=preds)
-
-
-def _member_predicate(index: int, allowed: set) -> Callable[[tuple], bool]:
-    return lambda row: row[index] in allowed
+    return Relation(schema, cols, None, pat["nrows"])
 
 
 def _materialize(pat):
     """A matched pattern as ``(schema, rows)`` of u64 code tuples.
 
-    Same-variable repeats (e.g. ``?x :p ?x``) and the ``keep`` restriction
-    become row filters; a repeated variable keeps its first position. An
-    empty match still names its variables, so the operators above can pad or
-    project by schema.
+    Same-variable repeats (e.g. ``?x :p ?x``) become a row filter; a repeated
+    variable keeps its first position. An empty match still names its
+    variables, so the operators above can pad or project by schema.
     """
     varpos = pat["varpos"]
     schema = tuple(varpos)
@@ -3114,13 +3076,9 @@ def _materialize(pat):
     needed = sorted({idx for pos in varpos.values() for idx in pos})
     views = {idx: memoryview(pat["cols"][idx]).cast("Q").tolist() for idx in needed}
     eq_checks = [(pos[0], later) for pos in varpos.values() for later in pos[1:]]
-    members = [(varpos[var][0], allowed) for var, allowed in (pat.get("keep") or {}).items()]
-    if eq_checks or members:
+    if eq_checks:
         keep = [
-            i
-            for i in range(pat["nrows"])
-            if all(views[a][i] == views[b][i] for a, b in eq_checks)
-            and all(views[p][i] in allowed for p, allowed in members)
+            i for i in range(pat["nrows"]) if all(views[a][i] == views[b][i] for a, b in eq_checks)
         ]
         views = {idx: [column[i] for i in keep] for idx, column in views.items()}
     return schema, list(zip(*(views[pos[0]] for pos in varpos.values()), strict=True))
@@ -3128,15 +3086,10 @@ def _materialize(pat):
 
 def _pattern_body(pat) -> tuple:
     """The matched pattern as ``(schema, cols, rows)`` — columnar when it
-    can be: single-position variables and no pending restriction
-    (``_materialize`` turns repeats and ``keep`` sets into row filters)."""
+    can be: single-position variables (``_materialize`` turns repeats into a
+    row filter)."""
     varpos = pat["varpos"]
-    if (
-        pat["nrows"]
-        and varpos
-        and not pat.get("keep")
-        and all(len(pos) == 1 for pos in varpos.values())
-    ):
+    if pat["nrows"] and varpos and all(len(pos) == 1 for pos in varpos.values()):
         cols = tuple(memoryview(pat["cols"][pos[0]]).cast("Q") for pos in varpos.values())
         return tuple(varpos), cols, None
     schema, rows = _materialize(pat)
@@ -3175,17 +3128,15 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
 
 def _materialize_eager_restrictions(store, pat, bound) -> None:
     """Apply a matched pattern's deferred per-variable restrictions — over
-    the variables not in ``bound``, the relation it is about to join — and
-    any code sets its match left to test, compacting it natively to the rows
-    that pass, so its real size, not the match's, is what the join sees."""
+    the variables not in ``bound``, the relation it is about to join —
+    compacting it natively to the rows that pass, so its real size, not the
+    match's, is what the join sees."""
     input_rows = pat["nrows"]
     pending = pat.pop("deferred_var_preds", None)
     if pending:
         pending = {v: conjuncts for v, conjuncts in pending.items() if v not in bound}
     if pending:
         _restrict_pattern(store, pat, pending)
-    if pat.get("keep") and pat["nrows"]:
-        _compact_pattern(pat, pat.pop("keep"))
     pat["_trace_match_rows"] = input_rows
 
 
@@ -3225,15 +3176,13 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
     row; the union default graph holds a triple once per graph that has it,
     so the count is whole. The pattern's native keep narrows each probe on the
     positions it leaves free (a code range inside the native match, a code
-    column over the rows it returns), as do a ``keep`` restriction and
-    ``row_preds`` over the extended row; with ``keep_unmatched`` a row without
-    a continuation is kept, padded with None (a left join).
+    column over the rows it returns), as do ``row_preds`` over the extended
+    row; with ``keep_unmatched`` a row without a continuation is kept, padded
+    with None (a left join).
     """
     bound = [(schema.index(v), pos) for v, pos in pat["varpos"].items() if v in schema]
     free = {v: pos for v, pos in pat["varpos"].items() if v not in schema}
     eq_checks = [(pos[0], later) for pos in free.values() for later in pos[1:]]
-    keep = pat.get("keep") or {}
-    members = [(pos[0], keep[v]) for v, pos in free.items() if v in keep]
     out_positions = [pos[0] for pos in free.values()]
     needed = sorted({idx for pos in free.values() for idx in pos})
     # A code range rides every probe; a code column is tested on the rows a
@@ -3280,10 +3229,8 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
                     raise NotImplementedError
                 views = {idx: memoryview(cols[idx]).cast("Q").tolist() for idx in needed}
                 for j in range(len(views[needed[0]])):
-                    if (
-                        all(views[a][j] == views[b][j] for a, b in eq_checks)
-                        and all(views[p][j] in allowed for p, allowed in members)
-                        and all(test(views[p][j]) for p, test in tests)
+                    if all(views[a][j] == views[b][j] for a, b in eq_checks) and all(
+                        test(views[p][j]) for p, test in tests
                     ):
                         extended = row + tuple(views[idx][j] for idx in out_positions)
                         if all(pred(extended) for pred in row_preds):

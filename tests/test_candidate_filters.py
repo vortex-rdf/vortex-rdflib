@@ -38,10 +38,6 @@ def _price_code(store, i: int) -> int:
     return store._dict.encode(f'"{(i * 37) % 1000}"^^<{XSD}integer>')
 
 
-def _subject_code(store, i: int) -> int:
-    return store._dict.encode(f"<http://ex.org/p{i}>")
-
-
 def _price_match(store):
     """The four code columns of every price quad."""
     return store._store().match_codes(None, PRICE, None, None)
@@ -371,41 +367,28 @@ def test_compacting_a_match_keeps_the_allowed_rows_in_match_order(varpos, keep, 
 
 
 @pytest.mark.parametrize(
-    ("kept", "sparql_expr", "limit"),
-    [(S, "?v < 300", 300), (V, "?v < 300", 300), (V, "?v < 5000", 5000)],
-    ids=["other-variable", "same-variable", "same-variable-nothing-narrowed"],
+    ("limit", "compacted"), [(300, True), (5000, False)], ids=["narrowed", "every-row-passes"]
 )
-def test_restricting_a_match_applies_the_codes_it_left_to_test(tmp_path, kept, sparql_expr, limit):
-    """A file-backed match narrowed to a code range leaves the code set itself
-    to test (``pat["keep"]``). The restriction intersects it with the verdicts
-    on the conjunct's variable and compacts the match once, in match order."""
+def test_restricting_a_match_compacts_it_to_the_rows_that_pass(tmp_path, limit, compacted):
+    """The restriction compacts the match once, in match order, to the rows
+    whose code passes the conjunct, dropping the columns of constant
+    positions; a match whose rows all pass keeps its own columns."""
     store = VortexRdflibStore(_products(tmp_path), in_memory=True)
     columns = _price_match(store)
     subjects, prices = (memoryview(columns[i]).cast("Q").tolist() for i in (0, 2))
-    even = range(0, 200, 2)
-    code_of = _subject_code if kept == S else _price_code
-    preset = {code_of(store, i) for i in even}
     passing = {_price_code(store, i) for i in range(200) if (i * 37) % 1000 < limit}
-    pat: dict = {
-        "varpos": {S: [0], V: [2]},
-        "cols": columns,
-        "nrows": len(subjects),
-        "index": 0,
-        "keep": {kept: preset},
-    }
-    [conjunct] = filters.analyze_expr(filter_expr(sparql_expr), [V], CTX, {}).per_var[V]
+    pat: dict = {"varpos": {S: [0], V: [2]}, "cols": columns, "nrows": len(subjects), "index": 0}
+    [conjunct] = filters.analyze_expr(filter_expr(f"?v < {limit}"), [V], CTX, {}).per_var[V]
     pd._restrict_pattern(store, pat, {V: [conjunct]})
-    rows = [
-        i
-        for i, (subject, price) in enumerate(zip(subjects, prices, strict=True))
-        if price in passing and (subject if kept == S else price) in preset
-    ]
-    assert 0 < len(rows) < len(subjects)
-    assert "keep" not in pat
+    rows = [i for i, price in enumerate(prices) if price in passing]
+    assert 0 < len(rows) and (len(rows) < len(subjects)) == compacted
     assert pat["nrows"] == len(rows)
     assert memoryview(pat["cols"][0]).cast("Q").tolist() == [subjects[i] for i in rows]
     assert memoryview(pat["cols"][2]).cast("Q").tolist() == [prices[i] for i in rows]
-    assert pat["cols"][1] is None and pat["cols"][3] is None
+    if compacted:
+        assert pat["cols"][1] is None and pat["cols"][3] is None
+    else:
+        assert pat["cols"] is columns
 
 
 def test_iri_equality_is_a_keep_on_the_match(tmp_path, monkeypatch, capsys):
