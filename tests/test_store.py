@@ -428,10 +428,10 @@ def _spy_on_constructors(monkeypatch) -> list:
 
 
 def test_terms_built_directly_are_rdflibs(monkeypatch, caplog):
-    """IRIs, unescaped plain and language-tagged literals and canonical
-    xsd:integer literals are built without rdflib's constructors; over
-    generated spellings of every kind, each term is the one the
-    constructors make, in everything rdflib exposes."""
+    """IRIs, and plain, language-tagged and xsd:integer literals without
+    escapes (an integer that int() reads) are built without rdflib's
+    constructors; over generated spellings of every kind, each term is the
+    one the constructors make, in everything rdflib exposes."""
     caplog.set_level(logging.ERROR, logger="rdflib.term")  # "abc"^^xsd:integer logs a warning
     # The import-time check passes on the rdflib this package pins.
     assert VortexRdflibStore._from_n3_safe is terms_mod._term_built_directly
@@ -440,6 +440,9 @@ def test_terms_built_directly_are_rdflibs(monkeypatch, caplog):
         f'"0"^^{INTEGER}',
         f'"-0"^^{INTEGER}',
         f'"1{"0" * 5000}"^^{INTEGER}',  # canonical, past int()'s digit limit: no value
+        f'" 7 "^^{INTEGER}',
+        f'"1\\u0032"^^{INTEGER}',
+        f'"12a"^^{INTEGER}',
         '""',
         '""@en',
     ]

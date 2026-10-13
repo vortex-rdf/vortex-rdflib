@@ -217,45 +217,59 @@ def _term_built_directly(value: str) -> Node:
     """`_term_by_constructors`, except for the terms whose every attribute
     the spelling gives, made directly with ``str.__new__`` and the slots
     ``Literal.__new__`` sets: an IRI (``URIRef`` only adds a warning about
-    characters vortex-rdf's parser never lets into an IRI), and a plain,
-    language-tagged or canonical xsd:integer literal without escapes
-    (``Literal`` normalizes nothing in it)."""
+    characters vortex-rdf's parser never lets into an IRI), a plain or
+    language-tagged literal without escapes (``Literal`` normalizes nothing
+    in it), and an xsd:integer literal without escapes that ``int()`` reads
+    (``Literal`` takes that int as its value and spells it as the int).
+    Every other spelling goes to the constructors split once, so no kind
+    builds slower than through `_term_by_constructors`."""
+    if value.startswith("_:"):
+        return BNode(value[2:])
     first = value[:1]
     if first == "<" and value[-1:] == ">":
         return _new_str(URIRef, value[1:-1])
     end = value.rfind('"') if first == '"' else 0
-    if end > 0:
-        body, suffix = value[1:end], value[end + 1 :]
-        if "\\" not in body:
-            if not suffix:
-                term = _new_str(Literal, body)
-                term._language = None
-                term._datatype = None
-                term._value = body
-                term._ill_typed = None
-                return term
-            if suffix[0] == "@":
-                language = suffix[1:]
-                if _is_valid_langtag(language):
-                    term = _new_str(Literal, body)
-                    term._language = language
-                    term._datatype = None
-                    term._value = body
-                    term._ill_typed = None
-                    return term
-            elif suffix == INTEGER_SUFFIX and CANONICAL_INTEGER.fullmatch(body):
-                try:
-                    number = int(body)
-                except ValueError:
-                    # Past int()'s digit limit: rdflib keeps it with no value.
-                    return _term_by_constructors(value)
-                term = _new_str(Literal, body)
-                term._language = None
-                term._datatype = XSD_INTEGER
-                term._value = number
-                term._ill_typed = False
-                return term
-    return _term_by_constructors(value)
+    if end <= 0:
+        return _term_by_constructors(value)  # no term spelling: its error
+    lexical, suffix = value[1:end], value[end + 1 :]
+    if "\\" in lexical:
+        lexical = _ESCAPE_RE.sub(_unescape_match, lexical)
+    elif not suffix:
+        term = _new_str(Literal, lexical)
+        term._language = None
+        term._datatype = None
+        term._value = lexical
+        term._ill_typed = None
+        return term
+    elif suffix[0] == "@":
+        language = suffix[1:]
+        if _is_valid_langtag(language):
+            term = _new_str(Literal, lexical)
+            term._language = language
+            term._datatype = None
+            term._value = lexical
+            term._ill_typed = None
+            return term
+    elif suffix == INTEGER_SUFFIX:
+        try:
+            number = int(lexical)
+        except ValueError:
+            # Ill-typed: rdflib keeps it as written, with no value.
+            return Literal(lexical, datatype=XSD_INTEGER)
+        term = _new_str(Literal, number)
+        term._language = None
+        term._datatype = XSD_INTEGER
+        term._value = number
+        term._ill_typed = False
+        return term
+    # The rest of `_term_by_constructors`, on the parts split above.
+    if not suffix:
+        return Literal(lexical)
+    if suffix.startswith("@") and len(suffix) > 1:
+        return Literal(lexical, lang=suffix[1:])
+    if suffix.startswith("^^<") and suffix.endswith(">"):
+        return Literal(lexical, datatype=URIRef(suffix[3:-1]))
+    raise ValueError(f"Could not parse returned RDF term as N-Triples: {value!r}")
 
 
 #: Spellings `_term_builder` builds both ways: each kind
@@ -275,6 +289,9 @@ _SELF_CHECK = (
     f'"12345678901234567890123"{INTEGER_SUFFIX}',
     f'"042"{INTEGER_SUFFIX}',
     f'"-0"{INTEGER_SUFFIX}',
+    f'" 7"{INTEGER_SUFFIX}',
+    f'"+5"{INTEGER_SUFFIX}',
+    f'"1\\u0032"{INTEGER_SUFFIX}',
     '"1e2"^^<http://www.w3.org/2001/XMLSchema#double>',
     '"x"^^<http://ex.org/dt>',
     '"q\\"uote"',
