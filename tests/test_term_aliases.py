@@ -249,6 +249,46 @@ def test_alias_classes_are_rdflibs_term_equality(generated_store, caplog, calls)
     assert _partition(codes, lambda c: aliases.get(c, c)) == expected
 
 
+def test_query_constants_look_up_no_twin(generated_store, monkeypatch):
+    """A query constant's code is negative because its canonical spelling is
+    not in the dictionary, so the alias pass looks no twin up for it."""
+    store = generated_store
+    lookups = []
+
+    class _Lookups:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def encode_many(self, spellings):
+            lookups.extend(spellings)
+            return self._inner.encode_many(spellings)
+
+        def encode(self, spelling):
+            lookups.append(spelling)
+            return self._inner.encode(spelling)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    scope = query_scope.QueryScope()
+    token = query_scope.enter(scope)
+    try:
+        constants = [
+            Literal("123456789", datatype=URIRef(INTEGER)),
+            Literal("1.25", datatype=URIRef(f"{XSD}decimal")),
+            Literal("never", datatype=URIRef(UNCONVERTED[0])),
+        ]
+        assert all(store._dict.encode(canonical_spelling(term)) is None for term in constants)
+        codes = [store._foreign_code(term) for term in constants]
+        monkeypatch.setattr(store, "_dict", _Lookups(store._dict))
+        aliases: dict = {}
+        pd._alias_codes(store, codes, store._terms().foreign, aliases)
+    finally:
+        query_scope.leave(token)
+    assert len(set(codes)) == 3 and all(code < 0 for code in codes)
+    assert lookups == [] and aliases == {}
+
+
 def test_the_alias_pass_builds_only_spellings_rdflib_may_rewrite(tmp_path, monkeypatch):
     """Canonical xsd:integer literals and those of a datatype rdflib cannot
     convert are classified by spelling, without a term; a spelling rdflib

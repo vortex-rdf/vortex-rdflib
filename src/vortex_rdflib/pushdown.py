@@ -1053,8 +1053,10 @@ def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
     code aliases is a property of the store, not of the query: each literal
     code is classified once per query, and later calls in the query only
     look their codes up. A query constant outside the dictionary (a negative
-    code, stable for the query too) takes part through its own term. For
-    most stores no code aliases another and ``aliases`` stays empty.
+    code, stable for the query too) takes part through its own term; its
+    canonical spelling is not in the dictionary, which is why its code is
+    negative (`_constant_codes`), so no twin is looked up for it. For most
+    stores no code aliases another and ``aliases`` stays empty.
     """
     literal_lo, iri_lo, _ = store._term_kind_bounds()
     terms = store._terms()
@@ -1080,7 +1082,9 @@ def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
                 if isinstance(term, Literal) and term.datatype is not None:
                     typed.append((code, term, None))
         firsts, reps = terms.alias_firsts, terms.alias_reps
-        twins = _canonical_twins(store, [(t, s) for _, t, s in typed if t not in firsts])
+        twins = _canonical_twins(
+            store, [(t, s) for _, t, s in typed if s is not None and t not in firsts]
+        )
         for code, term, _ in typed:
             representative = firsts.get(term)
             if representative is None:
@@ -1137,10 +1141,9 @@ def _rewritable(codes, spellings) -> Iterator[tuple[int, str]]:
 
 def _canonical_twins(store, read: list) -> dict:
     """The code of each term's canonical spelling, for the ``(term,
-    spelling)`` pairs of ``read`` whose term was read from another spelling,
-    or is a query constant (spelling ``None``), and whose canonical spelling
-    the dictionary holds: one ``encode_many`` call, and the codes it finds
-    decoded to confirm the term."""
+    spelling)`` pairs of ``read`` whose term was read from another spelling
+    and whose canonical spelling the dictionary holds: one ``encode_many``
+    call, and the codes it finds decoded to confirm the term."""
     wanted: dict = {}
     for term, spelling in read:
         if term not in wanted:
