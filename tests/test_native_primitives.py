@@ -1,7 +1,7 @@
-"""The vortex-rdf 0.11 primitives the pushdown builds on, each pinned where
-it is used: what reaches the native layer, and that the answer is still
-rdflib's. The equivalence matrix in ``test_pushdown`` covers the answers of
-every shape; these say *how* they are reached."""
+"""The vortex-rdf primitives the pushdown builds on, each pinned where it is
+used: what reaches the native layer, and that the answer is rdflib's. The
+equivalence matrix in ``test_pushdown`` covers the answers of every shape;
+these say *how* they are reached."""
 
 import json
 

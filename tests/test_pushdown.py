@@ -1326,7 +1326,7 @@ class _CountingTermDict:
 
 
 def _counting_term_dict(graph) -> _CountingTermDict:
-    """Install the counter over the store's resident term dictionary."""
+    """Install the counter over the store's term dictionary."""
     counting = _CountingTermDict(graph.store._dict)
     graph.store._dict = counting
     return counting

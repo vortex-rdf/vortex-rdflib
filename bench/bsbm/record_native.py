@@ -11,8 +11,7 @@ vortex-rdf build, separating native time from Python time.
 
 Not recorded: operations on the ``U64Column`` results the proxies return
 (``join_indices``, ``take``, ``distinct``, ``value_counts``), ``len()`` on the
-proxies, and calls that raise (a call is logged once it has returned). They are
-negligible: about 0.5 ms of ``U64Column`` calls over the 10k-product stream.
+proxies, and calls that raise (a call is logged once it has returned).
 """
 
 import argparse

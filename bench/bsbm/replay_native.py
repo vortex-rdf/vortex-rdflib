@@ -8,8 +8,8 @@ re-issues every call in order, timing each; the first passes warm the page
 cache, the last is reported per method and per template. A call the installed
 API rejects (a changed signature, an argument out of range, a missing method)
 counts under ``errors`` and is skipped; ``first_error`` keeps the first reason
-per method. On a vortex-rdf that accepts ``max_resident_bytes`` (0.11), file
-stores open with vortex-rdflib 0.2.0's 1 GiB default.
+per method. A file store opens with a 1 GiB dictionary residency budget when the
+installed vortex-rdf accepts ``max_resident_bytes``, and memory-mapped otherwise.
 """
 
 import argparse
@@ -60,7 +60,7 @@ def _open(store_path: str, in_memory: bool):
             in_memory=False,
             max_resident_bytes=1 << 30,  # ty: ignore[unknown-argument]
         )
-    except TypeError:  # 0.12+: memory-mapped, no residency budget
+    except TypeError:  # no residency budget: the store is memory-mapped
         return VortexRdfStore(store_path, in_memory=False)
 
 

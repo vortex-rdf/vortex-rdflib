@@ -267,7 +267,7 @@ def vortex_files(tmp_path_factory, source_nq) -> dict[str, str]:
 def stores(vortex_files) -> dict[str, VortexRdflibStore]:
     """Opened stores, keyed `<residency>_<variant>`.
 
-    `mem_nocodes` is the Dictionary layout with the u32 code path forced off:
+    `mem_nocodes` is the Dictionary layout with the u64 code path forced off:
     `VORTEX_RDF_DISABLE_CODE_PATH` is read at construction, so it only has to
     be set while that one store is built. Against `mem_noidx` it isolates the
     cost of decoding codes versus parsing N-Triples term strings.
@@ -390,7 +390,7 @@ def test_triples(benchmark, stores, name):
 @pytest.mark.parametrize("variant", STORE_VARIANTS)
 def test_triples_p_scan(benchmark, stores, variant):
     """The same predicate scan across the store variants that change how a
-    match is served: u32 code path, code path disabled (string fallback on
+    match is served: u64 code path, code path disabled (string fallback on
     the same file), Default layout (no dictionary at all), file-backed."""
     store, pattern = stores[variant], PATTERNS["p-scan"]
     assert _consume_triples(store, pattern) > 0
@@ -423,7 +423,7 @@ def test_triples_across_graphs(benchmark, stores):
 
 @pytest.mark.parametrize("file_key", ("dict_noidx", "default"))
 def test_open_file(benchmark, vortex_files, file_key):
-    """Lazy open: reads the footer and metadata, not the data."""
+    """Memory-mapped open: reads the footer and metadata, not the data."""
     benchmark(VortexRdflibStore, vortex_files[file_key])
 
 

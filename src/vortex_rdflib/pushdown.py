@@ -26,7 +26,8 @@ What runs in code space:
 - a ``Filter`` over a block is split into conjuncts (:mod:`.filters`):
   those over one variable that are a kind test or an IRI equality (``=``,
   ``sameTerm``, ``IN``) become a ``keep`` on the match of every pattern
-  binding the variable, so the rows that fail never leave it; the others over
+  binding the variable, so the rows that fail never leave it (a probed
+  pattern tests a code set on the rows each probe returns); the others over
   one variable are evaluated once per distinct code of the variable, on the
   pattern that binds it — over the pattern's whole column when it is
   matched, over the codes the probes reach when it is probed — by
@@ -2542,8 +2543,9 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
     then = time.perf_counter_ns() if traced else 0
     if any(pat["unsatisfiable"] for pat in patterns):
         # A literal bound into subject or predicate position, or a keep that
-        # is an empty code column (IRIs the dictionary lacks): the block is
-        # empty whatever the other patterns count.
+        # is an empty code column (IRIs the dictionary lacks, an empty ``IN``
+        # list, lists with no IRI in common): the block is empty whatever the
+        # other patterns count.
         for pat in patterns:
             pat["estimate"] = 0
     else:
@@ -2937,8 +2939,9 @@ def _push_native_restrictions(store, pat, var_preds) -> dict:
 
     The keep is exact, so it may narrow a variable the relation will already
     bind when the pattern joins: the rows it drops could not have joined. A
-    code column left empty (IRIs the dictionary lacks) makes the pattern
-    unsatisfiable, so nothing is counted or matched for it.
+    code column left empty (IRIs the dictionary lacks, an empty ``IN`` list,
+    lists with no IRI in common) makes the pattern unsatisfiable, so nothing
+    is counted or matched for it.
     """
     residual: dict = {}
     for var, positions in pat["varpos"].items():

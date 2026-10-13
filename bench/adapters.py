@@ -38,7 +38,7 @@ Engines: SPARQL evaluation is rdflib's engine for every adapter but one, so
 the store serving triple patterns is the only variable across the comparable
 rows. oxrdflib is among them: it is asked with ``use_store_provided=False``,
 which stops ``OxigraphStore.query`` from handing the query text to
-pyoxigraph. For vortex adapters with a resident dictionary, rdflib's engine
+pyoxigraph. For vortex adapters of the Dictionary layout, rdflib's engine
 hands the algebra nodes this package understands to its code-space pushdown.
 The two ``pushdown off`` rows run the primary configuration of each
 residency with ``VORTEX_RDF_DISABLE_PUSHDOWN=1``, so the pushdown's own
@@ -68,7 +68,7 @@ work. What keeps it comparable at all:
 
 The Vortex rows are all Dictionary layout — the layout that enables the term
 code path and so the only one worth tuning — crossed over the two axes that
-change how a store answers: **residency** (file-backed lazy open vs fully
+change how a store answers: **residency** (memory-mapped file vs fully
 in-memory) and **secondary index** (none, ``secondary-by-copy``,
 ``secondary-by-reference``).
 """

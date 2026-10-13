@@ -84,9 +84,9 @@ class VortexRdflibStore(Store):
         self.layout = _LAYOUT_ALIASES.get(layout, layout) if layout else None
         self.backend = backend
         # File-backed stores are memory-mapped: a query reads only the pages it
-        # touches, and the OS page cache, the only cache of store data, decides
-        # what stays in RAM. in_memory loads the whole store up front instead.
-        # Env override for benchmark sweeps.
+        # touches. vortex-rdf keeps a bounded cache of the dictionary windows
+        # it reads; the OS page cache holds the rest. in_memory loads the whole
+        # store up front instead. Env override for benchmark sweeps.
         if in_memory is None:
             in_memory = os.environ.get("VORTEX_RDF_IN_MEMORY") == "1"
         self.in_memory = in_memory
