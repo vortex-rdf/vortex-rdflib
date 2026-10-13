@@ -143,6 +143,18 @@ def canonical_spelling(node) -> str:
     raise TypeError(f"not an RDF term: {node!r}")
 
 
+#: The form of every IRI vortex-rdf parses: a scheme, then none of the
+#: characters no IRI holds.
+_IRI_FORM = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*:[^\x00-\x20<>"{}|^`\\]*')
+
+
+def unparseable_iri(node) -> bool:
+    """Whether ``node`` is an IRI without the form of every IRI vortex-rdf
+    parses — a relative one (no BASE), say. It is no term of a file, and the
+    native parser rejects its spelling."""
+    return isinstance(node, URIRef) and _IRI_FORM.fullmatch(node) is None
+
+
 def kind_bounds(term_dict) -> tuple[int, int, int]:
     """``(literal_lo, iri_lo, blank_lo)``: the first code of each term kind.
 

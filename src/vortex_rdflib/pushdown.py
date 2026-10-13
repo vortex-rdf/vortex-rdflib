@@ -112,7 +112,6 @@ import heapq
 import json
 import math
 import os
-import re
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -130,7 +129,7 @@ from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
 
 from . import candidates, filters, query_scope
-from .terms import canonical_spelling
+from .terms import canonical_spelling, unparseable_iri
 
 _EVAL_KEY = "vortex_rdflib_bgp"
 
@@ -569,25 +568,18 @@ def _active_scope(ctx, store) -> _GraphScope:
     return _GraphScope(store._graph_n3(getattr(ctx, "graph", None)))
 
 
-#: The form of every IRI vortex-rdf's parser reads as a graph name: a scheme,
-#: then none of the characters no IRI holds.
-_GRAPH_IRI = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*:[^\x00-\x20<>"{}|^`\\]*')
-
-
 def _graph_scope(ctx, node) -> _GraphScope:
     """The scope a ``Graph`` node establishes, mirroring rdflib's ``evalGraph``:
     a bound term names one graph, an unbound variable ranges over the named
     graphs. A term that cannot name a graph is left to rdflib rather than
-    guessed at: one other than an IRI or a blank node, and an IRI without the
-    form of an absolute one (``<zz>`` with no BASE), which vortex-rdf's parser
-    rejects and the store answers with nothing."""
+    guessed at: one other than an IRI or a blank node, and an IRI vortex-rdf's
+    parser rejects (:func:`~vortex_rdflib.terms.unparseable_iri`), which the
+    store answers with nothing."""
     term = node.term
     value = ctx[term]
     if value is None:
         return _GraphScope(None, term)
-    if not isinstance(value, (URIRef, BNode)):
-        raise NotImplementedError
-    if isinstance(value, URIRef) and not _GRAPH_IRI.fullmatch(value):
+    if not isinstance(value, (URIRef, BNode)) or unparseable_iri(value):
         raise NotImplementedError
     return _GraphScope(canonical_spelling(value), None)
 
@@ -1518,15 +1510,20 @@ def _constant_codes(store, terms: list) -> list:
 
     One ``encode_many`` looks every spelling up, tolerant of spelling: the
     native layer canonicalizes a term the way its pattern parser does, so a
-    miss means no match of any pattern could reach the term either. A term
-    the native parser rejects leaves the table to rdflib.
+    miss means no match of any pattern could reach the term either. An IRI
+    the parser rejects (:func:`~vortex_rdflib.terms.unparseable_iri`) is no
+    term of the file and is not looked up; any other term the native parser
+    rejects leaves the table to rdflib.
     """
     if not terms:
         return []
+    rejected = [unparseable_iri(term) for term in terms]
+    spellings = [canonical_spelling(t) for t, out in zip(terms, rejected, strict=True) if not out]
     try:
-        found = store._dict.encode_many([canonical_spelling(term) for term in terms])
+        encoded = iter(store._dict.encode_many(spellings) if spellings else ())
     except ValueError:
         raise NotImplementedError from None
+    found = [None if out else next(encoded) for out in rejected]
     store._prime_decode_cache([code for code in found if code is not None])
     codes = []
     for term, code in zip(terms, found, strict=True):
@@ -1737,9 +1734,11 @@ def _substituted_patterns(store, rows, pat, bound) -> list:
                 # The dictionary stores canonical N-Triples forms: a literal
                 # ('"') cannot occupy subject or predicate position or name a
                 # graph, and only an IRI ('<') can be a predicate — such a
-                # binding simply has no continuation.
+                # binding simply has no continuation, nor has a constant with
+                # no spelling (an IRI the parser rejects).
                 if (
-                    (idx == 0 and term[:1] == '"')
+                    term is None
+                    or (idx == 0 and term[:1] == '"')
                     or (idx == 1 and term[:1] != "<")
                     or (idx == 3 and term[:1] == '"')
                 ):
@@ -2864,9 +2863,14 @@ def _pattern_terms(ctx, store, s, p, o, scope) -> dict:
     rs, rp, ro = ctx[s], ctx[p], ctx[o]
 
     # rdflib joins can propagate a literal into subject or predicate
-    # position; that pattern is unsatisfiable, not an error.
-    unsatisfiable = (rs is not None and not isinstance(rs, (URIRef, BNode))) or (
-        rp is not None and not isinstance(rp, URIRef)
+    # position; that pattern is unsatisfiable, not an error. So is one that
+    # holds an IRI vortex-rdf's parser rejects, which is no term of the file.
+    unsatisfiable = (
+        (rs is not None and not isinstance(rs, (URIRef, BNode)))
+        or (rp is not None and not isinstance(rp, URIRef))
+        or unparseable_iri(rs)
+        or unparseable_iri(rp)
+        or unparseable_iri(ro)
     )
 
     varpos: dict = {}
@@ -3285,12 +3289,15 @@ def _probe_spellings(store, rows, bound) -> dict:
     """The N-Triples spelling of every code the probes substitute: one
     batch decode for dictionary codes, and for a constant outside the
     dictionary the canonical spelling :func:`_constant_codes` looked up
-    (which then matches nothing)."""
+    (which then matches nothing), or ``None`` for an IRI the parser rejects,
+    which it did not look up."""
     distinct = {row[row_idx] for row in rows for row_idx, _ in bound}
     codes = [code for code in distinct if code >= 0]
     foreign = store._terms().foreign
-    n3_cache: dict[int, str] = {
-        code: canonical_spelling(foreign[code]) for code in distinct if code < 0
+    n3_cache: dict[int, str | None] = {
+        code: None if unparseable_iri(foreign[code]) else canonical_spelling(foreign[code])
+        for code in distinct
+        if code < 0
     }
     for code, term in zip(codes, store._dict.decode_many(codes), strict=True):
         if term is None:

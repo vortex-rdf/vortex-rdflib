@@ -9,7 +9,15 @@ from vortex_rdf import VortexRdfStore
 from . import query_scope
 from .pushdown import register_sparql_pushdown
 from .query_scope import QueryTerms
-from .terms import BLANK, IRI, LITERAL, canonical_spelling, kind_bounds, unescape
+from .terms import (
+    BLANK,
+    IRI,
+    LITERAL,
+    canonical_spelling,
+    kind_bounds,
+    unescape,
+    unparseable_iri,
+)
 
 #: Sentinel for a cached lookup whose answer may legitimately be ``None``.
 _UNRESOLVED = object()
@@ -308,6 +316,10 @@ class VortexRdflibStore(Store):
             return
         if p is not None and not isinstance(p, URIRef):
             return
+        # So is one holding an IRI vortex-rdf's parser rejects, which is no
+        # term of the file.
+        if unparseable_iri(s) or unparseable_iri(p) or unparseable_iri(o):
+            return
 
         s_n3 = self._node_to_n3(s)
         p_n3 = self._node_to_n3(p)
@@ -430,8 +442,10 @@ class VortexRdflibStore(Store):
                 self._all_contexts = self._distinct_graphs(None, None, None)
             return iter(self._all_contexts)
         s, p, o = triple
-        if (s is not None and not isinstance(s, (URIRef, BNode))) or (
-            p is not None and not isinstance(p, URIRef)
+        if (
+            (s is not None and not isinstance(s, (URIRef, BNode)))
+            or (p is not None and not isinstance(p, URIRef))
+            or any(unparseable_iri(term) for term in triple)
         ):
             return iter(())
         return iter(

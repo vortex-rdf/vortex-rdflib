@@ -523,6 +523,10 @@ QUERIES += [
     'SELECT ?s WHERE { VALUES ?n { "zz\\nyy" "Alice" } ?s <http://ex.org/name> ?n }',
     """SELECT ?n WHERE { VALUES ?n { "zz\\nyy" "Alice" }
         FILTER EXISTS { ?s <http://ex.org/name> ?n } }""",
+    # a relative IRI (no BASE), which no probe can match
+    "SELECT ?s ?o WHERE { VALUES ?o { <zz> <http://ex.org/carol> } ?s <http://ex.org/knows> ?o }",
+    """SELECT ?o ?s WHERE { VALUES ?o { <zz> <http://ex.org/carol> }
+        OPTIONAL { ?s <http://ex.org/likes> ?o } }""",
     """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/bob> }
         ?x <http://ex.org/name> ?n FILTER(?x = <http://ex.org/bob>) }""",
     "SELECT * WHERE { VALUES (?x ?y) { (1 2) (UNDEF 3) (<http://ex.org/nobody> UNDEF) } }",
@@ -987,6 +991,37 @@ REJECTED_GRAPH_NAMES = {
 }
 
 
+#: Terms vortex-rdf's parser rejects in subject, predicate and object
+#: position: a relative IRI (no BASE), written or bound through VALUES. Where
+#: its VALUES row survives (an OPTIONAL with nothing to match), rdflib yields
+#: the IRI.
+REJECTED_TERMS = {
+    "predicate": "SELECT ?s ?o WHERE { ?s <zz> ?o }",
+    "subject": "SELECT ?p ?o WHERE { <zz> ?p ?o }",
+    "object": "SELECT ?s ?p WHERE { ?s ?p <zz> }",
+    "values": "SELECT ?s ?p ?o WHERE { VALUES ?o { <zz> <http://ex.org/carol> } ?s ?p ?o }",
+    "values-optional": """SELECT ?o ?s WHERE {
+        VALUES ?o { <zz> <http://ex.org/carol> } OPTIONAL { ?s <http://ex.org/likes> ?o } }""",
+}
+
+
+def _answer_in_mode(monkeypatch, mode, path, view, sparql):
+    """``sparql`` over ``view`` of the file-backed store at ``path``, with the
+    pushdown on, limited to BGPs (``VORTEX_RDF_PUSHDOWN_OPS=bgp``) or
+    unregistered."""
+    monkeypatch.setattr(pd, "_ENABLED_OPS", pd._ENABLED_OPS)
+    if mode == "bgp":
+        monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "bgp")
+    # Building the store registers the pushdown, so it is built first.
+    store = VortexRdflibStore(str(path), in_memory=False)
+    if mode == "unregistered":
+        unregister_sparql_pushdown()
+    try:
+        return run(view(store), sparql)
+    finally:
+        register_sparql_pushdown()
+
+
 @pytest.mark.parametrize("mode", ["pushdown", "bgp", "unregistered"])
 @pytest.mark.parametrize(
     "sparql", list(REJECTED_GRAPH_NAMES.values()), ids=list(REJECTED_GRAPH_NAMES)
@@ -1002,17 +1037,24 @@ def test_a_graph_name_the_parser_rejects_matches_nothing(
     memory.parse(data=FIXTURE_NQ, format="nquads")
     expected = run(memory, sparql)
     assert expected
-    monkeypatch.setattr(pd, "_ENABLED_OPS", pd._ENABLED_OPS)
-    if mode == "bgp":
-        monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "bgp")
-    # Building the store registers the pushdown, so it is built first.
-    store = VortexRdflibStore(str(dict_vortex_quads), in_memory=False)
-    if mode == "unregistered":
-        unregister_sparql_pushdown()
-    try:
-        assert run(Dataset(store=store, default_union=True), sparql) == expected
-    finally:
-        register_sparql_pushdown()
+    union = _answer_in_mode(
+        monkeypatch, mode, dict_vortex_quads, lambda s: Dataset(store=s, default_union=True), sparql
+    )
+    assert union == expected
+
+
+@pytest.mark.parametrize("mode", ["pushdown", "bgp", "unregistered"])
+@pytest.mark.parametrize("sparql", list(REJECTED_TERMS.values()), ids=list(REJECTED_TERMS))
+def test_a_term_the_parser_rejects_matches_nothing(dict_vortex, monkeypatch, sparql, mode):
+    """A term vortex-rdf's parser rejects is no term of the file, so a
+    pattern holding it matches nothing, as in rdflib's own store: the
+    pushdown's pattern is unsatisfiable, a VALUES constant gets a code that
+    joins nothing and is still yielded, and ``triples()`` yields nothing."""
+    memory = Graph()
+    memory.parse(data=FIXTURE_NT, format="nt")
+    expected = run(memory, sparql)
+    answer = _answer_in_mode(monkeypatch, mode, dict_vortex, lambda s: Graph(store=s), sparql)
+    assert answer == expected
 
 
 def test_a_context_naming_no_graph_is_empty(dict_vortex_quads):
@@ -1025,6 +1067,16 @@ def test_a_context_naming_no_graph_is_empty(dict_vortex_quads):
         for pattern in ((None, None, None), (None, name, None), ground):
             assert list(store.triples(pattern, context)) == []
         assert store.__len__(context) == 0
+
+
+def test_a_term_the_parser_rejects_has_no_triples_and_no_graphs(dict_vortex_quads):
+    """An IRI the native parser rejects, in any position, is no term of the
+    file: ``triples()`` yields nothing and ``contexts()`` names no graph."""
+    store = VortexRdflibStore(str(dict_vortex_quads), in_memory=False)
+    relative = URIRef("zz")
+    for pattern in ((relative, None, None), (None, relative, None), (None, None, relative)):
+        assert list(store.triples(pattern, None)) == []
+        assert list(store.contexts(pattern)) == []
 
 
 @pytest.mark.parametrize("sparql", ORDER_QUERIES)
