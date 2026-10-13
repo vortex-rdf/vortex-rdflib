@@ -519,6 +519,10 @@ QUERIES += [
         ?x <http://ex.org/note> ?n }""",
     """SELECT ?x ?n WHERE { VALUES ?n { "x"@en-US "x"@EN-US "x"@en }
         ?x <http://ex.org/note> ?n }""",
+    # an absent literal with a newline, substituted into a probe
+    'SELECT ?s WHERE { VALUES ?n { "zz\\nyy" "Alice" } ?s <http://ex.org/name> ?n }',
+    """SELECT ?n WHERE { VALUES ?n { "zz\\nyy" "Alice" }
+        FILTER EXISTS { ?s <http://ex.org/name> ?n } }""",
     """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/bob> }
         ?x <http://ex.org/name> ?n FILTER(?x = <http://ex.org/bob>) }""",
     "SELECT * WHERE { VALUES (?x ?y) { (1 2) (UNDEF 3) (<http://ex.org/nobody> UNDEF) } }",

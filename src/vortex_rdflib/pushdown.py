@@ -3326,12 +3326,15 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
 
 def _probe_spellings(store, rows, bound) -> dict:
     """The N-Triples spelling of every code the probes substitute: one
-    batch decode for dictionary codes, the term's own spelling for a
-    constant outside the dictionary (which then matches nothing)."""
+    batch decode for dictionary codes, and for a constant outside the
+    dictionary the canonical spelling :func:`_constant_codes` looked up
+    (which then matches nothing)."""
     distinct = {row[row_idx] for row in rows for row_idx, _ in bound}
     codes = [code for code in distinct if code >= 0]
     foreign = store._terms().foreign
-    n3_cache: dict[int, str] = {code: foreign[code].n3() for code in distinct if code < 0}
+    n3_cache: dict[int, str] = {
+        code: canonical_spelling(foreign[code]) for code in distinct if code < 0
+    }
     for code, term in zip(codes, store._dict.decode_many(codes), strict=True):
         if term is None:
             raise ValueError(f"term code {code} is not in the store dictionary")

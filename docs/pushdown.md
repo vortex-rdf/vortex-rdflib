@@ -132,7 +132,7 @@ The head is what rdflib puts above a block:
 
 ## Returning solutions
 
-[`_yield_rows`](../src/vortex_rdflib/pushdown.py#L3452) turns code rows into
+[`_yield_rows`](../src/vortex_rdflib/pushdown.py#L3455) turns code rows into
 rdflib solutions, lazily:
 
 - It reads the rows in chunks that grow from 64 to 4096 rows
@@ -146,7 +146,7 @@ rdflib solutions, lazily:
 A consumer that stops early, such as a `LIMIT` or an `EXISTS` that found a
 match, never decodes the rows it did not read. Columns are turned into Python
 tuples one slice at a time, for the same reason
-([`_column_rows`](../src/vortex_rdflib/pushdown.py#L3416)).
+([`_column_rows`](../src/vortex_rdflib/pushdown.py#L3419)).
 
 ## A worked example
 
@@ -261,7 +261,7 @@ the join from the pattern sizes:
      the result stays columnar. Other cases (several shared variables, a
      repeated variable as in `?x <p> ?x`, a filter still to apply in Python, a
      cross product) use the Python hash join
-     [`_join`](../src/vortex_rdflib/pushdown.py#L3342).
+     [`_join`](../src/vortex_rdflib/pushdown.py#L3345).
 
 A literal that a join puts in subject or predicate position is not an error:
 the pattern simply matches nothing, as with `Store.triples()`.
@@ -768,7 +768,7 @@ When rdflib evaluates a `Graph` node itself (with
 `VORTEX_RDF_PUSHDOWN_OPS=bgp`, for example), it changes `solution.ctx.graph`
 while it yields rows. The hook then gives each solution its own context, so
 that change cannot leak into later rows
-([`_pushed_graph`](../src/vortex_rdflib/pushdown.py#L3438)).
+([`_pushed_graph`](../src/vortex_rdflib/pushdown.py#L3441)).
 
 ## Caches and lifetimes
 
