@@ -15,7 +15,8 @@ a term's kind a range test on its code.
 import re
 from collections.abc import Callable
 
-from rdflib.term import BNode, Literal, Node, URIRef, _is_valid_langtag
+import rdflib.term
+from rdflib.term import BNode, Literal, Node, URIRef
 
 LITERAL = "literal"
 IRI = "iri"
@@ -211,6 +212,9 @@ def _term_by_constructors(value: str) -> Node:
 
 
 _new_str = str.__new__
+#: rdflib's own language-tag check, which ``Literal`` applies; ``None`` in an
+#: rdflib release without it, and then the constructors build every term.
+_is_valid_langtag = getattr(rdflib.term, "_is_valid_langtag", None)
 
 
 def _term_built_directly(value: str) -> Node:
@@ -243,7 +247,8 @@ def _term_built_directly(value: str) -> Node:
         return term
     elif suffix[0] == "@":
         language = suffix[1:]
-        if _is_valid_langtag(language):
+        # Not None: `_term_builder` picks this builder only when rdflib has it.
+        if _is_valid_langtag(language):  # ty: ignore[call-non-callable]
             term = _new_str(Literal, lexical)
             term._language = language
             term._datatype = None
@@ -331,6 +336,8 @@ def _term_builder() -> Callable[[str], Node]:
     """`_term_built_directly` if it builds every spelling of `_SELF_CHECK`
     as rdflib's constructors do, else `_term_by_constructors` for every term
     — as after an rdflib release that changes what ``Literal`` sets."""
+    if _is_valid_langtag is None:
+        return _term_by_constructors
     for spelling in _SELF_CHECK:
         try:
             same = _same_term(_term_built_directly(spelling), _term_by_constructors(spelling))

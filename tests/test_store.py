@@ -1,6 +1,8 @@
 import logging
 import random
 import re
+import subprocess
+import sys
 
 import pytest
 from rdflib import BNode, Dataset, Graph, Literal, URIRef
@@ -464,12 +466,12 @@ def test_terms_built_directly_are_rdflibs(monkeypatch, caplog):
     assert direct > 800
 
 
-@pytest.mark.parametrize("failure", ["mismatch", "error"])
+@pytest.mark.parametrize("failure", ["mismatch", "error", "no-langtag-check"])
 def test_a_failed_self_check_leaves_every_term_to_rdflibs_constructors(monkeypatch, failure):
     """At import, `_term_builder` builds a fixed sample both ways. When the
     terms differ, or the direct build fails — as after an rdflib release
-    that changes what ``Literal`` sets — every term goes through rdflib's
-    constructors."""
+    that changes what ``Literal`` sets — or rdflib has no language-tag check
+    to call, every term goes through rdflib's constructors."""
     spellings = ["<http://ex.org/a>", '"plain"', '"x"@en', f'"42"^^{INTEGER}']
     constructed = _spy_on_constructors(monkeypatch)
     assert terms_mod._term_builder() is terms_mod._term_built_directly
@@ -479,6 +481,8 @@ def test_a_failed_self_check_leaves_every_term_to_rdflibs_constructors(monkeypat
     assert constructed == []
     if failure == "mismatch":
         monkeypatch.setattr(terms_mod, "_same_term", lambda a, b: False)
+    elif failure == "no-langtag-check":
+        monkeypatch.setattr(terms_mod, "_is_valid_langtag", None)
     else:
 
         def broken(value):
@@ -491,6 +495,25 @@ def test_a_failed_self_check_leaves_every_term_to_rdflibs_constructors(monkeypat
         constructed.clear()
         term = build(spelling)
         assert type(term) in constructed and term == _by_rdflib(spelling)
+
+
+def test_an_rdflib_without_the_private_names_still_imports():
+    """``rdflib.term._is_valid_langtag`` and ``_toPythonMapping`` are looked
+    up, not imported: with both gone the package imports, the store builds
+    terms with rdflib's constructors, and the alias pass has no converter
+    table. A fresh interpreter, so the deletion stays there."""
+    code = (
+        "import sys\n"
+        "import vortex_rdflib\n"  # rdflib's own modules, imported with their names
+        "for name in [m for m in sys.modules if m.startswith('vortex_rdflib')]:\n"
+        "    del sys.modules[name]\n"
+        "import rdflib.term\n"
+        "del rdflib.term._is_valid_langtag, rdflib.term._toPythonMapping\n"
+        "from vortex_rdflib import pushdown, store, terms\n"
+        "assert store.VortexRdflibStore._from_n3_safe is terms._term_by_constructors\n"
+        "assert pushdown._toPythonMapping is None\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_no_path_store():

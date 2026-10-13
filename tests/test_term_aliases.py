@@ -140,6 +140,23 @@ def test_the_by_spelling_check_agrees_with_rdflib(caplog):
     assert counts["skipped"] > 400 and counts["rewritten"] > 1000 and counts["ill-typed"] > 400
 
 
+def test_without_rdflibs_converter_table_every_typed_spelling_is_built(monkeypatch):
+    """With no ``_toPythonMapping`` to read, as in an rdflib release without
+    it, nothing is known to be kept as written: the alias pass builds every
+    typed spelling."""
+    spellings = [
+        f'"42"^^<{INTEGER}>',
+        f'"042"^^<{INTEGER}>',
+        '"x"^^<http://ex.org/dt>',
+        f'"1.5"^^<{XSD}decimal>',
+        '"plain"',
+        '"x"@en',
+    ]
+    assert [i for i, _ in pd._rewritable(range(6), spellings)] == [1, 3]
+    monkeypatch.setattr(pd, "_toPythonMapping", None)
+    assert [i for i, _ in pd._rewritable(range(6), spellings)] == [0, 1, 2, 3]
+
+
 @pytest.fixture(scope="module")
 def generated_store(tmp_path_factory) -> VortexRdflibStore:
     """A store whose objects are generated typed literals — integer forms and

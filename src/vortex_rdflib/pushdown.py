@@ -122,11 +122,12 @@ from itertools import islice
 from operator import itemgetter
 from typing import Any
 
+import rdflib.term
 from rdflib.plugins.sparql import CUSTOM_EVALS
 from rdflib.plugins.sparql.evaluate import evalPart
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.plugins.sparql.sparql import FrozenBindings
-from rdflib.term import BNode, Literal, URIRef, Variable, _toPythonMapping
+from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
 
 from . import candidates, filters, query_scope
@@ -1095,6 +1096,11 @@ def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
                 aliases[code] = representative
 
 
+#: rdflib's datatype converters (``Literal`` normalizes the lexical forms of
+#: their datatypes); ``None`` in an rdflib release without them, and then the
+#: alias pass builds every typed literal.
+_toPythonMapping = getattr(rdflib.term, "_toPythonMapping", None)
+
 #: A canonical xsd:integer's whole spelling, which rdflib keeps as written.
 _CANONICAL_INTEGER_SPELLING = re.compile(
     f'"(?:{CANONICAL_INTEGER.pattern})"{re.escape(INTEGER_SUFFIX)}'
@@ -1105,17 +1111,24 @@ def _rewritable(codes, spellings) -> Iterator[tuple[int, str]]:
     """The ``(code, spelling)`` pairs whose typed literal rdflib's
     normalization may rewrite: every typed spelling but a canonical
     xsd:integer and one of a datatype rdflib has no converter for, which
-    ``Literal`` keeps as written."""
+    ``Literal`` keeps as written. Without rdflib's converter table every
+    typed spelling."""
     canonical = _CANONICAL_INTEGER_SPELLING.fullmatch
+    mapping = _toPythonMapping
     converted = None
     for code, spelling in zip(codes, spellings, strict=True):
         if spelling is None:
             raise ValueError(f"term code {code} is not in the store dictionary")
-        if not spelling.endswith(">") or canonical(spelling) is not None:
+        if not spelling.endswith(">"):
+            continue
+        if mapping is None:
+            yield code, spelling
+            continue
+        if canonical(spelling) is not None:
             continue
         if converted is None:
             # Read per call, so a datatype bound at runtime counts.
-            converted = {str(datatype) for datatype in _toPythonMapping if datatype is not None}
+            converted = {str(datatype) for datatype in mapping if datatype is not None}
         cut = spelling.rfind('"^^<')
         if cut > 0 and spelling[cut + 4 : -1] not in converted:
             continue
