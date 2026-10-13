@@ -289,6 +289,53 @@ def test_query_constants_look_up_no_twin(generated_store, monkeypatch):
     assert lookups == [] and aliases == {}
 
 
+def test_canonical_twins_look_up_alone_after_a_rejected_batch_and_check_the_term(
+    tmp_path, monkeypatch
+):
+    """When ``encode_many`` rejects the batch, each spelling is looked up on
+    its own, and one the parser rejects finds nothing; a code found counts as
+    a twin only if it decodes to the same term."""
+    nt = tmp_path / "twins.nt"
+    nt.write_text(
+        f'<http://ex.org/s> <http://ex.org/p> "42"^^<{INTEGER}> .\n'
+        '<http://ex.org/s> <http://ex.org/p> "x"@en .\n',
+        encoding="utf-8",
+    )
+    out = tmp_path / "twins.vortex"
+    serialize_rdf(str(nt), str(out), layout="dictionary")
+    store = VortexRdflibStore(str(out), in_memory=True)
+    real = store._dict
+    assert real is not None
+    encode = real.encode
+    forty_two = Literal("042", datatype=URIRef(INTEGER))  # rdflib reads 42
+    rejected = Literal("7", datatype=URIRef("http://ex.org/dt"))
+    read = [(forty_two, f'"042"^^<{INTEGER}>'), (rejected, '"07"^^<http://ex.org/dt>')]
+
+    class _Stub:
+        def __init__(self, encode_many, encode):
+            self.encode_many, self.encode = encode_many, encode
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    def reject_batch(spellings):
+        raise ValueError("a spelling of the batch is not a term")
+
+    def reject_one(spelling):
+        if spelling == canonical_spelling(rejected):
+            raise ValueError("not a term")
+        return encode(spelling)
+
+    monkeypatch.setattr(store, "_dict", _Stub(reject_batch, reject_one))
+    assert pd._canonical_twins(store, read) == {forty_two: encode(f'"42"^^<{INTEGER}>')}
+
+    def another_term(spellings):
+        return [encode('"x"@en') for _ in spellings]
+
+    monkeypatch.setattr(store, "_dict", _Stub(another_term, encode))
+    assert pd._canonical_twins(store, read[:1]) == {}
+
+
 def test_the_alias_pass_builds_only_spellings_rdflib_may_rewrite(tmp_path, monkeypatch):
     """Canonical xsd:integer literals and those of a datatype rdflib cannot
     convert are classified by spelling, without a term; a spelling rdflib
