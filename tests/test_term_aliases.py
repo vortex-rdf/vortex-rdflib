@@ -10,12 +10,13 @@ import logging
 import random
 
 import pytest
+import rdflib
 from rdflib import Graph, Literal, URIRef
 from rdflib.term import _toPythonMapping
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_pushdown import both_ways
+from test_pushdown import both_ways, run
 from vortex_rdflib import VortexRdflibStore, query_scope
 from vortex_rdflib.terms import LITERAL, canonical_spelling, escape, parse_spelling
 
@@ -385,6 +386,29 @@ def test_the_alias_pass_builds_only_spellings_rdflib_may_rewrite(tmp_path, monke
     ):
         with_pushdown, without_pushdown = both_ways(graph, sparql)
         assert with_pushdown == without_pushdown, sparql
+
+
+def test_without_normalization_distinct_keeps_042_and_42_apart(tmp_path, monkeypatch):
+    """With ``rdflib.NORMALIZE_LITERALS`` off, "042" and "42" are two
+    xsd:integer terms: DISTINCT keeps both, with the pushdown and without
+    it, as rdflib's own graph of the same file does."""
+    nt = tmp_path / "unnormalized.nt"
+    nt.write_text(
+        f'<http://ex.org/a> <http://ex.org/p> "042"^^<{INTEGER}> .\n'
+        f'<http://ex.org/b> <http://ex.org/p> "42"^^<{INTEGER}> .\n',
+        encoding="utf-8",
+    )
+    out = tmp_path / "unnormalized.vortex"
+    serialize_rdf(str(nt), str(out), layout="dictionary")
+    monkeypatch.setattr(rdflib, "NORMALIZE_LITERALS", False)
+    expected = Graph()
+    expected.parse(str(nt), format="nt")
+    sparql = "SELECT DISTINCT ?o WHERE { ?s <http://ex.org/p> ?o }"
+    answer = run(expected, sparql)
+    assert [str(row[0]) for row in answer] == ["042", "42"]
+    graph = Graph(store=VortexRdflibStore(str(out), in_memory=True))
+    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    assert with_pushdown == without_pushdown == answer
 
 
 _GENERATED_QUERIES = [

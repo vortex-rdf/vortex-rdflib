@@ -78,11 +78,12 @@ dictionary.
   decoded once per query and kept until the query ends
   ([`_prime_decode_cache`](../src/vortex_rdflib/store.py#L514)). IRIs, blank
   nodes, and plain, language-tagged and `xsd:integer` literals without
-  escapes (an integer `int()` reads), are made without rdflib's constructors,
+  escapes (an integer `int()` reads, a non-canonical one only while
+  `rdflib.NORMALIZE_LITERALS` holds), are made without rdflib's constructors,
   with the attributes those set; every other spelling reaches the
-  constructors split once. At import, a fixed sample is built both ways, and if any term differs
-  the constructors build every term
-  ([`_term_builder`](../src/vortex_rdflib/terms.py#L337)).
+  constructors split once. At import, a fixed sample is built both ways, and
+  if any term differs the constructors build every term
+  ([`_term_builder`](../src/vortex_rdflib/terms.py#L341)).
 
 Codes follow the byte order of the term spellings, so each kind of term fills
 one contiguous range of codes: first the default graph's empty name, then

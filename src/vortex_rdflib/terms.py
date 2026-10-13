@@ -225,7 +225,8 @@ def _term_built_directly(value: str) -> Node:
     (``BNode`` adds nothing to a label), a plain or language-tagged literal
     without escapes (``Literal`` normalizes nothing in it), and an
     xsd:integer literal without escapes that ``int()`` reads (``Literal``
-    takes that int as its value and spells it as the int).
+    takes that int as its value and spells it as the int, a non-canonical
+    form only while ``rdflib.NORMALIZE_LITERALS`` holds).
     Every other spelling goes to the constructors split once, so no kind
     builds slower than through `_term_by_constructors`. Assumes rdflib's own
     xsd:integer binding (``int``), as the native filters do."""
@@ -262,6 +263,9 @@ def _term_built_directly(value: str) -> Node:
             number = int(lexical)
         except ValueError:
             # Ill-typed: rdflib keeps it as written, with no value.
+            return Literal(lexical, datatype=XSD_INTEGER)
+        if not rdflib.NORMALIZE_LITERALS and CANONICAL_INTEGER.fullmatch(lexical) is None:
+            # Not normalizing (read per call), rdflib keeps it as written.
             return Literal(lexical, datatype=XSD_INTEGER)
         term = _new_str(Literal, number)
         term._language = None

@@ -5,6 +5,7 @@ import subprocess
 import sys
 
 import pytest
+import rdflib
 from rdflib import BNode, Dataset, Graph, Literal, URIRef
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, ConjunctiveGraph
 from rdflib.plugins.parsers import ntriples
@@ -465,6 +466,18 @@ def test_terms_built_directly_are_rdflibs(monkeypatch, caplog):
                 got, want = getattr(term, name), getattr(expected, name)
                 assert type(got) is type(want) and got == want, (spelling, name)
     assert direct > 800
+
+
+@pytest.mark.parametrize("lexical", ["042", "+5", " 7", "-0", "42"])
+def test_without_normalization_an_integer_is_built_as_rdflib_keeps_it(monkeypatch, lexical):
+    """With ``rdflib.NORMALIZE_LITERALS`` switched off after import, rdflib
+    keeps a non-canonical xsd:integer as written; the direct path reads the
+    switch at each call and builds the same term."""
+    monkeypatch.setattr(rdflib, "NORMALIZE_LITERALS", False)
+    spelling = f'"{lexical}"^^{INTEGER}'
+    term = terms_mod._term_built_directly(spelling)
+    assert terms_mod._same_term(term, terms_mod._term_by_constructors(spelling))
+    assert str(term) == lexical
 
 
 @pytest.mark.parametrize("failure", ["mismatch", "error", "no-langtag-check"])
