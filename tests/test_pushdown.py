@@ -973,6 +973,43 @@ def test_graph_scope_reaches_the_native_match(dataset, monkeypatch):
     assert patterns == ["<http://ex.org/g/1>", "<http://ex.org/absent>", None]
 
 
+@pytest.mark.parametrize("mode", ["pushdown", "bgp", "unregistered"])
+def test_a_literal_graph_name_matches_nothing(dict_vortex_quads, monkeypatch, mode):
+    """``GRAPH ?g`` with ``?g`` bound to a literal answers as rdflib's own
+    store does: the literal names no graph. Where rdflib evaluates the
+    ``GRAPH`` (BGP-only pushdown, no pushdown), it asks the store for a
+    context named ``URIRef("zz")``, an IRI no graph of the file can have."""
+    sparql = """SELECT ?s WHERE {
+        VALUES ?g { "zz" <http://ex.org/g/1> } GRAPH ?g { ?s <http://ex.org/name> ?o } }"""
+    memory = Dataset(default_union=True)
+    memory.parse(data=FIXTURE_NQ, format="nquads")
+    expected = run(memory, sparql)
+    assert expected
+    monkeypatch.setattr(pd, "_ENABLED_OPS", pd._ENABLED_OPS)
+    if mode == "bgp":
+        monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "bgp")
+    # Building the store registers the pushdown, so it is built first.
+    store = VortexRdflibStore(str(dict_vortex_quads), in_memory=False)
+    if mode == "unregistered":
+        unregister_sparql_pushdown()
+    try:
+        assert run(Dataset(store=store, default_union=True), sparql) == expected
+    finally:
+        register_sparql_pushdown()
+
+
+def test_a_context_naming_no_graph_is_empty(dict_vortex_quads):
+    """A literal, or an IRI the native parser rejects, names no graph of the
+    file: a context it identifies has no triples and no length."""
+    store = VortexRdflibStore(str(dict_vortex_quads), in_memory=False)
+    name = URIRef("http://ex.org/name")
+    ground = (URIRef("http://ex.org/alice"), name, Literal("Alice"))
+    for context in (Literal("zz"), Graph(store=store, identifier=URIRef("zz"))):
+        for pattern in ((None, None, None), (None, name, None), ground):
+            assert list(store.triples(pattern, context)) == []
+        assert store.__len__(context) == 0
+
+
 @pytest.mark.parametrize("sparql", ORDER_QUERIES)
 def test_order_by_sequence_equals_default_evaluator(graph, sparql):
     with_pushdown, without_pushdown = both_ways(graph, sparql, run_ordered)

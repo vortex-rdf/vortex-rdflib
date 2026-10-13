@@ -19,6 +19,14 @@ _UNRESOLVED = object()
 #: selects those rows — ``None`` being the wildcard over every graph.
 DEFAULT_GRAPH = ""
 
+
+class _NoGraph(NotImplementedError):
+    """A context names no graph the file can hold (see
+    :meth:`VortexRdflibStore._graph_n3`). As a ``NotImplementedError`` it makes
+    the pushdown leave the block to rdflib, whose ``triples()`` answers it with
+    nothing."""
+
+
 #: The layout names the constructor accepts: the layouts' own, ``typed_object``
 #: and the ``cottas-native*`` names of COTTAS benchmark scripts. The layout is
 #: only a label here: VortexRdfStore auto-detects the actual layout from the
@@ -183,6 +191,13 @@ class VortexRdflibStore(Store):
         a blank node, and that blank node names nothing the file holds — see
         :meth:`_blank_graph_n3`, which tells it apart from a real blank-node
         graph name.
+
+        An identifier that names no graph the file can hold raises
+        :class:`_NoGraph`: a term other than an IRI or a blank node, or an IRI
+        vortex-rdf's parser rejects, which is what rdflib's ``get_context``
+        builds from a literal a ``GRAPH`` variable is bound to (``"zz"``
+        becomes ``URIRef("zz")``). A count capped at zero rows parses the name
+        without reading a row; a graph the file is known to hold skips it.
         """
         if context is None:
             return None
@@ -204,7 +219,15 @@ class VortexRdflibStore(Store):
             return DEFAULT_GRAPH
         if isinstance(identifier, BNode):
             return self._blank_graph_n3(identifier)
-        return canonical_spelling(identifier)
+        if not isinstance(identifier, URIRef):
+            raise _NoGraph
+        spelling = canonical_spelling(identifier)
+        if spelling not in self._contexts_by_spelling:
+            try:
+                self._store().count_quads(None, None, None, spelling, limit=0)
+            except ValueError:
+                raise _NoGraph from None
+        return spelling
 
     def _blank_graph_n3(self, identifier: BNode) -> str | None:
         """A blank-node-identified graph: itself if the file holds a graph by
@@ -269,9 +292,10 @@ class VortexRdflibStore(Store):
         ``context`` restricts the match to one graph (:meth:`_graph_n3` maps
         it to a graph name); ``None`` — and a bare ``Graph`` over this store —
         is the union over every graph, where a triple several graphs hold is
-        yielded once per graph. The store streams the quads it holds rather
-        than building the RDF merge of the union, which would mean a set the
-        size of the result.
+        yielded once per graph; a context that names no graph the file can
+        hold yields nothing. The store streams the quads it holds rather than
+        building the RDF merge of the union, which would mean a set the size
+        of the result.
         """
         if self.path is None:
             return
@@ -288,7 +312,10 @@ class VortexRdflibStore(Store):
         s_n3 = self._node_to_n3(s)
         p_n3 = self._node_to_n3(p)
         o_n3 = self._node_to_n3(o)
-        g_n3 = self._graph_n3(context)
+        try:
+            g_n3 = self._graph_n3(context)
+        except _NoGraph:
+            return
         # One named graph: every matched row is in it, so the contexts are one
         # tuple and the graph column is never read. The tuple is taken once
         # the match has a row, which proves the file holds the graph; a name
@@ -511,11 +538,15 @@ class VortexRdflibStore(Store):
         """Quads in ``context``, or in the whole store for the union view.
 
         The union counts quads, not distinct triples: a triple several graphs
-        hold counts once per graph, exactly as ``triples()`` yields it.
+        hold counts once per graph, exactly as ``triples()`` yields it. A
+        context that names no graph the file can hold has none.
         """
         if self.path is None:
             return 0
-        g_n3 = self._graph_n3(context)
+        try:
+            g_n3 = self._graph_n3(context)
+        except _NoGraph:
+            return 0
         if g_n3 is None:
             return len(self._store())
         return self._store().count_quads(None, None, None, g_n3)
