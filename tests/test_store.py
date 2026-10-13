@@ -9,7 +9,7 @@ from rdflib import BNode, Dataset, Graph, Literal, URIRef
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, ConjunctiveGraph
 from rdflib.plugins.parsers import ntriples
 from rdflib.term import Node
-from vortex_rdf import serialize_rdf
+from vortex_rdf import U64Column, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
 import vortex_rdflib.terms as terms_mod
@@ -665,6 +665,31 @@ def test_a_suspended_triples_call_stays_on_its_file(tmp_path, in_memory):
     hosts = {str(triple[0]).split("/")[2] for triple, _ in store.triples((None, None, None))}
     graphs = {str(ctx[0].identifier) for _, ctx in store.triples((None, None, None))}
     assert hosts == {"b.example"} and graphs == {f"http://b.example/g/{i}" for i in range(1, 5)}
+
+
+@pytest.mark.parametrize("longer", [0, 1, 2, 3])
+def test_triples_rejects_match_columns_of_unequal_lengths(chunked_quads, longer):
+    """The columns of one native match must be equally long: triples()
+    raises on one that is a code longer, as ``zip(strict=True)`` did,
+    rather than reading every column by the first one's length."""
+    store = VortexRdflibStore(str(chunked_quads), in_memory=True)
+    native = store._store()
+
+    class _OneCodeLonger:
+        def match_codes(self, *args, **kwargs):
+            matched = native.match_codes(*args, **kwargs)
+            assert matched is not None
+            cols = list(matched)
+            codes = memoryview(cols[longer]).cast("Q").tolist()
+            cols[longer] = U64Column([*codes, codes[0]])
+            return tuple(cols)
+
+        def __getattr__(self, name):
+            return getattr(native, name)
+
+    store._native = _OneCodeLonger()  # ty: ignore[invalid-assignment]
+    with pytest.raises(ValueError, match="unequal lengths"):
+        next(store.triples((None, P0, None)))
 
 
 def test_an_early_stop_decodes_a_chunk_not_the_match(chunked_quads):

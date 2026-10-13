@@ -394,6 +394,11 @@ class VortexRdflibStore(Store):
             cols = store.match_codes(s_n3, p_n3, o_n3, g_n3)
             if cols is not None:
                 rows = len(cols[0])
+                # The columns of one native match are equally long; reading
+                # them by the first one's length would hide a native bug.
+                if not len(cols[1]) == len(cols[2]) == len(cols[3]) == rows:
+                    lengths = [len(column) for column in cols]
+                    raise ValueError(f"match columns of unequal lengths: {lengths}")
                 if not rows:
                     return
                 if g_n3 is not None:
@@ -430,9 +435,6 @@ class VortexRdflibStore(Store):
                         if len(graphs) == 1:
                             shared = contexts[g_codes[0]]
                         else:
-                            # strict: the columns come from one native match
-                            # and must be equally long; truncation would hide a
-                            # native bug.
                             for row in zip(s_codes, p_codes, o_codes, g_codes, strict=True):
                                 yield (
                                     (cache[row[0]], cache[row[1]], cache[row[2]]),
