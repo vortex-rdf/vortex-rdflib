@@ -1116,7 +1116,8 @@ def _rewritable(codes, spellings) -> Iterator[tuple[int, str]]:
     normalization may rewrite: every typed spelling but a canonical
     xsd:integer and one of a datatype rdflib has no converter for, which
     ``Literal`` keeps as written. Without rdflib's converter table every
-    typed spelling."""
+    typed spelling. Assumes rdflib's own xsd:integer binding, as the native
+    filters do."""
     canonical = _CANONICAL_INTEGER_SPELLING.fullmatch
     mapping = _toPythonMapping
     converted = None

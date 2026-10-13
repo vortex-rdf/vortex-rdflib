@@ -226,7 +226,8 @@ def _term_built_directly(value: str) -> Node:
     in it), and an xsd:integer literal without escapes that ``int()`` reads
     (``Literal`` takes that int as its value and spells it as the int).
     Every other spelling goes to the constructors split once, so no kind
-    builds slower than through `_term_by_constructors`."""
+    builds slower than through `_term_by_constructors`. Assumes rdflib's own
+    xsd:integer binding (``int``), as the native filters do."""
     if value.startswith("_:"):
         return BNode(value[2:])
     first = value[:1]

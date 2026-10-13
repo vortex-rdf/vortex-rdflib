@@ -316,8 +316,9 @@ class VortexRdflibStore(Store):
         yielded once per graph; a context that names no graph the file can
         hold yields nothing. The store streams the quads it holds rather than
         building the RDF merge of the union, which would mean a set the size
-        of the result, and decodes them a chunk at a time, so a consumer that
-        stops early decodes the rows it read.
+        of the result, and decodes them a chunk at a time, the first of 64
+        rows, so a consumer that stops early decodes only the chunks it
+        reached.
         """
         if self.path is None:
             return
@@ -409,7 +410,8 @@ class VortexRdflibStore(Store):
                 # most. Each chunk's codes become Python ints, and those the
                 # call's term cache (the query's, inside one) lacks are
                 # decoded in one GIL-released decode_many call, so a consumer
-                # that stops early (rdflib's LIMIT, ASK) decodes what it read.
+                # that stops early (rdflib's LIMIT, ASK) decodes only the
+                # chunks it reached.
                 views = [memoryview(column).cast("Q") for column in cols]
                 cache = self._terms().decode
                 contexts: dict[int, tuple] = {}
