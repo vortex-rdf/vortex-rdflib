@@ -42,7 +42,7 @@ CONVERTED = tuple(
     f"{XSD}{name}"
     for name in ("int", "decimal", "double", "boolean", "date", "token", "normalizedString")
 )
-#: Lexical forms of the converted datatypes, some of them one value apart.
+#: Lexical forms of the converted datatypes, several of them spellings of one value.
 CONVERTED_FORMS = (
     "1.50", "1.5", "01.5", "+1.5", "1e2", "100.0", "1.0E2", "true", "1", "false", "0",
     "2020-01-01", " 7 ", "a  b", "x\ty",
