@@ -1118,18 +1118,20 @@ def _rewritable(codes, spellings) -> Iterator[tuple[int, str]]:
     ``Literal`` keeps as written. Without rdflib's converter table every
     typed spelling. Assumes rdflib's own xsd:integer binding, as the native
     filters do."""
-    canonical = _CANONICAL_INTEGER_SPELLING.fullmatch
     mapping = _toPythonMapping
+    if mapping is None:
+        for code, spelling in zip(codes, spellings, strict=True):
+            if spelling is None:
+                raise ValueError(f"term code {code} is not in the store dictionary")
+            if spelling.endswith(">"):
+                yield code, spelling
+        return
+    canonical = _CANONICAL_INTEGER_SPELLING.fullmatch
     converted = None
     for code, spelling in zip(codes, spellings, strict=True):
         if spelling is None:
             raise ValueError(f"term code {code} is not in the store dictionary")
-        if not spelling.endswith(">"):
-            continue
-        if mapping is None:
-            yield code, spelling
-            continue
-        if canonical(spelling) is not None:
+        if not spelling.endswith(">") or canonical(spelling) is not None:
             continue
         if converted is None:
             # Read per call, so a datatype bound at runtime counts.
