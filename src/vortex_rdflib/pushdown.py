@@ -112,6 +112,7 @@ import heapq
 import json
 import math
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -568,16 +569,25 @@ def _active_scope(ctx, store) -> _GraphScope:
     return _GraphScope(store._graph_n3(getattr(ctx, "graph", None)))
 
 
+#: The form of every IRI vortex-rdf's parser reads as a graph name: a scheme,
+#: then none of the characters no IRI holds.
+_GRAPH_IRI = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*:[^\x00-\x20<>"{}|^`\\]*')
+
+
 def _graph_scope(ctx, node) -> _GraphScope:
     """The scope a ``Graph`` node establishes, mirroring rdflib's ``evalGraph``:
     a bound term names one graph, an unbound variable ranges over the named
-    graphs. A term bound to something that cannot name a graph is left to
-    rdflib rather than guessed at."""
+    graphs. A term that cannot name a graph is left to rdflib rather than
+    guessed at: one other than an IRI or a blank node, and an IRI without the
+    form of an absolute one (``<zz>`` with no BASE), which vortex-rdf's parser
+    rejects and the store answers with nothing."""
     term = node.term
     value = ctx[term]
     if value is None:
         return _GraphScope(None, term)
     if not isinstance(value, (URIRef, BNode)):
+        raise NotImplementedError
+    if isinstance(value, URIRef) and not _GRAPH_IRI.fullmatch(value):
         raise NotImplementedError
     return _GraphScope(canonical_spelling(value), None)
 

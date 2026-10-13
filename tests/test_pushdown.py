@@ -973,14 +973,31 @@ def test_graph_scope_reaches_the_native_match(dataset, monkeypatch):
     assert patterns == ["<http://ex.org/g/1>", "<http://ex.org/absent>", None]
 
 
+#: Graph names vortex-rdf's parser rejects, each next to a graph the file
+#: holds: a literal ``?g`` is bound to (rdflib's ``GRAPH`` asks for the
+#: context ``URIRef("zz")``), and a relative IRI, bound or written (no BASE).
+REJECTED_GRAPH_NAMES = {
+    "literal": """SELECT ?s WHERE {
+        VALUES ?g { "zz" <http://ex.org/g/1> } GRAPH ?g { ?s <http://ex.org/name> ?o } }""",
+    "relative-iri": """SELECT ?s WHERE {
+        VALUES ?g { <zz> <http://ex.org/g/1> } GRAPH ?g { ?s <http://ex.org/name> ?o } }""",
+    "relative-iri-constant": """SELECT ?s WHERE {
+        { GRAPH <zz> { ?s <http://ex.org/name> ?o } }
+        UNION { GRAPH <http://ex.org/g/1> { ?s <http://ex.org/name> ?o } } }""",
+}
+
+
 @pytest.mark.parametrize("mode", ["pushdown", "bgp", "unregistered"])
-def test_a_literal_graph_name_matches_nothing(dict_vortex_quads, monkeypatch, mode):
-    """``GRAPH ?g`` with ``?g`` bound to a literal answers as rdflib's own
-    store does: the literal names no graph. Where rdflib evaluates the
-    ``GRAPH`` (BGP-only pushdown, no pushdown), it asks the store for a
-    context named ``URIRef("zz")``, an IRI no graph of the file can have."""
-    sparql = """SELECT ?s WHERE {
-        VALUES ?g { "zz" <http://ex.org/g/1> } GRAPH ?g { ?s <http://ex.org/name> ?o } }"""
+@pytest.mark.parametrize(
+    "sparql", list(REJECTED_GRAPH_NAMES.values()), ids=list(REJECTED_GRAPH_NAMES)
+)
+def test_a_graph_name_the_parser_rejects_matches_nothing(
+    dict_vortex_quads, monkeypatch, sparql, mode
+):
+    """A graph name vortex-rdf's parser rejects names no graph of the file,
+    so it matches nothing, as in rdflib's own store; the pushdown leaves its
+    block to rdflib, and rdflib's evaluation (BGP-only pushdown, or none)
+    asks the store for that context."""
     memory = Dataset(default_union=True)
     memory.parse(data=FIXTURE_NQ, format="nquads")
     expected = run(memory, sparql)
