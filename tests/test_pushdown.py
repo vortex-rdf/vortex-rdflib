@@ -1084,13 +1084,14 @@ def test_probe_join_pads_rows_when_the_pattern_shares_no_variable(graph):
 
 
 #: Quads under `http://ex/` for the probe joins' multiplicity. `s1` holds `q`
-#: and `p` in both g1 and g2, so the union default graph has two quads of each;
-#: `s2` holds only `p`, `s3` only `q`; `s4` holds both in the default graph and
-#: `p` in g1 too.
+#: in g1 and g2 and `p` in g1, g2 and g3, so the union default graph has two
+#: quads of its `q` triple and three of its `p` triple; `s2` holds only `p`,
+#: `s3` only `q`; `s4` holds both in the default graph and `p` in g1 too.
 PROBE_QUADS = """\
 <http://ex/s1> <http://ex/q> <http://ex/x> <http://ex/g1> .
 <http://ex/s1> <http://ex/p> <http://ex/o1> <http://ex/g1> .
 <http://ex/s1> <http://ex/p> <http://ex/o1> <http://ex/g2> .
+<http://ex/s1> <http://ex/p> <http://ex/o1> <http://ex/g3> .
 <http://ex/s2> <http://ex/p> <http://ex/o1> <http://ex/g1> .
 <http://ex/s1> <http://ex/q> <http://ex/x> <http://ex/g2> .
 <http://ex/s3> <http://ex/q> <http://ex/x> <http://ex/g1> .
@@ -1106,12 +1107,12 @@ _EX = "PREFIX : <http://ex/> "
 #: the `limit` of the fully bound counts that probe makes.
 PROBE_MULTIPLICITY = {
     # The union default graph: a triple several graphs hold is one solution per
-    # graph. `s1` joins 2 `q` quads with 2 `p` quads, `s4` 1 with 2.
-    "bgp-join": (True, _EX + "SELECT ?s WHERE { ?s :q :x . ?s :p :o1 }", 6, "_probe_join", None),
+    # graph. `s1` joins 2 `q` quads with 3 `p` quads, `s4` 1 with 2.
+    "bgp-join": (True, _EX + "SELECT ?s WHERE { ?s :q :x . ?s :p :o1 }", 8, "_probe_join", None),
     "group-join": (
         True,
         _EX + "SELECT ?s WHERE { { ?s :q :x } { ?s :p :o1 } }",
-        6,
+        8,
         "_probe_join",
         None,
     ),
@@ -1119,7 +1120,7 @@ PROBE_MULTIPLICITY = {
     "optional": (
         True,
         _EX + "SELECT ?s WHERE { ?s :q :x OPTIONAL { ?s :p :o1 } }",
-        7,
+        9,
         "_probe_join",
         None,
     ),
@@ -1132,7 +1133,7 @@ PROBE_MULTIPLICITY = {
         None,
     ),
     # A fixed graph holds at most one quad of a triple: `s1` and `s4` have the
-    # `p` triple in a second graph, which the probe does not read.
+    # `p` triple in other graphs too, which the probe does not read.
     "graph-variable": (
         True,
         _EX + "SELECT ?g ?s WHERE { GRAPH ?g { ?s :q :x . ?s :p :o1 } }",
@@ -1501,7 +1502,7 @@ def test_tuple_filter_prunes_a_bgp_so_a_remaining_pattern_is_probed(
     tmp_path, monkeypatch, in_graph
 ):
     """When pruning lets a remaining pattern be probed instead of matched
-    whole, the FILTER prunes mid-join — BSBM Explore Q5's win. `?a < ?b`
+    whole, the FILTER prunes mid-join, as in BSBM Explore Q5. `?a < ?b`
     holds for `s0` only, so one row survives the `p`/`q` join, and `r`'s 400
     rows are probed from it (1 × 100 < 400) rather than matched and
     hash-joined, as the unpruned 50 rows would be (50 × 100 ≥ 400). A GRAPH

@@ -477,3 +477,4 @@ def test_values_only_rdflib_answers_are_decoded_in_one_batch(tmp_path, monkeypat
     query = "SELECT ?s WHERE { ?s <http://ex.org/label> ?l FILTER(strlen(?l) > 10) }"
     assert len(run(graph, query)) == sum(1 for i in range(200) if len(f"product {i}") > 10)
     assert "decode" not in calls
+    assert "decode_many" in calls

@@ -25,10 +25,12 @@ def _iri(name: str) -> URIRef:
 
 #: (subject, object) pairs over ``P``. ``<…/a>`` is a prefix of every other
 #: IRI object, followed by a character below ``>`` in all but ``<…/ab>``;
-#: ``<…/s1>`` is a prefix of ``<…/s10>``, ``<…/s11>`` and ``<…/s12>``. Both
-#: blank nodes share a subject, so their rows read the same in either order.
+#: ``<…/s1>`` is a prefix of ``<…/s10>``, ``<…/s11>`` and ``<…/s12>``.
+#: ``<…/a/é>`` is spelled outside ASCII. Both blank nodes share a subject, so
+#: their rows read the same in either order.
 DATA = [
     ("s1", _iri("a")),
+    ("s1", _iri("a/é")),
     ("s10", _iri("a")),
     ("s10", _iri("a1")),
     ("s11", _iri("a#c")),
@@ -148,21 +150,26 @@ def test_blank_nodes_order_by_label(tmp_path, ranked):
 
 
 def test_an_iri_code_without_a_spelling_raises_the_store_error(order_files):
-    """An IRI code ``decode_many`` answers ``None`` for raises the error the
-    store's own decode raises."""
+    """An IRI code ``decode_many`` cannot spell raises the store's own decode
+    error. The double spells the first code it is handed but not the second,
+    and the error names the second."""
     store = VortexRdflibStore(str(order_files["secondary-by-copy"]))
     dictionary = store._dict
     assert dictionary is not None
-    code = dictionary.encode(f"<{EX}a>")
-    assert code is not None
+    iris = {dictionary.encode(f"<{EX}{name}>") for name in ("a", "ab")}
+    assert None not in iris and len(iris) == 2
+    handed: list = []
 
     class _Dict:
         def decode_many(self, codes):
-            return [None for _ in codes]
+            handed.extend(codes)
+            return [dictionary.decode(codes[0])] + [None for _ in codes[1:]]
 
         def __getattr__(self, name):
             return getattr(dictionary, name)
 
     store._dict = _Dict()  # ty: ignore[invalid-assignment]
-    with pytest.raises(ValueError, match=f"term code {code} is not in the store dictionary"):
-        pd._rank_codes(store, {}, {code})
+    with pytest.raises(ValueError) as raised:
+        pd._rank_codes(store, {}, iris)
+    assert len(handed) == 2 and set(handed) == iris
+    assert str(raised.value) == f"term code {handed[1]} is not in the store dictionary"

@@ -227,6 +227,11 @@ SHAPES = [
         "SELECT * WHERE { ?s ex:p ?o { ?s ex:q ?x FILTER(!bound(?o)) } }",
         id="nested-shared-not-bound",
     ),
+    # The group's own pattern binds ?s too: the FILTER sees that binding.
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o { ?s ex:q ?x FILTER(?s != ex:s2) } }",
+        id="nested-pattern-var-ne",
+    ),
     # OPTIONAL: its own FILTER is the condition and sees the left side; a
     # FILTER in a group nested inside it does not.
     pytest.param(
@@ -245,6 +250,11 @@ SHAPES = [
         """SELECT * WHERE { ?s ex:p ?o
             OPTIONAL { ?s ex:q ?x { ?x ex:r ?y FILTER(strstarts(?o, "a")) } } }""",
         id="optional-nested-strstarts",
+    ),
+    # The nested group's own pattern binds ?s too: the FILTER sees that binding.
+    pytest.param(
+        "SELECT * WHERE { ?s ex:p ?o OPTIONAL { ?s ex:q ?x { ?s ex:q ?x2 FILTER(?s != ex:s2) } } }",
+        id="optional-nested-pattern-var-ne",
     ),
     # UNION branches.
     pytest.param(
@@ -1228,6 +1238,8 @@ NATIVE = [
         "graph-minus-bound",
         "graph-joined-eq",
         "graph-values-eq",
+        "nested-pattern-var-ne",
+        "optional-nested-pattern-var-ne",
         "minus-var-bound",
         "minus-var-isiri",
         "minus-var-tuple",

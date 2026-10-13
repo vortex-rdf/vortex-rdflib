@@ -39,7 +39,7 @@ def _dictionary(store: VortexRdfStore) -> TermDict:
     return dictionary
 
 
-def _code(dictionary: TermDict, term: str) -> int:
+def _encode(dictionary: TermDict, term: str) -> int:
     code = dictionary.encode(term)
     assert code is not None
     return code
@@ -52,13 +52,13 @@ def test_version_is_0_12():
 def test_stores_open_mapped_or_in_memory_without_a_residency_budget(contract_store):
     assert _dictionary(VortexRdfStore(contract_store)).file_backed is True
     assert _dictionary(VortexRdfStore(contract_store, in_memory=True)).file_backed is False
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="max_resident_bytes"):
         VortexRdfStore(contract_store, max_resident_bytes=1 << 20)  # ty: ignore[unknown-argument]
 
 
 def test_filter_codes_answers_subsets_of_sorted_unique_candidates(contract_store):
     dictionary = _dictionary(VortexRdfStore(contract_store))
-    tagged = sorted({_code(dictionary, '"Abc"@en'), _code(dictionary, '"x\\n"@en')})
+    tagged = sorted({_encode(dictionary, '"Abc"@en'), _encode(dictionary, '"x\\n"@en')})
     every = U64Column(list(range(len(dictionary))))
     passed, undecided = dictionary.filter_codes("lang", "en", every)
     literals = range(*dictionary.prefix_range('"'))
@@ -68,9 +68,9 @@ def test_filter_codes_answers_subsets_of_sorted_unique_candidates(contract_store
     assert set(_codes(undecided)).isdisjoint(literals)
     passed, _ = dictionary.filter_codes("lang", "en", U64Column(tagged))
     assert _codes(passed) == tagged
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="sorted and unique"):
         dictionary.filter_codes("lang", "en", U64Column(tagged[::-1]))
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="'codes'"):
         # the candidate codes are required
         dictionary.filter_codes("lang", "en")  # ty: ignore[missing-argument]
 
@@ -95,7 +95,7 @@ def test_filter_codes_answers_subsets_of_sorted_unique_candidates(contract_store
 )
 def test_string_kinds(contract_store, kind, arg, options, text, expected):
     dictionary = _dictionary(VortexRdfStore(contract_store))
-    code = dictionary.prefix_range("_:")[0] if text == "BLANK" else _code(dictionary, text)
+    code = dictionary.prefix_range("_:")[0] if text == "BLANK" else _encode(dictionary, text)
     passed, undecided = dictionary.filter_codes(kind, arg, U64Column([code]), **options)
     if expected is None:
         assert _codes(undecided) == [code] and not len(passed)
@@ -112,7 +112,7 @@ def test_an_empty_keep_matches_nothing(contract_store):
 
 def test_wide_integers_are_undecided(contract_store):
     dictionary = _dictionary(VortexRdfStore(contract_store))
-    code = _code(dictionary, f'"9223372036854775808"^^<{XSD}long>')
+    code = _encode(dictionary, f'"9223372036854775808"^^<{XSD}long>')
     _, undecided = dictionary.filter_codes("num_lt", f'"5"^^<{XSD}integer>', U64Column([code]))
     assert _codes(undecided) == [code]
 
@@ -121,7 +121,7 @@ def test_str_of_a_normalized_typed_literal_is_never_decided_from_its_stored_form
     """rdflib reads STR("042"^^xsd:integer) as "42": a verdict taken from the
     stored "042" would differ, so it must be undecided or rdflib's."""
     dictionary = _dictionary(VortexRdfStore(contract_store))
-    code = _code(dictionary, f'"042"^^<{XSD}integer>')
+    code = _encode(dictionary, f'"042"^^<{XSD}integer>')
     passed, _ = dictionary.filter_codes("strstarts", '"0"', U64Column([code]), as_str=True)
     assert code not in set(_codes(passed))
     passed, undecided = dictionary.filter_codes("strstarts", '"4"', U64Column([code]), as_str=True)

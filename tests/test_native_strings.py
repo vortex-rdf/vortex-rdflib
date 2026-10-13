@@ -245,8 +245,9 @@ def test_string_functions_agree_with_rdflib(corpus, sparql_expr):
 )
 def test_bsbm_literals_agree_with_python_re():
     """The same differential over a real dictionary's literals: up to 20,000
-    literal codes of a BSBM store, random allow-list patterns, and words of
-    its labels as CONTAINS/STRSTARTS/STRENDS constants."""
+    literal codes of a BSBM store, random allow-list patterns, and the first
+    words of string literals from across those codes as
+    CONTAINS/STRSTARTS/STRENDS constants."""
     store = VortexRdflibStore(os.environ["VORTEX_RDFLIB_BSBM_STORE"])
     assert store._dict is not None
     lo, hi = store._kind_ranges()[filters.LITERAL]
@@ -274,16 +275,18 @@ def test_bsbm_literals_agree_with_python_re():
     assert completed >= 50
     assert checked >= 20 * len(codes)
     words = []
-    for spelling in list(spellings.values())[:400]:
+    sample = list(spellings.values())
+    for spelling in sample[:: max(1, len(sample) // 400)]:
         view = parse_spelling(spelling)
         if view.dt in (None, XSD + "string") and view.lex and view.lex.split():
             words.append(view.lex.split()[0])
+    assert len(set(words)) >= 20
     tests = {
         "contains": lambda text, word: word in text,
         "strstarts": str.startswith,
         "strends": str.endswith,
     }
-    for word in words[:50]:
+    for word in list(dict.fromkeys(words))[:50]:
         for function, test in tests.items():
             shape = NativeShape(function, canonical_spelling(Literal(word)))
             passed, undecided = candidates.evaluate(store, shape, codes)
