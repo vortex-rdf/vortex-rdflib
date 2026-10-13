@@ -25,11 +25,11 @@ class QueryTerms:
 
     ``decode`` maps codes to the rdflib terms they decode to; ``alias_*`` are
     the literal codes classified for term aliasing (``pushdown._alias_codes``):
-    every code looked at, each typed term's first code, and the codes whose
-    term an earlier code already carries; ``foreign`` and ``foreign_codes``
-    map the negative codes of query constants the dictionary lacks to their
-    terms and back; ``blank_graphs`` says, per blank-node spelling, whether
-    the file holds a graph by that name.
+    every code looked at, the code representing each typed term built, and
+    the codes whose term another code represents; ``foreign`` and
+    ``foreign_codes`` map the negative codes of query constants the
+    dictionary lacks to their terms and back; ``blank_graphs`` says, per
+    blank-node spelling, whether the file holds a graph by that name.
     """
 
     __slots__ = (

@@ -112,6 +112,7 @@ import heapq
 import json
 import math
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -125,7 +126,7 @@ from rdflib.plugins.sparql import CUSTOM_EVALS
 from rdflib.plugins.sparql.evaluate import evalPart
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.plugins.sparql.sparql import FrozenBindings
-from rdflib.term import BNode, Literal, URIRef, Variable
+from rdflib.term import BNode, Literal, URIRef, Variable, _toPythonMapping
 from vortex_rdf import U64Column
 
 from . import candidates, filters, query_scope
@@ -1035,18 +1036,22 @@ def _term_distinct(store, tuples: Iterator[tuple], foreign: dict) -> Iterator[tu
 
 
 def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
-    """Record in ``aliases`` each code of ``codes`` whose decoded term equals
-    another code's, mapped to the code that term was first seen under —
-    rdflib compares decoded terms, and two spellings of a typed literal can
-    be one term (``"042"^^xsd:integer`` and ``"42"^^xsd:integer`` are both
-    ``42``).
+    """Record in ``aliases`` each code of ``codes`` whose decoded term another
+    code represents, mapped to that code — rdflib compares decoded terms,
+    and two spellings of a typed literal can be one term
+    (``"042"^^xsd:integer`` and ``"42"^^xsd:integer`` are both ``42``).
 
     IRIs, blank nodes and untyped literals are one term per spelling, so
-    only typed literals can alias, and whether one does is a property of the
-    store, not of the query: each literal code is classified once per
-    query — its spelling decoded, a typed literal's term registered under
-    the first code that carried it — and later calls in the query only look
-    their codes up. A query constant outside the dictionary (a negative
+    only typed literals can alias, and only through rdflib's normalization:
+    a typed spelling rdflib keeps as written is its term's canonical one
+    (``canonical_spelling``), and every other spelling of that term is one
+    rdflib rewrites. So only the typed spellings rdflib may rewrite are
+    built (`_rewritable`), and each term built is represented by its
+    canonical spelling's code when the dictionary holds it
+    (`_canonical_twins`), else by the first code that carried it. Whether a
+    code aliases is a property of the store, not of the query: each literal
+    code is classified once per query, and later calls in the query only
+    look their codes up. A query constant outside the dictionary (a negative
     code, stable for the query too) takes part through its own term. For
     most stores no code aliases another and ``aliases`` stays empty.
     """
@@ -1063,22 +1068,22 @@ def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
         local = [c for c in pending if c >= 0]
         if local:
             cache = terms.decode
-            for code, spelling in zip(local, store._dict.decode_many(local), strict=True):
-                if spelling is None:
-                    raise ValueError(f"term code {code} is not in the store dictionary")
-                if spelling.endswith(">"):
-                    term = cache.get(code)
-                    if term is None:
-                        term = cache[code] = store._from_n3_safe(spelling)
-                    typed.append((code, term))
+            for code, spelling in _rewritable(local, store._dict.decode_many(local)):
+                term = cache.get(code)
+                if term is None:
+                    term = cache[code] = store._from_n3_safe(spelling)
+                typed.append((code, term, spelling))
         for code in pending:
             if code < 0:
                 term = foreign[code]
                 if isinstance(term, Literal) and term.datatype is not None:
-                    typed.append((code, term))
+                    typed.append((code, term, None))
         firsts, reps = terms.alias_firsts, terms.alias_reps
-        for code, term in typed:
-            representative = firsts.setdefault(term, code)
+        twins = _canonical_twins(store, [(t, s) for _, t, s in typed if t not in firsts])
+        for code, term, _ in typed:
+            representative = firsts.get(term)
+            if representative is None:
+                representative = firsts[term] = twins.get(term, code)
             if representative != code:
                 reps[code] = representative
         classified.update(pending)
@@ -1088,6 +1093,73 @@ def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
             representative = reps.get(code)
             if representative is not None:
                 aliases[code] = representative
+
+
+#: A canonical xsd:integer spelling (a minus as the only sign, no leading
+#: zero, ASCII digits): rdflib keeps it as written.
+_CANONICAL_INTEGER = re.compile(
+    r'"(?:0|-?[1-9][0-9]*)"\^\^<http://www\.w3\.org/2001/XMLSchema#integer>'
+)
+
+
+def _rewritable(codes, spellings) -> Iterator[tuple[int, str]]:
+    """The ``(code, spelling)`` pairs whose typed literal rdflib's
+    normalization may rewrite: every typed spelling but a canonical
+    xsd:integer and one of a datatype rdflib has no converter for, which
+    ``Literal`` keeps as written."""
+    canonical = _CANONICAL_INTEGER.fullmatch
+    converted = None
+    for code, spelling in zip(codes, spellings, strict=True):
+        if spelling is None:
+            raise ValueError(f"term code {code} is not in the store dictionary")
+        if not spelling.endswith(">") or canonical(spelling) is not None:
+            continue
+        if converted is None:
+            # Read per call, so a datatype bound at runtime counts.
+            converted = {str(datatype) for datatype in _toPythonMapping if datatype is not None}
+        cut = spelling.rfind('"^^<')
+        if cut > 0 and spelling[cut + 4 : -1] not in converted:
+            continue
+        yield code, spelling
+
+
+def _canonical_twins(store, read: list) -> dict:
+    """The code of each term's canonical spelling, for the ``(term,
+    spelling)`` pairs of ``read`` whose term was read from another spelling,
+    or is a query constant (spelling ``None``), and whose canonical spelling
+    the dictionary holds: one ``encode_many`` call, and the codes it finds
+    decoded to confirm the term."""
+    wanted: dict = {}
+    for term, spelling in read:
+        if term not in wanted:
+            canonical = canonical_spelling(term)
+            if canonical != spelling:
+                wanted[term] = canonical
+    if not wanted:
+        return {}
+    spellings = list(wanted.values())
+    try:
+        found = store._dict.encode_many(spellings)
+    except ValueError:
+        # A spelling the native parser rejects fails the whole batch; alone,
+        # it names no term of the file.
+        found = []
+        for spelling in spellings:
+            try:
+                found.append(store._dict.encode(spelling))
+            except ValueError:
+                found.append(None)
+    hits = [code for code in found if code is not None]
+    if not hits:
+        return {}
+    # The lookup canonicalizes a spelling as the native parser does, so a
+    # code is a twin only if it decodes to the same term.
+    cache = store._prime_decode_cache(hits)
+    return {
+        term: code
+        for term, code in zip(wanted, found, strict=True)
+        if code is not None and cache[code] == term
+    }
 
 
 def _eval_aggregate(ctx, store, part):
