@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.2.0...v0.3.0) - 2026-10-13
 
-Requires vortex-rdf 0.12 (`vortex-rdf>=0.12,<0.13`, up from 0.11): file-backed
+Requires vortex-rdf 0.12.1 (`vortex-rdf>=0.12.1,<0.13`, up from 0.11): file-backed
 stores are memory-mapped, FILTER predicates are evaluated by vortex-rdf over
 the codes each query produces — never over the whole dictionary — and nothing
 a query learns about terms outlives it. Removed: the `max_resident_bytes`
