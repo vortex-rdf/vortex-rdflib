@@ -1,5 +1,4 @@
 import os
-from collections.abc import Callable
 from pathlib import Path
 
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, Dataset, Graph
@@ -285,27 +284,21 @@ class VortexRdflibStore(Store):
             contexts = by_spelling[spelling] = (Graph(store=self, identifier=identifier),)
         return contexts
 
-    def _graph_contexts(self) -> Callable[[int], tuple]:
-        """The context tuple of a graph column's code, resolved through the
-        dictionary and context caches the store holds now: a call that keeps
-        this resolves against the file it started on, whatever ``close()``
-        or ``open()`` does meanwhile (each replaces those, never clears
-        them)."""
-        term_dict = self._dict
-        if term_dict is None:
-            raise ValueError("store has no term dictionary (code path inactive)")
-        by_code, by_spelling = self._contexts_by_code, self._contexts_by_spelling
-
-        def context_of(code: int) -> tuple:
-            contexts = by_code.get(code)
-            if contexts is None:
-                spelling = term_dict.decode(code)
-                if spelling is None:
-                    raise ValueError(f"term code {code} is not in the store dictionary")
-                contexts = by_code[code] = self._context_tuple(spelling, by_spelling)
-            return contexts
-
-        return context_of
+    def _context_of_code(self, code: int, term_dict, by_code: dict, by_spelling: dict) -> tuple:
+        """The context tuple of a graph column's code, resolved through
+        ``term_dict`` and the context caches ``by_code`` and ``by_spelling``
+        the store held when the caller started: a ``triples()`` call keeps
+        resolving against the file it started on, whatever ``close()`` or
+        ``open()`` does meanwhile (each replaces those, never clears them)."""
+        contexts = by_code.get(code)
+        if contexts is None:
+            if term_dict is None:
+                raise ValueError("store has no term dictionary (code path inactive)")
+            spelling = term_dict.decode(code)
+            if spelling is None:
+                raise ValueError(f"term code {code} is not in the store dictionary")
+            contexts = by_code[code] = self._context_tuple(spelling, by_spelling)
+        return contexts
 
     def triples(self, triple_pattern, context=None):
         """RDFLib Store API: yields ``((s, p, o), contexts)`` for a pattern.
@@ -377,9 +370,10 @@ class VortexRdflibStore(Store):
             if self._dict is not None:
                 cols = store.match_codes(s_n3, p_n3, o_n3, None)
                 if cols is not None:
-                    context_of = self._graph_contexts()
+                    term_dict, by_code = self._dict, self._contexts_by_code
+                    by_spelling = self._contexts_by_spelling
                     for code in memoryview(cols[3]).cast("Q").tolist():
-                        yield triple, context_of(code)
+                        yield triple, self._context_of_code(code, term_dict, by_code, by_spelling)
                     return
             *_, graphs = store.match_columns(s_n3, p_n3, o_n3, None)
             by_spelling = self._contexts_by_spelling
@@ -387,10 +381,11 @@ class VortexRdflibStore(Store):
                 yield triple, self._context_tuple(g_raw, by_spelling)
             return
 
-        # The dictionary, and the graph contexts below, are bound once: rows
+        # The dictionary and the graph-context caches are bound once: rows
         # read after a close(), or an open() of another file, still come from
         # the file the call started on.
-        term_dict = self._dict
+        term_dict, by_code = self._dict, self._contexts_by_code
+        by_spelling = self._contexts_by_spelling
         if term_dict is not None:
             cols = store.match_codes(s_n3, p_n3, o_n3, g_n3)
             if cols is not None:
@@ -403,8 +398,7 @@ class VortexRdflibStore(Store):
                 if not rows:
                     return
                 if g_n3 is not None:
-                    fixed = self._context_tuple(g_n3)
-                context_of = self._graph_contexts()
+                    fixed = self._context_tuple(g_n3, by_spelling)
                 # Zero-copy u64 views over the Rust column buffers, read a
                 # chunk at a time: 64 rows, then four times more, 4096 at
                 # most. Each chunk's codes become Python ints, and those the
@@ -433,7 +427,9 @@ class VortexRdflibStore(Store):
                         g_codes = chunk[3].tolist()
                         graphs = set(g_codes)
                         for code in graphs.difference(contexts):
-                            contexts[code] = context_of(code)
+                            contexts[code] = self._context_of_code(
+                                code, term_dict, by_code, by_spelling
+                            )
                         if len(graphs) == 1:
                             shared = contexts[g_codes[0]]
                         else:
@@ -453,7 +449,6 @@ class VortexRdflibStore(Store):
         # term, so memoizing the parse by string turns per-row term
         # construction into per-distinct-term construction.
         subjects, predicates, objects, graphs = store.match_columns(s_n3, p_n3, o_n3, g_n3)
-        by_spelling = self._contexts_by_spelling
         if g_n3 is not None and subjects:
             fixed = self._context_tuple(g_n3, by_spelling)
         parse = self._from_n3_safe
@@ -502,8 +497,12 @@ class VortexRdflibStore(Store):
             if cols is not None:
                 # Native distinct, in first-seen order.
                 codes = memoryview(cols[3].distinct()).cast("Q").tolist()
-                context_of = self._graph_contexts()
-                return [context_of(code)[0] for code in codes]
+                term_dict, by_code = self._dict, self._contexts_by_code
+                by_spelling = self._contexts_by_spelling
+                return [
+                    self._context_of_code(code, term_dict, by_code, by_spelling)[0]
+                    for code in codes
+                ]
         *_spo, graphs = store.match_columns(s_n3, p_n3, o_n3, None)
         return [self._context_tuple(name)[0] for name in dict.fromkeys(graphs)]
 
