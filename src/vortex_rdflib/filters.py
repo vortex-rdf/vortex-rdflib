@@ -27,9 +27,7 @@ lists them) also carries that predicate (``Conjunct.native``, a
 :class:`~vortex_rdflib.candidates.NativeShape`). A kind test is its kind's
 code range and an IRI equality its IRIs' codes, which the pushdown turns into
 a ``keep`` on the native match (:func:`native_restriction`), so the rows that
-fail never cross into Python; on a file-backed store a set of 33 to 4,096
-codes is the exception: the scan gets its bounding range, and Python tests its
-codes on the rows that range admits (``pushdown._split_keeps``).
+fail never cross into Python.
 Every other native shape is answered by vortex-rdf over the distinct codes a
 query produced (:func:`candidates.evaluate`, called from
 :func:`evaluate_column`), never over the whole dictionary, and only the codes

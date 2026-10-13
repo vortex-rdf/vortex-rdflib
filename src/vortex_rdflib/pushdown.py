@@ -26,9 +26,7 @@ What runs in code space:
 - a ``Filter`` over a block is split into conjuncts (:mod:`.filters`):
   those over one variable that are a kind test or an IRI equality (``=``,
   ``sameTerm``, ``IN``) become a ``keep`` on the match of every pattern
-  binding the variable, so the rows that fail never leave it (a file-backed
-  store's set of 33 to 4,096 codes goes to the scan as its bounding range,
-  and its codes are tested on the rows that range admits); the others over
+  binding the variable, so the rows that fail never leave it; the others over
   one variable are evaluated once per distinct code of the variable, on the
   pattern that binds it — over the pattern's whole column when it is
   matched, over the codes the probes reach when it is probed — by
@@ -2343,33 +2341,10 @@ def _count_patterns(store, patterns, counts: dict) -> int:
     return len(counts) - before
 
 
-#: vortex-rdf 0.11 pushes a keep set of 33 to 4,096 codes into a file scan
-#: as one ``list_contains`` expression, which evaluates far slower than the
-#: scan it narrows (2,000 codes: ~25x an unnarrowed match); a smaller set
-#: becomes OR'd equalities and a larger one an in-memory test, both cheap.
-_FILE_LIST_CONTAINS = range(33, 4097)
-
-
 def _split_keeps(store, nkeep) -> tuple[dict, dict]:
-    """A pattern's native keep, split into what goes to the native layer and
-    the code sets Python tests on the rows it returns.
-
-    Everything goes natively, except on a file-backed store a code set the
-    scan would evaluate as ``list_contains`` (``_FILE_LIST_CONTAINS``): that
-    one goes as its bounding code range, a cheap superset the scan prunes by
-    zone maps, and its codes are tested over the rows that range admits.
-    """
-    if not nkeep or store.in_memory:
-        return nkeep or {}, {}
-    native, tested = {}, {}
-    for position, keep in nkeep.items():
-        if isinstance(keep, tuple) or len(keep) not in _FILE_LIST_CONTAINS:
-            native[position] = keep
-        else:
-            view = memoryview(keep).cast("Q")
-            native[position] = (view[0], view[-1] + 1)
-            tested[position] = keep
-    return native, tested
+    """A pattern's native keep, and the code sets Python tests on the rows it
+    returns: every keep goes natively, so nothing is left to test."""
+    return nkeep or {}, {}
 
 
 def _narrowing(keep=None, limit=None) -> dict:

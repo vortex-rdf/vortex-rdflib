@@ -9,7 +9,7 @@ value model treats specially: decimals against doubles, integers past 2^53,
 
 import pytest
 from rdflib.term import Variable
-from vortex_rdf import serialize_rdf
+from vortex_rdf import U64Column, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
 from test_filters import SPELLINGS, filter_expr, rdflib_answer, typed
@@ -475,32 +475,33 @@ def _outcome(graph, sparql):
         return type(error)
 
 
-def test_mid_size_code_set_goes_to_a_file_scan_as_a_range(tmp_path, monkeypatch, capsys):
+def test_a_mid_size_code_set_goes_to_the_native_layer_whole(tmp_path, monkeypatch, capsys):
     """On a file-backed store a keep of 33 to 4,096 codes — here the 100 IRIs
-    of an IN list — goes to the scan as its bounding range, and its codes are
-    tested on the rows that range admits (`_split_keeps`)."""
+    of an IN list — reaches the native match as the exact code set, and no
+    set is left to test on the rows it returns (`_split_keeps`)."""
     import json
 
     from rdflib import Graph
 
     from test_pushdown import both_ways
 
-    nt = tmp_path / "iris.nt"
+    nt = tmp_path / "s.nt"
     nt.write_text(
         "".join(
-            f"<http://ex.org/s{i}> <http://ex.org/p> <http://ex.org/o{i}> .\n" for i in range(200)
+            f"<http://ex.org/s{i}> <http://ex.org/p> <http://ex.org/o{i}> .\n" for i in range(300)
         ),
         encoding="utf-8",
     )
-    out = tmp_path / "iris.vortex"
+    out = tmp_path / "s.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
-    graph = Graph(store=VortexRdflibStore(str(out), in_memory=False))
-    listed = ", ".join(f"<http://ex.org/o{i}>" for i in range(0, 200, 2))
-    query = f"SELECT ?s ?o WHERE {{ ?s <http://ex.org/p> ?o FILTER(?o IN ({listed})) }}"
-    register_sparql_pushdown()
+    store = VortexRdflibStore(str(out), in_memory=False)
+    keep = {0: U64Column(list(range(1, 101)))}
+    assert pd._split_keeps(store, keep) == (keep, {})
+    subjects = ", ".join(f"<http://ex.org/s{i}>" for i in range(0, 200, 2))
+    query = f"SELECT ?s WHERE {{ ?s <http://ex.org/p> ?o FILTER(?s IN ({subjects})) }}"
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
-    with_pushdown, without_pushdown = both_ways(graph, query)
+    with_pushdown, without_pushdown = both_ways(Graph(store=store), query)
     assert with_pushdown == without_pushdown
     assert len(with_pushdown) == 100
     trace = [
@@ -508,9 +509,7 @@ def test_mid_size_code_set_goes_to_a_file_scan_as_a_range(tmp_path, monkeypatch,
         for line in capsys.readouterr().err.splitlines()
         if line.startswith(pd._TRACE_PREFIX)
     ]
-    pushed = next(e for e in trace if e["event"] == "bgp_native_restriction")
-    assert pushed["keep"] == {"2": {"codes": 100}}
     match = next(
         e for e in trace if e["event"] == "native_call_complete" and e["operation"] == "match_codes"
     )
-    assert set(match["keep"]["2"]) == {"range"}
+    assert match["keep"] == {"0": {"codes": 100}}

@@ -371,11 +371,6 @@ used when no code that can appear at the pattern's position is undecided
 When undecided codes can appear, the conjunct stays on the Python routes, which
 then only evaluate the undecided codes.
 
-On a file-backed store, vortex-rdf applies a mid-sized code set slowly inside a
-file scan. Such a set is sent as its bounding code range instead, and the exact
-set is tested in Python
-([`_split_keeps`](../src/vortex_rdflib/pushdown.py#L2060)).
-
 Where vortex-rdf and rdflib could disagree, rdflib's answer wins:
 
 - `!=` never becomes a keep: rdflib lets every IRI and blank node pass it,
@@ -802,8 +797,6 @@ In vortex-rdflib:
 
 In vortex-rdf:
 
-- Apply mid-sized code-set keeps quickly in file scans, so that `_split_keeps`
-  can go.
 - Apply keeps and counts on in-memory stores column-wise instead of row by row.
 - Make small batches cheaper, for example by running them on the calling
   thread.
