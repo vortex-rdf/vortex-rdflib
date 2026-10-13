@@ -619,6 +619,54 @@ def test_triples_yield_the_rows_and_contexts_of_the_match(chunked_quads, monkeyp
     assert 1 in graphs_per_chunk and max(graphs_per_chunk) == 4
 
 
+def _quads_file(tmp_path, host: str) -> str:
+    """300 subjects of ``host``, two rows each: the first 50 in graph 1, the
+    next 200 in graphs 2 and 3, the last 50 in graph 4 — so a full scan
+    meets graphs 2 and 3 in its second chunk and graph 4 in its third."""
+
+    def graph(i: int) -> str:
+        return f"<http://{host}/g/{1 if i < 50 else 4 if i >= 250 else 2 + i % 2}>"
+
+    nq = tmp_path / f"{host}.nq"
+    nq.write_text(
+        "".join(
+            f"<http://{host}/s/{i:04d}> <http://{host}/p{p}> <http://{host}/o/{i}> {graph(i)} .\n"
+            for i in range(300)
+            for p in range(2)
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / f"{host}.vortex"
+    serialize_rdf(str(nq), str(out), layout="dictionary", format="nquads")
+    return str(out)
+
+
+@pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
+def test_a_suspended_triples_call_stays_on_its_file(tmp_path, in_memory):
+    """triples() read part-way keeps the dictionary and graph contexts it
+    started with: the rows read after ``store.close()``, and after
+    ``store.open()`` of another file, still come from the first file, in
+    its graphs; the second file then reads as itself."""
+    first = _quads_file(tmp_path, "a.example")
+    second = _quads_file(tmp_path, "b.example")
+    store = VortexRdflibStore(first, in_memory=in_memory)
+
+    def read(rows) -> list:
+        return [(triple, ctx[0].identifier) for triple, ctx in rows]
+
+    expected = read(store.triples((None, None, None)))
+    rows = store.triples((None, None, None))
+    got = read([next(rows)])
+    store.close()
+    got += read(next(rows) for _ in range(99))  # into the second chunk
+    store.open(second)
+    got += read(rows)  # the third chunk
+    assert got == expected and len({graph for _, graph in got}) == 4
+    hosts = {str(triple[0]).split("/")[2] for triple, _ in store.triples((None, None, None))}
+    graphs = {str(ctx[0].identifier) for _, ctx in store.triples((None, None, None))}
+    assert hosts == {"b.example"} and graphs == {f"http://b.example/g/{i}" for i in range(1, 5)}
+
+
 def test_an_early_stop_decodes_a_chunk_not_the_match(chunked_quads):
     """rdflib's own evaluator stops after a LIMIT's rows or at an ASK's first
     row; triples() has decoded the codes of the first chunk, not those of
