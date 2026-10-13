@@ -1,14 +1,19 @@
+import logging
+import random
 import re
 
 import pytest
 from rdflib import BNode, Dataset, Graph, Literal, URIRef
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, ConjunctiveGraph
 from rdflib.plugins.parsers import ntriples
+from rdflib.term import Node
 from vortex_rdf import serialize_rdf
 
+import vortex_rdflib.store as store_mod
 from conftest import GRAPH_1, GRAPH_2, LAYOUTS
 from test_pushdown import both_ways
 from vortex_rdflib import VortexRdflibStore
+from vortex_rdflib.terms import escape, parse_spelling
 
 FOAF_NAME = URIRef("http://xmlns.com/foaf/0.1/name")
 FOAF_KNOWS = URIRef("http://xmlns.com/foaf/0.1/knows")
@@ -341,6 +346,147 @@ def test_from_n3_safe_reads_iris_and_blank_nodes():
 def test_from_n3_safe_rejects_a_malformed_spelling(spelling):
     with pytest.raises(ValueError, match=re.escape(repr(spelling))):
         VortexRdflibStore._from_n3_safe(spelling)
+
+
+XSD = "http://www.w3.org/2001/XMLSchema#"
+INTEGER = f"<{XSD}integer>"
+#: Literal text: the characters the store escapes, controls, non-ASCII.
+_LITERAL_TEXT = 'aZ09 -.,"\\\n\t\r\x01\x7fé日\U0001f600'
+#: IRI text: characters an IRI holds, non-ASCII included.
+_IRI_TEXT = "aZ09-._~:/?#[]@!$&'()*+,;=%é日\U0001f600"
+_TAGS = ("en", "en-us", "fr", "zh-hant-tw", "de-1996", "EN-GB", "x-private")
+_OTHER_TYPED = (
+    ("1.50", f"{XSD}decimal"),
+    ("1e2", f"{XSD}double"),
+    ("true", f"{XSD}boolean"),
+    ("1", f"{XSD}boolean"),
+    ("2020-01-01", f"{XSD}date"),
+    ("42", f"{XSD}int"),
+    ("x  y", f"{XSD}token"),
+    ("abc", f"{XSD}integer"),
+)
+
+
+def _generated_spellings(rng: random.Random, n: int) -> list[str]:
+    """Store spellings of every kind `_from_n3_safe` reads: IRIs, plain and
+    language-tagged literals with and without escapes, canonical and other
+    xsd:integer forms, other datatypes, blank nodes."""
+
+    def text(alphabet: str) -> str:
+        return "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 10)))
+
+    spellings = []
+    for _ in range(n):
+        kind = rng.randrange(8)
+        if kind == 0:
+            spellings.append(f"<http://ex.org/{text(_IRI_TEXT)}>")
+        elif kind == 1:
+            spellings.append(f'"{escape(text(_LITERAL_TEXT))}"')
+        elif kind == 2:
+            spellings.append(f'"{escape(text(_LITERAL_TEXT))}"@{rng.choice(_TAGS)}')
+        elif kind == 3:
+            spellings.append(f'"{rng.randint(-(10**25), 10**25)}"^^{INTEGER}')
+        elif kind == 4:
+            prefix = rng.choice(("0", "+", "-0", " ", ""))
+            suffix = rng.choice(("", " ", ".0", "_1"))
+            spellings.append(f'"{prefix}{rng.randrange(10**6)}{suffix}"^^{INTEGER}')
+        elif kind == 5:
+            lexical, datatype = rng.choice(_OTHER_TYPED)
+            spellings.append(f'"{lexical}"^^<{datatype}>')
+        elif kind == 6:
+            spellings.append(f"_:b{rng.randrange(10**6)}")
+        else:
+            spellings.append(f'"{escape(text(_LITERAL_TEXT))}"^^<http://ex.org/dt>')
+    return spellings
+
+
+def _by_rdflib(spelling: str) -> Node:
+    """The term rdflib's constructors make from a spelling."""
+    if spelling.startswith("<"):
+        return URIRef(spelling[1:-1])
+    if spelling.startswith("_:"):
+        return BNode(spelling[2:])
+    view = parse_spelling(spelling)
+    if view.dt is not None:
+        return Literal(view.lex, datatype=URIRef(view.dt))
+    return Literal(view.lex, lang=view.lang)
+
+
+def _spy_on_constructors(monkeypatch) -> list:
+    """Record the class of every URIRef, BNode and Literal constructor call."""
+    constructed = []
+    for cls in (URIRef, BNode, Literal):
+        original = cls.__new__
+
+        def spy(kind, *args, _original=original, **kwargs):
+            constructed.append(kind)
+            return _original(kind, *args, **kwargs)
+
+        monkeypatch.setattr(cls, "__new__", spy)
+    return constructed
+
+
+def test_terms_built_directly_are_rdflibs(monkeypatch, caplog):
+    """IRIs, unescaped plain and language-tagged literals and canonical
+    xsd:integer literals are built without rdflib's constructors; over
+    generated spellings of every kind, each term is the one the
+    constructors make, in everything rdflib exposes."""
+    caplog.set_level(logging.ERROR, logger="rdflib.term")  # "abc"^^xsd:integer logs a warning
+    # The import-time check passes on the rdflib this package pins.
+    assert VortexRdflibStore._from_n3_safe is store_mod._term_built_directly
+    rng = random.Random(20261013)
+    spellings = _generated_spellings(rng, 3000) + [
+        f'"0"^^{INTEGER}',
+        f'"-0"^^{INTEGER}',
+        f'"1{"0" * 5000}"^^{INTEGER}',  # canonical, past int()'s digit limit: no value
+        '""',
+        '""@en',
+    ]
+    constructed = _spy_on_constructors(monkeypatch)
+    direct = 0
+    for spelling in spellings:
+        constructed.clear()
+        term = VortexRdflibStore._from_n3_safe(spelling)
+        direct += not constructed
+        expected = _by_rdflib(spelling)
+        assert type(term) is type(expected), spelling
+        assert term == expected and hash(term) == hash(expected), spelling
+        assert str(term) == str(expected) and term.n3() == expected.n3(), spelling
+        if isinstance(expected, Literal):
+            assert isinstance(term, Literal)
+            for name in ("value", "datatype", "language", "ill_typed"):
+                got, want = getattr(term, name), getattr(expected, name)
+                assert type(got) is type(want) and got == want, (spelling, name)
+    assert direct > 800
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "error"])
+def test_a_failed_self_check_leaves_every_term_to_rdflibs_constructors(monkeypatch, failure):
+    """At import, `_term_builder` builds a fixed sample both ways. When the
+    terms differ, or the direct build fails — as after an rdflib release
+    that changes what ``Literal`` sets — every term goes through rdflib's
+    constructors."""
+    spellings = ["<http://ex.org/a>", '"plain"', '"x"@en', f'"42"^^{INTEGER}']
+    constructed = _spy_on_constructors(monkeypatch)
+    assert store_mod._term_builder() is store_mod._term_built_directly
+    constructed.clear()
+    for spelling in spellings:
+        store_mod._term_built_directly(spelling)
+    assert constructed == []
+    if failure == "mismatch":
+        monkeypatch.setattr(store_mod, "_same_term", lambda a, b: False)
+    else:
+
+        def broken(value):
+            raise AttributeError("'Literal' object has no attribute '_ill_typed'")
+
+        monkeypatch.setattr(store_mod, "_term_built_directly", broken)
+    build = store_mod._term_builder()
+    assert build is store_mod._term_by_constructors
+    for spelling in spellings:
+        constructed.clear()
+        term = build(spelling)
+        assert type(term) in constructed and term == _by_rdflib(spelling)
 
 
 def test_no_path_store():
