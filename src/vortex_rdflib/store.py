@@ -1,11 +1,9 @@
 import os
-import re
-from collections.abc import Callable
 from pathlib import Path
 
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, Dataset, Graph
 from rdflib.store import NO_STORE, VALID_STORE, Store
-from rdflib.term import BNode, IdentifiedNode, Literal, Node, URIRef, _is_valid_langtag
+from rdflib.term import BNode, IdentifiedNode, Node, URIRef
 from vortex_rdf import VortexRdfStore
 
 from . import query_scope
@@ -15,9 +13,9 @@ from .terms import (
     BLANK,
     IRI,
     LITERAL,
+    _term_builder,
     canonical_spelling,
     kind_bounds,
-    unescape,
     unparseable_iri,
 )
 
@@ -59,147 +57,6 @@ def _term_debug(t):
         return t.n3()
     except Exception:
         return repr(t)
-
-
-def _term_by_constructors(value: str) -> Node:
-    """The rdflib term for a stored N-Triples spelling, built by rdflib's
-    constructors: an IRI, a blank node, or a literal whose lexical form is
-    unescaped by the N-Triples rules (:func:`~vortex_rdflib.terms.unescape`),
-    so an escaped backslash before ``x41`` decodes to a backslash and
-    ``x41``."""
-    if len(value) >= 2 and value[0] == "<" and value[-1] == ">":
-        return URIRef(value[1:-1])
-    if value.startswith("_:"):
-        return BNode(value[2:])
-    end = value.rfind('"')
-    if not value.startswith('"') or end <= 0:
-        raise ValueError(f"Could not parse returned RDF term as N-Triples: {value!r}")
-    lexical, suffix = unescape(value[1:end]), value[end + 1 :]
-    if not suffix:
-        return Literal(lexical)
-    if suffix.startswith("@") and len(suffix) > 1:
-        return Literal(lexical, lang=suffix[1:])
-    if suffix.startswith("^^<") and suffix.endswith(">"):
-        return Literal(lexical, datatype=URIRef(suffix[3:-1]))
-    raise ValueError(f"Could not parse returned RDF term as N-Triples: {value!r}")
-
-
-_new_str = str.__new__
-_XSD_INTEGER = URIRef("http://www.w3.org/2001/XMLSchema#integer")
-_INTEGER_SUFFIX = f"^^<{_XSD_INTEGER}>"
-#: A canonical xsd:integer lexical form, which rdflib keeps as written.
-_CANONICAL_INTEGER = re.compile(r"0|-?[1-9][0-9]*")
-
-
-def _term_built_directly(value: str) -> Node:
-    """`_term_by_constructors`, except for the terms whose every attribute
-    the spelling gives, made directly with ``str.__new__`` and the slots
-    ``Literal.__new__`` sets: an IRI (``URIRef`` only adds a warning about
-    characters vortex-rdf's parser never lets into an IRI), and a plain,
-    language-tagged or canonical xsd:integer literal without escapes
-    (``Literal`` normalizes nothing in it)."""
-    first = value[:1]
-    if first == "<" and value[-1:] == ">":
-        return _new_str(URIRef, value[1:-1])
-    end = value.rfind('"') if first == '"' else 0
-    if end > 0:
-        body, suffix = value[1:end], value[end + 1 :]
-        if "\\" not in body:
-            if not suffix:
-                term = _new_str(Literal, body)
-                term._language = None
-                term._datatype = None
-                term._value = body
-                term._ill_typed = None
-                return term
-            if suffix[0] == "@":
-                language = suffix[1:]
-                if _is_valid_langtag(language):
-                    term = _new_str(Literal, body)
-                    term._language = language
-                    term._datatype = None
-                    term._value = body
-                    term._ill_typed = None
-                    return term
-            elif suffix == _INTEGER_SUFFIX and _CANONICAL_INTEGER.fullmatch(body):
-                try:
-                    number = int(body)
-                except ValueError:
-                    # Past int()'s digit limit: rdflib keeps it with no value.
-                    return _term_by_constructors(value)
-                term = _new_str(Literal, body)
-                term._language = None
-                term._datatype = _XSD_INTEGER
-                term._value = number
-                term._ill_typed = False
-                return term
-    return _term_by_constructors(value)
-
-
-#: Spellings `_term_builder` builds both ways: each kind
-#: `_term_built_directly` makes itself, and kinds next to them it leaves to
-#: rdflib's constructors.
-_SELF_CHECK = (
-    "<http://ex.org/a>",
-    "<http://ex.org/été#日>",
-    '"plain"',
-    '""',
-    '"café \U0001f600"',
-    '"x"@en',
-    '"x"@en-us',
-    f'"0"{_INTEGER_SUFFIX}',
-    f'"42"{_INTEGER_SUFFIX}',
-    f'"-7"{_INTEGER_SUFFIX}',
-    f'"12345678901234567890123"{_INTEGER_SUFFIX}',
-    f'"042"{_INTEGER_SUFFIX}',
-    f'"-0"{_INTEGER_SUFFIX}',
-    '"1e2"^^<http://www.w3.org/2001/XMLSchema#double>',
-    '"x"^^<http://ex.org/dt>',
-    '"q\\"uote"',
-    '"tab\\there"@en',
-    "_:b0",
-)
-_UNSET = object()
-
-
-def _same_term(a: Node, b: Node) -> bool:
-    """Whether two terms are alike in all rdflib exposes: type, string,
-    equality, hash and ``n3()``; a literal's value, datatype, language and
-    ill-typedness; every slot their classes declare, by value and type."""
-    if type(a) is not type(b) or str(a) != str(b) or a != b or hash(a) != hash(b):
-        return False
-    if a.n3() != b.n3():
-        return False
-    if isinstance(a, Literal) and isinstance(b, Literal):
-        for x, y in (
-            (a.value, b.value),
-            (a.datatype, b.datatype),
-            (a.language, b.language),
-            (a.ill_typed, b.ill_typed),
-        ):
-            if type(x) is not type(y) or x != y:
-                return False
-    for cls in type(a).__mro__:
-        slots = cls.__dict__.get("__slots__", ())
-        for name in (slots,) if isinstance(slots, str) else slots:
-            x, y = getattr(a, name, _UNSET), getattr(b, name, _UNSET)
-            if type(x) is not type(y) or x != y:
-                return False
-    return getattr(a, "__dict__", None) == getattr(b, "__dict__", None)
-
-
-def _term_builder() -> Callable[[str], Node]:
-    """`_term_built_directly` if it builds every spelling of `_SELF_CHECK`
-    as rdflib's constructors do, else `_term_by_constructors` for every term
-    — as after an rdflib release that changes what ``Literal`` sets."""
-    for spelling in _SELF_CHECK:
-        try:
-            same = _same_term(_term_built_directly(spelling), _term_by_constructors(spelling))
-        except Exception:
-            same = False
-        if not same:
-            return _term_by_constructors
-    return _term_built_directly
 
 
 class VortexRdflibStore(Store):

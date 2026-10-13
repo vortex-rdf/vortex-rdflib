@@ -10,7 +10,7 @@ from rdflib.term import Node
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-import vortex_rdflib.store as store_mod
+import vortex_rdflib.terms as terms_mod
 from conftest import GRAPH_1, GRAPH_2, LAYOUTS
 from test_pushdown import _counting_term_dict, both_ways
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
@@ -434,7 +434,7 @@ def test_terms_built_directly_are_rdflibs(monkeypatch, caplog):
     constructors make, in everything rdflib exposes."""
     caplog.set_level(logging.ERROR, logger="rdflib.term")  # "abc"^^xsd:integer logs a warning
     # The import-time check passes on the rdflib this package pins.
-    assert VortexRdflibStore._from_n3_safe is store_mod._term_built_directly
+    assert VortexRdflibStore._from_n3_safe is terms_mod._term_built_directly
     rng = random.Random(20261013)
     spellings = _generated_spellings(rng, 3000) + [
         f'"0"^^{INTEGER}',
@@ -469,21 +469,21 @@ def test_a_failed_self_check_leaves_every_term_to_rdflibs_constructors(monkeypat
     constructors."""
     spellings = ["<http://ex.org/a>", '"plain"', '"x"@en', f'"42"^^{INTEGER}']
     constructed = _spy_on_constructors(monkeypatch)
-    assert store_mod._term_builder() is store_mod._term_built_directly
+    assert terms_mod._term_builder() is terms_mod._term_built_directly
     constructed.clear()
     for spelling in spellings:
-        store_mod._term_built_directly(spelling)
+        terms_mod._term_built_directly(spelling)
     assert constructed == []
     if failure == "mismatch":
-        monkeypatch.setattr(store_mod, "_same_term", lambda a, b: False)
+        monkeypatch.setattr(terms_mod, "_same_term", lambda a, b: False)
     else:
 
         def broken(value):
             raise AttributeError("'Literal' object has no attribute '_ill_typed'")
 
-        monkeypatch.setattr(store_mod, "_term_built_directly", broken)
-    build = store_mod._term_builder()
-    assert build is store_mod._term_by_constructors
+        monkeypatch.setattr(terms_mod, "_term_built_directly", broken)
+    build = terms_mod._term_builder()
+    assert build is terms_mod._term_by_constructors
     for spelling in spellings:
         constructed.clear()
         term = build(spelling)

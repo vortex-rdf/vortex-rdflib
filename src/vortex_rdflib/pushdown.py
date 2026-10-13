@@ -130,7 +130,7 @@ from rdflib.term import BNode, Literal, URIRef, Variable, _toPythonMapping
 from vortex_rdf import U64Column
 
 from . import candidates, filters, query_scope
-from .terms import canonical_spelling, unparseable_iri
+from .terms import CANONICAL_INTEGER, INTEGER_SUFFIX, canonical_spelling, unparseable_iri
 
 _EVAL_KEY = "vortex_rdflib_bgp"
 
@@ -1095,10 +1095,9 @@ def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
                 aliases[code] = representative
 
 
-#: A canonical xsd:integer spelling (a minus as the only sign, no leading
-#: zero, ASCII digits): rdflib keeps it as written.
-_CANONICAL_INTEGER = re.compile(
-    r'"(?:0|-?[1-9][0-9]*)"\^\^<http://www\.w3\.org/2001/XMLSchema#integer>'
+#: A canonical xsd:integer's whole spelling, which rdflib keeps as written.
+_CANONICAL_INTEGER_SPELLING = re.compile(
+    f'"(?:{CANONICAL_INTEGER.pattern})"{re.escape(INTEGER_SUFFIX)}'
 )
 
 
@@ -1107,7 +1106,7 @@ def _rewritable(codes, spellings) -> Iterator[tuple[int, str]]:
     normalization may rewrite: every typed spelling but a canonical
     xsd:integer and one of a datatype rdflib has no converter for, which
     ``Literal`` keeps as written."""
-    canonical = _CANONICAL_INTEGER.fullmatch
+    canonical = _CANONICAL_INTEGER_SPELLING.fullmatch
     converted = None
     for code, spelling in zip(codes, spellings, strict=True):
         if spelling is None:
