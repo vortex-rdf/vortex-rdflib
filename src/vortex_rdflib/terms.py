@@ -232,10 +232,10 @@ def _term_built_directly(value: str) -> Node:
     first = value[:1]
     if first == "<" and value[-1:] == ">":
         return _new_str(URIRef, value[1:-1])
-    if first == "_" and value[1:2] == ":":
-        return _new_str(BNode, value[2:])
     end = value.rfind('"') if first == '"' else 0
     if end <= 0:
+        if first == "_" and value[1:2] == ":":
+            return _new_str(BNode, value[2:])
         return _term_by_constructors(value)  # no term spelling: its error
     lexical, suffix = value[1:end], value[end + 1 :]
     if "\\" in lexical:
