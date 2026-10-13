@@ -50,6 +50,9 @@ rebuild them from their RDF source with `serialize_rdf`.
 - Decode the values rdflib's evaluator reads in one batch (filters) ([`e04a8a4`](https://github.com/vortex-rdf/vortex-rdflib/commit/e04a8a43c5136a8b255f11fc29ddb166b5057fce) by @julianrojas87)
 - Send mid-size code-set keeps natively on vortex-rdf 0.12 (pushdown) ([`a7f46af`](https://github.com/vortex-rdf/vortex-rdflib/commit/a7f46afda8aa89496d098a0881df6b9e092381bf) by @julianrojas87)
 - Drop the unreachable split-keep plumbing (pushdown) ([`a0b07c0`](https://github.com/vortex-rdf/vortex-rdflib/commit/a0b07c0c2198a52128ba29651336f68b004ae0a3) by @julianrojas87)
+- Classify DISTINCT aliases by spelling, building only non-canonical typed literals (pushdown) ([`7a4d7a5`](https://github.com/vortex-rdf/vortex-rdflib/commit/7a4d7a5a250d7046edd843b98504e3022523248b) by @julianrojas87)
+- Build decoded IRIs and simple literals directly, checked against rdflib's constructors at import (store) ([`45b695c`](https://github.com/vortex-rdf/vortex-rdflib/commit/45b695cd47c0ca7f2b00b767252053cc90631182) by @julianrojas87)
+- Decode triples() lazily, in growing chunks (store) ([`e2192b7`](https://github.com/vortex-rdf/vortex-rdflib/commit/e2192b78b77546cb2ff9f92d8a7b040ddfb89c37) by @julianrojas87)
 
 ### Fixed
 
