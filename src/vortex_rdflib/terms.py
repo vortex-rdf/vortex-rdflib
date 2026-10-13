@@ -228,7 +228,8 @@ def _term_built_directly(value: str) -> Node:
     takes that int as its value and spells it as the int, a non-canonical
     form only while ``rdflib.NORMALIZE_LITERALS`` holds).
     Every other spelling goes to the constructors split once, so no kind
-    builds slower than through `_term_by_constructors`. Assumes rdflib's own
+    builds slower than through `_term_by_constructors` but an ill-typed
+    xsd:integer, which first fails ``int()``. Assumes rdflib's own
     xsd:integer binding (``int``), as the native filters do."""
     first = value[:1]
     if first == "<" and value[-1:] == ">":
@@ -262,7 +263,10 @@ def _term_built_directly(value: str) -> Node:
         try:
             number = int(lexical)
         except ValueError:
-            # Ill-typed: rdflib keeps it as written, with no value.
+            number = None
+        if number is None:
+            # Ill-typed: rdflib keeps it as written, with no value. Built
+            # outside the handler, so the warning rdflib logs chains nothing.
             return Literal(lexical, datatype=XSD_INTEGER)
         if not rdflib.NORMALIZE_LITERALS and CANONICAL_INTEGER.fullmatch(lexical) is None:
             # Not normalizing (read per call), rdflib keeps it as written.

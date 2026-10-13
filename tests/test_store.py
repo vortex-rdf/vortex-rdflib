@@ -468,6 +468,15 @@ def test_terms_built_directly_are_rdflibs(monkeypatch, caplog):
     assert direct > 800
 
 
+def test_an_ill_typed_integer_logs_as_through_the_constructors(caplog):
+    """rdflib logs one warning for an ill-typed xsd:integer; built by the
+    direct path, its exception chains nothing from the path's own int()."""
+    caplog.set_level(logging.WARNING, logger="rdflib.term")
+    terms_mod._term_built_directly(f'"abc"^^{INTEGER}')
+    (record,) = caplog.records
+    assert record.exc_info is not None and record.exc_info[1].__context__ is None
+
+
 @pytest.mark.parametrize("lexical", ["042", "+5", " 7", "-0", "42"])
 def test_without_normalization_an_integer_is_built_as_rdflib_keeps_it(monkeypatch, lexical):
     """With ``rdflib.NORMALIZE_LITERALS`` switched off after import, rdflib
