@@ -8,8 +8,8 @@ re-issues every call in order, timing each; the first passes warm the page
 cache, the last is reported per method and per template. A call the installed
 API rejects (a changed signature, an argument out of range, a missing method)
 counts under ``errors`` and is skipped; ``first_error`` keeps the first reason
-per method. On a vortex-rdf that accepts ``max_resident_bytes`` (0.11), file
-stores open with vortex-rdflib 0.2.0's 1 GiB default.
+per method. A file store opens with a 1 GiB dictionary residency budget when the
+installed vortex-rdf accepts ``max_resident_bytes``, and memory-mapped otherwise.
 """
 
 import argparse
@@ -27,7 +27,7 @@ def _key(key):
 
 
 def decode_value(value):
-    from vortex_rdf import U32Column
+    from vortex_rdf import U64Column
 
     if isinstance(value, list):
         return [decode_value(v) for v in value]
@@ -37,7 +37,7 @@ def decode_value(value):
         if set(value) == {"tuple"}:
             return tuple(decode_value(v) for v in value["tuple"])
         if set(value) == {"codes"}:
-            return U32Column(value["codes"])
+            return U64Column(value["codes"])
         return {_key(k): decode_value(v) for k, v in value.items()}
     return value
 
@@ -55,8 +55,12 @@ def _open(store_path: str, in_memory: bool):
     if in_memory:
         return VortexRdfStore(store_path, in_memory=True)
     try:
-        return VortexRdfStore(store_path, in_memory=False, max_resident_bytes=1 << 30)
-    except TypeError:  # 0.12+: memory-mapped, no residency budget
+        return VortexRdfStore(
+            store_path,
+            in_memory=False,
+            max_resident_bytes=1 << 30,  # ty: ignore[unknown-argument]
+        )
+    except TypeError:  # no residency budget: the store is memory-mapped
         return VortexRdfStore(store_path, in_memory=False)
 
 

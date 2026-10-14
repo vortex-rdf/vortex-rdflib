@@ -519,6 +519,14 @@ QUERIES += [
         ?x <http://ex.org/note> ?n }""",
     """SELECT ?x ?n WHERE { VALUES ?n { "x"@en-US "x"@EN-US "x"@en }
         ?x <http://ex.org/note> ?n }""",
+    # an absent literal with a newline, substituted into a probe
+    'SELECT ?s WHERE { VALUES ?n { "zz\\nyy" "Alice" } ?s <http://ex.org/name> ?n }',
+    """SELECT ?n WHERE { VALUES ?n { "zz\\nyy" "Alice" }
+        FILTER EXISTS { ?s <http://ex.org/name> ?n } }""",
+    # a relative IRI (no BASE), which no probe can match
+    "SELECT ?s ?o WHERE { VALUES ?o { <zz> <http://ex.org/carol> } ?s <http://ex.org/knows> ?o }",
+    """SELECT ?o ?s WHERE { VALUES ?o { <zz> <http://ex.org/carol> }
+        OPTIONAL { ?s <http://ex.org/likes> ?o } }""",
     """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/bob> }
         ?x <http://ex.org/name> ?n FILTER(?x = <http://ex.org/bob>) }""",
     "SELECT * WHERE { VALUES (?x ?y) { (1 2) (UNDEF 3) (<http://ex.org/nobody> UNDEF) } }",
@@ -565,6 +573,40 @@ QUERIES += [
         ?x <http://ex.org/score> ?s . ?x <http://ex.org/age> ?a . ?x <http://ex.org/name> ?n
         MINUS { ?x <http://ex.org/weight> ?w }
         FILTER(?a < ?s) }""",
+]
+
+#: The string shapes vortex-rdf evaluates over candidate codes:
+#: lowered and upper-cased texts, STR() over IRIs, blank nodes and typed
+#: literals, tagged constants (an upper-case tag never matches a stored one),
+#: and REGEX over texts with newlines.
+QUERIES += [
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(regex(lcase(?n), "^bo")) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(contains(ucase(str(?n)), "OB")) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(strstarts(?n, "B"@en-us)) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(contains(?n, "o"@EN)) }',
+    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(strends(lcase(?n), "b")) }',
+    'SELECT ?x ?n WHERE { ?x <http://ex.org/note> ?n FILTER(regex(?n, "k$")) }',
+    'SELECT ?x ?n WHERE { ?x <http://ex.org/note> ?n FILTER(regex(?n, "^line$", "m")) }',
+    'SELECT ?x ?n WHERE { ?x <http://ex.org/note> ?n FILTER(regex(str(?n), "\\\\w+", "i")) }',
+    'SELECT ?x ?n WHERE { ?x <http://ex.org/note> ?n FILTER(contains(lcase(?n), "ün")) }',
+    'SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(strstarts(str(?a), "4")) }',
+    'SELECT ?s WHERE { ?s ?p ?o FILTER(regex(str(?s), "^b")) }',
+    'SELECT ?s ?o WHERE { ?s ?p ?o FILTER(strstarts(str(?o), "http://ex.org/c")) }',
+]
+
+#: IRI equality as a keep: =, sameTerm and IN over IRIs only, constants the
+#: dictionary lacks, the empty list, the predicate position.
+QUERIES += [
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(?o IN (<http://ex.org/carol>, <http://ex.org/bob>)) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(sameTerm(?o, <http://ex.org/carol>)) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(<http://ex.org/carol> = ?o) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(?o IN (<http://ex.org/nobody>)) }",
+    "SELECT ?s WHERE { ?s ?p ?o FILTER(?o IN ()) }",
+    "SELECT ?s ?p WHERE { ?s ?p ?o FILTER(?p IN (<http://ex.org/knows>, <http://ex.org/likes>)) }",
+    "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o FILTER(?o = <http://ex.org/carol>) }",
+    "ASK { ?s ?p ?o FILTER(?o = <http://ex.org/nobody>) }",
+    """SELECT ?x ?n WHERE { ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?n
+        FILTER(?y IN (<http://ex.org/bob>, <http://ex.org/carol>)) }""",
 ]
 
 #: Shapes that name a graph. rdflib evaluates the `Graph` node itself — a
@@ -694,6 +736,13 @@ def graph(dict_vortex, request):
     return Graph(store=VortexRdflibStore(str(dict_vortex), in_memory=request.param))
 
 
+# One param, so the node ids keep their file- prefix.
+@pytest.fixture(params=["file"])
+def file_graph(dict_vortex):
+    """The fixture store, file-backed only: the other routes; the default route runs both modes."""
+    return Graph(store=VortexRdflibStore(str(dict_vortex), in_memory=False))
+
+
 @pytest.fixture(scope="module")
 def dict_vortex_quads(tmp_path_factory):
     d = tmp_path_factory.mktemp("pushdown-quads")
@@ -711,6 +760,15 @@ def dataset(dict_vortex_quads, request):
     the same questions with the graph column in play."""
     return Dataset(
         store=VortexRdflibStore(str(dict_vortex_quads), in_memory=request.param), default_union=True
+    )
+
+
+# One param, so the node ids keep their file- prefix.
+@pytest.fixture(params=["file"])
+def file_dataset(dict_vortex_quads):
+    """The quad store, file-backed only: the other routes; the default route runs both modes."""
+    return Dataset(
+        store=VortexRdflibStore(str(dict_vortex_quads), in_memory=False), default_union=True
     )
 
 
@@ -732,12 +790,12 @@ def variant_vortex(tmp_path_factory):
     return files
 
 
-#: Store configurations the native layer serves differently: a dictionary
-#: left in the file (read on demand, `TermDict.file_backed`), and the
-#: secondary indexes, whose served views order an unlimited match their own
-#: way — which a LIMIT pushed into the match must not change.
+#: Store configurations the native layer serves differently: a memory-mapped
+#: dictionary (`TermDict.file_backed`), and the secondary indexes, whose
+#: served views order an unlimited match their own way — which a LIMIT
+#: pushed into the match must not change.
 STORE_VARIANTS: dict[str, tuple[str, dict[str, Any]]] = {
-    "file-backed-dictionary": ("none", {"max_resident_bytes": 0}),
+    "file-backed-dictionary": ("none", {"in_memory": False}),
     "secondary-by-copy": ("by-copy", {}),
     "secondary-by-reference-mem": ("by-reference", {"in_memory": True}),
 }
@@ -747,7 +805,7 @@ STORE_VARIANTS: dict[str, tuple[str, dict[str, Any]]] = {
 def variant_graph(variant_vortex, request):
     index, kwargs = STORE_VARIANTS[request.param]
     store = VortexRdflibStore(str(variant_vortex[index]), **kwargs)
-    if "max_resident_bytes" in kwargs:
+    if request.param == "file-backed-dictionary":
         assert store._dict is not None and store._dict.file_backed
     return Graph(store=store)
 
@@ -791,11 +849,11 @@ def test_pushdown_equals_default_evaluator(graph, sparql):
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
-def test_pushdown_equals_default_evaluator_over_quads(dataset, sparql):
+def test_pushdown_equals_default_evaluator_over_quads(file_dataset, sparql):
     """The same shapes over the union default graph of a quad store: the
     pushdown must scope every native match to the graph rdflib would have
     asked, duplicates across graphs included."""
-    with_pushdown, without_pushdown = both_ways(dataset, sparql)
+    with_pushdown, without_pushdown = both_ways(file_dataset, sparql)
     assert with_pushdown == without_pushdown
 
 
@@ -809,7 +867,7 @@ def test_store_variants_equal_default_evaluator(variant_graph, sparql):
 
 @pytest.mark.parametrize("sparql", GRAPH_QUERIES)
 def test_graph_pattern_over_a_file_backed_dictionary(dict_vortex_quads, sparql):
-    store = VortexRdflibStore(str(dict_vortex_quads), max_resident_bytes=0)
+    store = VortexRdflibStore(str(dict_vortex_quads))
     assert store._dict is not None and store._dict.file_backed
     dataset = Dataset(store=store, default_union=True)
     with_pushdown, without_pushdown = both_ways(dataset, sparql)
@@ -825,27 +883,27 @@ def test_graph_pattern_equals_default_evaluator(dataset, sparql):
 
 
 @pytest.mark.parametrize("sparql", GRAPH_QUERIES)
-def test_graph_pattern_probe_path_equals_default_evaluator(dataset, monkeypatch, sparql):
+def test_graph_pattern_probe_path_equals_default_evaluator(file_dataset, monkeypatch, sparql):
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    with_probe, without_pushdown = both_ways(dataset, sparql)
+    with_probe, without_pushdown = both_ways(file_dataset, sparql)
     assert with_probe == without_pushdown
 
 
 @pytest.mark.parametrize("sparql", GRAPH_QUERIES)
-def test_graph_pattern_bgp_only_equals_default_evaluator(dataset, monkeypatch, sparql):
+def test_graph_pattern_bgp_only_equals_default_evaluator(file_dataset, monkeypatch, sparql):
     """With only BGPs intercepted, rdflib evaluates the `Graph` node itself
     and walks the store's graphs — so each block is pushed down under a
     *constant* scope instead of binding the graph from the column. Both
     routes must answer identically."""
     monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
-    bgp_only, without_pushdown = both_ways(dataset, sparql)
+    bgp_only, without_pushdown = both_ways(file_dataset, sparql)
     assert bgp_only == without_pushdown
 
 
 @pytest.mark.parametrize("sparql", GRAPH_QUERIES)
-def test_graph_pattern_generic_filter_equals_default_evaluator(dataset, monkeypatch, sparql):
+def test_graph_pattern_generic_filter_equals_default_evaluator(file_dataset, monkeypatch, sparql):
     monkeypatch.setattr(filters, "_FAST_ENABLED", False)
-    generic, without_pushdown = both_ways(dataset, sparql)
+    generic, without_pushdown = both_ways(file_dataset, sparql)
     assert generic == without_pushdown
 
 
@@ -919,6 +977,108 @@ def test_graph_scope_reaches_the_native_match(dataset, monkeypatch):
     assert patterns == ["<http://ex.org/g/1>", "<http://ex.org/absent>", None]
 
 
+#: Graph names vortex-rdf's parser rejects, each next to a graph the file
+#: holds: a literal ``?g`` is bound to (rdflib's ``GRAPH`` asks for the
+#: context ``URIRef("zz")``), and a relative IRI, bound or written (no BASE).
+REJECTED_GRAPH_NAMES = {
+    "literal": """SELECT ?s WHERE {
+        VALUES ?g { "zz" <http://ex.org/g/1> } GRAPH ?g { ?s <http://ex.org/name> ?o } }""",
+    "relative-iri": """SELECT ?s WHERE {
+        VALUES ?g { <zz> <http://ex.org/g/1> } GRAPH ?g { ?s <http://ex.org/name> ?o } }""",
+    "relative-iri-constant": """SELECT ?s WHERE {
+        { GRAPH <zz> { ?s <http://ex.org/name> ?o } }
+        UNION { GRAPH <http://ex.org/g/1> { ?s <http://ex.org/name> ?o } } }""",
+}
+
+
+#: Terms vortex-rdf's parser rejects in subject, predicate and object
+#: position: a relative IRI (no BASE), written or bound through VALUES. Where
+#: its VALUES row survives (an OPTIONAL with nothing to match), rdflib yields
+#: the IRI.
+REJECTED_TERMS = {
+    "predicate": "SELECT ?s ?o WHERE { ?s <zz> ?o }",
+    "subject": "SELECT ?p ?o WHERE { <zz> ?p ?o }",
+    "object": "SELECT ?s ?p WHERE { ?s ?p <zz> }",
+    "values": "SELECT ?s ?p ?o WHERE { VALUES ?o { <zz> <http://ex.org/carol> } ?s ?p ?o }",
+    "values-optional": """SELECT ?o ?s WHERE {
+        VALUES ?o { <zz> <http://ex.org/carol> } OPTIONAL { ?s <http://ex.org/likes> ?o } }""",
+}
+
+
+def _answer_in_mode(monkeypatch, mode, path, view, sparql):
+    """``sparql`` over ``view`` of the file-backed store at ``path``, with the
+    pushdown on, limited to BGPs (``VORTEX_RDF_PUSHDOWN_OPS=bgp``) or
+    unregistered."""
+    monkeypatch.setattr(pd, "_ENABLED_OPS", pd._ENABLED_OPS)
+    if mode == "bgp":
+        monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "bgp")
+    # Building the store registers the pushdown, so it is built first.
+    store = VortexRdflibStore(str(path), in_memory=False)
+    if mode == "unregistered":
+        unregister_sparql_pushdown()
+    try:
+        return run(view(store), sparql)
+    finally:
+        register_sparql_pushdown()
+
+
+@pytest.mark.parametrize("mode", ["pushdown", "bgp", "unregistered"])
+@pytest.mark.parametrize(
+    "sparql", list(REJECTED_GRAPH_NAMES.values()), ids=list(REJECTED_GRAPH_NAMES)
+)
+def test_a_graph_name_the_parser_rejects_matches_nothing(
+    dict_vortex_quads, monkeypatch, sparql, mode
+):
+    """A graph name vortex-rdf's parser rejects names no graph of the file,
+    so it matches nothing, as in rdflib's own store; the pushdown leaves its
+    block to rdflib, and rdflib's evaluation (BGP-only pushdown, or none)
+    asks the store for that context."""
+    memory = Dataset(default_union=True)
+    memory.parse(data=FIXTURE_NQ, format="nquads")
+    expected = run(memory, sparql)
+    assert expected
+    union = _answer_in_mode(
+        monkeypatch, mode, dict_vortex_quads, lambda s: Dataset(store=s, default_union=True), sparql
+    )
+    assert union == expected
+
+
+@pytest.mark.parametrize("mode", ["pushdown", "bgp", "unregistered"])
+@pytest.mark.parametrize("sparql", list(REJECTED_TERMS.values()), ids=list(REJECTED_TERMS))
+def test_a_term_the_parser_rejects_matches_nothing(dict_vortex, monkeypatch, sparql, mode):
+    """A term vortex-rdf's parser rejects is no term of the file, so a
+    pattern holding it matches nothing, as in rdflib's own store: the
+    pushdown's pattern is unsatisfiable, a VALUES constant gets a code that
+    joins nothing and is still yielded, and ``triples()`` yields nothing."""
+    memory = Graph()
+    memory.parse(data=FIXTURE_NT, format="nt")
+    expected = run(memory, sparql)
+    answer = _answer_in_mode(monkeypatch, mode, dict_vortex, lambda s: Graph(store=s), sparql)
+    assert answer == expected
+
+
+def test_a_context_naming_no_graph_is_empty(dict_vortex_quads):
+    """A literal, or an IRI the native parser rejects, names no graph of the
+    file: a context it identifies has no triples and no length."""
+    store = VortexRdflibStore(str(dict_vortex_quads), in_memory=False)
+    name = URIRef("http://ex.org/name")
+    ground = (URIRef("http://ex.org/alice"), name, Literal("Alice"))
+    for context in (Literal("zz"), Graph(store=store, identifier=URIRef("zz"))):
+        for pattern in ((None, None, None), (None, name, None), ground):
+            assert list(store.triples(pattern, context)) == []
+        assert store.__len__(context) == 0
+
+
+def test_a_term_the_parser_rejects_has_no_triples_and_no_graphs(dict_vortex_quads):
+    """An IRI the native parser rejects, in any position, is no term of the
+    file: ``triples()`` yields nothing and ``contexts()`` names no graph."""
+    store = VortexRdflibStore(str(dict_vortex_quads), in_memory=False)
+    relative = URIRef("zz")
+    for pattern in ((relative, None, None), (None, relative, None), (None, None, relative)):
+        assert list(store.triples(pattern, None)) == []
+        assert list(store.contexts(pattern)) == []
+
+
 @pytest.mark.parametrize("sparql", ORDER_QUERIES)
 def test_order_by_sequence_equals_default_evaluator(graph, sparql):
     with_pushdown, without_pushdown = both_ways(graph, sparql, run_ordered)
@@ -926,35 +1086,35 @@ def test_order_by_sequence_equals_default_evaluator(graph, sparql):
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
-def test_probe_join_path_equals_default_evaluator(graph, monkeypatch, sparql):
+def test_probe_join_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
     """Same A/B matrix with the probe threshold forced to zero, so every
     shared-variable join takes the per-binding probe path instead of the
     hash join — both strategies must be observationally identical."""
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    with_probe, without_pushdown = both_ways(graph, sparql)
+    with_probe, without_pushdown = both_ways(file_graph, sparql)
     assert with_probe == without_pushdown
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
-def test_bgp_only_mode_equals_default_evaluator(graph, monkeypatch, sparql):
+def test_bgp_only_mode_equals_default_evaluator(file_graph, monkeypatch, sparql):
     """``VORTEX_RDF_PUSHDOWN_OPS=bgp``: only basic graph patterns are solved
     here, every head is rdflib's own operator over the rows we hand back."""
     monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
-    bgp_only, without_pushdown = both_ways(graph, sparql)
+    bgp_only, without_pushdown = both_ways(file_graph, sparql)
     assert bgp_only == without_pushdown
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
-def test_python_filter_routes_equal_default_evaluator(graph, monkeypatch, sparql):
+def test_python_filter_routes_equal_default_evaluator(file_graph, monkeypatch, sparql):
     """With the native term predicates off, every conjunct the native layer
     would decide runs on the Python fast route instead."""
     monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
-    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    with_pushdown, without_pushdown = both_ways(file_graph, sparql)
     assert with_pushdown == without_pushdown
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
-def test_batched_probe_path_equals_default_evaluator(graph, monkeypatch, sparql):
+def test_batched_probe_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
     """Every probe through the native batch calls, in batches of three —
     a lone probe included."""
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
@@ -962,7 +1122,7 @@ def test_batched_probe_path_equals_default_evaluator(graph, monkeypatch, sparql)
     monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
     monkeypatch.setattr(pd, "_SCAN_BATCH_MIN", 1)
     monkeypatch.setattr(pd, "_MEMORY_SCAN_BATCH_MIN", 1)
-    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    with_pushdown, without_pushdown = both_ways(file_graph, sparql)
     assert with_pushdown == without_pushdown
 
 
@@ -976,11 +1136,11 @@ def test_grouped_counts_over_pairs_equal_default_evaluator(dataset, monkeypatch,
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
-def test_generic_filter_route_equals_default_evaluator(graph, monkeypatch, sparql):
+def test_generic_filter_route_equals_default_evaluator(file_graph, monkeypatch, sparql):
     """``VORTEX_RDF_FILTER_FAST=0``: every FILTER value goes through rdflib's
     own expression evaluator, once per distinct value."""
     monkeypatch.setattr(filters, "_FAST_ENABLED", False)
-    generic, without_pushdown = both_ways(graph, sparql)
+    generic, without_pushdown = both_ways(file_graph, sparql)
     assert generic == without_pushdown
 
 
@@ -1027,6 +1187,154 @@ def test_probe_join_pads_rows_when_the_pattern_shares_no_variable(graph):
     )
     assert schema == (Variable("z"), Variable("x"), Variable("a"))
     assert rows == [(0, None, None), (1, None, None)]
+
+
+#: Quads under `http://ex/` for the probe joins' multiplicity. `s1` holds `q`
+#: in g1 and g2 and `p` in g1, g2 and g3, so the union default graph has two
+#: quads of its `q` triple and three of its `p` triple; `s2` holds only `p`,
+#: `s3` only `q`; `s4` holds both in the default graph and `p` in g1 too.
+PROBE_QUADS = """\
+<http://ex/s1> <http://ex/q> <http://ex/x> <http://ex/g1> .
+<http://ex/s1> <http://ex/p> <http://ex/o1> <http://ex/g1> .
+<http://ex/s1> <http://ex/p> <http://ex/o1> <http://ex/g2> .
+<http://ex/s1> <http://ex/p> <http://ex/o1> <http://ex/g3> .
+<http://ex/s2> <http://ex/p> <http://ex/o1> <http://ex/g1> .
+<http://ex/s1> <http://ex/q> <http://ex/x> <http://ex/g2> .
+<http://ex/s3> <http://ex/q> <http://ex/x> <http://ex/g1> .
+<http://ex/s4> <http://ex/q> <http://ex/x> .
+<http://ex/s4> <http://ex/p> <http://ex/o1> .
+<http://ex/s4> <http://ex/p> <http://ex/o1> <http://ex/g1> .
+"""
+
+_EX = "PREFIX : <http://ex/> "
+
+#: Per shape: whether the default graph is the union of the graphs, the query,
+#: the rows rdflib answers, the probe the pushdown takes when it probes, and
+#: the `limit` of the fully bound counts that probe makes.
+PROBE_MULTIPLICITY = {
+    # The union default graph: a triple several graphs hold is one solution per
+    # graph. `s1` joins 2 `q` quads with 3 `p` quads, `s4` 1 with 2.
+    "bgp-join": (True, _EX + "SELECT ?s WHERE { ?s :q :x . ?s :p :o1 }", 8, "_probe_join", None),
+    "group-join": (
+        True,
+        _EX + "SELECT ?s WHERE { { ?s :q :x } { ?s :p :o1 } }",
+        8,
+        "_probe_join",
+        None,
+    ),
+    # `s3` has no `p`: its row is padded, once.
+    "optional": (
+        True,
+        _EX + "SELECT ?s WHERE { ?s :q :x OPTIONAL { ?s :p :o1 } }",
+        9,
+        "_probe_join",
+        None,
+    ),
+    # The condition rejects `s1`: its 2 rows are padded, not repeated.
+    "optional-condition": (
+        True,
+        _EX + "SELECT ?s WHERE { ?s :q :x OPTIONAL { ?s :p :o1 FILTER(?s != :s1) } }",
+        5,
+        "_probe_join",
+        None,
+    ),
+    # A fixed graph holds at most one quad of a triple: `s1` and `s4` have the
+    # `p` triple in other graphs too, which the probe does not read.
+    "graph-variable": (
+        True,
+        _EX + "SELECT ?g ?s WHERE { GRAPH ?g { ?s :q :x . ?s :p :o1 } }",
+        2,
+        "_probe_join",
+        1,
+    ),
+    "named-graph": (
+        True,
+        _EX + "SELECT ?s WHERE { GRAPH :g2 { ?s :q :x . ?s :p :o1 } }",
+        1,
+        "_probe_join",
+        1,
+    ),
+    "default-graph": (
+        False,
+        _EX + "SELECT ?s WHERE { ?s :q :x . ?s :p :o1 }",
+        1,
+        "_probe_join",
+        1,
+    ),
+    # EXISTS is boolean: the rows of the block, `s1` twice.
+    "exists": (
+        True,
+        _EX + "SELECT ?s WHERE { ?s :q :x FILTER EXISTS { ?s :p :o1 } }",
+        3,
+        "_probe_exists",
+        1,
+    ),
+}
+
+
+@pytest.fixture(scope="module")
+def probe_quads(tmp_path_factory):
+    d = tmp_path_factory.mktemp("pushdown-probe-quads")
+    nq = d / "probe.nq"
+    nq.write_text(PROBE_QUADS, encoding="utf-8")
+    out = d / "probe.vortex"
+    serialize_rdf(str(nq), str(out), layout="dictionary", format="nquads")
+    return out
+
+
+def _recording(calls, name):
+    """`pd.<name>`, appending its name to `calls` as it is called."""
+    original = getattr(pd, name)
+
+    def record(*args, **kwargs):
+        calls.append(name)
+        return original(*args, **kwargs)
+
+    return record
+
+
+def _probe_dataset(path, union: bool) -> Dataset:
+    """The probe quads, file-backed, with the union default graph or the default
+    graph alone."""
+    store = VortexRdflibStore(str(path), in_memory=False)
+    assert store._dict is not None and store._dict.file_backed
+    return Dataset(store=store, default_union=union)
+
+
+@pytest.mark.parametrize("fanout", [0, 100])
+@pytest.mark.parametrize("case", PROBE_MULTIPLICITY)
+def test_a_probe_join_keeps_the_multiplicity_rdflib_reads(probe_quads, monkeypatch, case, fanout):
+    """A pattern with subject, predicate and object bound is one solution per
+    quad it matches, probed per row (fanout 0) or hash-joined (fanout 100).
+    Where the graph is open, in the union default graph, that is one per graph
+    holding the triple; where it is fixed, at most one; an EXISTS test adds
+    none."""
+    union, sparql, rows, probed, _ = PROBE_MULTIPLICITY[case]
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+    probes = []
+    for name in ("_probe_join", "_probe_exists"):
+        monkeypatch.setattr(pd, name, _recording(probes, name))
+    with_pushdown, without_pushdown = both_ways(_probe_dataset(probe_quads, union), sparql)
+    assert with_pushdown == without_pushdown
+    assert len(without_pushdown) == rows
+    assert (probed in probes) == (fanout == 0)
+
+
+@pytest.mark.parametrize("case", PROBE_MULTIPLICITY)
+def test_an_existence_probe_asks_for_one_row_unless_the_graph_is_open(
+    probe_quads, monkeypatch, case
+):
+    """A fully bound probe counts every quad only in the union default graph.
+    A fixed graph holds at most one and an EXISTS test is boolean in any
+    graph, so both ask for one row."""
+    union, sparql, _, _, expected = PROBE_MULTIPLICITY[case]
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    dataset = _probe_dataset(probe_quads, union)
+    native = _counting_native(dataset)
+    register_sparql_pushdown()
+    run(dataset, sparql)
+    asked = [limit for args, limit in native.count_calls if None not in args[:3]]
+    assert asked and set(asked) == {expected}
 
 
 def test_hash_joined_bgp_keeps_a_columnar_body(graph, monkeypatch):
@@ -1129,10 +1437,23 @@ class _CountingTermDict:
 
 
 def _counting_term_dict(graph) -> _CountingTermDict:
-    """Install the counter over the store's resident term dictionary."""
+    """Install the counter over the store's term dictionary."""
     counting = _CountingTermDict(graph.store._dict)
     graph.store._dict = counting
     return counting
+
+
+def is_graph_name_check(args) -> bool:
+    """Whether a native count is the store's own question whether a bare
+    Graph's blank-node label names a graph of the file
+    (`VortexRdflibStore._blank_graph_n3`, once per query): bookkeeping, not
+    what a query plan costs."""
+    return (
+        len(args) == 4
+        and args[:3] == (None, None, None)
+        and isinstance(args[3], str)
+        and args[3].startswith("_:")
+    )
 
 
 @pytest.mark.parametrize(
@@ -1287,7 +1608,7 @@ def test_tuple_filter_prunes_a_bgp_so_a_remaining_pattern_is_probed(
     tmp_path, monkeypatch, in_graph
 ):
     """When pruning lets a remaining pattern be probed instead of matched
-    whole, the FILTER prunes mid-join — BSBM Explore Q5's win. `?a < ?b`
+    whole, the FILTER prunes mid-join, as in BSBM Explore Q5. `?a < ?b`
     holds for `s0` only, so one row survives the `p`/`q` join, and `r`'s 400
     rows are probed from it (1 × 100 < 400) rather than matched and
     hash-joined, as the unpruned 50 rows would be (50 × 100 ≥ 400). A GRAPH
@@ -1354,8 +1675,8 @@ def test_columnar_join_matches_row_join():
     expected = pd._join(
         schema_a, list(zip(ka, va, strict=True)), schema_b, list(zip(kb, vb, strict=True))
     )[1]
-    cols_a = (array("I", ka), array("I", va))
-    cols_b = (array("I", kb), array("I", vb))
+    cols_a = (array("Q", ka), array("Q", va))
+    cols_b = (array("Q", kb), array("Q", vb))
     joined = pd._join_columns(schema_a, cols_a, schema_b, cols_b)
     assert joined is not None
     schema, cols = joined
@@ -1385,8 +1706,8 @@ def test_hash_join_kernels_join_like_a_nested_loop(tail_width):
     expected = [ra + rb[1:] for ra in rows_a for rb in rows_b if ra[0] == rb[0]]
 
     assert pd._join(schema_a, rows_a, schema_b, rows_b) == (schema_a + schema_b[1:], expected)
-    cols_a = tuple(array("I", column) for column in zip(*rows_a, strict=True))
-    cols_b = tuple(array("I", column) for column in zip(*rows_b, strict=True))
+    cols_a = tuple(array("Q", column) for column in zip(*rows_a, strict=True))
+    cols_b = tuple(array("Q", column) for column in zip(*rows_b, strict=True))
     joined = pd._join_columns(schema_a, cols_a, schema_b, cols_b)
     assert joined is not None
     assert pd._cols_to_rows(joined[1]) == expected
@@ -1504,23 +1825,28 @@ def test_limit_decodes_only_the_first_chunk(tmp_path):
     store = VortexRdflibStore(str(out), in_memory=True)
     graph = Graph(store=store)
     register_sparql_pushdown()
+    counting = _counting_term_dict(graph)
     rows = run(graph, "SELECT * WHERE { ?s ?p ?o } LIMIT 10")
     assert len(rows) == 10
-    assert len(store._decode_cache) <= 3 * pd._CHUNK_START
+    assert counting.decoded <= 3 * pd._CHUNK_START
 
 
 class _CountingNative:
     """A VortexRdfStore stand-in that counts the counts and matches the
-    pushdown asks for — each probe of a batch call is one."""
+    pushdown asks for — each probe of a batch call is one. ``count_calls``
+    lists the pattern and limit of each plain ``count_quads`` call."""
 
     def __init__(self, inner):
         self._inner = inner
         self.counts = 0
         self.matches = 0
         self.batches = 0
+        self.count_calls: list[tuple[tuple, int | None]] = []
 
     def count_quads(self, *args, **kwargs):
-        self.counts += 1
+        if not is_graph_name_check(args):
+            self.counts += 1
+            self.count_calls.append((args, kwargs.get("limit")))
         return self._inner.count_quads(*args, **kwargs)
 
     def match_codes(self, *args, **kwargs):
@@ -1542,14 +1868,8 @@ class _CountingNative:
 
 
 def _counting_native(graph) -> _CountingNative:
-    """Install the counter, with the store's own bookkeeping already done.
-
-    Resolving the graph's identifier costs one `count_quads` (a bare `Graph`
-    is blank-node labelled, and only the store can say whether that names a
-    graph of the file) — once per store, cached. Warming it here keeps the
-    assertions below about what a *query* costs.
-    """
-    graph.store._graph_n3(graph)
+    """Install the counter. The store's own graph-name check is not counted
+    (`is_graph_name_check`): it is not what a query plan costs."""
     native = _CountingNative(graph.store._store())
     graph.store._native = native
     return native
@@ -1678,6 +1998,71 @@ def test_init_bindings_are_visible_to_filters(graph):
     assert with_pushdown == without_pushdown == [(Literal(42),)]
 
 
+#: Per path of an IRI keep, a query whose answer changes if the path breaks:
+#: ``(query, IRIs bound through initBindings, rows rdflib answers)``.
+IRI_KEEP_PATHS = {
+    "column-tested-on-probed-rows": (
+        """SELECT * WHERE {
+            <http://ex.org/alice> <http://ex.org/knows> ?v . ?v <http://ex.org/knows> ?w
+            FILTER(?w IN (<http://ex.org/bob>, <http://ex.org/carol>)) }""",
+        None,
+        1,
+    ),
+    "columns-matched-apart": (
+        """SELECT * WHERE { ?a ?p ?x . ?b ?q ?y
+            FILTER(?x IN (<http://ex.org/bob>)) FILTER(?y IN (<http://ex.org/carol>)) }""",
+        None,
+        8,
+    ),
+    "columns-intersect": (
+        """SELECT ?s ?o WHERE { ?s ?p ?o
+            FILTER(?o IN (<http://ex.org/bob>, <http://ex.org/carol>)
+                && ?o IN (<http://ex.org/carol>, <http://ex.org/dave>)) }""",
+        None,
+        4,
+    ),
+    "columns-intersect-to-nothing": (
+        """SELECT ?s ?o WHERE { ?s ?p ?o
+            FILTER(?o IN (<http://ex.org/bob>) && ?o IN (<http://ex.org/carol>)) }""",
+        None,
+        0,
+    ),
+    "iri-that-is-no-iriref": (
+        "SELECT ?s ?o WHERE { ?s ?p ?o FILTER(?o = ?y) }",
+        {"y": "http://ex.org/bob>"},
+        0,
+    ),
+}
+
+
+@pytest.mark.parametrize("fanout", [100, 0])
+@pytest.mark.parametrize(
+    ("sparql", "init", "expected"), list(IRI_KEEP_PATHS.values()), ids=list(IRI_KEEP_PATHS)
+)
+def test_iri_keep_paths_agree_with_rdflib(file_graph, monkeypatch, fanout, sparql, init, expected):
+    """The paths an IRI keep takes, each with a query whose answer changes if
+    the path breaks, hash-joined (``_PROBE_FANOUT`` 100) and probed (0):
+
+    - a probed pattern's free variable tests the keep's codes on the rows each
+      probe returns (``keep_member``);
+    - two patterns narrowed by different code sets at one position are two
+      matches, not one (``_pattern_key``);
+    - code sets on one variable intersect (``intersect_keeps``);
+    - an IRI that is no N-Triples IRIREF makes no keep (``_SPELLABLE_IRI``):
+      a bound variable's here, which ``encode_many`` would read as another
+      IRI."""
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+    bindings = None if init is None else {name: URIRef(iri) for name, iri in init.items()}
+
+    def answer(graph, sparql):
+        rows = graph.query(sparql, initBindings=bindings)
+        return sorted((tuple(row) for row in rows), key=_row_key)
+
+    with_pushdown, without_pushdown = both_ways(file_graph, sparql, answer)
+    assert with_pushdown == without_pushdown
+    assert len(without_pushdown) == expected
+
+
 def test_distinct_and_count_are_answered_in_code_space(graph, monkeypatch):
     distincts, aggregates = [], []
     original_distinct = pd._eval_distinct
@@ -1709,20 +2094,21 @@ _ALIAS_QUERIES = [
 
 
 @pytest.mark.parametrize("order", [1, -1], ids=["forward", "reverse"])
-def test_term_aliases_are_classified_once_per_store(graph, order):
+def test_term_aliases_are_classified_within_each_query(graph, order):
     """Which codes alias ("042" and "42" are one integer, and so is a query's
-    "0042" the dictionary lacks) is the store's to remember: whatever query
-    classifies a code first, every later one — on the same store, in either
-    order — answers as rdflib does, and the classification is not redone."""
-    store = graph.store
+    "0042" the dictionary lacks) is classified per query: whatever query runs
+    first, each answers as rdflib does, and a query run again decodes exactly
+    what it did the first time — nothing carried over from earlier queries."""
     for sparql in _ALIAS_QUERIES[::order]:
         with_pushdown, without_pushdown = both_ways(graph, sparql)
         assert with_pushdown == without_pushdown, sparql
-    assert store._alias_reps, "the fixture's two spellings of 42 alias"
-    classified = len(store._alias_classified)
-    for sparql in _ALIAS_QUERIES:
-        run(graph, sparql)
-    assert len(store._alias_classified) == classified
+    counting = _counting_term_dict(graph)
+    decoded = []
+    for _ in range(2):
+        before = counting.decoded
+        run(graph, _ALIAS_QUERIES[0])
+        decoded.append(counting.decoded - before)
+    assert decoded[0] == decoded[1] > 0
 
 
 def test_count_over_one_pattern_counts_instead_of_matching(graph):
@@ -1750,9 +2136,10 @@ def test_distinct_decodes_only_the_survivors(tmp_path):
     store = VortexRdflibStore(str(out), in_memory=True)
     graph = Graph(store=store)
     register_sparql_pushdown()
+    counting = _counting_term_dict(graph)
     rows = run(graph, "SELECT DISTINCT ?p WHERE { ?s ?p ?o }")
     assert len(rows) == 7
-    assert len(store._decode_cache) == 7
+    assert counting.decoded == 7
 
 
 def test_left_join_probe_and_hash_paths_are_ours(graph, monkeypatch):

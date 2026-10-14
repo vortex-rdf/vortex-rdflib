@@ -22,15 +22,18 @@ evaluated **per distinct value**, never per row, through two routes:
 ``UNKNOWN`` is sticky through ``&&``/``||``/``!`` except where rdflib itself
 short-circuits first (``false && ?`` is false, ``true || ?`` is true).
 
-A single-variable conjunct of one of the shapes the native layer evaluates
-over the dictionary itself (``TermDict.filter_codes``: the kind tests,
-``datatype``, ``lang``, ``langMatches``, a numeric comparison with a
-constant, ``strstarts(str(?v), ...)``) also carries that predicate
-(``Conjunct.native``). Its definite answers are a one-time scan of the
-dictionary, memoized; the pushdown turns them into a ``keep`` on the native
-match, so the rows that fail never cross into Python, and
-:func:`evaluate_column` reads them instead of decoding a value. The codes
-the native layer leaves undecided go down the two routes above.
+A single-variable conjunct of a shape vortex-rdf evaluates (:func:`native_shape`
+lists them) also carries that predicate (``Conjunct.native``, a
+:class:`~vortex_rdflib.candidates.NativeShape`). A kind test is its kind's
+code range and an IRI equality its IRIs' codes, which the pushdown turns into
+a ``keep`` on the native match (:func:`native_restriction`), so the rows that
+fail never cross into Python. The one exception is a probed pattern: it
+carries a range into each probe and tests a code set on the rows the probe
+returns.
+Every other native shape is answered by vortex-rdf over the distinct codes a
+query produced (:func:`candidates.evaluate`, called from
+:func:`evaluate_column`), never over the whole dictionary, and only the codes
+it leaves undecided go down the two routes above.
 """
 
 import re
@@ -46,16 +49,19 @@ from rdflib.plugins.sparql.operators import _lang_range_check
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.plugins.sparql.sparql import FrozenBindings, SPARQLError
 from rdflib.term import BNode, Literal, URIRef, Variable
-from vortex_rdf import U32Column
+from vortex_rdf import U64Column
 
+from . import candidates
+from .candidates import IRI_IN, NativeShape
 from .terms import BLANK, IRI, LITERAL, TermView, canonical_spelling, kind_of, parse_spelling
 
 # Force the generic route everywhere (VORTEX_RDF_FILTER_FAST=0): the
 # equivalence tests run the matrix both ways.
 _FAST_ENABLED: bool = True
-# Answer the conjuncts the native layer can evaluate from its dictionary
-# scan (VORTEX_RDF_NATIVE_FILTERS=0 keeps them on the Python fast route,
-# for A/B measurements; the generic route above disables them too).
+# Decide the conjuncts that have a native shape inside vortex-rdf: kind tests
+# as code ranges, IRI equalities as code sets, the others over the codes a
+# query produced (VORTEX_RDF_NATIVE_FILTERS=0 keeps them on the Python
+# routes, for A/B measurements; the generic route above disables them too).
 _NATIVE_ENABLED: bool = True
 
 
@@ -77,6 +83,9 @@ _XSD_STRING = _XSD + "string"
 _XSD_BOOLEAN = _XSD + "boolean"
 _XSD_INTEGER = _XSD + "integer"
 _RDF_LANGSTRING = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+#: How rdflib's parser spells ``IN ()``; its evaluator reads it back as the
+#: empty list.
+_RDF_NIL = URIRef("http://www.w3.org/1999/02/22-rdf-syntax-ns#nil")
 _XML_COMPARABLE = frozenset(
     {
         "http://www.w3.org/1999/02/22-rdf-syntax-ns#XMLLiteral",
@@ -484,7 +493,9 @@ def _compile_relational(node, slots, consts):
         raise _NotFast
     left = _compile(node.expr, slots, consts)
     if op in ("IN", "NOT IN"):
-        others = node.other if isinstance(node.other, list) else [node.other]
+        others = node.other
+        if not isinstance(others, list):
+            others = [] if others == _RDF_NIL else [others]
         views = [view_of_node(x) for x in others]
         negate = op == "NOT IN"
 
@@ -684,6 +695,20 @@ _TWO_ARGS = {
     "Builtin_sameTerm": _same_term,
 }
 _REGEX_FLAGS = {"i": re.IGNORECASE, "s": re.DOTALL, "m": re.MULTILINE}
+#: What ``re.compile`` raises for a pattern it cannot compile: a syntax error,
+#: a repetition count past its limit, nesting past the recursion limit.
+_COMPILE_ERRORS = (re.error, OverflowError, RecursionError)
+
+
+def _regex_flags(flags) -> tuple[str, int]:
+    """The flags of a REGEX flags literal (``None`` for none) that rdflib maps
+    (``i``, ``s``, ``m``; it ignores every other letter), as those letters and
+    as ``re`` flags."""
+    kept = "".join(flag for flag in ("" if flags is None else str(flags)) if flag in _REGEX_FLAGS)
+    compile_flags = 0
+    for flag in kept:
+        compile_flags |= _REGEX_FLAGS[flag]
+    return kept, compile_flags
 
 
 def _compile_regex(node, slots, consts):
@@ -694,12 +719,10 @@ def _compile_regex(node, slots, consts):
         flags is not None and not _string_like(view_of_node(flags))
     ):
         raise _NotFast
-    cflags = 0
-    for flag in str(flags or ""):
-        cflags |= _REGEX_FLAGS.get(flag, 0)
+    _, compile_flags = _regex_flags(flags)
     try:
-        regex = re.compile(str(pattern), cflags)
-    except re.error as error:
+        regex = re.compile(str(pattern), compile_flags)
+    except _COMPILE_ERRORS as error:
         raise _NotFast from error
     text = _compile(node.text, slots, consts)
 
@@ -759,9 +782,6 @@ _NUM_KINDS = {
     "!=": "num_ne",
 }
 _SWAPPED = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "=": "=", "!=": "!="}
-#: The native predicates whose definite answers are all literals: a
-#: non-literal code is in neither of their sets and fails them, except `!=`.
-_LITERAL_DOMAIN = frozenset({"datatype", "lang", "lang_matches", *_NUM_KINDS.values()})
 #: Language ranges on which the native basic filtering (RFC 4647 §3.3.1) and
 #: rdflib's `_lang_range_check` agree: `*`, or ASCII alphanumeric subtags.
 _LANG_RANGE = re.compile(r"\*|[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
@@ -772,14 +792,125 @@ def _call_on(node, name: str, var) -> bool:
     return isinstance(node, CompValue) and node.name == name and node.arg == var
 
 
+def _string_literal(term) -> bool:
+    """rdflib's ``string()``: a plain, ``xsd:string`` or language-tagged
+    literal."""
+    return isinstance(term, Literal) and (
+        term.datatype is None or str(term.datatype) == _XSD_STRING
+    )
+
+
 def _string_constant(term) -> bool:
     """A plain or ``xsd:string`` literal: what the native string predicates
     take as their argument."""
-    return (
-        isinstance(term, Literal)
-        and term.language is None
-        and (term.datatype is None or str(term.datatype) == _XSD_STRING)
-    )
+    return _string_literal(term) and term.language is None
+
+
+#: The string functions with a native kind, by rdflib's builtin name.
+_STRING_FUNCTIONS = {
+    "Builtin_CONTAINS": "contains",
+    "Builtin_STRSTARTS": "strstarts",
+    "Builtin_STRENDS": "strends",
+}
+#: The case wrappers a native string kind takes as its ``case``.
+_CASE_WRAPPERS = {"Builtin_LCASE": "lower", "Builtin_UCASE": "upper"}
+
+
+def _text_shape(node, var) -> tuple[str | None, bool] | None:
+    """How a string function's text reads ``var``: ``(case, as_str)`` for
+    ``var``, ``STR(var)`` and ``LCASE``/``UCASE`` of either — ``None`` for
+    anything else."""
+    case = None
+    if isinstance(node, CompValue) and node.name in _CASE_WRAPPERS:
+        case, node = _CASE_WRAPPERS[node.name], node.arg
+    if isinstance(node, _VAR_LIKE) and node == var:
+        return case, False
+    if _call_on(node, "Builtin_STR", var):
+        return case, True
+    return None
+
+
+def _string_function_shape(expr, var, consts) -> NativeShape | None:
+    """CONTAINS, STRSTARTS or STRENDS of ``var``'s text and a string constant.
+
+    rdflib's ``_compatibleStrings`` makes a tagged constant demand the text's
+    own tag, compared as written: ``STR()`` text has none (an error for every
+    value) and a stored tag is lower-case, so a tag that is not lower-case
+    never matches either. Both stay with the Python routes."""
+    text = _text_shape(expr.arg1, var)
+    constant = _constant_term(expr.arg2, consts)
+    if text is None or not _string_literal(constant):
+        return None
+    case, as_str = text
+    language = constant.language
+    if language is not None and (as_str or language != language.lower()):
+        return None
+    kind = _STRING_FUNCTIONS[expr.name]
+    return NativeShape(kind, canonical_spelling(constant), case=case, as_str=as_str)
+
+
+def _regex_shape(expr, var, consts) -> NativeShape | None:
+    """REGEX of ``var``'s text with a constant string pattern and flags.
+
+    rdflib compiles the pattern with Python's ``re`` and raises for every
+    string text when that fails, so such a pattern stays with rdflib. Only
+    the flags rdflib maps (``i``, ``s``, ``m``) are kept; it ignores the
+    rest."""
+    text = _text_shape(expr.text, var)
+    pattern = _constant_term(expr.pattern, consts)
+    flags = None if expr.flags is None else _constant_term(expr.flags, consts)
+    if text is None or not _string_literal(pattern):
+        return None
+    if expr.flags is not None and not _string_literal(flags):
+        return None
+    kept, compile_flags = _regex_flags(flags)
+    try:
+        re.compile(str(pattern), compile_flags)
+    except _COMPILE_ERRORS:
+        return None
+    case, as_str = text
+    return NativeShape("regex", str(pattern), flags=kept, case=case, as_str=as_str)
+
+
+#: IRIs ``canonical_spelling`` spells as an N-Triples IRIREF.
+_SPELLABLE_IRI = re.compile(r'[^\x00-\x20<>"{}|^`\\]*')
+
+
+def _iri_spelling(node, consts) -> str | None:
+    """The spelling of the IRI an operand without block variables evaluates
+    to, or ``None`` when it is not an IRI the dictionary could hold."""
+    iri = _constant_term(node, consts)
+    if not isinstance(iri, URIRef) or not _SPELLABLE_IRI.fullmatch(str(iri)):
+        return None
+    return canonical_spelling(iri)
+
+
+def _iri_equality(left, right, var, consts) -> NativeShape | None:
+    """``var = <iri>`` or ``<iri> = var`` (``=`` and ``sameTerm`` alike): true
+    for exactly that IRI — rdflib's ``eq`` and ``==`` are term equality for
+    an IRI, and no literal or blank node equals one."""
+    for side, other in ((left, right), (right, left)):
+        if isinstance(side, _VAR_LIKE) and side == var:
+            spelling = _iri_spelling(other, consts)
+            return None if spelling is None else NativeShape(IRI_IN, (spelling,))
+    return None
+
+
+def _iri_list(left, right, var, consts) -> NativeShape | None:
+    """``var IN (<iri>, ...)``: true for exactly those IRIs. rdflib's parser
+    spells an empty list as rdf:nil, which its evaluator reads back as the
+    empty list."""
+    if not (isinstance(left, _VAR_LIKE) and left == var):
+        return None
+    if not isinstance(right, list):
+        return NativeShape(IRI_IN, ()) if right == _RDF_NIL else None
+    spellings = []
+    for node in right:
+        spelling = _iri_spelling(node, consts)
+        if spelling is None:
+            return None
+        spellings.append(spelling)
+    return NativeShape(IRI_IN, tuple(dict.fromkeys(spellings)))
 
 
 def _constant_term(node, consts: dict):
@@ -801,19 +932,22 @@ def _constant_term(node, consts: dict):
     return result if isinstance(result, (Literal, URIRef)) else None
 
 
-def native_shape(expr, var, consts: dict) -> tuple[str, str] | None:
-    """The native term predicate ``(kind, arg)`` that ``expr`` is as a test of
-    ``var`` alone — any other variable seen only through ``consts`` — or
-    ``None``.
+def native_shape(expr, var, consts: dict) -> NativeShape | None:
+    """The native predicate (:class:`~vortex_rdflib.candidates.NativeShape`)
+    that ``expr`` is as a test of ``var`` alone — any other variable seen only
+    through ``consts`` — or ``None``.
 
     The shapes: ``isIRI``/``isURI``/``isBlank``/``isLiteral`` of ``var``;
     ``datatype(var) = <iri>`` and ``lang(var) = "tag"`` (either way round);
     ``langMatches(lang(var), "range")``; ``strstarts(str(var), "prefix")``;
-    and ``var`` compared with a well-formed numeric literal by any of
-    ``< <= > >= = !=`` (either way round). The native layer answers each
-    over the stored spellings with rdflib's own rules wherever it gives a
-    definite answer (``tests/test_native_filters.py`` pins that against
-    rdflib's evaluator) and leaves every other value undecided.
+    ``REGEX``, ``CONTAINS``, ``STRSTARTS`` and ``STRENDS`` of ``var`` or
+    ``STR(var)``, either under ``LCASE``/``UCASE``, with a constant pattern or
+    string; ``var = <iri>``, ``<iri> = var``, ``sameTerm`` of ``var`` and an
+    IRI, and ``var IN (<iri>, ...)``; and ``var`` compared with a well-formed
+    numeric literal by any of ``< <= > >= = !=`` (either way round). vortex-rdf
+    answers each over the codes a query produced with rdflib's own rules
+    wherever it gives a definite answer (``tests/test_native_filters.py`` pins
+    that against rdflib's evaluator) and leaves every other code undecided.
     """
     if not isinstance(expr, CompValue):
         return None
@@ -821,36 +955,49 @@ def native_shape(expr, var, consts: dict) -> tuple[str, str] | None:
     if name in ("Builtin_isIRI", "Builtin_isURI", "Builtin_isBLANK", "Builtin_isLITERAL"):
         if expr.arg != var:
             return None
-        return {"Builtin_isBLANK": ("is_blank", ""), "Builtin_isLITERAL": ("is_literal", "")}.get(
-            name, ("is_iri", "")
+        kind = {"Builtin_isBLANK": "is_blank", "Builtin_isLITERAL": "is_literal"}.get(
+            name, "is_iri"
         )
+        return NativeShape(kind, "")
     if name == "Builtin_LANGMATCHES":
         if not _call_on(expr.arg1, "Builtin_LANG", var):
             return None
         # rdflib's `string()` admits a language-tagged range: its lexical
         # form is the range either way.
         rng = _constant_term(expr.arg2, consts)
-        if not isinstance(rng, Literal) or (
-            rng.datatype is not None and str(rng.datatype) != _XSD_STRING
-        ):
+        if not _string_literal(rng):
             return None
-        return ("lang_matches", str(rng)) if _LANG_RANGE.fullmatch(str(rng)) else None
-    if name == "Builtin_STRSTARTS":
-        if not _call_on(expr.arg1, "Builtin_STR", var):
-            return None
+        return NativeShape("lang_matches", str(rng)) if _LANG_RANGE.fullmatch(str(rng)) else None
+    if name == "Builtin_STRSTARTS" and _call_on(expr.arg1, "Builtin_STR", var):
         prefix = _constant_term(expr.arg2, consts)
-        return ("str_prefix", str(prefix)) if _string_constant(prefix) else None
-    if name != "RelationalExpression" or expr.other is None or isinstance(expr.other, list):
+        if _string_constant(prefix):
+            return NativeShape("str_prefix", str(prefix))
+    if name in _STRING_FUNCTIONS:
+        return _string_function_shape(expr, var, consts)
+    if name == "Builtin_REGEX":
+        return _regex_shape(expr, var, consts)
+    if name == "Builtin_sameTerm":
+        return _iri_equality(expr.arg1, expr.arg2, var, consts)
+    if name != "RelationalExpression" or expr.other is None:
         return None
     op, left, right = expr.op, expr.expr, expr.other
+    if op == "IN":
+        return _iri_list(left, right, var, consts)
+    if isinstance(right, list):
+        return None
     if op == "=":
         for call, other in ((left, right), (right, left)):
             if _call_on(call, "Builtin_DATATYPE", var):
                 datatype = _constant_term(other, consts)
-                return ("datatype", str(datatype)) if isinstance(datatype, URIRef) else None
+                if not isinstance(datatype, URIRef):
+                    return None
+                return NativeShape("datatype", str(datatype))
             if _call_on(call, "Builtin_LANG", var):
                 tag = _constant_term(other, consts)
-                return ("lang", str(tag)) if _string_constant(tag) else None
+                return NativeShape("lang", str(tag)) if _string_constant(tag) else None
+        iri = _iri_equality(left, right, var, consts)
+        if iri is not None:
+            return iri
     kind = _NUM_KINDS.get(op)
     if kind is None:
         return None
@@ -870,48 +1017,7 @@ def native_shape(expr, var, consts: dict) -> tuple[str, str] | None:
         or numeric_value(view_of_node(constant)) is None
     ):
         return None
-    return (kind, canonical_spelling(constant))
-
-
-class NativeVerdicts:
-    """A native term predicate's partition of the dictionary
-    (``TermDict.filter_codes``): the ascending codes it definitely holds for,
-    and those it leaves undecided. A literal-domain predicate decides every
-    code outside the literal range by ``nonliteral``; any other code in
-    neither set fails."""
-
-    __slots__ = ("true", "undecided", "_true", "_undecided", "literal_domain", "nonliteral")
-
-    def __init__(self, true, undecided, literal_domain: bool, nonliteral: bool):
-        self.true = true
-        self.undecided = undecided
-        self._true = memoryview(true).cast("I")
-        self._undecided = memoryview(undecided).cast("I")
-        self.literal_domain = literal_domain
-        self.nonliteral = nonliteral
-
-    def undecided_in(self, lo: int, hi: int) -> bool:
-        """Whether any undecided code lies in ``[lo, hi)``."""
-        return bisect_left(self._undecided, hi) > bisect_left(self._undecided, lo)
-
-    def split(self, codes, literals: tuple[int, int]) -> tuple[set, list]:
-        """Of ``codes``: the set that passes, and the codes left undecided.
-
-        The undecided set is read first: it holds the codes whose native
-        verdict is not rdflib's (see :func:`native_verdicts`), whichever set
-        they would otherwise be found in.
-        """
-        passed: set = set()
-        undecided: list = []
-        lo, hi = literals
-        for code in codes:
-            if _sorted_contains(self._undecided, code):
-                undecided.append(code)
-            elif _sorted_contains(self._true, code):
-                passed.add(code)
-            elif self.literal_domain and self.nonliteral and not lo <= code < hi:
-                passed.add(code)
-        return passed, undecided
+    return NativeShape(kind, canonical_spelling(constant))
 
 
 def _sorted_contains(view, code: int) -> bool:
@@ -919,80 +1025,22 @@ def _sorted_contains(view, code: int) -> bool:
     return index < len(view) and view[index] == code
 
 
-def native_verdicts(store, kind: str, arg: str) -> NativeVerdicts | None:
-    """The store dictionary's partition by a native predicate, or ``None``
-    when the native layer refuses the argument (a numeric constant outside
-    its value model, say).
-
-    For the numeric comparisons the ``xsd:long`` and ``xsd:unsignedLong``
-    literals beyond 64 bits join the undecided set: the native layer holds
-    them to XSD's bounds and orders them by their datatype IRI, where rdflib
-    — which checks no upper bound for either — compares them by value.
-    """
-    try:
-        true, undecided = store._dict.filter_codes(kind, arg)
-    except ValueError:
-        return None
-    if kind in _NUM_KINDS.values():
-        suspects = store._wide_integer_codes()
-        if suspects:
-            merged = set(memoryview(undecided).cast("I"))
-            merged.update(suspects)
-            undecided = U32Column(sorted(merged))
-    return NativeVerdicts(true, undecided, kind in _LITERAL_DOMAIN, kind == "num_ne")
-
-
-def wide_integer_codes(store) -> list:
-    """The codes of the ``xsd:long`` and ``xsd:unsignedLong`` literals the
-    native value model leaves without a value: one is out of 64-bit range
-    (or malformed) exactly when a ``num_eq`` against a zero of its own
-    datatype is undecided. Two dictionary scans, once per store; empty for
-    most stores, which use ``xsd:integer``."""
-    codes: set = set()
-    for local in ("long", "unsignedLong"):
-        datatype = _XSD + local
-        typed, _ = store._dict.filter_codes("datatype", datatype)
-        if not len(typed):
-            continue
-        _, undecided = store._dict.filter_codes("num_eq", f'"0"^^<{datatype}>')
-        left, _ = typed.join_indices(undecided)
-        codes.update(memoryview(typed.take(left)).cast("I").tolist())
-    return sorted(codes)
-
-
-#: The term kinds that can occupy each quad position (s, p, o, g) — an
-#: undecided native verdict matters only for a code the position can hold.
-_POSITION_KINDS = ((IRI, BLANK), (IRI,), (LITERAL, IRI, BLANK), (IRI, BLANK))
-
-
-def native_restriction(store, conjuncts: list, positions) -> tuple:
-    """``(keep, residual)`` for one variable's conjuncts at ``positions``.
-
-    ``keep`` admits exactly the codes that pass every conjunct the native
-    layer decides for each code those positions can hold — a ``(lo, hi)``
-    code range for the kind tests, an ascending code column otherwise, or
-    ``None`` when no conjunct qualifies — and ``residual`` are the conjuncts
-    left to the Python routes. A conjunct qualifies when its native
-    predicate leaves no code of those kinds undecided; ``!=`` never does,
-    since every non-literal passes it and no single keep says so.
-    """
+def native_restriction(store, conjuncts: list) -> tuple:
+    """``(keep, residual)`` for one variable's conjuncts. ``keep`` admits
+    exactly the codes passing every conjunct vortex-rdf answers with a keep
+    (:func:`candidates.keep_of`) — ``None`` when there is none — and
+    ``residual`` are the other conjuncts, evaluated over the codes the query
+    produces (:func:`evaluate_column`)."""
     if not (_FAST_ENABLED and _NATIVE_ENABLED):
         return None, conjuncts
-    kinds = {kind for position in positions for kind in _POSITION_KINDS[position]}
-    ranges = store._kind_ranges()
     keeps, residual = [], []
     for conjunct in conjuncts:
         keep = None
         if conjunct.native is not None:
-            kind, arg = conjunct.native
-            if kind in ("is_literal", "is_iri", "is_blank"):
-                keep = ranges[{"is_literal": LITERAL, "is_iri": IRI, "is_blank": BLANK}[kind]]
-            elif kind != "num_ne":
-                verdicts = store._native_verdicts(kind, arg)
-                if verdicts is not None and not any(
-                    verdicts.undecided_in(*ranges[k]) for k in kinds
-                ):
-                    keep = verdicts.true
+            try:
+                keep = candidates.keep_of(store, conjunct.native)
+            except ValueError:
+                keep = None  # a constant the native parser refuses
         if keep is None:
             residual.append(conjunct)
         else:
@@ -1018,10 +1066,10 @@ def intersect_keeps(keeps: list):
         left, _ = result.join_indices(other)
         result = result.take(left)
     if ranges:
-        view = memoryview(result).cast("I")
+        view = memoryview(result).cast("Q")
         start, stop = bisect_left(view, lo), bisect_left(view, hi)
         if (start, stop) != (0, len(view)):
-            result = U32Column(view[start:stop])
+            result = U64Column(view[start:stop])
     return result
 
 
@@ -1031,7 +1079,7 @@ def keep_member(keep) -> Callable[[int], bool]:
     if isinstance(keep, tuple):
         lo, hi = keep
         return lambda code: lo <= code < hi
-    view = memoryview(keep).cast("I")
+    view = memoryview(keep).cast("Q")
     return lambda code: _sorted_contains(view, code)
 
 
@@ -1043,7 +1091,7 @@ def expr_vars(node, out: list | None = None) -> list:
     order. An EXISTS body is walked in its translated form (the instance
     attribute): rdflib pulls the body's FILTERs out of the parse tree it
     keeps under the key, so only the translation still names their
-    variables."""
+    variables, and a VALUES table in it names its own in each row's keys."""
     if out is None:
         out = []
     if isinstance(node, _VAR_LIKE):
@@ -1057,10 +1105,38 @@ def expr_vars(node, out: list | None = None) -> list:
         for key in node.keys():
             if key != "_vars":
                 expr_vars(dict.__getitem__(node, key), out)
+    elif isinstance(node, dict):
+        expr_vars(list(node), out)
     elif isinstance(node, (list, tuple)):
         for x in node:
             expr_vars(x, out)
     return out
+
+
+def has_minus(node) -> bool:
+    """Whether an algebra tree or an expression holds a MINUS, one in an
+    EXISTS body included (walked in its translated form, as
+    :func:`expr_vars` does)."""
+    if isinstance(node, (list, tuple)):
+        return any(has_minus(item) for item in node)
+    if not isinstance(node, CompValue):
+        return False
+    if node.name == "Minus":
+        return True
+    if node.name in ("Builtin_EXISTS", "Builtin_NOTEXISTS"):
+        return has_minus(getattr(node, "graph", None))
+    return any(has_minus(dict.__getitem__(node, key)) for key in node.keys() if key != "_vars")
+
+
+def has_exists(node) -> bool:
+    """Whether an expression holds an EXISTS or a NOT EXISTS."""
+    if isinstance(node, (list, tuple)):
+        return any(has_exists(item) for item in node)
+    if not isinstance(node, CompValue):
+        return False
+    if node.name in ("Builtin_EXISTS", "Builtin_NOTEXISTS"):
+        return True
+    return any(has_exists(dict.__getitem__(node, key)) for key in node.keys() if key != "_vars")
 
 
 def _is_impure(node) -> bool:
@@ -1090,9 +1166,9 @@ class Conjunct:
     kind_only: bool
     consts: dict = field(default_factory=dict)  # visible ctx-bound vars -> rdflib terms
     ctx: Any = None
-    # The native term predicate `(kind, arg)` a single-variable conjunct is
-    # (see `native_shape`), or None.
-    native: tuple[str, str] | None = None
+    # The native predicate a single-variable conjunct is (see `native_shape`),
+    # or None.
+    native: NativeShape | None = None
 
     def generic(self, bound: dict) -> bool:
         """rdflib's own answer for one value assignment (``bound`` maps the
@@ -1153,34 +1229,53 @@ def analyze_filter(node, block_vars, ctx) -> FilterPlan:
     return analyze_expr(node.expr, block_vars, ctx, visible)
 
 
+def _compile_conjunct(
+    expr, variables: tuple, consts: dict, ctx, native: NativeShape | None
+) -> Conjunct:
+    """``expr`` as a conjunct of ``variables``, every other variable it reads
+    fixed to the term ``consts`` gives it, or unbound: its fast route compiled
+    over those constants (none when the fast routes are off, a constant has no
+    term view or the expression is outside the whitelist), kind-only when it
+    reads nothing but term kinds. ``native`` is the predicate vortex-rdf
+    decides it by, if any."""
+    fast = None
+    if _FAST_ENABLED:
+        try:
+            const_views = {v: view_of_node(term) for v, term in consts.items()}
+        except _NotFast:
+            const_views = None
+        if const_views is not None:
+            fast = compile_fast(expr, variables, const_views)
+    return Conjunct(
+        expr, variables, fast, fast is not None and is_kind_only(expr), consts, ctx, native
+    )
+
+
 def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
     """Route the conjuncts of a boolean expression over ``block_vars``;
     ``visible`` maps the context-bound variables the expression may see to
-    their terms, every other non-block variable is unbound."""
+    their terms, every other non-block variable is unbound.
+
+    A conjunct holding an EXISTS under another operator, with a MINUS in its
+    body, is left to rdflib (``NotImplementedError``): it would be decided
+    with only the conjunct's variables bound, where rdflib binds the whole
+    row, which that MINUS then always shares."""
     block_set = set(block_vars)
     plan = FilterPlan([], {}, [], [])
     for conjunct_expr in _flatten_and(expr, []):
         expr = conjunct_expr
         if _is_impure(expr):
             raise NotImplementedError
+        shape = exists_shape(expr)
+        if shape is None and has_minus(expr):
+            raise NotImplementedError
         referenced = expr_vars(expr)
         variables = tuple(v for v in referenced if v in block_set)
         consts = {v: visible[v] for v in referenced if v in visible and v not in block_set}
-        fast = None
-        if _FAST_ENABLED:
-            try:
-                const_views = {v: view_of_node(term) for v, term in consts.items()}
-            except _NotFast:
-                const_views = None
-            if const_views is not None:
-                fast = compile_fast(expr, variables, const_views)
         native = None
         if len(variables) == 1 and _FAST_ENABLED and _NATIVE_ENABLED:
             native = native_shape(expr, variables[0], consts)
-        conjunct = Conjunct(
-            expr, variables, fast, fast is not None and is_kind_only(expr), consts, ctx, native
-        )
-        shape = exists_shape(expr)
+        conjunct = _compile_conjunct(expr, variables, consts, ctx, native)
         if shape is not None:
             plan.exists.append(ExistsConjunct(conjunct, *shape))
         elif not variables:
@@ -1190,6 +1285,19 @@ def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
         else:
             plan.tuples.append(conjunct)
     return plan
+
+
+def specialize(conjunct: Conjunct, var, consts: dict) -> Conjunct | None:
+    """``conjunct`` as a test of ``var`` alone, its other variables fixed to
+    the terms ``consts`` gives them: a single-variable conjunct carrying the
+    native shape that makes it (:func:`native_shape`), its fast route compiled
+    over those constants — or ``None`` when it has no native shape that way.
+    Its generic route is rdflib's evaluator over the same constants, so every
+    value it decides is rdflib's answer."""
+    shape = native_shape(conjunct.expr, var, consts)
+    if shape is None:
+        return None
+    return _compile_conjunct(conjunct.expr, (var,), consts, conjunct.ctx, shape)
 
 
 # --- evaluation ----------------------------------------------------------------
@@ -1206,11 +1314,13 @@ def evaluate_constant(conjunct: Conjunct) -> bool:
 
 def evaluate_column(store, conjuncts: list, codes) -> set:
     """The subset of ``codes`` (distinct codes of one variable) passing every
-    conjunct. Kind-only predicates never decode; a conjunct with a native
-    predicate reads its memoized partition of the dictionary, and only the
-    codes the native layer leaves undecided go on; the others decode the
-    surviving codes once, in one batch, and parse their spellings."""
-    remaining = set(codes)
+    conjunct — ``codes`` itself when it is a set and no conjunct runs.
+    Kind-only predicates never decode; a conjunct with a native shape is
+    answered by vortex-rdf over the codes still in play
+    (:func:`candidates.evaluate`), and only the codes it leaves undecided go
+    on; the others decode the surviving codes once, in one batch, and parse
+    their spellings."""
+    remaining = codes if isinstance(codes, set) else set(codes)
     views: dict = {}
     bounds = None
     for conjunct in conjuncts:
@@ -1219,27 +1329,25 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
         fast = conjunct.fast
         passed: set = set()
         unknown: list = []
-        candidates = remaining
+        pending = remaining
         if conjunct.native is not None and not conjunct.kind_only and _NATIVE_ENABLED:
-            verdicts = store._native_verdicts(*conjunct.native)
-            if verdicts is not None:
-                passed, candidates = verdicts.split(remaining, store._kind_ranges()[LITERAL])
-        if not candidates:
+            passed, pending = candidates.evaluate(store, conjunct.native, remaining)
+        if not pending:
             pass
         elif fast is None:
-            unknown = list(candidates)
+            unknown = list(pending)
         elif conjunct.kind_only:
             if bounds is None:
                 bounds = store._term_kind_bounds()
-            for code in candidates:
+            for code in pending:
                 r = fast((TermView(kind_of(code, bounds), None),))
                 if r is True:
                     passed.add(code)
                 elif r is UNKNOWN:
                     unknown.append(code)
         else:
-            decode_views(store, candidates, views)
-            for code in candidates:
+            decode_views(store, pending, views)
+            for code in pending:
                 r = fast((views[code],))
                 if r is True:
                     passed.add(code)
@@ -1247,8 +1355,10 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
                     unknown.append(code)
         if unknown:
             var = conjunct.vars[0]
+            # One decode_many; the loop reads the terms it returns.
+            terms = store._prime_decode_cache(unknown)
             for code in unknown:
-                if conjunct.generic({var: store._decode_term(code)}):
+                if conjunct.generic({var: terms[code]}):
                     passed.add(code)
         remaining = passed
     return remaining
@@ -1257,13 +1367,13 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
 def _fast_route(store, fast, views: dict) -> Callable[[tuple], Any]:
     """``fast`` over a code tuple: each code parsed into a view once, through
     ``views``, a dictionary code decoded and a negative (query-constant) one
-    taken from the store's foreign terms; an unbound ``None`` stays unbound."""
+    taken from the query's foreign terms; an unbound ``None`` stays unbound."""
 
     def view_of(code):
         view = views.get(code)
         if view is None:
             if code < 0:
-                view = views[code] = view_of_node(store._foreign[code])
+                view = views[code] = view_of_node(store._terms().foreign[code])
             else:
                 spelling = store._dict.decode(code)
                 if spelling is None:
@@ -1303,6 +1413,31 @@ def tuple_predicate(
                     }
                 )
             memo[key] = r
+        return r is True
+
+    return predicate
+
+
+def constant_predicate(conjunct: Conjunct) -> Callable[[Any], bool]:
+    """A single-variable conjunct as a test of a query constant (a VALUES
+    table's term, as rdflib binds it), memoized per term: the fast route over
+    the constant's view, rdflib's evaluator where that is unknown, a number
+    the fast route refuses included (see :func:`_constant_view`)."""
+    memo: dict = {}
+    fast = conjunct.fast
+    var = conjunct.vars[0]
+
+    def predicate(term) -> bool:
+        r = memo.get(term)
+        if r is None:
+            r = UNKNOWN
+            if fast is not None:
+                view = _constant_view(term)
+                if view is not UNKNOWN:
+                    r = fast((view,))
+            if r is UNKNOWN:
+                r = conjunct.generic({var: term})
+            memo[term] = r
         return r is True
 
     return predicate

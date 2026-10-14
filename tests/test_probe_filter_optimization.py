@@ -4,6 +4,7 @@ from rdflib import Graph, URIRef
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
+from test_candidate_filters import _spy_filters
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 
 PREFIX = "VORTEX_RDF_QUERY_TRACE "
@@ -69,7 +70,8 @@ def test_probe_filter_evaluates_only_reached_codes(tmp_path, capsys, monkeypatch
         if e["event"] == "bgp_join_step_complete" and e["original_pattern_index"] == 1
     )
     assert step["strategy"] == "probe"
-    assert step["pattern_match_rows"] == 300
+    # Counted at its step only as far as the probe decision needs.
+    assert (step["pattern_match_rows"], step["estimate_limit"]) == (101, 101)
     assert step["pattern_restricted_rows"] == 1
 
 
@@ -156,19 +158,22 @@ def test_non_probe_filter_keeps_eager_route(tmp_path, monkeypatch):
     assert len(seen[0]) == 300
 
 
-def test_native_probe_filter_never_reaches_python(tmp_path, capsys, monkeypatch):
-    """With the native predicate, the langMatches filter is a keep on the
-    probed pattern: the probe returns only rows that pass, and no value is
-    evaluated in Python — not even the one the probe reaches."""
+def test_native_probe_filter_evaluates_only_the_reached_code(tmp_path, capsys, monkeypatch):
+    """With the native predicate, the langMatches filter is answered by
+    vortex-rdf over the one name the probe reached: no value goes to the
+    Python routes."""
     graph = _graph(tmp_path)
-    seen = []
-    original = filters.evaluate_column
-
-    def spy(store, conjuncts, codes):
-        seen.append(set(codes))
-        return original(store, conjuncts, codes)
-
-    monkeypatch.setattr(filters, "evaluate_column", spy)
+    recording = _spy_filters(graph)
+    decoded = []
+    original_decode = filters.decode_views
+    monkeypatch.setattr(
+        filters, "decode_views", lambda *a: decoded.append(a) or original_decode(*a)
+    )
+    generic = []
+    original_generic = filters.Conjunct.generic
+    monkeypatch.setattr(
+        filters.Conjunct, "generic", lambda self, b: generic.append(b) or original_generic(self, b)
+    )
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     rows = list(
@@ -180,16 +185,11 @@ def test_native_probe_filter_never_reaches_python(tmp_path, capsys, monkeypatch)
     )
     payloads = _events(capsys.readouterr())
     assert rows == [(URIRef("http://ex/s0"), rows[0][1])]
-    assert seen == []
-    pushed = next(e for e in payloads if e["event"] == "bgp_native_restriction")
-    assert pushed["original_pattern_index"] == 1
-    assert pushed["residual_predicate_count"] == 0
+    assert [(kind, len(codes)) for kind, _, _, codes in recording.calls] == [("lang_matches", 1)]
+    assert decoded == [] and generic == []
     step = next(
         e
         for e in payloads
         if e["event"] == "bgp_join_step_complete" and e["original_pattern_index"] == 1
     )
-    # Planned on the pattern's own count: the keep narrows the probe, not
-    # the estimate a probe of one row is decided by.
     assert step["strategy"] == "probe"
-    assert step["estimated_rows"] == 300

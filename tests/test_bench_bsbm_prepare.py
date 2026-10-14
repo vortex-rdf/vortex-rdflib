@@ -180,7 +180,7 @@ def test_regenerating_over_a_from_directory_never_writes_through_its_links(
     dataset_bytes = (source / "dataset.nt").read_bytes()
     pool_files = sorted(p.name for p in (source / "td_data").iterdir())
     if not keep_source:
-        shutil.rmtree(source)  # the links dangle now
+        shutil.rmtree(source)  # the links dangle
     monkeypatch.setattr(prepare.tools, "generate", fake_generate)
     assert prepare.main(args(out, "--products", "7")) == 0
     if keep_source:  # the source is still what its own meta.json describes

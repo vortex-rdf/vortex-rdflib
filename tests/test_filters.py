@@ -12,9 +12,8 @@ from rdflib.plugins.sparql.evalutils import _ebv
 from rdflib.plugins.sparql.parser import parseQuery
 from rdflib.plugins.sparql.sparql import FrozenBindings, QueryContext
 from rdflib.term import Variable
-from rdflib.util import from_n3
 
-from vortex_rdflib import filters
+from vortex_rdflib import VortexRdflibStore, filters
 from vortex_rdflib.terms import BLANK, IRI, LITERAL, TermView, kind_bounds, kind_of, parse_spelling
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
@@ -77,6 +76,7 @@ SPELLINGS = [
     "<http://ex.org/x>",
     "<http://ex.org/y>",
     "_:b0",
+    "<http://www.w3.org/1999/02/22-rdf-syntax-ns#nil>",
     None,
 ]
 
@@ -197,7 +197,7 @@ RAISES = "rdflib raises"
 
 
 def rdflib_answer(expr, spelling):
-    bindings = {} if spelling is None else {V: from_n3(spelling)}
+    bindings = {} if spelling is None else {V: VortexRdflibStore._from_n3_safe(spelling)}
     try:
         return _ebv(expr, FrozenBindings(CTX, bindings))
     except Exception:  # noqa: BLE001 - rdflib's own bugs (e.g. NaN vs Decimal) are the oracle
@@ -210,8 +210,9 @@ def fast_answer(predicate, spelling):
 
 
 # `"maybe"^^xsd:boolean` is in the matrix on purpose — an ill-typed literal
-# the two routes must still agree on — and rdflib warns each time `from_n3`
-# parses one. Scoped to this test so the warning stays a signal anywhere else.
+# the two routes must still agree on — and rdflib warns each time a term is
+# built from one. Scoped to this test so the warning stays a signal anywhere
+# else.
 @pytest.mark.filterwarnings("ignore:Parsing weird boolean:UserWarning")
 @pytest.mark.parametrize("sparql_expr", EXPRESSIONS)
 def test_fast_route_agrees_with_rdflib(sparql_expr):
@@ -241,7 +242,7 @@ def test_two_variable_fast_route_agrees_with_rdflib(sparql_expr):
     predicate = filters.compile_fast(expr, (V, W), {})
     assert predicate is not None, "expression is in the whitelist"
     # 45x45 lookups of each spelling: parse every one once.
-    terms = {s: None if s is None else from_n3(s) for s in SPELLINGS}
+    terms = {s: None if s is None else VortexRdflibStore._from_n3_safe(s) for s in SPELLINGS}
     views = {s: None if s is None else parse_spelling(s) for s in SPELLINGS}
     answered = 0
     for left in SPELLINGS:

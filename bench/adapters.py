@@ -38,7 +38,7 @@ Engines: SPARQL evaluation is rdflib's engine for every adapter but one, so
 the store serving triple patterns is the only variable across the comparable
 rows. oxrdflib is among them: it is asked with ``use_store_provided=False``,
 which stops ``OxigraphStore.query`` from handing the query text to
-pyoxigraph. For vortex adapters with a resident dictionary, rdflib's engine
+pyoxigraph. For vortex adapters of the Dictionary layout, rdflib's engine
 hands the algebra nodes this package understands to its code-space pushdown.
 The two ``pushdown off`` rows run the primary configuration of each
 residency with ``VORTEX_RDF_DISABLE_PUSHDOWN=1``, so the pushdown's own
@@ -68,7 +68,7 @@ work. What keeps it comparable at all:
 
 The Vortex rows are all Dictionary layout — the layout that enables the term
 code path and so the only one worth tuning — crossed over the two axes that
-change how a store answers: **residency** (file-backed lazy open vs fully
+change how a store answers: **residency** (memory-mapped file vs fully
 in-memory) and **secondary index** (none, ``secondary-by-copy``,
 ``secondary-by-reference``).
 """
@@ -158,10 +158,9 @@ def _make_pyoxigraph(nq_path: str, nt_path: str, work_dir: str) -> "Store":
     """Oxigraph's own store, loaded and queried with no rdflib in between.
 
     `bulk_load` is pyoxigraph's documented path for a file this size: its own
-    parser straight into the store, twice as fast as the transactional `load`
-    here (15 ms against 32 ms at 20k quads). It is this row's counterpart of
-    the other stores' own fastest way in — `serialize_rdf`, `rdf2cottas`,
-    `hdt convert`.
+    parser straight into the store, without the transaction of `load`. It is
+    this row's counterpart of the other stores' own fastest way in —
+    `serialize_rdf`, `rdf2cottas`, `hdt convert`.
     """
     import pyoxigraph
 
@@ -180,18 +179,16 @@ def _make_rdflib_hdt(nq_path: str, nt_path: str, work_dir: str) -> "Graph":
 
     rdflib-hdt ships `optimize_sparql()`, a BGP fast path that would be the
     counterpart of this package's pushdown, but it is deliberately NOT called:
-    it answers this suite's joins wrongly (chain-2 26 rows against a verified
-    18, optional 152 against 1) and, despite its docstring, its global patch
-    also drops every other store's graph to zero rows. So this row is rdflib's
-    engine over the HDT store, exactly like the other contenders.
+    it answers this suite's `chain-2` and `optional` queries with the wrong
+    rows and, despite its docstring, its global patch also drops every other
+    store's graph to zero rows. So this row is rdflib's engine over the HDT
+    store, exactly like the other contenders.
 
     Labelled in-mem on the residency test the whole matrix uses: where a
-    query's bytes come from. Measured over repeated pattern scans, this store
-    issues no read syscalls and takes no page faults — `mapped=True` mmaps the
-    file, but `indexed=True` builds HDT's extra index at open and that walk
-    makes every page resident, so queries never go back to the file. The
-    file-backed rows (`vortex-rdflib (dict . file)`, `pycottas-rdflib`) do
-    read per query, tens of MB across the same scans.
+    query's bytes come from. `mapped=True` mmaps the file, but `indexed=True`
+    builds HDT's extra index at open and that walk makes every page resident,
+    so queries never go back to the file. The file-backed rows
+    (`vortex-rdflib (dict . file)`, `pycottas-rdflib`) read the file per query.
     """
     from rdflib import Graph
     from rdflib_hdt import HDTStore  # ty: ignore[unresolved-import]

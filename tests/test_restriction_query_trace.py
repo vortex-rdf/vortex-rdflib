@@ -17,8 +17,7 @@ def _events(captured):
 
 
 def test_restriction_trace_reports_distinct_bindings_and_rows(tmp_path, capsys, monkeypatch):
-    # The Python restriction route: langMatches would otherwise be a keep
-    # on the native match (see test_native_restriction_trace).
+    # The Python restriction route, whatever the native layer could decide.
     monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
     source = tmp_path / "restriction.nt"
     source.write_text(
@@ -64,10 +63,10 @@ def test_restriction_trace_reports_distinct_bindings_and_rows(tmp_path, capsys, 
     assert record["elapsed_ns"] > 0
 
 
-def test_native_restriction_trace(tmp_path, capsys, monkeypatch):
-    """A conjunct the native layer decides is traced where it is pushed —
-    the pattern, the variable and the keep it became — and the narrowed
-    match it rides is a `native_call_complete` carrying that keep."""
+def test_native_candidate_trace(tmp_path, capsys, monkeypatch):
+    """A conjunct vortex-rdf decides is traced as the filter_codes call it
+    made — its kind and how many codes it was sent, passed and left
+    undecided — beside the restriction it served; no keep rides the match."""
     source = tmp_path / "native.nt"
     source.write_text(
         "".join(
@@ -88,14 +87,16 @@ def test_native_restriction_trace(tmp_path, capsys, monkeypatch):
     )
     payloads = _events(capsys.readouterr())
     assert len(rows) == 10
-    pushed = next(e for e in payloads if e["event"] == "bgp_native_restriction")
-    assert pushed["variable"] == "n"
-    assert pushed["pushed_predicate_count"] == 1
-    assert pushed["keep"] == {"2": {"codes": 10}}
+    [call] = [e for e in payloads if e["event"] == "native_filter_complete"]
+    assert (call["kind"], call["candidate_codes"]) == ("lang_matches", 30)
+    assert (call["passed_codes"], call["undecided_codes"]) == (10, 0)
+    assert not [e for e in payloads if e["event"] == "bgp_native_restriction"]
+    [record] = [e for e in payloads if e["event"] == "bgp_restriction_complete"]
+    assert (record["input_rows"], record["output_rows"]) == (30, 10)
+    assert record["native_predicate_count"] == 1
     match = next(
         e
         for e in payloads
         if e["event"] == "native_call_complete" and e["operation"] == "match_codes"
     )
-    assert match["keep"] == {"2": {"codes": 10}}
-    assert match["returned_rows"] == 10
+    assert match["keep"] is None and match["returned_rows"] == 30

@@ -1,7 +1,7 @@
-"""The vortex-rdf 0.11 primitives the pushdown builds on, each pinned where
-it is used: what reaches the native layer, and that the answer is still
-rdflib's. The equivalence matrix in ``test_pushdown`` covers the answers of
-every shape; these say *how* they are reached."""
+"""The vortex-rdf primitives the pushdown builds on, each pinned where it is
+used: what reaches the native layer, and that the answer is rdflib's. The
+equivalence matrix in ``test_pushdown`` covers the answers of every shape;
+these say *how* they are reached."""
 
 import json
 
@@ -10,8 +10,8 @@ from rdflib import Graph, Literal, URIRef
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_pushdown import both_ways, run
-from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
+from test_pushdown import both_ways, is_graph_name_check, run
+from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 
@@ -65,8 +65,9 @@ class _Spy:
             return attribute
 
         def call(*args, **kwargs):
-            self.calls.append((name, kwargs))
-            self.args.append(args)
+            if not (name == "count_quads" and is_graph_name_check(args)):
+                self.calls.append((name, kwargs))
+                self.args.append(args)
             return attribute(*args, **kwargs)
 
         return call
@@ -76,7 +77,6 @@ class _Spy:
 
 
 def _spy(graph) -> _Spy:
-    graph.store._graph_n3(graph)  # the store's own bookkeeping, once
     spy = _Spy(graph.store._store())
     graph.store._native = spy
     return spy
@@ -138,66 +138,6 @@ def test_ask_and_count_over_a_native_filter_only_count(tmp_path, in_memory):
     counts = [kwargs for name, kwargs in spy.calls if name == "count_quads"]
     assert [kwargs.get("limit") for kwargs in counts] == [None, 1, 1]
     assert all(set(kwargs["keep"]) == {2} for kwargs in counts)
-
-
-def test_count_over_a_native_code_set_only_counts(tmp_path):
-    """The same for FILTERs the native layer answers with a code set — the
-    datatype and value bands of a price, a language: in memory, any set is a
-    keep the count takes."""
-    graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=True))
-    register_sparql_pushdown()
-    spy = _spy(graph)
-    count = """PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-        SELECT (COUNT(*) AS ?n) WHERE {
-        ?s <http://ex.org/price> ?v FILTER(?v < 300 && datatype(?v) = xsd:integer) }"""
-    assert run(graph, count) == [(Literal(sum(1 for i in range(200) if (i * 37) % 1000 < 300)),)]
-    assert run(graph, 'ASK { ?s ?p ?o FILTER(langMatches(lang(?o), "en")) }') is True
-    assert run(graph, 'ASK { ?s ?p ?o FILTER(langMatches(lang(?o), "de")) }') is False
-    assert "match_codes" not in spy.names()
-    with_pushdown, without_pushdown = both_ways(graph, count)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
-def test_band_around_an_anchor_is_a_keep_on_the_scan(tmp_path, monkeypatch, capsys, in_memory):
-    """BSBM Explore Q5's band: once the anchor binds `?ref`, the two-variable
-    conjuncts are tests of `?v` alone and become a keep on the price scan, so
-    only the products inside the band leave the native match — and, decided
-    there, the FILTER above evaluates nothing."""
-    graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=in_memory))
-    query = """SELECT ?s ?v WHERE {
-        <http://ex.org/p0> <http://ex.org/price> ?ref .
-        ?s <http://ex.org/price> ?v
-        FILTER(?v < ?ref + 100 && ?v > ?ref - 100) }"""
-    built = []
-    original = filters.tuple_predicate
-    monkeypatch.setattr(
-        filters, "tuple_predicate", lambda *a, **k: built.append(a[1]) or original(*a, **k)
-    )
-    register_sparql_pushdown()
-    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
-    capsys.readouterr()
-    rows = run(graph, query)
-    trace = _trace(capsys)
-    integer = URIRef(XSD + "integer")
-    expected = sorted(
-        (URIRef(f"http://ex.org/p{i}"), Literal(str((i * 37) % 1000), datatype=integer))
-        for i in range(200)
-        if (i * 37) % 1000 < 100
-    )
-    assert sorted(rows) == expected
-    specialized = [e for e in trace if e["event"] == "bgp_tuple_specialized"]
-    assert sorted(e["native_predicate"] for e in specialized) == ["num_gt", "num_lt"]
-    scan = next(
-        m
-        for m in _native_calls(trace, "match_codes")
-        if m["pattern"][1] == "<http://ex.org/price>" and m["pattern"][0] is None
-    )
-    assert scan["returned_rows"] == len(expected)
-    assert built == []
-    monkeypatch.delenv("VORTEX_RDF_TRACE_QUERY")
-    with_pushdown, without_pushdown = both_ways(graph, query)
-    assert with_pushdown == without_pushdown
 
 
 def test_values_constants_are_encoded_in_one_batch(tmp_path):
