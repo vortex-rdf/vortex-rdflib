@@ -5,11 +5,12 @@ usage: python -m bench.bsbm.replay_native <store.vortex> <trace.jsonl>
 
 Opens the store with ``vortex_rdf.VortexRdfStore`` (no vortex-rdflib) and
 re-issues every call in order, timing each; the first passes warm the page
-cache, the last is reported per method and per template. A call the installed
-API rejects (a changed signature, an argument out of range, a missing method)
+cache, the last is reported per method and per template. A call that returns an
+iterator (``match_codes_many``, ``match_code_chunks``) is timed to the end of
+its pulls, since its work runs as they are made. A call the installed API
+rejects (a changed signature, an argument out of range, a missing method)
 counts under ``errors`` and is skipped; ``first_error`` keeps the first reason
-per method. A file store opens with a 1 GiB dictionary residency budget when the
-installed vortex-rdf accepts ``max_resident_bytes``, and memory-mapped otherwise.
+per method.
 """
 
 import argparse
@@ -17,6 +18,7 @@ import json
 import sys
 import time
 from collections import defaultdict
+from collections.abc import Iterator
 
 from .cli import add_residency
 
@@ -52,16 +54,7 @@ def _reject(stats: dict, reason: str) -> None:
 def _open(store_path: str, in_memory: bool):
     from vortex_rdf import VortexRdfStore
 
-    if in_memory:
-        return VortexRdfStore(store_path, in_memory=True)
-    try:
-        return VortexRdfStore(
-            store_path,
-            in_memory=False,
-            max_resident_bytes=1 << 30,  # ty: ignore[unknown-argument]
-        )
-    except TypeError:  # no residency budget: the store is memory-mapped
-        return VortexRdfStore(store_path, in_memory=False)
+    return VortexRdfStore(store_path, in_memory=in_memory)
 
 
 def replay(
@@ -101,7 +94,9 @@ def replay(
                     continue
                 t0 = time.perf_counter_ns()
                 try:
-                    fn(*args, **kwargs)
+                    result = fn(*args, **kwargs)
+                    if isinstance(result, Iterator):
+                        list(result)
                 except Exception as error:  # noqa: BLE001 — a rejected call is counted, never fatal
                     _reject(stats, f"{type(error).__name__}: {error}")
                     continue
