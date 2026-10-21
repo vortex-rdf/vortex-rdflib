@@ -1145,6 +1145,62 @@ def test_generic_filter_route_equals_default_evaluator(file_graph, monkeypatch, 
     assert generic == without_pushdown
 
 
+@pytest.fixture
+def over_budget(monkeypatch):
+    """A pair budget of 0: every BGP join step that makes a row is over it."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+
+
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_over_budget_equals_default_evaluator(graph, over_budget, sparql):
+    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", ORDER_QUERIES)
+def test_over_budget_order_by_sequence_equals_default_evaluator(graph, over_budget, sparql):
+    with_pushdown, without_pushdown = both_ways(graph, sparql, run_ordered)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
+def test_over_budget_graph_pattern_equals_default_evaluator(dataset, over_budget, sparql):
+    with_pushdown, without_pushdown = both_ways(dataset, sparql)
+    assert with_pushdown == without_pushdown
+
+
+#: The forced paths of the matrices above, by id: the fixture that forces the
+#: path, and the test of a trace event that shows the path taken.
+FORCED_PATHS = {
+    "budget0": ("over_budget", lambda event: event["event"] == "bgp_over_budget"),
+}
+
+
+@pytest.mark.parametrize("forcing", list(FORCED_PATHS))
+def test_forcing_reaches_the_path(
+    request, dict_vortex, dict_vortex_quads, monkeypatch, capsys, forcing
+):
+    """A forced matrix passes for nothing unless the planner reads what its
+    fixture sets: under each forcing, a query of the matrix traces the path."""
+    fixture, taken = FORCED_PATHS[forcing]
+    request.getfixturevalue(fixture)
+    graph = Graph(store=VortexRdflibStore(str(dict_vortex), in_memory=False))
+    dataset = Dataset(
+        store=VortexRdflibStore(str(dict_vortex_quads), in_memory=False), default_union=True
+    )
+    matrix = [(graph, sparql) for sparql in QUERIES + ORDER_QUERIES]
+    matrix += [(dataset, sparql) for sparql in GRAPH_QUERIES]
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    register_sparql_pushdown()
+    capsys.readouterr()
+
+    def reaches(view, sparql) -> bool:
+        run(view, sparql)
+        return any(taken(event) for event in _trace_events(capsys.readouterr().err))
+
+    assert any(reaches(view, sparql) for view, sparql in matrix), forcing
+
+
 def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
     """A 1-row anchor joined against a 300-row predicate must take the probe
     path under the real threshold, and still produce the right rows."""
@@ -1161,7 +1217,7 @@ def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
 
     probes = []
     original = pd._probe_join
-    monkeypatch.setattr(pd, "_probe_join", lambda *a: probes.append(1) or original(*a))
+    monkeypatch.setattr(pd, "_probe_join", lambda *a, **k: probes.append(1) or original(*a, **k))
     graph = Graph(store=VortexRdflibStore(str(out)))
     register_sparql_pushdown()
     rows = run(
@@ -1748,7 +1804,7 @@ def test_tuple_filter_prunes_a_bgp_so_a_remaining_pattern_is_probed(
     )
     probes = []
     original = pd._probe_join
-    monkeypatch.setattr(pd, "_probe_join", lambda *a: probes.append(1) or original(*a))
+    monkeypatch.setattr(pd, "_probe_join", lambda *a, **k: probes.append(1) or original(*a, **k))
     register_sparql_pushdown()
     patterns = "?s <http://ex.org/p> ?a . ?s <http://ex.org/q> ?b . ?s <http://ex.org/r> ?c"
     body = f"GRAPH <http://ex.org/g> {{ {patterns} }}" if in_graph else patterns

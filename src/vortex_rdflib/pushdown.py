@@ -2261,6 +2261,42 @@ def _filter_relation(rel: Relation, preds) -> Relation:
 # that for this many rows.
 _PROBE_FANOUT = 100
 
+_PAIR_BUDGET_ENV = "VORTEX_RDF_PAIR_BUDGET"
+
+
+def _pair_budget() -> int:
+    """``VORTEX_RDF_PAIR_BUDGET``, an integer of at least 0, or ``1 << 24``
+    when it is unset."""
+    value = os.environ.get(_PAIR_BUDGET_ENV)
+    if value is None:
+        return 1 << 24
+    try:
+        budget = int(value)
+    except ValueError:
+        budget = None
+    if budget is None or budget < 0:
+        raise ValueError(f"{_PAIR_BUDGET_ENV} must be an integer >= 0, got {value!r}")
+    return budget
+
+
+#: The most row pairs one join step of a BGP may make, set when the module is
+#: imported (:func:`_pair_budget`). A step whose two sides' product is within
+#: it is built uncounted; past that, its pairs are counted natively first
+#: (:func:`_pair_count`), and a step that counts more is not built
+#: (:class:`_OverBudget`). A probe step, which has no pairs to count, stops
+#: once its rows pass a quarter of the budget.
+_PAIR_BUDGET = _pair_budget()
+
+
+class _OverBudget(Exception):
+    """A join step of a BGP over :data:`_PAIR_BUDGET`, raised before the step
+    is built. ``pairs`` is the step's pair count, ``None`` for a probe step,
+    which stops on its rows. :func:`_join_incremental_bgp` catches it."""
+
+    def __init__(self, pairs: int | None):
+        super().__init__(pairs)
+        self.pairs = pairs
+
 
 def _pattern_trace_shape(ctx, triple) -> dict:
     resolved = [ctx[term] for term in triple]
@@ -2583,9 +2619,10 @@ def _batched_probes(store, patterns) -> list[int]:
     return batched if len(batched) >= minimum else []
 
 
-def _run_probes(store, probes, count: bool) -> list:
+def _run_probes(store, probes, count: bool) -> list | Iterator:
     """Native answers to ``(n3, narrowing)`` probes (see :func:`_narrowing`),
-    in order: counts or code columns.
+    in order: a list of counts, or an iterator of code columns that makes
+    each answer as it is pulled (:func:`_probe_matches`).
 
     The probes :func:`_batched_probes` picks go through one
     ``count_quads_many`` or ``match_codes_many`` call — every probe parsed
@@ -2596,28 +2633,58 @@ def _run_probes(store, probes, count: bool) -> list:
     if not probes:
         return []
     native = _native(store)
-    call = native.count_quads if count else native.match_codes
     minimum = _MEMORY_SCAN_BATCH_MIN if store.in_memory else _SCAN_BATCH_MIN
     batched = _batched_probes(store, [n3 for n3, _ in probes]) if len(probes) >= minimum else []
+    if not count:
+        return _probe_matches(native, probes, batched)
     if not batched:
-        return [call(*n3, **narrowing) for n3, narrowing in probes]
+        return [native.count_quads(*n3, **narrowing) for n3, narrowing in probes]
     answers: list = [None] * len(probes)
-    batch = []
-    for i in batched:
-        n3, narrowing = probes[i]
-        batch.append(
-            {"s": n3[0], "p": n3[1], "o": n3[2], "g": n3[3], **narrowing}
-            if narrowing
-            else tuple(n3)
-        )
-    many = native.count_quads_many if count else native.match_codes_many
-    for i, answer in zip(batched, many(batch), strict=True):
+    batch = [_batch_probe(*probes[i]) for i in batched]
+    for i, answer in zip(batched, native.count_quads_many(batch), strict=True):
         answers[i] = answer
     done = set(batched)
     for i, (n3, narrowing) in enumerate(probes):
         if i not in done:
-            answers[i] = call(*n3, **narrowing)
+            answers[i] = native.count_quads(*n3, **narrowing)
     return answers
+
+
+def _batch_probe(n3, narrowing):
+    """A probe as the batch calls take it: its quad pattern, or a dict of the
+    pattern and its narrowing."""
+    if narrowing:
+        return {"s": n3[0], "p": n3[1], "o": n3[2], "g": n3[3], **narrowing}
+    return tuple(n3)
+
+
+def _probe_matches(native, probes, batched) -> Iterator:
+    """The code columns of each probe, in order, each made when it is pulled:
+    the ``batched`` probes' from the one ``match_codes_many`` call the first
+    pull makes, whose probes all run while the consumer works through the
+    answers before theirs, the others from a ``match_codes`` call at their
+    position. Closing the iterator releases the batch's answers, which
+    aborts the probes still in flight."""
+    in_batch = set(batched)
+    answers = iter(())
+    if batched:
+        answers = native.match_codes_many([_batch_probe(*probes[i]) for i in batched])
+    try:
+        for i, (n3, narrowing) in enumerate(probes):
+            if i not in in_batch:
+                yield native.match_codes(*n3, **narrowing)
+                continue
+            try:
+                answer = next(answers)
+            except StopIteration:
+                raise ValueError(
+                    f"match_codes_many answered fewer than its {len(batched)} probes"
+                ) from None
+            yield answer
+    finally:
+        close = getattr(answers, "close", None)
+        if close is not None:
+            close()
 
 
 def _match_resolved_pattern(store, pat, memo=None, limit=None) -> tuple[int, int]:
@@ -2698,6 +2765,12 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
     Before a step, a tuple conjunct the relation binds all but one variable
     of may become a restriction of the pattern binding that one
     (:func:`_specialize_tuple_conjuncts`).
+
+    A step over :data:`_PAIR_BUDGET` is not built — a hash step whose pairs,
+    counted once its two sides' product passes the budget, are more than
+    the budget, or a probe step whose rows pass a quarter of it: it is
+    traced as ``bgp_over_budget`` and the block goes back to rdflib
+    (``NotImplementedError``).
     """
     counts: dict[tuple, int] = {}
     memo: dict[tuple, tuple] = {}
@@ -2791,44 +2864,63 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
             stats["estimate_calls"] += 1
         estimate = pat["estimate"]
 
-        if shared and running * _PROBE_FANOUT < estimate:
-            if cols is not None:
-                rows, cols = _cols_to_rows(cols), None
-            probe_calls = len(rows)
-            then = time.perf_counter_ns() if traced else 0
-            schema, rows = _probe_join(store, schema, rows, pat)
-            probe_ns = time.perf_counter_ns() - then if then else 0
-            stats["probe_calls"] += probe_calls
-            stats["native_ns"] += probe_ns
-            strategy, source = "probe", "probed"
-            match_rows = estimate
-            restricted_rows = pat.pop("_trace_probe_restricted_rows", len(rows))
-        else:
-            calls, native_ns = _match_resolved_pattern(store, pat, memo)
-            stats["initial_calls"] += calls
-            stats["native_ns"] += native_ns
-            then = time.perf_counter_ns() if traced else 0
-            _materialize_eager_restrictions(store, pat, schema)
-            stats["restriction_ns"] += time.perf_counter_ns() - then if then else 0
-            match_rows = pat["_trace_match_rows"]
-            restricted_rows = pat["nrows"]
-            schema_b, cols_b, rows_b = _pattern_body(pat)
-            joined = (
-                _join_columns(schema, cols, schema_b, cols_b)
-                if cols is not None and cols_b is not None
-                else None
-            )
-            if joined is not None:
-                schema, cols = joined
-                strategy = "hash_columns"
-            else:
+        pair_count = None
+        try:
+            if shared and running * _PROBE_FANOUT < estimate:
+                strategy, source = "probe", "probed"
                 if cols is not None:
                     rows, cols = _cols_to_rows(cols), None
-                if rows_b is None:
-                    rows_b = _cols_to_rows(cols_b)
-                schema, rows = _join(schema, rows, schema_b, rows_b)
-                strategy = "hash_rows"
-            source = "matched"
+                probe_calls = len(rows)
+                then = time.perf_counter_ns() if traced else 0
+                schema, rows = _probe_join(store, schema, rows, pat, max_rows=_PAIR_BUDGET // 4)
+                probe_ns = time.perf_counter_ns() - then if then else 0
+                stats["probe_calls"] += probe_calls
+                stats["native_ns"] += probe_ns
+                match_rows = estimate
+                restricted_rows = pat.pop("_trace_probe_restricted_rows", len(rows))
+            else:
+                strategy, source = "hash_columns", "matched"
+                calls, native_ns = _match_resolved_pattern(store, pat, memo)
+                stats["initial_calls"] += calls
+                stats["native_ns"] += native_ns
+                then = time.perf_counter_ns() if traced else 0
+                _materialize_eager_restrictions(store, pat, schema)
+                stats["restriction_ns"] += time.perf_counter_ns() - then if then else 0
+                match_rows = pat["_trace_match_rows"]
+                restricted_rows = pat["nrows"]
+                schema_b, cols_b, rows_b = _pattern_body(pat)
+                joined = (
+                    _join_columns(schema, cols, schema_b, cols_b)
+                    if cols is not None and cols_b is not None
+                    else None
+                )
+                if joined is not None:
+                    schema, cols = joined
+                    if running * restricted_rows > _PAIR_BUDGET:
+                        # Past the product bound the join counted its pairs
+                        # before building them, one joined row per pair.
+                        pair_count = len(cols[0])
+                else:
+                    strategy = "hash_rows"
+                    if cols is not None:
+                        rows, cols = _cols_to_rows(cols), None
+                    if rows_b is None:
+                        rows_b = _cols_to_rows(cols_b)
+                    pair_count = _row_step_pairs(schema, rows, schema_b, rows_b)
+                    if pair_count is not None and pair_count > _PAIR_BUDGET:
+                        raise _OverBudget(pair_count)
+                    schema, rows = _join(schema, rows, schema_b, rows_b)
+        except _OverBudget as over:
+            _trace_event(
+                "bgp_over_budget",
+                execution_index=execution_index,
+                original_pattern_index=pat.get("index"),
+                strategy=strategy,
+                pair_count=over.pairs,
+                input_rows=running,
+                estimated_rows=estimate,
+            )
+            raise NotImplementedError from None
 
         _trace_event(
             "bgp_join_step_complete",
@@ -2839,6 +2931,7 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
             input_rows=running,
             estimated_rows=estimate,
             estimate_limit=count_limit,
+            pair_count=pair_count,
             pattern_match_rows=match_rows,
             pattern_restricted_rows=restricted_rows,
             native_initial_match_count=int(source == "matched"),
@@ -3306,6 +3399,33 @@ def _cols_to_rows(cols) -> list:
     return list(zip(*(col.tolist() for col in cols), strict=True))
 
 
+def _pair_count(left: U64Column, right: U64Column) -> int | None:
+    """The row pairs a join of the two key columns makes, counted natively
+    (``join_count``, no pair built) — or ``None``, uncounted, when the
+    columns' product is within :data:`_PAIR_BUDGET`."""
+    if len(left) * len(right) <= _PAIR_BUDGET:
+        return None
+    return left.join_count(right)
+
+
+def _row_step_pairs(schema_a, rows_a, schema_b, rows_b) -> int | None:
+    """The pairs :func:`_join` makes of two row relations, as
+    :func:`_pair_count` counts them: ``None`` while their product is within
+    :data:`_PAIR_BUDGET`; past it, the pairs of the first shared variable's
+    codes, copied into native columns (with several shared variables an
+    upper bound of the joined rows), or the product when none is shared."""
+    product = len(rows_a) * len(rows_b)
+    if product <= _PAIR_BUDGET:
+        return None
+    shared = [v for v in schema_b if v in schema_a]
+    if not shared:
+        return product
+    ia, ib = schema_a.index(shared[0]), schema_b.index(shared[0])
+    return _pair_count(
+        U64Column([row[ia] for row in rows_a]), U64Column([row[ib] for row in rows_b])
+    )
+
+
 def _join_columns(schema_a, cols_a, schema_b, cols_b):
     """Hash join of two columnar relations sharing exactly one variable,
     columns out — the rows exist only when a consumer materializes them.
@@ -3315,7 +3435,10 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
     Native kernels, GIL released: ``join_indices`` pairs the rows of the two
     key columns in nested-loop order (the left rows in order, each with its
     right matches in theirs) and ``take`` gathers every output column by
-    those indices.
+    those indices. Past the product bound the pairs are counted first
+    (:func:`_pair_count`): a join over :data:`_PAIR_BUDGET` raises
+    :class:`_OverBudget` with its count before a pair is built, and one
+    within it is built with the budget as ``join_indices``' cap.
     """
     shared = [v for v in schema_b if v in schema_a]
     if len(shared) != 1:
@@ -3325,7 +3448,14 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
     keep_b = [i for i, v in enumerate(schema_b) if v not in schema_a]
     schema = schema_a + tuple(schema_b[i] for i in keep_b)
     left = [_native_column(col) for col in cols_a]
-    a_idx, b_idx = left[ia].join_indices(_native_column(cols_b[ib]))
+    key = _native_column(cols_b[ib])
+    pairs = _pair_count(left[ia], key)
+    if pairs is None:
+        a_idx, b_idx = left[ia].join_indices(key)
+    elif pairs <= _PAIR_BUDGET:
+        a_idx, b_idx = left[ia].join_indices(key, max_pairs=_PAIR_BUDGET)
+    else:
+        raise _OverBudget(pairs)
     out = [col.take(a_idx) for col in left]
     out += [_native_column(cols_b[i]).take(b_idx) for i in keep_b]
     return schema, tuple(memoryview(col).cast("Q") for col in out)
@@ -3364,7 +3494,9 @@ def _join_patterns(store, patterns, stats=None, pushed=None) -> Relation:
 _PROBE_BATCH = 4096
 
 
-def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
+def _probe_join(
+    store, schema, rows, pat, keep_unmatched=False, row_preds=(), max_rows: int | None = None
+):
     """Join the relation against a pattern by re-matching it per binding.
 
     The adaptive half of the join strategy: when the running relation is far
@@ -3383,7 +3515,11 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
     positions it leaves free (a code range inside the native match, a code
     column over the rows it returns), as do ``row_preds`` over the extended
     row; with ``keep_unmatched`` a row without a continuation is kept, padded
-    with None (a left join).
+    with None (a left join). Each batch's answers are pulled as the join
+    reaches them and released when the batch ends, however it ends. Once a
+    probe's rows take the join past ``max_rows``, it drops the rows it made
+    and the batch it is pulling, which aborts the probes still in flight,
+    and raises :class:`_OverBudget`.
     """
     bound = [(schema.index(v), pos) for v, pos in pat["varpos"].items() if v in schema]
     free = {v: pos for v, pos in pat["varpos"].items() if v not in schema}
@@ -3416,33 +3552,41 @@ def _probe_join(store, schema, rows, pat, keep_unmatched=False, row_preds=()):
             if patterns[i] is not None
         ]
         answers = iter(_run_probes(store, probes, count=not free))
-        for i in batch:
-            row = rows[i]
-            matched = False
-            if patterns[i] is None:
-                pass
-            elif not free:
-                # Existence probe: a count, no columns; the row stands once
-                # per quad counted.
-                count = next(answers)
-                if count and all(pred(row) for pred in row_preds):
-                    out.extend([row] * count)
-                    matched = True
-            else:
-                cols = next(answers)
-                if cols is None:
-                    raise NotImplementedError
-                views = {idx: memoryview(cols[idx]).cast("Q").tolist() for idx in needed}
-                for j in range(len(views[needed[0]])):
-                    if all(views[a][j] == views[b][j] for a, b in eq_checks) and all(
-                        test(views[p][j]) for p, test in tests
-                    ):
-                        extended = row + tuple(views[idx][j] for idx in out_positions)
-                        if all(pred(extended) for pred in row_preds):
-                            out.append(extended)
-                            matched = True
-            if keep_unmatched and not matched:
-                out.append(row + pad)
+        try:
+            for i in batch:
+                row = rows[i]
+                matched = False
+                if patterns[i] is None:
+                    pass
+                elif not free:
+                    # Existence probe: a count, no columns; the row stands once
+                    # per quad counted.
+                    count = next(answers)
+                    if count and all(pred(row) for pred in row_preds):
+                        out.extend([row] * count)
+                        matched = True
+                else:
+                    cols = next(answers)
+                    if cols is None:
+                        raise NotImplementedError
+                    views = {idx: memoryview(cols[idx]).cast("Q").tolist() for idx in needed}
+                    for j in range(len(views[needed[0]])):
+                        if all(views[a][j] == views[b][j] for a, b in eq_checks) and all(
+                            test(views[p][j]) for p, test in tests
+                        ):
+                            extended = row + tuple(views[idx][j] for idx in out_positions)
+                            if all(pred(extended) for pred in row_preds):
+                                out.append(extended)
+                                matched = True
+                if keep_unmatched and not matched:
+                    out.append(row + pad)
+                if max_rows is not None and len(out) > max_rows:
+                    out.clear()
+                    raise _OverBudget(None)
+        finally:
+            close = getattr(answers, "close", None)
+            if close is not None:
+                close()
     combined_schema = schema + tuple(free.keys())
     # The deferred per-variable restrictions, over the codes the probes
     # actually reached rather than the pattern's whole column. A variable
