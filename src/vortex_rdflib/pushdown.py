@@ -17,12 +17,25 @@ What runs in code space:
   ``_PROBE_FANOUT`` rows is not counted until its join step, and then only as
   far as the probe-or-match decision needs; the smallest counted pattern is
   matched and seeds the relation, and each further pattern — smallest first
-  among those sharing a variable with the relation — is either re-probed per
-  row of the relation when the relation is far smaller than the pattern's
-  count (``_probe_join``, the probes batched into one native call) or
-  matched once and hash-joined by the native ``join_indices``/``take``
-  kernels; a pattern that counts to nothing empties the block before
-  anything is matched, and the join itself never decodes a term;
+  among those sharing a variable with the relation — is joined per row of
+  the relation when the relation is far smaller than the pattern's count
+  (re-probed natively where each probe is a point lookup, ``_probe_join``;
+  matched once, narrowed to the codes the relation binds, where each would
+  scan, ``_keep_scan``) or matched once and hash-joined by the native
+  ``join_indices``/``take`` kernels; a pattern that counts to nothing empties
+  the block before anything is matched, and the join itself never decodes a
+  term. A join step whose pairs would pass ``_PAIR_BUDGET``
+  (``VORTEX_RDF_PAIR_BUDGET``) is not built whole: a hash step has its pairs
+  counted natively once its sides' product passes the budget, a probe step
+  stops once its rows pass a quarter of it, and a keep-scan once its match
+  passes it. When it is the last step and shares one variable it streams
+  instead (tier 1): the smaller side is grouped, the other is fed through the
+  groups, and the pairs are gathered a piece at a time as the rows are read,
+  so the join holds one piece. Any other step is put back and a pattern that
+  provably fits joins first (tier 2); when none does, rdflib finishes the
+  patterns left per row of the relation so far (tier 3) where the relation
+  goes straight to the emitter, and elsewhere the node goes back to rdflib,
+  which offers the BGP below it alone, where tier 3 applies;
 - a ``Filter`` over a block is split into conjuncts (:mod:`.filters`):
   those over one variable that are a kind test or an IRI equality (``=``,
   ``sameTerm``, ``IN``) become a ``keep`` on the match of every pattern
@@ -87,9 +100,23 @@ solves the group once per named graph. The rows of the default graph are
 dropped from a variable's match, which is what makes ``GRAPH`` range over the
 named graphs only.
 
+Cancellation: ``cancel_scope(token)`` gives the queries started inside it a
+``vortex_rdf.CancelToken``. A query keeps it in its scope
+(:mod:`.query_scope`), so every step of its lazy result runs under it, the
+steps after the block included. A native call the token can stop — a batch,
+a chunked match, a one-shot call that scans a file-backed store — is given
+it (``cancel=``) and races it; the other one-shot calls — a point lookup, a
+call capped at one row, any call on an in-memory store — check it as they
+are made, as do the loops between calls: the pieces of a streamed join, the
+rows rdflib finishes, the probes of a join. ``token.cancel()``, from any
+thread, stops the query at the next of these with ``vortex_rdf.Cancelled``,
+which reaches the caller and is never a hand-back. A query started outside a
+block has no token, and without one no native call gains a keyword.
+
 rdflib only catches ``NotImplementedError`` at hook-call time, so every
-capability check and every native call happens before a generator is handed
-back; the generators only decode. The hook applies when the active graph's
+capability check and every native call that can decline happens before a
+generator is handed back; the generators decode, pull iterators created
+while planning, and run kernels. The hook applies when the active graph's
 store is a VortexRdflibStore with the code path available (Dictionary layout,
 its dictionary memory-mapped from the file or loaded with the store);
 behaviour is identical to rdflib's default evaluation, only faster, and the
