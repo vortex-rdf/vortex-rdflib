@@ -2823,25 +2823,35 @@ def _batched_probes(store, patterns) -> list[int]:
 def _run_probes(store, probes, count: bool) -> list | Iterator:
     """Native answers to ``(n3, narrowing)`` probes (see :func:`_narrowing`),
     in order: a list of counts, or an iterator of code columns that makes
-    each answer as it is pulled (:func:`_probe_matches`).
+    each answer as it is pulled.
 
     The probes :func:`_batched_probes` picks go through one
     ``count_quads_many`` or ``match_codes_many`` call — every probe parsed
     before any runs, as many running at once on the native runtime as
     :func:`_probe_lookahead` names, a file-backed store overlapping their
-    reads — and the rest through plain calls. A batch call races the query's
-    cancel token, a plain one as :func:`_cancel_kw_for` decides.
+    reads — and the rest through plain calls. The query's cancel token is
+    read once: a batch call races it, a plain call races or checks it as
+    :func:`_cancel_kw_for` decides, and without a token no call is given a
+    keyword. The matches come from :func:`_probe_matches` under a token or
+    when only some probes are batched; otherwise from a generator over the
+    plain calls, or from the batch's own native iterator
+    (:func:`_batch_answers`).
     """
     if not probes:
         return []
     native = _native(store)
     minimum = _MEMORY_SCAN_BATCH_MIN if store.in_memory else _SCAN_BATCH_MIN
     batched = _batched_probes(store, [n3 for n3, _ in probes]) if len(probes) >= minimum else []
-    lookahead = _probe_lookahead(store, [probes[i][0] for i in batched])
-    if not count:
-        return _probe_matches(store, native, probes, batched, lookahead)
     cancel = _cancel_kw()
+    if not count:
+        if cancel or 0 < len(batched) < len(probes):
+            return _probe_matches(store, native, probes, batched, cancel)
+        if batched:
+            return _batch_answers(store, native, probes)
+        return (native.match_codes(*n3, **narrowing) for n3, narrowing in probes)
     if not batched:
+        if not cancel:
+            return [native.count_quads(*n3, **narrowing) for n3, narrowing in probes]
         return [
             native.count_quads(
                 *n3, **narrowing, **_cancel_kw_for(cancel, store, n3, narrowing.get("limit"))
@@ -2850,6 +2860,7 @@ def _run_probes(store, probes, count: bool) -> list | Iterator:
         ]
     answers: list = [None] * len(probes)
     batch = [_batch_probe(*probes[i]) for i in batched]
+    lookahead = _probe_lookahead(store, [probes[i][0] for i in batched])
     counts = native.count_quads_many(batch, lookahead=lookahead, **cancel)
     for i, answer in zip(batched, counts, strict=True):
         answers[i] = answer
@@ -2871,34 +2882,62 @@ def _batch_probe(n3, narrowing):
     return tuple(n3)
 
 
-#: What :func:`_probe_matches` reads past a batch's last answer when the batch
-#: has no more.
+#: What :func:`_probe_matches` and :func:`_batch_answers` read past a batch's
+#: last answer when the batch has no more.
 _NO_ANSWER = object()
 
 
-def _probe_matches(store, native, probes, batched, lookahead: int) -> Iterator:
+def _batch_answers(store, native, probes) -> Iterator:
+    """The code columns of every probe, in order, from one
+    ``match_codes_many`` call the first pull makes: the native iterator's
+    answers, each waited for as it is pulled, while the probes run as far
+    ahead as :func:`_probe_lookahead` lets them. A batch that answers fewer
+    probes than it was given raises ``ValueError`` at the first probe left
+    without an answer, and one that answers more, with its last probe.
+    Closing the iterator releases the batch's answers, which aborts the
+    probes still in flight."""
+    total = len(probes)
+    answers = native.match_codes_many(
+        [_batch_probe(*probe) for probe in probes],
+        lookahead=_probe_lookahead(store, [n3 for n3, _ in probes]),
+    )
+    try:
+        yield from islice(answers, total - 1)
+        last = next(answers, _NO_ANSWER)
+        if last is _NO_ANSWER:
+            raise ValueError(f"match_codes_many answered fewer than its {total} probes")
+        if next(answers, _NO_ANSWER) is not _NO_ANSWER:
+            raise ValueError(f"match_codes_many answered more than its {total} probes")
+        yield last
+    finally:
+        close = getattr(answers, "close", None)
+        if close is not None:
+            close()
+
+
+def _probe_matches(store, native, probes, batched, cancel: dict) -> Iterator:
     """The code columns of each probe, in order, each made when it is pulled:
     the ``batched`` probes' from the one ``match_codes_many`` call the first
-    pull makes, whose probes run, as far ahead as ``lookahead`` lets them,
-    while the consumer works through the answers before theirs; the others
-    from a ``match_codes`` call at their position. A batch that answers
-    fewer probes than it was given raises ``ValueError`` at the first probe
-    left without an answer, and one that answers more, with its last probe.
-    Each probe checks the query's cancel token first
-    (:func:`_check_cancelled`); the batch races it, a plain call as
-    :func:`_cancel_kw_for` decides. Closing the iterator releases the batch's
-    answers, which aborts the probes still in flight."""
+    pull makes, whose probes run, as far ahead as :func:`_probe_lookahead`
+    lets them, while the consumer works through the answers before theirs;
+    the others from a ``match_codes`` call at their position. ``cancel`` is
+    the query's cancel keyword (:func:`_cancel_kw`): the batch is given it,
+    and a plain call races or checks the token as :func:`_cancel_kw_for`
+    decides. A batch that answers fewer probes than it was given raises
+    ``ValueError`` at the first probe left without an answer, and one that
+    answers more, with its last probe. Closing the iterator releases the
+    batch's answers, which aborts the probes still in flight."""
     in_batch = set(batched)
-    cancel = _cancel_kw()
     answers = iter(())
     if batched:
         answers = native.match_codes_many(
-            [_batch_probe(*probes[i]) for i in batched], lookahead=lookahead, **cancel
+            [_batch_probe(*probes[i]) for i in batched],
+            lookahead=_probe_lookahead(store, [probes[i][0] for i in batched]),
+            **cancel,
         )
     unanswered = len(batched)
     try:
         for i, (n3, narrowing) in enumerate(probes):
-            _check_cancelled()
             if i not in in_batch:
                 limit = narrowing.get("limit")
                 yield native.match_codes(

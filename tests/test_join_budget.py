@@ -14,6 +14,7 @@ keep-scan), and joins that match as a hash step does, under the same
 budget."""
 
 import builtins
+import contextlib
 import os
 import subprocess
 import sys
@@ -22,7 +23,7 @@ import weakref
 import pytest
 from rdflib import Dataset, Graph, URIRef, Variable
 from rdflib.plugins.sparql.processor import SPARQLProcessor
-from vortex_rdf import U64Column, serialize_rdf
+from vortex_rdf import CancelToken, U64Column, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
 from test_native_primitives import _spy
@@ -35,7 +36,12 @@ from test_pushdown import (
     run,
     run_ordered,
 )
-from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
+from vortex_rdflib import (
+    VortexRdflibStore,
+    cancel_scope,
+    register_sparql_pushdown,
+    unregister_sparql_pushdown,
+)
 
 EX = "http://ex/"
 _PREFIX = f"PREFIX : <{EX}> "
@@ -520,19 +526,27 @@ class _ShortBatches:
         return getattr(self._inner, name)
 
 
-def test_a_batch_short_of_answers_raises(graph, monkeypatch):
-    """The answers of a batch are pulled one probe at a time: a batch that
-    answers fewer probes than it was given raises at the first probe left
-    without an answer rather than handing another probe's answer on."""
+def _scope(tokened: bool):
+    """A ``cancel_scope`` with a fresh token, or no scope at all."""
+    return cancel_scope(CancelToken()) if tokened else contextlib.nullcontext()
+
+
+@pytest.mark.parametrize("tokened", [False, True], ids=["untokened", "tokened"])
+def test_a_batch_short_of_answers_raises(graph, monkeypatch, tokened):
+    """The answers of a batch are pulled one probe at a time, under a cancel
+    token or without one: a batch that answers fewer probes than it was
+    given raises at the first probe left without an answer rather than
+    handing another probe's answer on."""
     monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
     monkeypatch.setattr(pd, "_SCAN_BATCH_MIN", 1)
     monkeypatch.setattr(pd, "_MEMORY_SCAN_BATCH_MIN", 1)
     graph.store._native = _ShortBatches(graph.store._store())
     probes = [((None, f"<{EX}p>", None, None), {}), ((None, f"<{EX}q>", None, None), {})]
-    answers = iter(pd._run_probes(graph.store, probes, count=False))
-    assert len(next(answers)[0]) == 10
-    with pytest.raises(ValueError, match="fewer than its 2 probes"):
-        next(answers)
+    with _scope(tokened):
+        answers = iter(pd._run_probes(graph.store, probes, count=False))
+        assert len(next(answers)[0]) == 10
+        with pytest.raises(ValueError, match="fewer than its 2 probes"):
+            next(answers)
 
 
 class _LongBatches:
@@ -550,19 +564,21 @@ class _LongBatches:
         return getattr(self._inner, name)
 
 
-def test_a_batch_past_its_probes_raises(graph, monkeypatch):
-    """A batch that answers more probes than it was given raises at its last
-    probe rather than handing that probe an answer the batch may have
-    misplaced."""
+@pytest.mark.parametrize("tokened", [False, True], ids=["untokened", "tokened"])
+def test_a_batch_past_its_probes_raises(graph, monkeypatch, tokened):
+    """A batch that answers more probes than it was given, under a cancel
+    token or without one, raises at its last probe rather than handing that
+    probe an answer the batch may have misplaced."""
     monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
     monkeypatch.setattr(pd, "_SCAN_BATCH_MIN", 1)
     monkeypatch.setattr(pd, "_MEMORY_SCAN_BATCH_MIN", 1)
     graph.store._native = _LongBatches(graph.store._store())
     probes = [((None, f"<{EX}p>", None, None), {}), ((None, f"<{EX}q>", None, None), {})]
-    answers = iter(pd._run_probes(graph.store, probes, count=False))
-    assert len(next(answers)[0]) == 10
-    with pytest.raises(ValueError, match="more than its 2 probes"):
-        next(answers)
+    with _scope(tokened):
+        answers = iter(pd._run_probes(graph.store, probes, count=False))
+        assert len(next(answers)[0]) == 10
+        with pytest.raises(ValueError, match="more than its 2 probes"):
+            next(answers)
 
 
 def _streams(events) -> list[dict]:
