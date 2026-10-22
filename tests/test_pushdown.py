@@ -1955,9 +1955,10 @@ def test_columnar_join_matches_row_join():
     cols_b = (array("Q", kb), array("Q", vb))
     joined = pd._join_columns(schema_a, cols_a, schema_b, cols_b)
     assert joined is not None
-    schema, cols = joined
+    schema, cols, pairs = joined
     assert schema == ("k", "x", "y")
     assert pd._cols_to_rows(cols) == expected
+    assert pairs is None  # within the product bound: built uncounted
     # Several shared variables decline: the row join handles them.
     assert pd._join_columns(("k", "x"), cols_a, ("k", "x"), cols_a) is None
 

@@ -159,7 +159,7 @@ from rdflib.plugins.sparql.evaluate import evalBGP, evalPart
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
-from vortex_rdf import Cancelled, CancelToken, CodeGroups, U64Column
+from vortex_rdf import Cancelled, CancelToken, CodeGroups, JoinTooLarge, U64Column
 
 from . import candidates, filters, query_scope
 from .terms import CANONICAL_INTEGER, INTEGER_SUFFIX, canonical_spelling, unparseable_iri
@@ -2442,11 +2442,12 @@ def _pair_budget() -> int:
 
 #: The most row pairs one join step of a BGP may make, set when the module is
 #: imported (:func:`_pair_budget`). A step whose two sides' product is within
-#: it is built uncounted; past that, its pairs are counted natively first
-#: (:func:`_pair_count`), and a step that counts more is not built
-#: (:class:`_OverBudget`). A probe step, which has no pairs to count, stops
-#: once its rows pass a quarter of the budget; a keep-scan, once its match
-#: passes the budget.
+#: it is built uncounted; past that, its pairs are counted natively before
+#: any is built (by ``join_indices`` capped at the budget in
+#: :func:`_join_columns`, by :func:`_pair_count` for a join of rows), and a
+#: step that counts more is not built (:class:`_OverBudget`). A probe step,
+#: which has no pairs to count, stops once its rows pass a quarter of the
+#: budget; a keep-scan, once its match passes the budget.
 _PAIR_BUDGET = _pair_budget()
 
 
@@ -3266,11 +3267,7 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
                     else None
                 )
                 if joined is not None:
-                    schema, cols = joined
-                    if running * restricted_rows > _PAIR_BUDGET:
-                        # Past the product bound the join counted its pairs
-                        # before building them, one joined row per pair.
-                        pair_count = len(cols[0])
+                    schema, cols, pair_count = joined
                 else:
                     if strategy == "hash_columns":
                         strategy = "hash_rows"
@@ -3824,7 +3821,8 @@ def _cols_to_rows(cols) -> list:
 def _pair_count(left: U64Column, right: U64Column) -> int | None:
     """The row pairs a join of the two key columns makes, counted natively
     (``join_count``, no pair built) — or ``None``, uncounted, when the
-    columns' product is within :data:`_PAIR_BUDGET`."""
+    columns' product is within :data:`_PAIR_BUDGET`: the count a join of
+    rows makes before it is built (:func:`_row_step_pairs`)."""
     if len(left) * len(right) <= _PAIR_BUDGET:
         return None
     return left.join_count(right)
@@ -3850,17 +3848,19 @@ def _row_step_pairs(schema_a, rows_a, schema_b, rows_b) -> int | None:
 
 def _join_columns(schema_a, cols_a, schema_b, cols_b):
     """Hash join of two columnar relations sharing exactly one variable,
-    columns out — the rows exist only when a consumer materializes them.
-    ``None`` when the shape is not its case (several or no shared
-    variables); the row join handles those.
+    columns out — the rows exist only when a consumer materializes them:
+    the joined schema, its columns and the step's pair count, ``None`` while
+    it is uncounted. ``None`` when the shape is not its case (several or no
+    shared variables); the row join handles those.
 
     Native kernels, GIL released: ``join_indices`` pairs the rows of the two
     key columns in nested-loop order (the left rows in order, each with its
     right matches in theirs) and ``take`` gathers every output column by
-    those indices. Past the product bound the pairs are counted first
-    (:func:`_pair_count`): a join over :data:`_PAIR_BUDGET` raises
-    :class:`_OverBudget` with its count before a pair is built, and one
-    within it is built with the budget as ``join_indices``' cap.
+    those indices. Within the product bound the join is built uncounted.
+    Past it, ``join_indices`` has :data:`_PAIR_BUDGET` as its cap, so it
+    counts the pairs before it builds any: a join over the budget is refused
+    (``JoinTooLarge``) and raises :class:`_OverBudget` with that count, and
+    one within it is built, its pair count the pairs it made.
     """
     shared = [v for v in schema_b if v in schema_a]
     if len(shared) != 1:
@@ -3871,16 +3871,18 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
     schema = schema_a + tuple(schema_b[i] for i in keep_b)
     left = [_native_column(col) for col in cols_a]
     key = _native_column(cols_b[ib])
-    pairs = _pair_count(left[ia], key)
-    if pairs is None:
+    pairs = None
+    if len(left[ia]) * len(key) <= _PAIR_BUDGET:
         a_idx, b_idx = left[ia].join_indices(key)
-    elif pairs <= _PAIR_BUDGET:
-        a_idx, b_idx = left[ia].join_indices(key, max_pairs=_PAIR_BUDGET)
     else:
-        raise _OverBudget(pairs)
+        try:
+            a_idx, b_idx = left[ia].join_indices(key, max_pairs=_PAIR_BUDGET)
+        except JoinTooLarge as refused:
+            raise _OverBudget(refused.pairs) from None
+        pairs = len(a_idx)
     out = [col.take(a_idx) for col in left]
     out += [_native_column(cols_b[i]).take(b_idx) for i in keep_b]
-    return schema, tuple(memoryview(col).cast("Q") for col in out)
+    return schema, tuple(memoryview(col).cast("Q") for col in out), pairs
 
 
 def _slices(cols: Sequence[U64Column], nrows: int) -> Iterator[tuple[U64Column, ...]]:

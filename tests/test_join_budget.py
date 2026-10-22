@@ -865,7 +865,7 @@ def test_a_memoized_match_is_sliced(graph):
     rows = pd._rows_of(pd.Relation(schema, None, None, 0, pieces=pieces))
     assert spy.names() == []
     views = tuple(memoryview(column).cast("Q") for column in columns)
-    joined_schema, joined = pd._join_columns(
+    joined_schema, joined, _ = pd._join_columns(
         (s, x), views, (s, y), (memoryview(match[0]).cast("Q"), memoryview(match[2]).cast("Q"))
     )
     assert schema == joined_schema == (s, x, y)
