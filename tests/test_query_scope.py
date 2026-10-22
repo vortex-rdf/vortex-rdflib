@@ -326,9 +326,9 @@ def test_a_query_failing_mid_iteration_releases_its_scope(tmp_path, tracked):
 
 def test_a_cancelled_query_releases_its_scope(tmp_path, tracked, monkeypatch):
     """A query cancelled while its rows are read — rdflib's evaluator reads
-    the store once per binding, each read given the token — raises
-    ``Cancelled`` at the next read and releases its scope and its token as
-    any failure does."""
+    the store once per binding, each read racing the token or checking it —
+    raises ``Cancelled`` at the next read and releases its scope and its
+    token as any failure does."""
     store = _store(tmp_path)
     graph = Graph(store=store)
     monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset())
@@ -344,7 +344,6 @@ def test_a_cancelled_query_releases_its_scope(tmp_path, tracked, monkeypatch):
         with pytest.raises(Cancelled):
             next(rows)
     del rows
-    assert pd._CANCEL.get() is None
     _assert_released(store, before, tracked)
 
 

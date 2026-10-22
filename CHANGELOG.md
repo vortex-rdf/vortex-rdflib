@@ -42,6 +42,8 @@ store holds one chunk of codes at a time.
 
 - One keep-scan instead of a scan per row, and an explicit probe lookahead (pushdown) ([`5f6457a`](https://github.com/vortex-rdf/vortex-rdflib/commit/5f6457ae42b7e7634f80f52a1bb37d9da926a717) by @julianrojas87)
 - Triples() tells a large pattern by its first match, not a count (store) ([`d8f9104`](https://github.com/vortex-rdf/vortex-rdflib/commit/d8f91044deebcf73a7fd12ea2bf696d000a7064e) by @julianrojas87)
+- Answer plain probes without the token plumbing (pushdown) ([`a25c846`](https://github.com/vortex-rdf/vortex-rdflib/commit/a25c846259cebb7cfd8b36ceb7a8916bdb96e273) by @julianrojas87)
+- Count a hash step's pairs once (pushdown) ([`6c8af68`](https://github.com/vortex-rdf/vortex-rdflib/commit/6c8af680e400375a0bb698d78fa05c853ff3937e) by @julianrojas87)
 
 ### Fixed
 
@@ -50,6 +52,7 @@ store holds one chunk of codes at a time.
 - Count the probes a tripped step sent, and key the memo by the keep column (pushdown) ([`9868e2a`](https://github.com/vortex-rdf/vortex-rdflib/commit/9868e2aa5c318f3cd1f6c98acdf0ca6ebc24451c) by @julianrojas87)
 - Check the cancel token before a string-fallback read (store) ([`4409609`](https://github.com/vortex-rdf/vortex-rdflib/commit/44096098ac1c8679e22bcc7e8f94c1cceb95ea55) by @julianrojas87)
 - Triples() lets go of every column of a chunk before the next pull (store) ([`7452b04`](https://github.com/vortex-rdf/vortex-rdflib/commit/7452b04a264eb0b8af54f5eae0a75740d0b9ee1e) by @julianrojas87)
+- Check the cancel token per slice and per decode chunk (pushdown) ([`49c062f`](https://github.com/vortex-rdf/vortex-rdflib/commit/49c062f7669777644b67334ef5ca77132079774d) by @julianrojas87)
 
 ## [0.3.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.2.0...v0.3.0) - 2026-10-13
 

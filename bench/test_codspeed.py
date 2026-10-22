@@ -162,7 +162,8 @@ JOIN_QUERIES = ("star-2", "star-3", "chain-2", "optional", "filter-probe")
 #: grouped and the pattern fed.
 STREAMED_JOIN = "chain-2"
 
-#: The fed rows of each slice a streamed join step gathers in that task.
+#: The fed rows of each slice a streamed join step gathers in
+#: `test_join_streamed`.
 STREAMED_PIECE_ROWS = 256
 
 #: The join `test_join_keep_scan` runs on the file-backed unindexed store: the

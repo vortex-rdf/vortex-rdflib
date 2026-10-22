@@ -31,11 +31,14 @@ What runs in code space:
   passes it. When it is the last step and shares one variable it streams
   instead (tier 1): the smaller side is grouped, the other is fed through the
   groups, and the pairs are gathered a piece at a time as the rows are read,
-  so the join holds one piece. Any other step is put back and a pattern that
-  provably fits joins first (tier 2); when none does, rdflib finishes the
-  patterns left per row of the relation so far (tier 3) where the relation
-  goes straight to the emitter, and elsewhere the node goes back to rdflib,
-  which offers the BGP below it alone, where tier 3 applies;
+  so a consumer that reads the rows as they come holds one piece of the join
+  at a time, besides the grouped side and, unless it is a pattern fed in
+  chunks, the fed side; a consumer that holds rows drains the pieces into
+  rows first. Any other step is put back and a pattern that provably fits
+  joins first (tier 2); when none does, rdflib finishes the patterns left per
+  row of the relation so far (tier 3) where the relation goes straight to the
+  emitter, and elsewhere the node goes back to rdflib, which offers the BGP
+  below it alone, where tier 3 applies;
 - a ``Filter`` over a block is split into conjuncts (:mod:`.filters`):
   those over one variable that are a kind test or an IRI equality (``=``,
   ``sameTerm``, ``IN``) become a ``keep`` on the match of every pattern
@@ -4048,7 +4051,7 @@ def _fits(
 ) -> bool:
     """Whether joining ``pat`` into the relation — ``running`` rows over
     ``schema``, its body ``cols`` or ``rows`` — provably stays within
-    :data:`_PAIR_BUDGET`, from what is held already: nothing is counted or
+    :data:`_PAIR_BUDGET`, from what is held already: no pattern is counted or
     matched here.
 
     It does when the relation's rows times the pattern's count fit, a count
@@ -4154,14 +4157,14 @@ def _keep_scan(
     at every position it takes, on top of any keep already there
     (:func:`_set_native_keep`): the match leaves out only rows that no row of
     the relation joins, and the join pairs the others, quad by quad, as the
-    probes would have. The match goes through :func:`_match_resolved_pattern`
-    and is memoized under that keep. A pattern whose count may pass
-    :data:`_PAIR_BUDGET` — one over it, or a count stopped at its cap, a
-    lower bound — is matched only up to one row past the budget: a match
-    that reaches it is over the budget and is dropped, the pattern left
-    unread, raising :class:`_OverBudget` with the call it made. Returns the
-    native calls made and their time, as :func:`_match_resolved_pattern`
-    does."""
+    probes would have. The match goes through :func:`_match_resolved_pattern`:
+    a whole match is memoized under that keep, a limited one never is. A
+    pattern whose count may pass :data:`_PAIR_BUDGET` — one over it, or a
+    count stopped at its cap, a lower bound — is matched only up to one row
+    past the budget: a match that reaches it is over the budget and is
+    dropped, the pattern left unread, raising :class:`_OverBudget` with the
+    call it made. Returns the native calls made and their time, as
+    :func:`_match_resolved_pattern` does."""
     for var, positions in pat["varpos"].items():
         if var not in schema:
             continue
