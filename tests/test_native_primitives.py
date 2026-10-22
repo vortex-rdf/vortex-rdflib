@@ -4,6 +4,7 @@ equivalence matrix in ``test_pushdown`` covers the answers of every shape;
 these say *how* they are reached."""
 
 import json
+import weakref
 
 import pytest
 from rdflib import Graph, Literal, URIRef
@@ -51,13 +52,37 @@ def _native_calls(trace, operation) -> list[dict]:
     ]
 
 
+class _Chunks:
+    """A chunk iterator the spy handed out, counting in ``pulls[slot]`` the
+    chunks pulled from it."""
+
+    def __init__(self, inner, pulls: list[int]):
+        self._inner = inner
+        self._pulls = pulls
+        self._slot = len(pulls)
+        pulls.append(0)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        chunk = next(self._inner)
+        self._pulls[self._slot] += 1
+        return chunk
+
+
 class _Spy:
-    """The native store with every call recorded by name."""
+    """The native store with every call recorded by name. The chunk
+    iterators ``match_code_chunks`` returns count their pulls (``pulls``)
+    and are watched by weak references (``feeds``), so a test sees whether
+    they were released."""
 
     def __init__(self, inner):
         self._inner = inner
         self.calls: list[tuple[str, dict]] = []
         self.args: list[tuple] = []
+        self.pulls: list[int] = []
+        self.feeds: list[weakref.ref] = []
 
     def __getattr__(self, name):
         attribute = getattr(self._inner, name)
@@ -68,7 +93,11 @@ class _Spy:
             if not (name == "count_quads" and is_graph_name_check(args)):
                 self.calls.append((name, kwargs))
                 self.args.append(args)
-            return attribute(*args, **kwargs)
+            result = attribute(*args, **kwargs)
+            if name == "match_code_chunks" and result is not None:
+                result = _Chunks(result, self.pulls)
+                self.feeds.append(weakref.ref(result))
+            return result
 
         return call
 

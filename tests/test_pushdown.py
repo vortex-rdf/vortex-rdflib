@@ -1169,10 +1169,49 @@ def test_over_budget_graph_pattern_equals_default_evaluator(dataset, over_budget
     assert with_pushdown == without_pushdown
 
 
+@pytest.fixture
+def stream_pieces(request, monkeypatch):
+    """A pair budget of 0 and pieces of ``request.param`` rows (1 unless the
+    test sets it): every last hash join step that shares one variable and
+    makes a row streams, its fed side cut into pieces that small."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+    monkeypatch.setattr(pd, "_PIECE_ROWS", getattr(request, "param", 1))
+
+
+_PIECE_SIZES = pytest.mark.parametrize(
+    "stream_pieces", [1, 3], indirect=True, ids=["pieces1", "pieces3"]
+)
+
+
+@_PIECE_SIZES
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_stream_pieces_equals_default_evaluator(graph, stream_pieces, sparql):
+    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@_PIECE_SIZES
+@pytest.mark.parametrize("sparql", ORDER_QUERIES)
+def test_stream_pieces_order_by_sequence_equals_default_evaluator(graph, stream_pieces, sparql):
+    with_pushdown, without_pushdown = both_ways(graph, sparql, run_ordered)
+    assert with_pushdown == without_pushdown
+
+
+@_PIECE_SIZES
+@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
+def test_stream_pieces_graph_pattern_equals_default_evaluator(dataset, stream_pieces, sparql):
+    with_pushdown, without_pushdown = both_ways(dataset, sparql)
+    assert with_pushdown == without_pushdown
+
+
 #: The forced paths of the matrices above, by id: the fixture that forces the
 #: path, and the test of a trace event that shows the path taken.
 FORCED_PATHS = {
     "budget0": ("over_budget", lambda event: event["event"] == "bgp_over_budget"),
+    "stream": (
+        "stream_pieces",
+        lambda event: event["event"] == "bgp_join_step_complete" and event["strategy"] == "stream",
+    ),
 }
 
 
@@ -1181,15 +1220,20 @@ def test_forcing_reaches_the_path(
     request, dict_vortex, dict_vortex_quads, monkeypatch, capsys, forcing
 ):
     """A forced matrix passes for nothing unless the planner reads what its
-    fixture sets: under each forcing, a query of the matrix traces the path."""
+    fixture sets: under each forcing, a query of the matrix traces the path,
+    file-backed and in memory. The stores are built before the forcing is
+    applied, as the matrices build theirs."""
     fixture, taken = FORCED_PATHS[forcing]
+    matrices = {}
+    for in_memory in (False, True):
+        graph = Graph(store=VortexRdflibStore(str(dict_vortex), in_memory=in_memory))
+        dataset = Dataset(
+            store=VortexRdflibStore(str(dict_vortex_quads), in_memory=in_memory),
+            default_union=True,
+        )
+        matrix = [(graph, sparql) for sparql in QUERIES + ORDER_QUERIES]
+        matrices[in_memory] = matrix + [(dataset, sparql) for sparql in GRAPH_QUERIES]
     request.getfixturevalue(fixture)
-    graph = Graph(store=VortexRdflibStore(str(dict_vortex), in_memory=False))
-    dataset = Dataset(
-        store=VortexRdflibStore(str(dict_vortex_quads), in_memory=False), default_union=True
-    )
-    matrix = [(graph, sparql) for sparql in QUERIES + ORDER_QUERIES]
-    matrix += [(dataset, sparql) for sparql in GRAPH_QUERIES]
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     capsys.readouterr()
@@ -1198,7 +1242,8 @@ def test_forcing_reaches_the_path(
         run(view, sparql)
         return any(taken(event) for event in _trace_events(capsys.readouterr().err))
 
-    assert any(reaches(view, sparql) for view, sparql in matrix), forcing
+    for in_memory, matrix in matrices.items():
+        assert any(reaches(view, sparql) for view, sparql in matrix), (forcing, in_memory)
 
 
 def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):

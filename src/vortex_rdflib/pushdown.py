@@ -116,7 +116,7 @@ import os
 import re
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from itertools import islice
@@ -129,7 +129,7 @@ from rdflib.plugins.sparql.evaluate import evalPart
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
-from vortex_rdf import U64Column
+from vortex_rdf import CodeGroups, U64Column
 
 from . import candidates, filters, query_scope
 from .terms import CANONICAL_INTEGER, INTEGER_SUFFIX, canonical_spelling, unparseable_iri
@@ -469,6 +469,9 @@ def _solution(ctx, bindings: dict) -> _Solution:
 
 
 def _relation_rows(rel: "Relation") -> int | None:
+    """The relation's row count where it is known without reading the
+    rows: ``None`` for a columnar body still to be filtered and for a
+    streamed one."""
     if rel.rows is not None:
         return len(rel.rows)
     if rel.cols is not None and not rel.preds:
@@ -702,15 +705,17 @@ def _peel_graph(ctx, node, scope) -> tuple:
 class Relation:
     """A code-space relation.
 
-    ``schema`` names the variable-like terms. The body is either ``u64``
-    columns (``cols``, one per schema entry: zero-copy views over native
-    ``U64Column`` buffers — a single matched pattern's, or a hash join's
-    gathered columns) or materialized ``rows`` of ``int`` codes. ``None`` in
-    a row is an unbound variable and
+    ``schema`` names the variable-like terms. The body is exactly one of
+    ``u64`` columns (``cols``, one per schema entry: zero-copy views over
+    native ``U64Column`` buffers — a single matched pattern's, or a hash
+    join's gathered columns), materialized ``rows`` of ``int`` codes, or
+    ``pieces``: an iterator of column tuples in schema order, a join step
+    gathered a piece at a time as it is pulled (:func:`_streamed_step`),
+    consumed once. ``None`` in a row is an unbound variable and
     ``nullable`` lists the variables that may hold it; ``foreign`` maps
     negative codes to terms outside the dictionary; ``preds`` are row
-    predicates still to be applied while a columnar body streams (``nrows``
-    counts the rows before them).
+    predicates still to be applied while a columnar or streamed body streams
+    (``nrows`` counts a columnar body's rows before them).
     """
 
     schema: tuple
@@ -720,6 +725,7 @@ class Relation:
     nullable: frozenset = frozenset()
     foreign: dict = field(default_factory=dict)
     preds: tuple[Callable[[tuple], bool], ...] = ()
+    pieces: Iterator[tuple] | None = None
 
     @classmethod
     def from_rows(cls, schema, rows):
@@ -1552,7 +1558,15 @@ def _block_nonempty(ctx, store, block) -> bool:
             narrowing = _narrowing(pat.get("nkeep"), limit=1)
             return _native(store).count_quads(*pat["n3"], **narrowing) > 0
     rel = _solve_block(ctx, store, block, scope=scope, limit=1)
-    return next(_code_rows(rel), None) is not None
+    # One row is pulled, and the rows are closed after it: a streamed join
+    # gathers one piece and releases its feed.
+    rows = _code_rows(rel)
+    try:
+        return next(rows, None) is not None
+    finally:
+        close = getattr(rows, "close", None)
+        if close is not None:
+            close()
 
 
 def _single_pattern(ctx, store, block, scope) -> dict | None:
@@ -1983,10 +1997,15 @@ def _reject_forgotten_exists(ctx, conjuncts, kept) -> None:
 
 
 def _rows_of(rel: Relation) -> list:
-    """The relation's rows, materialized."""
+    """The relation's rows, materialized. A streamed body is drained into
+    rows, its ``preds`` applied, and the relation keeps them as its body, so
+    a second call returns the same list."""
     if rel.rows is not None:
         return rel.rows
-    return list(_code_rows(rel))
+    rows = list(_code_rows(rel))
+    if rel.pieces is not None:
+        rel.rows, rel.nrows, rel.preds, rel.pieces = rows, len(rows), (), None
+    return rows
 
 
 def _shared_key_ok(left: Relation, right: Relation, shared) -> None:
@@ -2238,8 +2257,9 @@ def _solve_minus(ctx, store, node, env, var_preds, scope) -> Relation:
 
 
 def _filter_relation(rel: Relation, preds) -> Relation:
-    """Apply row predicates: streamed over a columnar body, eagerly over rows."""
-    if rel.cols is not None:
+    """Apply row predicates: streamed over a columnar or streamed body,
+    eagerly over rows."""
+    if rel.rows is None:
         return Relation(
             rel.schema,
             rel.cols,
@@ -2248,8 +2268,8 @@ def _filter_relation(rel: Relation, preds) -> Relation:
             rel.nullable,
             rel.foreign,
             rel.preds + tuple(preds),
+            rel.pieces,
         )
-    assert rel.rows is not None  # a relation has exactly one body
     rows = [row for row in rel.rows if all(pred(row) for pred in preds)]
     return Relation(rel.schema, None, rows, len(rows), rel.nullable, rel.foreign)
 
@@ -2296,6 +2316,13 @@ class _OverBudget(Exception):
     def __init__(self, pairs: int | None):
         super().__init__(pairs)
         self.pairs = pairs
+
+
+#: The most rows of its fed side a streamed join step (:func:`_streamed_step`)
+#: takes at a time: a slice of a side it holds, or a chunk of a match it
+#: reads in chunks. A piece over :data:`_PAIR_BUDGET` is halved before it is
+#: gathered.
+_PIECE_ROWS = 65_536
 
 
 def _pattern_trace_shape(ctx, triple) -> dict:
@@ -2766,11 +2793,16 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
     of may become a restriction of the pattern binding that one
     (:func:`_specialize_tuple_conjuncts`).
 
-    A step over :data:`_PAIR_BUDGET` is not built — a hash step whose pairs,
-    counted once its two sides' product passes the budget, are more than
-    the budget, or a probe step whose rows pass a quarter of it: it is
-    traced as ``bgp_over_budget`` and the block goes back to rdflib
-    (``NotImplementedError``).
+    A step over :data:`_PAIR_BUDGET` — a hash step whose pairs, counted once
+    its two sides' product passes the budget, are more than the budget, or a
+    probe step whose rows pass a quarter of it — is traced as
+    ``bgp_over_budget`` and is not built. When it is the last step, a hash
+    step sharing one variable, it streams instead (:func:`_streamed_step`):
+    the relation returned is its pieces, gathered as they are pulled. Such a
+    step whose pattern counts more rows than the budget and than the
+    relation streams without reading the pattern whole: it reads it in
+    chunks (:func:`_read_in_chunks`). Any other step over the budget sends
+    the block back to rdflib (``NotImplementedError``).
     """
     counts: dict[tuple, int] = {}
     memo: dict[tuple, tuple] = {}
@@ -2864,7 +2896,10 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
             stats["estimate_calls"] += 1
         estimate = pat["estimate"]
 
-        pair_count = None
+        # Tier 1: the last step, when it shares one variable, streams
+        # (_streamed_step) rather than going back to rdflib over the budget.
+        streams = not remaining and len(shared) == 1
+        pair_count = pieces = feed = None
         try:
             if shared and running * _PROBE_FANOUT < estimate:
                 strategy, source = "probe", "probed"
@@ -2878,6 +2913,9 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
                 stats["native_ns"] += probe_ns
                 match_rows = estimate
                 restricted_rows = pat.pop("_trace_probe_restricted_rows", len(rows))
+            elif streams and _read_in_chunks(pat, running):
+                strategy, source = "stream", "chunked"
+                match_rows = restricted_rows = None
             else:
                 strategy, source = "hash_columns", "matched"
                 calls, native_ns = _match_resolved_pattern(store, pat, memo)
@@ -2902,14 +2940,14 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
                         pair_count = len(cols[0])
                 else:
                     strategy = "hash_rows"
-                    if cols is not None:
-                        rows, cols = _cols_to_rows(cols), None
+                    rows_a = _cols_to_rows(cols) if cols is not None else rows
                     if rows_b is None:
                         rows_b = _cols_to_rows(cols_b)
-                    pair_count = _row_step_pairs(schema, rows, schema_b, rows_b)
+                    pair_count = _row_step_pairs(schema, rows_a, schema_b, rows_b)
                     if pair_count is not None and pair_count > _PAIR_BUDGET:
                         raise _OverBudget(pair_count)
-                    schema, rows = _join(schema, rows, schema_b, rows_b)
+                    cols = None
+                    schema, rows = _join(schema, rows_a, schema_b, rows_b)
         except _OverBudget as over:
             _trace_event(
                 "bgp_over_budget",
@@ -2920,13 +2958,29 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
                 input_rows=running,
                 estimated_rows=estimate,
             )
-            raise NotImplementedError from None
+            if strategy == "probe" or not streams:
+                raise NotImplementedError from None
+            strategy, pair_count = "stream", over.pairs
 
+        if strategy == "stream":
+            if cols is None:
+                cols = tuple(U64Column([row[i] for row in rows]) for i in range(len(schema)))
+            schema, pieces = _streamed_step(store, schema, cols, pat, memo)
+            if "cols" not in pat:
+                feed = "chunks"
+                stats["initial_calls"] += 1
+            else:
+                feed = "slices"
+                if source == "chunked":
+                    # The memo held the pattern's match: it was read whole.
+                    source, match_rows = "matched", pat["nrows"]
+                    restricted_rows = match_rows
         _trace_event(
             "bgp_join_step_complete",
             execution_index=execution_index,
             original_pattern_index=pat.get("index"),
             strategy=strategy,
+            feed=feed,
             cardinality_source=source,
             input_rows=running,
             estimated_rows=estimate,
@@ -2934,14 +2988,18 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
             pair_count=pair_count,
             pattern_match_rows=match_rows,
             pattern_restricted_rows=restricted_rows,
-            native_initial_match_count=int(source == "matched"),
+            native_initial_match_count=int(source != "probed"),
             native_probe_call_count=probe_calls,
             native_probe_ns=probe_ns,
-            output_rows=len(cols[0]) if cols is not None else len(rows),
+            output_rows=(
+                None if pieces is not None else len(cols[0]) if cols is not None else len(rows)
+            ),
             output_columns=len(schema),
             shared_variable_count=len(shared),
             elapsed_ns=time.perf_counter_ns() - step_then if step_then else 0,
         )
+        if pieces is not None:
+            break
         cols, rows, tuples = _prune_early(store, schema, cols, rows, tuples, remaining, views)
         execution_index += 1
 
@@ -2961,6 +3019,8 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
         # The relation ran empty before these patterns were joined: the
         # schema names their variables, which no column carries.
         return Relation.from_rows(schema, []), stats
+    if pieces is not None:
+        return Relation(schema, None, None, 0, pieces=pieces), stats
     if cols is not None:
         return Relation(schema, cols, None, len(cols[0])), stats
     return Relation.from_rows(schema, rows), stats
@@ -3461,6 +3521,150 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
     return schema, tuple(memoryview(col).cast("Q") for col in out)
 
 
+def _slices(cols: Sequence[U64Column], nrows: int) -> Iterator[tuple[U64Column, ...]]:
+    """The columns in consecutive zero-copy slices (``U64Column.slice``) of
+    at most ``_PIECE_ROWS`` rows."""
+    for start in range(0, nrows, _PIECE_ROWS):
+        stop = min(start + _PIECE_ROWS, nrows)
+        yield tuple(col.slice(start, stop) for col in cols)
+
+
+def _gather_pieces(
+    groups: CodeGroups,
+    fed: Iterator[tuple[U64Column, ...]],
+    key: int,
+    grouped: Sequence[U64Column],
+    order: Sequence[int],
+) -> Iterator[tuple[memoryview, ...]]:
+    """The pieces of a streamed join step, each gathered when it is pulled.
+
+    Each column tuple ``fed`` yields is joined on its column ``key`` with the
+    grouped rows (``groups``, over the key column of ``grouped``). While a
+    part counts more than :data:`_PAIR_BUDGET` pairs and holds more than one
+    row it is split in halves; a single row is gathered whatever its count,
+    its pairs at most the grouped rows, which are held already. A part that
+    counts no pair is skipped. A part is gathered by ``CodeGroups.gather``:
+    per pair, in nested-loop order, its other columns at the fed row, then
+    ``grouped`` at the grouped row — permuted by ``order`` into the step's
+    schema. The feed is closed when the pieces end, fail or are closed, and
+    ``bgp_stream_complete`` is traced then: the pieces gathered, their rows,
+    and the time spent here (pulling the feed, counting, gathering), not in
+    the consumer."""
+    traced = _TRACE.get() is not None
+    pieces = output_rows = elapsed_ns = 0
+    resumed = time.perf_counter_ns() if traced else 0
+    try:
+        for part in fed:
+            parts = [part]
+            while parts:
+                part = parts.pop()
+                column = part[key]
+                length = len(column)
+                pairs = groups.count(column)
+                if pairs > _PAIR_BUDGET and length > 1:
+                    half = length // 2
+                    parts.append(tuple(col.slice(half, length) for col in part))
+                    parts.append(tuple(col.slice(0, half) for col in part))
+                    continue
+                if not pairs:
+                    continue
+                gathered = groups.gather(
+                    column, [col for i, col in enumerate(part) if i != key], grouped
+                )
+                piece = tuple(memoryview(gathered[i]).cast("Q") for i in order)
+                pieces += 1
+                output_rows += pairs
+                if traced:
+                    elapsed_ns += time.perf_counter_ns() - resumed
+                    resumed = 0
+                yield piece
+                # Dropped before the next gather: one piece is held at a time.
+                del gathered, piece
+                if traced:
+                    resumed = time.perf_counter_ns()
+    finally:
+        if resumed:
+            elapsed_ns += time.perf_counter_ns() - resumed
+        close = getattr(fed, "close", None)
+        if close is not None:
+            close()
+        _trace_event(
+            "bgp_stream_complete", pieces=pieces, output_rows=output_rows, elapsed_ns=elapsed_ns
+        )
+
+
+def _streamed_step(
+    store, schema: tuple, cols: tuple, pat: dict, memo: dict
+) -> tuple[tuple, Iterator[tuple[memoryview, ...]]]:
+    """The join of a relation (``schema``, a column per entry) with ``pat``,
+    sharing one variable, as pieces gathered while they are pulled: tier 1,
+    the last step of a BGP over :data:`_PAIR_BUDGET` or with a pattern too
+    large to read whole (:func:`_read_in_chunks`).
+
+    The side with fewer rows is grouped on its key column
+    (``U64Column.groups``): the relation's rows against the pattern's, its
+    match's when it is read — by this step, or into ``memo`` by another — and
+    its count when it is not. The other side is fed through the groups: the
+    relation in slices (:func:`_slices`); the pattern in slices of its match,
+    or, unread, in chunks of at most ``_PIECE_ROWS`` rows of
+    ``match_code_chunks`` narrowed by its native keep, opened here, so a
+    store that cannot serve them raises ``NotImplementedError`` while the
+    query is planned. Returns the step's schema — the relation's, then the
+    pattern's new variables, as :func:`_join_columns` has it — and the
+    pieces (:func:`_gather_pieces`)."""
+    varpos = pat["varpos"]
+    key_var = next(v for v in varpos if v in schema)
+    step_schema = schema + tuple(v for v in varpos if v not in schema)
+    relation = [_native_column(col) for col in cols]
+    if "cols" not in pat and _pattern_key(pat) in memo:
+        _match_resolved_pattern(store, pat, memo)
+    pattern_schema = tuple(varpos)
+    pattern = None
+    if "cols" in pat:
+        _, pattern_cols, pattern_rows = _pattern_body(pat)
+        if pattern_cols is not None:
+            pattern = [_native_column(col) for col in pattern_cols]
+        else:
+            pattern = [
+                U64Column([row[i] for row in pattern_rows]) for i in range(len(pattern_schema))
+            ]
+    pattern_size = pat["estimate"] if pattern is None else len(pattern[0])
+    if pattern is not None and pattern_size < len(relation[0]):
+        grouped, grouped_schema = pattern, pattern_schema
+        fed, fed_schema = _slices(relation, len(relation[0])), schema
+    else:
+        grouped, grouped_schema, fed_schema = relation, schema, pattern_schema
+        if pattern is not None:
+            fed = _slices(pattern, pattern_size)
+        else:
+            fed = _native(store).match_code_chunks(
+                *pat["n3"],
+                columns=[("s", "p", "o", "g")[varpos[v][0]] for v in pattern_schema],
+                batch_rows=_PIECE_ROWS,
+                **_narrowing(pat.get("nkeep")),
+            )
+            if fed is None:
+                raise NotImplementedError
+    groups = grouped[grouped_schema.index(key_var)].groups()
+    gathered_schema = [v for v in fed_schema if v != key_var] + list(grouped_schema)
+    order = [gathered_schema.index(v) for v in step_schema]
+    pieces = _gather_pieces(groups, fed, fed_schema.index(key_var), grouped, order)
+    return step_schema, pieces
+
+
+def _read_in_chunks(pat, running: int) -> bool:
+    """Whether a last hash step streams ``pat`` from chunks instead of
+    matching it whole: its count is more than :data:`_PAIR_BUDGET` rows and
+    more than the relation's ``running`` rows, and nothing needs its whole
+    columns — no deferred restriction (:func:`_restrict_pattern`) and no
+    repeated variable (:func:`_materialize`)."""
+    return (
+        pat["estimate"] > max(_PAIR_BUDGET, running)
+        and not pat.get("deferred_var_preds")
+        and all(len(positions) == 1 for positions in pat["varpos"].values())
+    )
+
+
 def _materialize_eager_restrictions(store, pat, bound) -> None:
     """Apply a matched pattern's deferred per-variable restrictions — over
     the variables not in ``bound``, the relation it is about to join —
@@ -3707,12 +3911,33 @@ def _join(schema_a, rows_a, schema_b, rows_b):
 
 
 def _code_rows(rel: Relation) -> Iterator[tuple]:
-    """The relation's rows as code tuples, lazily for a columnar body."""
-    rows = iter(rel.rows) if rel.rows is not None else _column_rows(rel.cols, rel.nrows)
+    """The relation's rows as code tuples, lazily for a columnar or streamed
+    body."""
+    if rel.rows is not None:
+        rows = iter(rel.rows)
+    elif rel.pieces is not None:
+        rows = _piece_rows(rel.pieces)
+    else:
+        rows = _column_rows(rel.cols, rel.nrows)
     if rel.preds:
         preds = rel.preds
         rows = (row for row in rows if all(pred(row) for pred in preds))
     return rows
+
+
+def _piece_rows(pieces) -> Iterator[tuple]:
+    """The rows of a streamed body, each piece's through
+    :func:`_column_rows`, a piece let go before the next is pulled. The
+    pieces are closed when the rows end, fail or are closed, which releases
+    what feeds them."""
+    try:
+        for piece in pieces:
+            yield from _column_rows(piece, len(piece[0]))
+            del piece
+    finally:
+        close = getattr(pieces, "close", None)
+        if close is not None:
+            close()
 
 
 def _column_rows(cols, nrows) -> Iterator[tuple]:
