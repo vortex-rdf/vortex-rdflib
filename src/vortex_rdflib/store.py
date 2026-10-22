@@ -483,7 +483,7 @@ class VortexRdflibStore(Store):
                                 yield (cache[row[0]], cache[row[1]], cache[row[2]]), shared
                         start, size = stop, min(size * 4, _CHUNK_MAX)
                     # Let go of this chunk's columns before the next pull.
-                    del cols, views, part
+                    del cols, column, views, part
             finally:
                 # Dropping a chunk iterator ends its native scan (a bare
                 # CodeChunks has no close()): once the rows run out, the

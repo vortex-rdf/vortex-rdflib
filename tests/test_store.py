@@ -861,10 +861,10 @@ def indexed_quads(tmp_path_factory) -> dict[str, str]:
 def test_a_large_pattern_reads_in_chunks(indexed_quads, monkeypatch, index, in_memory):
     """A pattern of more than ``_TRIPLES_CHUNK_ROWS`` rows, whose first
     match, asked for one row more, comes back full, is read through
-    ``match_code_chunks`` that many rows a chunk: it yields the triples one
-    ``match_codes`` match yields, each graph's one context tuple across the
-    chunks, under the union and in one named graph, and each chunk iterator
-    is dropped once read."""
+    ``match_code_chunks`` at most that many rows a chunk: it yields the
+    triples one ``match_codes`` match yields, each graph's one context tuple
+    across the chunks, under the union and in one named graph, and each
+    chunk iterator is dropped once read."""
     store = VortexRdflibStore(indexed_quads[index], in_memory=in_memory)
     reads = [
         (context, pattern)
@@ -935,3 +935,64 @@ def test_a_read_skips_chunks_without_rows(indexed_quads, monkeypatch):
     assert asked == [("s", "p", "o")] and len(got) > 7
     assert [triple for triple, _ in got] == [triple for triple, _ in want]
     assert all(ctx is want[0][1] for _, ctx in got)
+
+
+class _WatchedColumn(bytearray):
+    """A code column a weak reference can watch (``U64Column`` takes none): a
+    native column's codes as bytes, its length counted in codes. Like a
+    native column, it lives as long as a memoryview of it does."""
+
+    def __len__(self) -> int:
+        return super().__len__() // 8
+
+
+def _watched(cols, refs: list) -> tuple:
+    """``cols`` as watched columns, each watched by a weak reference in
+    ``refs``."""
+    watched = tuple(_WatchedColumn(memoryview(column)) for column in cols)
+    refs.extend(weakref.ref(column) for column in watched)
+    return watched
+
+
+def test_a_chunked_read_holds_one_chunk_of_codes_at_a_time(indexed_quads, monkeypatch):
+    """A pattern read in chunks keeps no column it is done with: when it asks
+    for the chunks, no column of its full first match is alive, and at each
+    later pull, no column of the chunk before."""
+    store = VortexRdflibStore(indexed_quads["no-index"])
+    native = store._store()
+    first: list[weakref.ref] = []
+    alive_at_chunk_call: list[int] = []
+    alive_at_pull: list[int] = []
+
+    class _Pulls:
+        """The chunks: each pull first counts the previous chunk's live columns."""
+
+        def __init__(self, chunks):
+            self._chunks = chunks
+            self._previous: list[weakref.ref] = []
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            alive_at_pull.append(sum(ref() is not None for ref in self._previous))
+            self._previous = []
+            return _watched(next(self._chunks), self._previous)
+
+    class _WatchedColumns:
+        def match_codes(self, *args, **kwargs):
+            return _watched(native.match_codes(*args, **kwargs), first)
+
+        def match_code_chunks(self, *args, **kwargs):
+            alive_at_chunk_call.append(sum(ref() is not None for ref in first))
+            return _Pulls(native.match_code_chunks(*args, **kwargs))
+
+        def __getattr__(self, name):
+            return getattr(native, name)
+
+    monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", 7)
+    store._native = _WatchedColumns()  # ty: ignore[invalid-assignment]
+    assert len(list(store.triples((None, None, None)))) == 300
+    assert len(first) == 4 and alive_at_chunk_call == [0]
+    # A count per pull, the last made by the pull that found no chunk left.
+    assert len(alive_at_pull) > 2 and set(alive_at_pull) == {0}
