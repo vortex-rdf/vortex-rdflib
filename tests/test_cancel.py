@@ -475,3 +475,57 @@ def test_a_point_read_checks_the_token_itself(graph, pattern, in_default_graph, 
         with pytest.raises(Cancelled):
             list(store.triples(pattern, context))
     assert spy.calls == [(call, {})]
+
+
+@pytest.fixture(scope="module")
+def default_vortex(tmp_path_factory):
+    """This module's statements in the Default layout: with no dictionary the
+    store reads through ``match_columns``, which takes no token."""
+    d = tmp_path_factory.mktemp("cancel-default")
+    nt = d / "cancel.nt"
+    nt.write_text(_statements(), encoding="utf-8")
+    out = d / "cancel-default.vortex"
+    serialize_rdf(str(nt), str(out), layout="default")
+    return out
+
+
+@pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda store: list(store.triples((None, P, None))),
+        lambda store: list(store.triples((S0, P, X0))),
+        lambda store: list(store.contexts((None, P, None))),
+    ],
+    ids=["pattern", "ground", "contexts"],
+)
+def test_the_string_fallback_checks_the_token(default_vortex, in_memory, read):
+    """A store without the code path reads through ``match_columns``, which
+    takes no token, so each such read checks it before the call: inside
+    ``cancel_scope`` a read goes through, and once the token is cancelled
+    the next raises ``Cancelled`` before any native call."""
+    graph = Graph(store=VortexRdflibStore(str(default_vortex), in_memory=in_memory))
+    spy = _spy(graph)
+    token = CancelToken()
+    with cancel_scope(token):
+        assert read(graph.store)
+        token.cancel()
+        with pytest.raises(Cancelled):
+            read(graph.store)
+    assert spy.calls == [("match_columns", {})]
+
+
+@pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
+def test_a_query_over_the_string_fallback_stops_on_cancel(default_vortex, in_memory):
+    """Without the code path rdflib evaluates the query, reading the second
+    pattern once per row of the first through ``triples()``. Cancelled once
+    the first row is read, the query stops at the next read."""
+    graph = Graph(store=VortexRdflibStore(str(default_vortex), in_memory=in_memory))
+    register_sparql_pushdown()
+    token = CancelToken()
+    with cancel_scope(token):
+        rows = iter(graph.query(_PREFIX + "SELECT ?s ?x WHERE { ?s :p ?o . ?x :p ?o }"))
+        assert next(rows)
+        token.cancel()
+        with pytest.raises(Cancelled):
+            next(rows)

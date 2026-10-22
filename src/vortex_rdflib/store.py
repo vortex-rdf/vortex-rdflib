@@ -323,7 +323,8 @@ class VortexRdflibStore(Store):
         once, when the iteration starts, and its one native match or count
         races it where the token can stop that call — a scan of a file-backed
         store — and checks it before the call otherwise
-        (``pushdown._cancel_kw_for``).
+        (``pushdown._cancel_kw_for``); a read through the string fallback,
+        which takes no token, checks it before the call.
         """
         if self.path is None:
             return
@@ -392,6 +393,7 @@ class VortexRdflibStore(Store):
                     for code in memoryview(cols[3]).cast("Q").tolist():
                         yield triple, self._context_of_code(code, term_dict, by_code, by_spelling)
                     return
+            _check_cancelled()
             *_, graphs = store.match_columns(s_n3, p_n3, o_n3, None)
             by_spelling = self._contexts_by_spelling
             for g_raw in graphs:
@@ -464,7 +466,9 @@ class VortexRdflibStore(Store):
         # String fallback (non-dictionary layouts, code path disabled):
         # match_columns shares one Python string object across repeats of a
         # term, so memoizing the parse by string turns per-row term
-        # construction into per-distinct-term construction.
+        # construction into per-distinct-term construction. It takes no
+        # cancel token, so the token is checked before it.
+        _check_cancelled()
         subjects, predicates, objects, graphs = store.match_columns(s_n3, p_n3, o_n3, g_n3)
         if g_n3 is not None and subjects:
             fixed = self._context_tuple(g_n3, by_spelling)
@@ -521,6 +525,7 @@ class VortexRdflibStore(Store):
                     self._context_of_code(code, term_dict, by_code, by_spelling)[0]
                     for code in codes
                 ]
+        _check_cancelled()
         *_spo, graphs = store.match_columns(s_n3, p_n3, o_n3, None)
         return [self._context_tuple(name)[0] for name in dict.fromkeys(graphs)]
 
