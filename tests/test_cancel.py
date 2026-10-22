@@ -421,13 +421,11 @@ def test_probes_stop_on_cancel(mem_graph):
 
 @pytest.mark.parametrize("chunk_rows", [None, 7], ids=["one-match", "chunked"])
 def test_triples_carries_the_token(graph, monkeypatch, chunk_rows):
-    """Inside ``cancel_scope`` the native call ``triples()`` makes for a
-    pattern that scans a file-backed store carries the token, and on an
-    in-memory store takes none. A pattern of more than
-    ``_TRIPLES_CHUNK_ROWS`` rows is read in chunks, every pull of which
-    waits for the native layer: the chunk call carries the token on any
-    store, and the count that finds the pattern carries it where the
-    one-shot match would."""
+    """Inside ``cancel_scope`` the match ``triples()`` makes for a pattern
+    that scans a file-backed store carries the token, and on an in-memory
+    store takes none; it asks for one row more than ``_TRIPLES_CHUNK_ROWS``.
+    A pattern of more rows is read in chunks, every pull of which waits for
+    the native layer: the chunk call carries the token on any store."""
     if chunk_rows is not None:
         monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", chunk_rows)
     spy = _spy(graph)
@@ -435,14 +433,12 @@ def test_triples_carries_the_token(graph, monkeypatch, chunk_rows):
     with cancel_scope(token):
         assert list(graph.store.triples((None, URIRef(f"{EX}p"), None)))
     raced = {} if graph.store.in_memory else {"cancel": token}
+    first = ("match_codes", {"limit": store_mod._TRIPLES_CHUNK_ROWS + 1, **raced})
     if chunk_rows is None:
-        assert spy.calls == [("match_codes", raced)]
+        assert spy.calls == [first]
     else:
         chunks = {"columns": ("s", "p", "o", "g"), "batch_rows": chunk_rows, "cancel": token}
-        assert spy.calls == [
-            ("count_quads", {"limit": chunk_rows + 1, **raced}),
-            ("match_code_chunks", chunks),
-        ]
+        assert spy.calls == [first, ("match_code_chunks", chunks)]
 
 
 def test_a_cancel_stops_a_chunked_triples_read_at_its_next_pull(graph, monkeypatch):
@@ -465,7 +461,7 @@ def test_a_cancel_stops_a_chunked_triples_read_at_its_next_pull(graph, monkeypat
 def test_an_in_memory_one_shot_call_checks_the_token_itself(mem_graph):
     """An in-memory one-shot call finishes without waiting, so it does not
     race the token, whatever its shape: inside ``cancel_scope`` the match
-    ``triples()`` makes for a pattern that scans takes no keyword, and once
+    ``triples()`` makes for a pattern that scans takes no token, and once
     the token is cancelled it raises ``Cancelled`` before any native call."""
     spy = _spy(mem_graph)
     token = CancelToken()
@@ -475,7 +471,7 @@ def test_an_in_memory_one_shot_call_checks_the_token_itself(mem_graph):
         token.cancel()
         with pytest.raises(Cancelled):
             list(mem_graph.store.triples(scan))
-    assert spy.calls == [("match_codes", {})]
+    assert spy.calls == [("match_codes", {"limit": store_mod._TRIPLES_CHUNK_ROWS + 1})]
 
 
 S0, P, X0 = URIRef(f"{EX}s0"), URIRef(f"{EX}p"), URIRef(f"{EX}x0")
@@ -492,7 +488,7 @@ S0, P, X0 = URIRef(f"{EX}s0"), URIRef(f"{EX}p"), URIRef(f"{EX}x0")
 )
 def test_a_point_read_checks_the_token_itself(graph, pattern, in_default_graph, call):
     """A point lookup of ``triples()`` does not race the token: inside
-    ``cancel_scope`` its native call takes no keyword, and once the token is
+    ``cancel_scope`` its native call takes no token, and once the token is
     cancelled it raises ``Cancelled`` before any native call."""
     store = graph.store
     context = Graph(store=store, identifier=DATASET_DEFAULT_GRAPH_ID) if in_default_graph else None
@@ -503,7 +499,10 @@ def test_a_point_read_checks_the_token_itself(graph, pattern, in_default_graph, 
         token.cancel()
         with pytest.raises(Cancelled):
             list(store.triples(pattern, context))
-    assert spy.calls == [(call, {})]
+    # A pattern with a free position is matched asking for one row more than
+    # one match of ``triples()`` holds; a ground one is not.
+    limited = {"limit": store_mod._TRIPLES_CHUNK_ROWS + 1} if None in pattern else {}
+    assert spy.calls == [(call, limited)]
 
 
 @pytest.fixture(scope="module")

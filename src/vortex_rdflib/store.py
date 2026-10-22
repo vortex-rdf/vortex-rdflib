@@ -35,9 +35,9 @@ _UNRESOLVED = object()
 #: selects those rows — ``None`` being the wildcard over every graph.
 DEFAULT_GRAPH = ""
 
-#: The most rows :meth:`VortexRdflibStore.triples` holds from one native
-#: read: a pattern that matches more is read through ``match_code_chunks``
-#: in chunks of at most this many rows, so a scan of a large store holds one
+#: The most rows :meth:`VortexRdflibStore.triples` reads as one match: a
+#: pattern that matches more is read through ``match_code_chunks`` in
+#: chunks of at most this many rows, so a scan of a large store holds one
 #: chunk of codes, not its whole match.
 _TRIPLES_CHUNK_ROWS = 65_536
 
@@ -127,12 +127,10 @@ class VortexRdflibStore(Store):
         # Everything a query learns about terms lives in its scope
         # (query_scope.QueryTerms, through `_terms()`); the store keeps
         # fixed-size structure only: the kind ranges, the default graph's
-        # code, the indexes, the number of quads and one context per graph of
-        # the file.
+        # code, the indexes and one context per graph of the file.
         self._kind_bounds: tuple[int, int, int] | None = None
         self._ranges: dict | None = None
         self._indexes: tuple = ()
-        self._size = 0
         self._default_code: int | None | object = _UNRESOLVED
         # One rdflib graph object per graph of the file, so a match yields
         # contexts without allocating one per row; keyed both ways a match
@@ -175,10 +173,6 @@ class VortexRdflibStore(Store):
         # each distinct code is decoded to an rdflib term once per query. None
         # on other layouts -> string fallback path.
         self._dict = self._native.term_dict() if self._use_codes else None
-        # The quads a store with term codes holds, known without a read: no
-        # pattern of one of at most _TRIPLES_CHUNK_ROWS is read in chunks
-        # (triples()). A store without codes never reads in chunks.
-        self._size = 0 if self._dict is None else len(self._native)
         self._kind_bounds = None
         self._ranges = None
         self._default_code = _UNRESOLVED
@@ -193,7 +187,6 @@ class VortexRdflibStore(Store):
         self._kind_bounds = None
         self._ranges = None
         self._indexes = ()
-        self._size = 0
         self._default_code = _UNRESOLVED
         self._contexts_by_spelling = {}
         self._contexts_by_code = {}
@@ -332,7 +325,7 @@ class VortexRdflibStore(Store):
         hold yields nothing. The store streams the quads it holds rather than
         building the RDF merge of the union, which would mean a set the size
         of the result. A pattern of more than ``_TRIPLES_CHUNK_ROWS`` rows is
-        read from the native layer in chunks of that many rows
+        read from the native layer in chunks of at most that many rows
         (:meth:`_code_matches`), so a scan of a large store holds one chunk of
         codes at a time. A match or chunk is decoded a slice at a time, the
         first of 64 rows, so a consumer that stops early decodes only the
@@ -489,6 +482,8 @@ class VortexRdflibStore(Store):
                             for row in zip(s_codes, p_codes, o_codes, strict=True):
                                 yield (cache[row[0]], cache[row[1]], cache[row[2]]), shared
                         start, size = stop, min(size * 4, _CHUNK_MAX)
+                    # Let go of this chunk's columns before the next pull.
+                    del cols, views, part
             finally:
                 # Dropping a chunk iterator ends its native scan (a bare
                 # CodeChunks has no close()): once the rows run out, the
@@ -523,30 +518,28 @@ class VortexRdflibStore(Store):
         self, store: VortexRdfStore, pattern: tuple, cancel: dict, one_shot: dict
     ) -> Iterable[tuple] | None:
         """The code columns :meth:`triples` reads for the quad pattern
-        ``pattern``, as matches to read in turn: ``match_codes``'s one match,
-        or, for a pattern of more than ``_TRIPLES_CHUNK_ROWS`` rows,
-        ``match_code_chunks``'s chunks of at most that many rows, of the columns
-        ``s``, ``p``, ``o`` and, under the union, ``g``. ``None`` when the
-        store has no term codes.
+        ``pattern``, as matches to read in turn: ``match_codes``'s one match of
+        a pattern of at most ``_TRIPLES_CHUNK_ROWS`` rows, or, for a pattern of
+        more, ``match_code_chunks``'s chunks of at most that many rows, of the
+        columns ``s``, ``p``, ``o`` and, under the union, ``g``. ``None`` when
+        the store has no term codes.
 
-        A store of at most ``_TRIPLES_CHUNK_ROWS`` rows holds no larger
-        pattern; on a larger one a count capped one row above tells. The
-        count and the one match race the query's token where it can stop
-        them, as ``pushdown._cancel_kw_for`` decides (``one_shot`` for the
-        match); the chunk call is given ``cancel`` as it is, since every pull
-        of a chunk waits for the native layer, in memory as on file.
+        The match is asked for one row more than ``_TRIPLES_CHUNK_ROWS``: one
+        that holds at most that many is the whole pattern, and a full one is
+        dropped before the chunks are read. It races the query's token where
+        the token can stop it (``one_shot``, ``pushdown._cancel_kw_for``); the
+        chunk call is given ``cancel`` as it is, since every pull of a chunk
+        waits for the native layer, in memory as on file.
         """
         chunk_rows = _TRIPLES_CHUNK_ROWS
-        if self._size > chunk_rows:
-            limit = chunk_rows + 1
-            capped = _cancel_kw_for(cancel, self, pattern, limit=limit)
-            if store.count_quads(*pattern, limit=limit, **capped) > chunk_rows:
-                columns = ("s", "p", "o", "g") if pattern[3] is None else ("s", "p", "o")
-                return store.match_code_chunks(
-                    *pattern, columns=columns, batch_rows=chunk_rows, **cancel
-                )
-        cols = store.match_codes(*pattern, **one_shot)
-        return None if cols is None else (cols,)
+        cols = store.match_codes(*pattern, limit=chunk_rows + 1, **one_shot)
+        if cols is None:
+            return None
+        if len(cols[0]) <= chunk_rows:
+            return (cols,)
+        del cols
+        columns = ("s", "p", "o", "g") if pattern[3] is None else ("s", "p", "o")
+        return store.match_code_chunks(*pattern, columns=columns, batch_rows=chunk_rows, **cancel)
 
     def contexts(self, triple=None):
         """RDFLib Store API: the graphs holding ``triple``, or every graph.

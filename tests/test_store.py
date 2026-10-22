@@ -1,8 +1,10 @@
+import itertools
 import logging
 import random
 import re
 import subprocess
 import sys
+import weakref
 from collections import Counter
 
 import pytest
@@ -717,7 +719,7 @@ def test_a_suspended_triples_call_stays_on_its_file(tmp_path, monkeypatch, in_me
         assert spy.names() == ["match_codes"]
     else:
         # Chunks were pulled after the close() and after the open().
-        assert spy.names() == ["count_quads", "match_code_chunks"]
+        assert spy.names() == ["match_codes", "match_code_chunks"]
         assert pulls[0] < pulls[1] < pulls[2]
     hosts = {str(triple[0]).split("/")[2] for triple, _ in store.triples((None, None, None))}
     graphs = {str(ctx[0].identifier) for _, ctx in store.triples((None, None, None))}
@@ -742,18 +744,25 @@ def test_triples_rejects_match_columns_of_unequal_lengths(
         cols[longer] = U64Column([*codes, codes[0]])
         return tuple(cols)
 
+    feeds: list[weakref.ref] = []
+
     class _OneCodeLonger:
         def match_codes(self, *args, **kwargs):
-            assert chunk_rows is None, "a pattern read in chunks makes no one-shot match"
             matched = native.match_codes(*args, **kwargs)
             assert matched is not None
+            if chunk_rows is not None:
+                # A pattern read in chunks: its first match is full, and dropped.
+                assert len(matched[0]) == kwargs["limit"] == chunk_rows + 1
+                return matched
             return one_code_longer(matched)
 
         def match_code_chunks(self, *args, **kwargs):
             chunks = native.match_code_chunks(*args, **kwargs)
             assert chunks is not None
             # The second chunk is the long one: every chunk is checked.
-            return (one_code_longer(cols) if i == 1 else cols for i, cols in enumerate(chunks))
+            feed = (one_code_longer(cols) if i == 1 else cols for i, cols in enumerate(chunks))
+            feeds.append(weakref.ref(feed))
+            return feed
 
         def __getattr__(self, name):
             return getattr(native, name)
@@ -761,8 +770,12 @@ def test_triples_rejects_match_columns_of_unequal_lengths(
     if chunk_rows is not None:
         monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", chunk_rows)
     store._native = _OneCodeLonger()  # ty: ignore[invalid-assignment]
-    with pytest.raises(ValueError, match="unequal lengths"):
+    with pytest.raises(ValueError, match="unequal lengths") as raised:
         list(store.triples((None, P0, None)))
+    if chunk_rows is not None:
+        # The failed read let go of its chunk iterator, though the traceback
+        # still holds the read's frame.
+        assert raised.tb is not None and [feed() for feed in feeds] == [None]
 
 
 @pytest.mark.parametrize("chunk_rows", [None, 1_000], ids=["one-match", "chunked"])
@@ -804,7 +817,7 @@ def test_an_early_stop_decodes_a_chunk_not_the_match(chunked_quads, monkeypatch,
         assert spy.names() == ["match_codes"] * 5
     else:
         # Three early stops, the whole match, then a read dropped after a row.
-        assert spy.names() == ["count_quads", "match_code_chunks"] * 5
+        assert spy.names() == ["match_codes", "match_code_chunks"] * 5
         assert spy.pulls[:3] == [1, 1, 1] and spy.pulls[3] >= 3 and spy.pulls[4] == 1
         assert [feed() for feed in spy.feeds[3:]] == [None, None]
 
@@ -846,12 +859,12 @@ def indexed_quads(tmp_path_factory) -> dict[str, str]:
 @pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
 @pytest.mark.parametrize("index", list(_INDEXES))
 def test_a_large_pattern_reads_in_chunks(indexed_quads, monkeypatch, index, in_memory):
-    """A pattern of more than ``_TRIPLES_CHUNK_ROWS`` rows, which a count
-    capped one row above finds, is read through ``match_code_chunks`` that
-    many rows a chunk: it yields the triples one ``match_codes`` match
-    yields, each graph's one context tuple across the chunks, under the
-    union and in one named graph, and each chunk iterator is dropped once
-    read."""
+    """A pattern of more than ``_TRIPLES_CHUNK_ROWS`` rows, whose first
+    match, asked for one row more, comes back full, is read through
+    ``match_code_chunks`` that many rows a chunk: it yields the triples one
+    ``match_codes`` match yields, each graph's one context tuple across the
+    chunks, under the union and in one named graph, and each chunk iterator
+    is dropped once read."""
     store = VortexRdflibStore(indexed_quads[index], in_memory=in_memory)
     reads = [
         (context, pattern)
@@ -874,32 +887,51 @@ def test_a_large_pattern_reads_in_chunks(indexed_quads, monkeypatch, index, in_m
         assert read(pattern, context) == want, (context, pattern)
         columns = ("s", "p", "o", "g") if context is None else ("s", "p", "o")
         assert spy.calls[seen:] == [
-            ("count_quads", {"limit": 8}),
+            ("match_codes", {"limit": 8}),
             ("match_code_chunks", {"columns": columns, "batch_rows": 7}),
         ], (context, pattern)
     assert len(spy.feeds) == len(reads) and all(feed() is None for feed in spy.feeds)
 
 
-@pytest.mark.parametrize(
-    ("chunk_rows", "pattern", "counted"),
-    [
-        (None, (None, None, None), False),
-        (300, (None, None, None), False),
-        (150, (None, P0, None), True),
-    ],
-    ids=["store-below-the-default", "store-of-that-many-rows", "pattern-of-that-many-rows"],
-)
-def test_a_small_pattern_keeps_one_match(indexed_quads, monkeypatch, chunk_rows, pattern, counted):
-    """A pattern of at most ``_TRIPLES_CHUNK_ROWS`` rows is one
-    ``match_codes`` match and no chunks: with no count on a store of at most
-    that many rows, which holds no larger pattern, and after the count,
-    capped one row above, on a larger store."""
+@pytest.mark.parametrize("chunk_rows", [None, 300], ids=["below-the-default", "of-that-many-rows"])
+def test_a_small_pattern_keeps_one_match(indexed_quads, monkeypatch, chunk_rows):
+    """A pattern of at most ``_TRIPLES_CHUNK_ROWS`` rows, exactly that many
+    included, is one ``match_codes`` match, asked for one row more, with no
+    count and no chunks: the 300-row store's full scan, below the default
+    and at a constant of 300."""
     store = VortexRdflibStore(indexed_quads["no-index"])
     if chunk_rows is not None:
         monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", chunk_rows)
     limit = store_mod._TRIPLES_CHUNK_ROWS
-    assert (len(store) > limit) == counted
     spy = _spy(Graph(store=store))
-    assert 0 < len(list(store.triples(pattern))) <= limit
-    count = [("count_quads", {"limit": limit + 1})] if counted else []
-    assert spy.calls == [*count, ("match_codes", {})]
+    assert len(list(store.triples((None, None, None)))) == 300 <= limit
+    assert spy.calls == [("match_codes", {"limit": limit + 1})]
+
+
+def test_a_read_skips_chunks_without_rows(indexed_quads, monkeypatch):
+    """Chunks without rows before the first that has some are skipped: the
+    read still takes the term cache and the named graph's one context tuple
+    at its first row, and yields what the one-match read yields."""
+    store = VortexRdflibStore(indexed_quads["no-index"])
+    context = Graph(store=store, identifier=G2)
+    want = list(store.triples((None, None, None), context))
+    native = store._store()
+    asked: list[tuple] = []
+
+    class _EmptyChunksFirst:
+        def match_code_chunks(self, *args, **kwargs):
+            chunks = native.match_code_chunks(*args, **kwargs)
+            assert chunks is not None
+            asked.append(kwargs["columns"])
+            empty = tuple(U64Column([]) for _ in kwargs["columns"])
+            return itertools.chain([empty, empty], chunks)
+
+        def __getattr__(self, name):
+            return getattr(native, name)
+
+    monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", 7)
+    store._native = _EmptyChunksFirst()  # ty: ignore[invalid-assignment]
+    got = list(store.triples((None, None, None), context))
+    assert asked == [("s", "p", "o")] and len(got) > 7
+    assert [triple for triple, _ in got] == [triple for triple, _ in want]
+    assert all(ctx is want[0][1] for _, ctx in got)
