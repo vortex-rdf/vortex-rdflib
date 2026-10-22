@@ -110,13 +110,13 @@ steps after the block included. A native call the token can stop — a batch,
 a chunked match, a one-shot call that scans a file-backed store — is given
 it (``cancel=``) and races it; the other one-shot calls — a point lookup, a
 call capped at one row, any call on an in-memory store — check it as they
-are made, as do the loops between calls: the pieces of a streamed join, the
-rows rdflib finishes, the probes of a join, and the slices and decode chunks
-a result's rows are read in. ``token.cancel()``, from any thread, stops the
-query at the next of these with ``vortex_rdf.Cancelled``, which reaches the
-caller and is never a hand-back; a result whose rows are decoded as they are
-read stops within one decode chunk. A query started outside a block has no
-token, and without one no native call gains a keyword.
+are made (a join's probes are calls of either kind), as do the loops between
+calls: a streamed join's pieces, the rows rdflib finishes, and the slices
+and decode chunks a result's rows are read in. ``token.cancel()``, from any
+thread, stops the query at the next of these with ``vortex_rdf.Cancelled``,
+which reaches the caller and is never a hand-back; a result whose rows are
+decoded as they are read stops within one decode chunk. A query started
+outside a block has no token, and without one no native call gains a keyword.
 
 rdflib only catches ``NotImplementedError`` at hook-call time, so every
 capability check and every native call that can decline happens before a
@@ -260,12 +260,12 @@ def cancel_scope(token: CancelToken) -> Iterator[CancelToken]:
     chunked match, a one-shot call that scans a file-backed store — is given
     it (``cancel=``) and races it; every other one-shot call — a point
     lookup, a call capped at one row, any call on an in-memory store, which
-    finishes without waiting — checks it as it is made, as do the loops
-    between calls: a streamed join's pieces, the rows rdflib finishes, the
-    per-row probes, and the slices and decode chunks of the rows it yields.
-    So ``token.cancel()``, from any thread, stops the query with
-    ``vortex_rdf.Cancelled`` at its next call, piece, finished row, probe,
-    slice or decode chunk, while it is planned or while its rows are read;
+    finishes without waiting — checks it as it is made (a join's per-row
+    probes are calls of either kind), as do the loops between calls: a
+    streamed join's pieces, the rows rdflib finishes, and the slices and decode
+    chunks of the rows it yields. So ``token.cancel()``, from any thread, stops
+    the query with ``vortex_rdf.Cancelled`` at its next call, piece, finished
+    row, slice or decode chunk, while it is planned or while its rows are read;
     the rows already decoded, at most one decode chunk of 4,096, are
     delivered first. A query keeps the token it started with until its rows
     end, the rows read after the block included; a query started outside a

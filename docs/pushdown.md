@@ -79,9 +79,10 @@ chunked match, a one-shot call that scans a file-backed store) is given it
 ([`_cancel_kw_for`](../src/vortex_rdflib/pushdown.py#L299)). The one-shot calls
 that finish without waiting (a point lookup, a call capped at one row, any call
 on an in-memory store) check it as they are made
-([`_check_cancelled`](../src/vortex_rdflib/pushdown.py#L289)), as do the loops
-between calls: the pieces of a streamed join, the rows rdflib finishes, the
-per-row probes, and the slices
+([`_check_cancelled`](../src/vortex_rdflib/pushdown.py#L289)); a join's per-row
+probes are calls of one kind or the other, so each is a check point of its
+own. The loops between calls check it too: the pieces of a streamed join, the
+rows rdflib finishes, and the slices
 ([`_column_rows`](../src/vortex_rdflib/pushdown.py#L4493)) and decode chunks
 ([`_yield_rows`](../src/vortex_rdflib/pushdown.py#L4582)) the rows of a result
 are read in. `token.cancel()`, from any thread, then raises

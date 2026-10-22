@@ -100,10 +100,11 @@ at the next point that checks it:
 - Every other one-shot call, which checks the token before it starts and then
   runs to completion: an in-memory call, a point lookup, a call capped at one
   row, and the string fallback (a layout other than `"dictionary"`, or
-  `VORTEX_RDF_DISABLE_CODE_PATH=1`).
+  `VORTEX_RDF_DISABLE_CODE_PATH=1`). The probes a join sends per row are calls
+  of one kind or the other, so each probe is a check point of its own.
 - Between calls: the pieces of a streamed join, the rows rdflib finishes when a
-  join over the pair budget is left to it, the probes a join sends per row, and
-  the slices and decode chunks the rows of a result are read in.
+  join over the pair budget is left to it, and the slices and decode chunks the
+  rows of a result are read in.
 
 A cancel takes effect at the next of these points, so rows that are already
 fetched are delivered until then: a result whose rows are decoded as they are
