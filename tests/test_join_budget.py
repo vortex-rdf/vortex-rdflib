@@ -13,6 +13,7 @@ store matches it once instead, narrowed to the relation's codes (a
 keep-scan), and joins that match as a hash step does, under the same
 budget."""
 
+import builtins
 import os
 import subprocess
 import sys
@@ -452,8 +453,9 @@ def test_a_probe_step_over_budget_discards_its_rows(file_graph, monkeypatch, cap
     point lookups, which a file-backed store batches. A budget of 16 lets the
     probe step make 16 // 4 = 4 rows, which the fifth probe passes, mid-way
     through the second batch. The step stops there: its batch is released
-    with its last probe never pulled and the rows it made are dropped. It is
-    planned again as a keep-scan, whose rows are the answer, none twice."""
+    with its last probe never pulled, the third batch is never sent, and the
+    rows it made are dropped. It is planned again as a keep-scan, whose rows
+    are the answer, none twice; its statistics count the six probes sent."""
     monkeypatch.setattr(pd, "_PAIR_BUDGET", 16)
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
     monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
@@ -497,9 +499,11 @@ def test_a_probe_step_over_budget_discards_its_rows(file_graph, monkeypatch, cap
         [step] = _fields(events, "bgp_join_step_complete")
         assert (step["strategy"], step["native_probe_call_count"], step["output_rows"]) == (
             "keep_scan",
-            9,
+            6,
             9,
         )
+        [done] = _fields(events, "bgp_complete")
+        assert done["native_probe_call_count"] == 6
 
 
 class _ShortBatches:
@@ -1364,6 +1368,41 @@ def test_a_put_back_keep_scan_drops_its_keep(graph, planned):
     assert pat.get("nkeep") is planned
     assert planned == whole
     assert "cols" not in pat and memo == {}
+
+
+def test_a_memo_key_holds_its_keep_column():
+    """A memo key names a code-column keep by the column itself, compared by
+    identity: a column of the same codes is another key, and the key holds
+    its column, so no later column can take its place while the memo keeps
+    the entry."""
+    n3 = [None, f"<{EX}q>", None, None]
+    keep = U64Column([1, 2])
+    key = pd._pattern_key({"n3": n3, "nkeep": {2: keep}})
+    assert key == pd._pattern_key({"n3": n3, "nkeep": {2: keep}})
+    assert key != pd._pattern_key({"n3": n3, "nkeep": {2: U64Column([1, 2])}})
+    [(position, (kind, held))] = key[-1]
+    assert (position, kind) == (2, "codes")
+    assert held is keep
+
+
+def test_a_keep_column_at_a_reused_address_is_no_memo_hit(graph, monkeypatch):
+    """Two patterns of one quad pattern, narrowed at their object by
+    different FILTER keeps, are matched apart even when every code column
+    has one address: the module's ``id`` patched to the worst reuse a freed
+    column's address could see. The memo does not name a keep by where it
+    lives."""
+
+    def one_address(obj):
+        return 0 if isinstance(obj, U64Column) else builtins.id(obj)
+
+    monkeypatch.setattr(pd, "id", one_address, raising=False)
+    sparql = (
+        _PREFIX + "SELECT ?a ?b ?c ?d WHERE { ?a :q ?b . ?c :q ?d "
+        "FILTER(?b IN (:y0-0, :y1-0) && ?d IN (:y2-1)) }"
+    )
+    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == 2
 
 
 @pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])

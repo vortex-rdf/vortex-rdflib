@@ -2336,9 +2336,10 @@ _PAIR_BUDGET = _pair_budget()
 class _OverBudget(Exception):
     """A join step of a BGP over :data:`_PAIR_BUDGET`, raised before the step
     is built. ``pairs`` is the step's pair count, ``None`` for a probe step
-    or a keep-scan, which stop on their rows. ``calls`` and ``native_ns`` are
-    the native matches the step made before it stopped and their time when
-    tracing, for its statistics. :func:`_join_incremental_bgp` catches it."""
+    or a keep-scan, which stop on their rows. ``calls`` are the native calls
+    the step made before it stopped — a probe step's probes, a keep-scan's
+    match — and ``native_ns`` the keep-scan's time when tracing, for the
+    step's statistics. :func:`_join_incremental_bgp` catches it."""
 
     def __init__(self, pairs: int | None, calls: int = 0, native_ns: int = 0):
         super().__init__(pairs)
@@ -2533,13 +2534,15 @@ def _pattern_static_rank(pat) -> tuple:
 def _pattern_key(pat) -> tuple:
     """What a pattern's native count and match are memoized by: the resolved
     quad pattern and its native keep (two triples resolving to the same quad
-    share both only when they are narrowed alike)."""
+    share both only when they are narrowed alike). A code column stands in
+    the key itself, compared by identity: the key holds it, so no later
+    column can take its place while the memo keeps the entry."""
     nkeep = pat.get("nkeep")
     if not nkeep:
         return tuple(pat["n3"])
     narrowing = tuple(
         sorted(
-            (position, ("range", *keep) if isinstance(keep, tuple) else ("codes", id(keep)))
+            (position, ("range", *keep) if isinstance(keep, tuple) else ("codes", keep))
             for position, keep in nkeep.items()
         )
     )
@@ -2781,6 +2784,20 @@ def _probe_matches(native, probes, batched, lookahead: int) -> Iterator:
         close = getattr(answers, "close", None)
         if close is not None:
             close()
+
+
+def _batch_probes_sent(store, probes, pulled: int, count: bool) -> int:
+    """How many of one batch's ``(n3, narrowing)`` probes have reached the
+    native layer once ``pulled`` of their answers are taken, as
+    :func:`_run_probes` sends them: every count, all made at once; of
+    matches, the batched ones (:func:`_batched_probes`), sent together at the
+    first pull, and the others pulled so far."""
+    if count:
+        return len(probes)
+    if not pulled:
+        return 0
+    batched = set(_batched_probes(store, [n3 for n3, _ in probes]))
+    return len(batched) + sum(1 for k in range(pulled) if k not in batched)
 
 
 def _match_resolved_pattern(store, pat, memo=None, limit=None) -> tuple[int, int]:
@@ -3037,8 +3054,9 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
                         pat,
                         max_rows=_PAIR_BUDGET // 4,
                     )
-                except _OverBudget:
-                    probed = None
+                except _OverBudget as over:
+                    # Only the probes sent before the tally passed count.
+                    probed, probe_calls = None, over.calls
                 probe_ns = time.perf_counter_ns() - then if then else 0
                 stats["probe_calls"] += probe_calls
                 stats["native_ns"] += probe_ns
@@ -3888,12 +3906,12 @@ def _put_back(
     so a later step takes it as planned. It is unread again, with its match
     left in the memo, and its native keep is ``nkeep``, the keep it was
     planned with: a keep-scan's narrower keep (:func:`_keep_scan`) goes, and
-    the match memoized under it leaves the memo with it, since a memo key
-    names a code column by its identity, which a later keep may take once
-    this one is gone. Its deferred restrictions — ``deferred``, which reading
-    it consumed — are back for the step that reads it, less the
-    per-variable conjuncts this step specialized onto it from tuple
-    conjuncts (``specialized``, :func:`_specialize_tuple_conjuncts`). Those
+    the match memoized under it leaves the memo with it — no step reads it
+    again, and it would hold the match's columns until the plan ends. Its
+    deferred restrictions — ``deferred``, which reading it consumed — are
+    back for the step that reads it, less the per-variable conjuncts this
+    step specialized onto it from tuple conjuncts (``specialized``,
+    :func:`_specialize_tuple_conjuncts`). Those
     tuple conjuncts are no longer applied: they are pending again among
     ``tuples``, in the FILTER's order, for the next step whose pattern binds
     their variable, or for the FILTER above. Returns the pending tuple
@@ -4054,7 +4072,7 @@ def _probe_join(
     reaches them and released when the batch ends, however it ends. Once a
     probe's rows take the join past ``max_rows``, it drops the rows it made
     and the batch it is pulling, which aborts the probes still in flight,
-    and raises :class:`_OverBudget`.
+    and raises :class:`_OverBudget` with the probes it sent.
     """
     bound = [(schema.index(v), pos) for v, pos in pat["varpos"].items() if v in schema]
     free = {v: pos for v, pos in pat["varpos"].items() if v not in schema}
@@ -4117,7 +4135,10 @@ def _probe_join(
                     out.append(row + pad)
                 if max_rows is not None and len(out) > max_rows:
                     out.clear()
-                    raise _OverBudget(None)
+                    sent = sum(n3 is not None for n3 in patterns[:start])
+                    pulled = sum(n3 is not None for n3 in patterns[start : i + 1])
+                    sent += _batch_probes_sent(store, probes, pulled, count=not free)
+                    raise _OverBudget(None, sent)
         finally:
             close = getattr(answers, "close", None)
             if close is not None:
