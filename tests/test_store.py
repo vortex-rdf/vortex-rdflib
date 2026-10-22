@@ -3,6 +3,7 @@ import random
 import re
 import subprocess
 import sys
+from collections import Counter
 
 import pytest
 import rdflib
@@ -13,8 +14,10 @@ from rdflib.term import Node
 from vortex_rdf import U64Column, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
+import vortex_rdflib.store as store_mod
 import vortex_rdflib.terms as terms_mod
 from conftest import GRAPH_1, GRAPH_2, LAYOUTS
+from test_native_primitives import _spy
 from test_pushdown import _counting_term_dict, both_ways
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
 from vortex_rdflib.terms import escape, parse_spelling
@@ -661,7 +664,8 @@ def test_triples_yield_the_rows_and_contexts_of_the_match(chunked_quads, monkeyp
 def _quads_file(tmp_path, host: str) -> str:
     """300 subjects of ``host``, two rows each: the first 50 in graph 1, the
     next 200 in graphs 2 and 3, the last 50 in graph 4 — so a full scan
-    meets graphs 2 and 3 in its second chunk and graph 4 in its third."""
+    meets graphs 2 and 3 in its second decode slice and graph 4 in its
+    third."""
 
     def graph(i: int) -> str:
         return f"<http://{host}/g/{1 if i < 50 else 4 if i >= 250 else 2 + i % 2}>"
@@ -680,12 +684,14 @@ def _quads_file(tmp_path, host: str) -> str:
     return str(out)
 
 
+@pytest.mark.parametrize("chunk_rows", [None, 7], ids=["one-match", "chunked"])
 @pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
-def test_a_suspended_triples_call_stays_on_its_file(tmp_path, in_memory):
-    """triples() read part-way keeps the dictionary and graph contexts it
-    started with: the rows read after ``store.close()``, and after
-    ``store.open()`` of another file, still come from the first file, in
-    its graphs; the second file then reads as itself."""
+def test_a_suspended_triples_call_stays_on_its_file(tmp_path, monkeypatch, in_memory, chunk_rows):
+    """triples() read part-way keeps the dictionary, graph contexts and chunk
+    iterator it started with: the rows read after ``store.close()``, and
+    after ``store.open()`` of another file, still come from the first file,
+    in its graphs — a pattern read in chunks pulls them from the first file
+    too; the second file then reads as itself."""
     first = _quads_file(tmp_path, "a.example")
     second = _quads_file(tmp_path, "b.example")
     store = VortexRdflibStore(first, in_memory=in_memory)
@@ -694,50 +700,83 @@ def test_a_suspended_triples_call_stays_on_its_file(tmp_path, in_memory):
         return [(triple, ctx[0].identifier) for triple, ctx in rows]
 
     expected = read(store.triples((None, None, None)))
+    if chunk_rows is not None:
+        monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", chunk_rows)
+    spy = _spy(Graph(store=store))
     rows = store.triples((None, None, None))
     got = read([next(rows)])
+    pulls = [sum(spy.pulls)]
     store.close()
-    got += read(next(rows) for _ in range(99))  # into the second chunk
+    got += read(next(rows) for _ in range(99))  # into the second decode slice
+    pulls.append(sum(spy.pulls))
     store.open(second)
-    got += read(rows)  # the third chunk
+    got += read(rows)  # the third decode slice
+    pulls.append(sum(spy.pulls))
     assert got == expected and len({graph for _, graph in got}) == 4
+    if chunk_rows is None:
+        assert spy.names() == ["match_codes"]
+    else:
+        # Chunks were pulled after the close() and after the open().
+        assert spy.names() == ["count_quads", "match_code_chunks"]
+        assert pulls[0] < pulls[1] < pulls[2]
     hosts = {str(triple[0]).split("/")[2] for triple, _ in store.triples((None, None, None))}
     graphs = {str(ctx[0].identifier) for _, ctx in store.triples((None, None, None))}
     assert hosts == {"b.example"} and graphs == {f"http://b.example/g/{i}" for i in range(1, 5)}
 
 
+@pytest.mark.parametrize("chunk_rows", [None, 1_000], ids=["one-match", "chunked"])
 @pytest.mark.parametrize("longer", [0, 1, 2, 3])
-def test_triples_rejects_match_columns_of_unequal_lengths(chunked_quads, longer):
-    """The columns of one native match must be equally long: triples()
-    raises on one that is a code longer, as ``zip(strict=True)`` did,
-    rather than reading every column by the first one's length."""
+def test_triples_rejects_match_columns_of_unequal_lengths(
+    chunked_quads, monkeypatch, longer, chunk_rows
+):
+    """The columns of one native match, and of each chunk of a pattern read
+    in chunks, must be equally long: triples() raises on one that is a code
+    longer, as ``zip(strict=True)`` did, rather than reading every column by
+    the first one's length."""
     store = VortexRdflibStore(str(chunked_quads), in_memory=True)
     native = store._store()
 
+    def one_code_longer(matched) -> tuple:
+        cols = list(matched)
+        codes = memoryview(cols[longer]).cast("Q").tolist()
+        cols[longer] = U64Column([*codes, codes[0]])
+        return tuple(cols)
+
     class _OneCodeLonger:
         def match_codes(self, *args, **kwargs):
+            assert chunk_rows is None, "a pattern read in chunks makes no one-shot match"
             matched = native.match_codes(*args, **kwargs)
             assert matched is not None
-            cols = list(matched)
-            codes = memoryview(cols[longer]).cast("Q").tolist()
-            cols[longer] = U64Column([*codes, codes[0]])
-            return tuple(cols)
+            return one_code_longer(matched)
+
+        def match_code_chunks(self, *args, **kwargs):
+            chunks = native.match_code_chunks(*args, **kwargs)
+            assert chunks is not None
+            # The second chunk is the long one: every chunk is checked.
+            return (one_code_longer(cols) if i == 1 else cols for i, cols in enumerate(chunks))
 
         def __getattr__(self, name):
             return getattr(native, name)
 
+    if chunk_rows is not None:
+        monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", chunk_rows)
     store._native = _OneCodeLonger()  # ty: ignore[invalid-assignment]
     with pytest.raises(ValueError, match="unequal lengths"):
-        next(store.triples((None, P0, None)))
+        list(store.triples((None, P0, None)))
 
 
-def test_an_early_stop_decodes_a_chunk_not_the_match(chunked_quads):
+@pytest.mark.parametrize("chunk_rows", [None, 1_000], ids=["one-match", "chunked"])
+def test_an_early_stop_decodes_a_chunk_not_the_match(chunked_quads, monkeypatch, chunk_rows):
     """rdflib's own evaluator stops after a LIMIT's rows or at an ASK's first
-    row; triples() has decoded the codes of the first chunk, not those of
-    the whole match."""
+    row; triples() has decoded the codes of the first slice, not those of
+    the whole match. A pattern read in chunks has pulled its first chunk
+    only, and a read its consumer drops lets go of its chunk iterator."""
+    if chunk_rows is not None:
+        monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", chunk_rows)
     graph = Graph(store=VortexRdflibStore(str(chunked_quads)))
     list(graph.store.contexts())  # one context per graph: store state, decoded once
     counting = _counting_term_dict(graph)
+    spy = _spy(graph)
     queries = [
         ("SELECT ?s ?o WHERE { ?s <http://ex.org/p0> ?o } LIMIT 3", 3),
         ("SELECT * WHERE { ?s ?p ?o } LIMIT 10", 10),
@@ -758,3 +797,109 @@ def test_an_early_stop_decodes_a_chunk_not_the_match(chunked_quads):
     assert counting.decoded - before <= 3 * pd._CHUNK_START
     assert sum(1 for _ in rows) == 2999
     assert counting.decoded - before > 3000  # the whole match's distinct codes
+    stopped = graph.store.triples((None, P0, None))
+    next(stopped)
+    del stopped
+    if chunk_rows is None:
+        assert spy.names() == ["match_codes"] * 5
+    else:
+        # Three early stops, the whole match, then a read dropped after a row.
+        assert spy.names() == ["count_quads", "match_code_chunks"] * 5
+        assert spy.pulls[:3] == [1, 1, 1] and spy.pulls[3] >= 3 and spy.pulls[4] == 1
+        assert [feed() for feed in spy.feeds[3:]] == [None, None]
+
+
+# ─── triples() reads a large pattern in chunks ──────────────────────────────
+
+#: The secondary-index configurations of one quad file: a served match may
+#: order its rows its own way, chunks come in base row order.
+_INDEXES = {
+    "no-index": [],
+    "by-copy": ["secondary-by-copy"],
+    "by-reference": ["secondary-by-reference"],
+}
+O3 = URIRef("http://ex.org/o/3")
+
+
+@pytest.fixture(scope="module")
+def indexed_quads(tmp_path_factory) -> dict[str, str]:
+    """The same 300 quads in one file per secondary-index configuration: 150
+    subjects with the predicates ``p0`` and ``p1``, each object one of seven,
+    the subjects in the three named graphs and the default graph in turn."""
+    lines = []
+    for i in range(150):
+        graph = _CHUNKED_GRAPHS[i % 4]
+        for p in range(2):
+            triple = f"<http://ex.org/s/{i}> <http://ex.org/p{p}> <http://ex.org/o/{(i + p) % 7}>"
+            lines.append(f"{triple} {graph} .\n" if graph else f"{triple} .\n")
+    d = tmp_path_factory.mktemp("indexed")
+    nq = d / "indexed.nq"
+    nq.write_text("".join(lines), encoding="utf-8")
+    files = {}
+    for name, indexes in _INDEXES.items():
+        out = d / f"{name}.vortex"
+        serialize_rdf(str(nq), str(out), layout="dictionary", format="nquads", indexes=indexes)
+        files[name] = str(out)
+    return files
+
+
+@pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
+@pytest.mark.parametrize("index", list(_INDEXES))
+def test_a_large_pattern_reads_in_chunks(indexed_quads, monkeypatch, index, in_memory):
+    """A pattern of more than ``_TRIPLES_CHUNK_ROWS`` rows, which a count
+    capped one row above finds, is read through ``match_code_chunks`` that
+    many rows a chunk: it yields the triples one ``match_codes`` match
+    yields, each graph's one context tuple across the chunks, under the
+    union and in one named graph, and each chunk iterator is dropped once
+    read."""
+    store = VortexRdflibStore(indexed_quads[index], in_memory=in_memory)
+    reads = [
+        (context, pattern)
+        for context in (None, Graph(store=store, identifier=G2))
+        for pattern in ((None, None, None), (None, P0, None), (None, None, O3))
+    ]
+
+    def read(pattern, context) -> Counter:
+        rows = list(store.triples(pattern, context))
+        shared: dict = {}
+        assert all(shared.setdefault(ctx[0].identifier, ctx) is ctx for _, ctx in rows)
+        return Counter((triple, ctx[0].identifier) for triple, ctx in rows)
+
+    expected = [read(pattern, context) for context, pattern in reads]
+    assert min(rows.total() for rows in expected) > 7
+    monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", 7)
+    spy = _spy(Graph(store=store))
+    for (context, pattern), want in zip(reads, expected, strict=True):
+        seen = len(spy.calls)
+        assert read(pattern, context) == want, (context, pattern)
+        columns = ("s", "p", "o", "g") if context is None else ("s", "p", "o")
+        assert spy.calls[seen:] == [
+            ("count_quads", {"limit": 8}),
+            ("match_code_chunks", {"columns": columns, "batch_rows": 7}),
+        ], (context, pattern)
+    assert len(spy.feeds) == len(reads) and all(feed() is None for feed in spy.feeds)
+
+
+@pytest.mark.parametrize(
+    ("chunk_rows", "pattern", "counted"),
+    [
+        (None, (None, None, None), False),
+        (300, (None, None, None), False),
+        (150, (None, P0, None), True),
+    ],
+    ids=["store-below-the-default", "store-of-that-many-rows", "pattern-of-that-many-rows"],
+)
+def test_a_small_pattern_keeps_one_match(indexed_quads, monkeypatch, chunk_rows, pattern, counted):
+    """A pattern of at most ``_TRIPLES_CHUNK_ROWS`` rows is one
+    ``match_codes`` match and no chunks: with no count on a store of at most
+    that many rows, which holds no larger pattern, and after the count,
+    capped one row above, on a larger store."""
+    store = VortexRdflibStore(indexed_quads["no-index"])
+    if chunk_rows is not None:
+        monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", chunk_rows)
+    limit = store_mod._TRIPLES_CHUNK_ROWS
+    assert (len(store) > limit) == counted
+    spy = _spy(Graph(store=store))
+    assert 0 < len(list(store.triples(pattern))) <= limit
+    count = [("count_quads", {"limit": limit + 1})] if counted else []
+    assert spy.calls == [*count, ("match_codes", {})]

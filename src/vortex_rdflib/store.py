@@ -1,4 +1,5 @@
 import os
+from collections.abc import Iterable
 from pathlib import Path
 
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, Dataset, Graph
@@ -33,6 +34,12 @@ _UNRESOLVED = object()
 #: no ``GRAPH`` names is the empty string, and ``""`` is also how a pattern
 #: selects those rows — ``None`` being the wildcard over every graph.
 DEFAULT_GRAPH = ""
+
+#: The most rows :meth:`VortexRdflibStore.triples` holds from one native
+#: read: a pattern that matches more is read through ``match_code_chunks``
+#: in chunks of at most this many rows, so a scan of a large store holds one
+#: chunk of codes, not its whole match.
+_TRIPLES_CHUNK_ROWS = 65_536
 
 
 class _NoGraph(NotImplementedError):
@@ -120,10 +127,12 @@ class VortexRdflibStore(Store):
         # Everything a query learns about terms lives in its scope
         # (query_scope.QueryTerms, through `_terms()`); the store keeps
         # fixed-size structure only: the kind ranges, the default graph's
-        # code, the indexes and one context per graph of the file.
+        # code, the indexes, the number of quads and one context per graph of
+        # the file.
         self._kind_bounds: tuple[int, int, int] | None = None
         self._ranges: dict | None = None
         self._indexes: tuple = ()
+        self._size = 0
         self._default_code: int | None | object = _UNRESOLVED
         # One rdflib graph object per graph of the file, so a match yields
         # contexts without allocating one per row; keyed both ways a match
@@ -166,6 +175,10 @@ class VortexRdflibStore(Store):
         # each distinct code is decoded to an rdflib term once per query. None
         # on other layouts -> string fallback path.
         self._dict = self._native.term_dict() if self._use_codes else None
+        # The quads a store with term codes holds, known without a read: no
+        # pattern of one of at most _TRIPLES_CHUNK_ROWS is read in chunks
+        # (triples()). A store without codes never reads in chunks.
+        self._size = 0 if self._dict is None else len(self._native)
         self._kind_bounds = None
         self._ranges = None
         self._default_code = _UNRESOLVED
@@ -180,6 +193,7 @@ class VortexRdflibStore(Store):
         self._kind_bounds = None
         self._ranges = None
         self._indexes = ()
+        self._size = 0
         self._default_code = _UNRESOLVED
         self._contexts_by_spelling = {}
         self._contexts_by_code = {}
@@ -317,14 +331,18 @@ class VortexRdflibStore(Store):
         yielded once per graph; a context that names no graph the file can
         hold yields nothing. The store streams the quads it holds rather than
         building the RDF merge of the union, which would mean a set the size
-        of the result, and decodes them a chunk at a time, the first of 64
-        rows, so a consumer that stops early decodes only the chunks it
-        reached. The query's cancel token (``pushdown.cancel_scope``) is read
-        once, when the iteration starts, and its one native match or count
-        races it where the token can stop that call — a scan of a file-backed
-        store — and checks it before the call otherwise
-        (``pushdown._cancel_kw_for``); a read through the string fallback,
-        which takes no token, checks it before the call.
+        of the result. A pattern of more than ``_TRIPLES_CHUNK_ROWS`` rows is
+        read from the native layer in chunks of that many rows
+        (:meth:`_code_matches`), so a scan of a large store holds one chunk of
+        codes at a time. A match or chunk is decoded a slice at a time, the
+        first of 64 rows, so a consumer that stops early decodes only the
+        slices, and pulls only the chunks, it reached. The query's cancel
+        token (``pushdown.cancel_scope``) is read once, when the iteration
+        starts: a one-shot native match or count races it where the token
+        can stop that call — a scan of a file-backed store — and checks it
+        before the call otherwise (``pushdown._cancel_kw_for``), every pull
+        of a chunk races it, and a read through the string fallback, which
+        takes no token, checks it before the call.
         """
         if self.path is None:
             return
@@ -400,68 +418,83 @@ class VortexRdflibStore(Store):
                 yield triple, self._context_tuple(g_raw, by_spelling)
             return
 
-        # The dictionary and the graph-context caches are bound once: rows
-        # read after a close(), or an open() of another file, still come from
-        # the file the call started on.
+        # The dictionary, the graph-context caches and a large pattern's chunk
+        # iterator are bound once: rows read after a close(), or an open() of
+        # another file, still come from the file the call started on.
         term_dict, by_code = self._dict, self._contexts_by_code
         by_spelling = self._contexts_by_spelling
+        matches = None
         if term_dict is not None:
-            cols = store.match_codes(*pattern, **one_shot)
-            if cols is not None:
-                rows = len(cols[0])
-                # The columns of one native match are equally long; reading
-                # them by the first one's length would hide a native bug.
-                if not len(cols[1]) == len(cols[2]) == len(cols[3]) == rows:
-                    lengths = [len(column) for column in cols]
-                    raise ValueError(f"match columns of unequal lengths: {lengths}")
-                if not rows:
-                    return
-                if g_n3 is not None:
-                    fixed = self._context_tuple(g_n3, by_spelling)
-                # Zero-copy u64 views over the Rust column buffers, read a
-                # chunk at a time: 64 rows, then four times more, 4096 at
-                # most. Each chunk's codes become Python ints, and those the
-                # call's term cache (the query's, inside one) lacks are
-                # decoded in one GIL-released decode_many call, so a consumer
-                # that stops early (rdflib's LIMIT, ASK) decodes only the
-                # chunks it reached.
-                views = [memoryview(column).cast("Q") for column in cols]
-                cache = self._terms().decode
-                contexts: dict[int, tuple] = {}
-                start, size = 0, _CHUNK_START
-                while start < rows:
-                    stop = min(start + size, rows)
-                    # A match that is one chunk is read from the views whole.
-                    chunk = views if stop - start == rows else [v[start:stop] for v in views]
-                    s_codes = chunk[0].tolist()
-                    p_codes = chunk[1].tolist()
-                    o_codes = chunk[2].tolist()
-                    self._decode_into(term_dict, cache, (s_codes, p_codes, o_codes))
-                    shared = fixed
-                    if shared is None:
-                        # Union: the fourth column names each row's graph. A
-                        # chunk whose rows all live in one graph — every chunk
-                        # of a single-graph file — shares that graph's context
-                        # and pays no per-row lookup.
-                        g_codes = chunk[3].tolist()
-                        graphs = set(g_codes)
-                        for code in graphs.difference(contexts):
-                            contexts[code] = self._context_of_code(
-                                code, term_dict, by_code, by_spelling
-                            )
-                        if len(graphs) == 1:
-                            shared = contexts[g_codes[0]]
-                        else:
-                            for row in zip(s_codes, p_codes, o_codes, g_codes, strict=True):
-                                yield (
-                                    (cache[row[0]], cache[row[1]], cache[row[2]]),
-                                    contexts[row[3]],
+            matches = self._code_matches(store, pattern, cancel, one_shot)
+        if matches is not None:
+            cache = None
+            contexts: dict[int, tuple] = {}
+            try:
+                for cols in matches:
+                    rows = len(cols[0])
+                    # The columns of one native match, or chunk, are equally
+                    # long; reading them by the first one's length would hide
+                    # a native bug.
+                    for column in cols:
+                        if len(column) != rows:
+                            lengths = list(map(len, cols))
+                            raise ValueError(f"match columns of unequal lengths: {lengths}")
+                    if not rows:
+                        continue
+                    if cache is None:
+                        # The match's first row: the call's term cache, and
+                        # the named graph's one context tuple (see `fixed`).
+                        cache = self._terms().decode
+                        if g_n3 is not None:
+                            fixed = self._context_tuple(g_n3, by_spelling)
+                    # Zero-copy u64 views over the Rust column buffers, read a
+                    # slice at a time: 64 rows, then four times more, 4096 at
+                    # most. Each slice's codes become Python ints, and those
+                    # the call's term cache (the query's, inside one) lacks
+                    # are decoded in one GIL-released decode_many call, so a
+                    # consumer that stops early (rdflib's LIMIT, ASK) decodes
+                    # only the slices it reached.
+                    views = [memoryview(column).cast("Q") for column in cols]
+                    start, size = 0, _CHUNK_START
+                    while start < rows:
+                        stop = min(start + size, rows)
+                        # A match or chunk that is one slice is read from the
+                        # views whole.
+                        part = views if stop - start == rows else [v[start:stop] for v in views]
+                        s_codes = part[0].tolist()
+                        p_codes = part[1].tolist()
+                        o_codes = part[2].tolist()
+                        self._decode_into(term_dict, cache, (s_codes, p_codes, o_codes))
+                        shared = fixed
+                        if shared is None:
+                            # Union: the fourth column names each row's graph.
+                            # A slice whose rows all live in one graph — every
+                            # slice of a single-graph file — shares that
+                            # graph's context and pays no per-row lookup.
+                            g_codes = part[3].tolist()
+                            graphs = set(g_codes)
+                            for code in graphs.difference(contexts):
+                                contexts[code] = self._context_of_code(
+                                    code, term_dict, by_code, by_spelling
                                 )
-                    if shared is not None:
-                        for row in zip(s_codes, p_codes, o_codes, strict=True):
-                            yield (cache[row[0]], cache[row[1]], cache[row[2]]), shared
-                    start, size = stop, min(size * 4, _CHUNK_MAX)
-                return
+                            if len(graphs) == 1:
+                                shared = contexts[g_codes[0]]
+                            else:
+                                for row in zip(s_codes, p_codes, o_codes, g_codes, strict=True):
+                                    yield (
+                                        (cache[row[0]], cache[row[1]], cache[row[2]]),
+                                        contexts[row[3]],
+                                    )
+                        if shared is not None:
+                            for row in zip(s_codes, p_codes, o_codes, strict=True):
+                                yield (cache[row[0]], cache[row[1]], cache[row[2]]), shared
+                        start, size = stop, min(size * 4, _CHUNK_MAX)
+            finally:
+                # Dropping a chunk iterator ends its native scan (a bare
+                # CodeChunks has no close()): once the rows run out, the
+                # consumer stops or a pull fails.
+                del matches
+            return
 
         # String fallback (non-dictionary layouts, code path disabled):
         # match_columns shares one Python string object across repeats of a
@@ -485,6 +518,35 @@ class VortexRdflibStore(Store):
                 (row[0], row[1], row[2]),
                 (fixed if fixed is not None else self._context_tuple(g_raw, by_spelling)),
             )
+
+    def _code_matches(
+        self, store: VortexRdfStore, pattern: tuple, cancel: dict, one_shot: dict
+    ) -> Iterable[tuple] | None:
+        """The code columns :meth:`triples` reads for the quad pattern
+        ``pattern``, as matches to read in turn: ``match_codes``'s one match,
+        or, for a pattern of more than ``_TRIPLES_CHUNK_ROWS`` rows,
+        ``match_code_chunks``'s chunks of at most that many rows, of the columns
+        ``s``, ``p``, ``o`` and, under the union, ``g``. ``None`` when the
+        store has no term codes.
+
+        A store of at most ``_TRIPLES_CHUNK_ROWS`` rows holds no larger
+        pattern; on a larger one a count capped one row above tells. The
+        count and the one match race the query's token where it can stop
+        them, as ``pushdown._cancel_kw_for`` decides (``one_shot`` for the
+        match); the chunk call is given ``cancel`` as it is, since every pull
+        of a chunk waits for the native layer, in memory as on file.
+        """
+        chunk_rows = _TRIPLES_CHUNK_ROWS
+        if self._size > chunk_rows:
+            limit = chunk_rows + 1
+            capped = _cancel_kw_for(cancel, self, pattern, limit=limit)
+            if store.count_quads(*pattern, limit=limit, **capped) > chunk_rows:
+                columns = ("s", "p", "o", "g") if pattern[3] is None else ("s", "p", "o")
+                return store.match_code_chunks(
+                    *pattern, columns=columns, batch_rows=chunk_rows, **cancel
+                )
+        cols = store.match_codes(*pattern, **one_shot)
+        return None if cols is None else (cols,)
 
     def contexts(self, triple=None):
         """RDFLib Store API: the graphs holding ``triple``, or every graph.

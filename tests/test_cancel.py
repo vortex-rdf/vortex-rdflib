@@ -19,6 +19,7 @@ from rdflib.graph import DATASET_DEFAULT_GRAPH_ID
 from vortex_rdf import Cancelled, CancelToken, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
+import vortex_rdflib.store as store_mod
 from test_native_primitives import _spy
 from test_pushdown import _trace_events, run
 from vortex_rdflib import VortexRdflibStore, cancel_scope, register_sparql_pushdown
@@ -91,11 +92,6 @@ def graph(cancel_vortex, request):
 @pytest.fixture
 def mem_graph(cancel_vortex):
     return Graph(store=VortexRdflibStore(str(cancel_vortex), in_memory=True))
-
-
-@pytest.fixture
-def file_graph(cancel_vortex):
-    return Graph(store=VortexRdflibStore(str(cancel_vortex), in_memory=False))
 
 
 def _store_calls(graph) -> None:
@@ -423,14 +419,47 @@ def test_probes_stop_on_cancel(mem_graph):
     assert len(native.selected) == 1
 
 
-def test_triples_carries_the_token(file_graph):
+@pytest.mark.parametrize("chunk_rows", [None, 7], ids=["one-match", "chunked"])
+def test_triples_carries_the_token(graph, monkeypatch, chunk_rows):
     """Inside ``cancel_scope`` the native call ``triples()`` makes for a
-    pattern that scans a file-backed store carries the token."""
-    spy = _spy(file_graph)
+    pattern that scans a file-backed store carries the token, and on an
+    in-memory store takes none. A pattern of more than
+    ``_TRIPLES_CHUNK_ROWS`` rows is read in chunks, every pull of which
+    waits for the native layer: the chunk call carries the token on any
+    store, and the count that finds the pattern carries it where the
+    one-shot match would."""
+    if chunk_rows is not None:
+        monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", chunk_rows)
+    spy = _spy(graph)
     token = CancelToken()
     with cancel_scope(token):
-        assert list(file_graph.store.triples((None, URIRef(f"{EX}p"), None)))
-    assert spy.calls == [("match_codes", {"cancel": token})]
+        assert list(graph.store.triples((None, URIRef(f"{EX}p"), None)))
+    raced = {} if graph.store.in_memory else {"cancel": token}
+    if chunk_rows is None:
+        assert spy.calls == [("match_codes", raced)]
+    else:
+        chunks = {"columns": ("s", "p", "o", "g"), "batch_rows": chunk_rows, "cancel": token}
+        assert spy.calls == [
+            ("count_quads", {"limit": chunk_rows + 1, **raced}),
+            ("match_code_chunks", chunks),
+        ]
+
+
+def test_a_cancel_stops_a_chunked_triples_read_at_its_next_pull(graph, monkeypatch):
+    """A pattern read in chunks keeps the token it started with: once the
+    token is cancelled, after the block too, the read yields the rest of the
+    chunk it holds and raises ``Cancelled`` at its next pull."""
+    monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", 7)
+    token = CancelToken()
+    with cancel_scope(token):
+        rows = graph.store.triples((None, URIRef(f"{EX}p"), None))
+        next(rows)
+    token.cancel()
+    read = 1
+    with pytest.raises(Cancelled):
+        for _ in rows:
+            read += 1
+    assert read <= 7 < SUBJECTS  # one chunk's rows, not the pattern's
 
 
 def test_an_in_memory_one_shot_call_checks_the_token_itself(mem_graph):
