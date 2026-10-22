@@ -207,26 +207,42 @@ def test_values_constants_are_encoded_in_one_batch(tmp_path):
 
 
 def test_probes_that_scan_are_batched(tmp_path, monkeypatch):
-    """Probes binding no subject scan the store, so they go to the native
-    layer in one batch; probes on a bound subject are point lookups, which
-    plain calls answer faster than a batch can be scheduled."""
+    """Probes binding no subject scan the store. The joins above a BGP — with
+    a VALUES table, an OPTIONAL — send them to the native layer in one batch;
+    a step of a BGP matches its pattern once instead, narrowed to the codes
+    its relation binds (a keep-scan). Probes on a bound subject are point
+    lookups, which plain calls answer faster than a batch can be scheduled."""
     graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=True))
     register_sparql_pushdown()
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
     spy = _spy(graph)
-    object_bound = """SELECT ?s ?o WHERE {
+    values = """SELECT ?s ?o WHERE {
         VALUES ?o { "product 1"@en "product 3"@en "product 4"@fr }
         ?s <http://ex.org/label> ?o }"""
-    rows = run(graph, object_bound)
-    assert len(rows) == 3
-    assert "match_codes_many" in spy.names()
-    spy.calls.clear()
+    optional = """SELECT ?o ?t WHERE {
+        <http://ex.org/p1> ?p ?o
+        OPTIONAL { ?t ?q ?o } }"""
+    bgp = """SELECT ?o ?t WHERE {
+        <http://ex.org/p1> ?p ?o .
+        ?t ?q ?o }"""
     subject_bound = """SELECT ?s ?v WHERE {
         VALUES ?s { <http://ex.org/p1> <http://ex.org/p2> <http://ex.org/p3> }
         ?s <http://ex.org/price> ?v }"""
+    # `?o` is p1's price, label and type: only p1 has that price and that
+    # label, and every product has that type.
+    for query, rows in ((values, 3), (optional, 202)):
+        spy.calls.clear()
+        assert len(run(graph, query)) == rows
+        assert "match_codes_many" in spy.names()
+    spy.calls.clear()
+    assert len(run(graph, bgp)) == 202
+    assert "match_codes_many" not in spy.names()
+    keyed = [kwargs for name, kwargs in spy.calls if name == "match_codes" and "keep" in kwargs]
+    assert [set(kwargs["keep"]) for kwargs in keyed] == [{2}]
+    spy.calls.clear()
     assert len(run(graph, subject_bound)) == 3
     assert "match_codes_many" not in spy.names()
-    for query in (object_bound, subject_bound):
+    for query in (values, optional, bgp, subject_bound):
         with_pushdown, without_pushdown = both_ways(graph, query)
         assert with_pushdown == without_pushdown
 

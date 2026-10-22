@@ -40,6 +40,9 @@ move the number:
                         every call: per-constant work is paid every time
   streamed join         one join query whose join step is over a lowered
                         pair budget, so it is gathered piece by piece
+  keep-scan join        one join on the file-backed unindexed store whose
+                        per-row probes would each scan the store, so its
+                        pattern is matched once, narrowed to the seed's codes
   residency + index     file-backed stores, where the per-call native floor
                         dominates and secondary indexes earn their keep:
                         the two lookups they target, per index config, plus
@@ -161,6 +164,20 @@ STREAMED_JOIN = "chain-2"
 
 #: The fed rows of each slice a streamed join step gathers in that task.
 STREAMED_PIECE_ROWS = 256
+
+#: The join `test_join_keep_scan` runs on the file-backed unindexed store: the
+#: `p1` subjects whose value is a literal with no language tag — a few hundred
+#: at the default size — against every statement that has one of them as its
+#: object. A probe per seed row would bind only its object, so each would scan
+#: the store; the step matches the pattern once instead, narrowed to the
+#: seed's codes. Not a dashboard query.
+KEEP_SCAN_JOIN = Query(
+    name="keep-scan",
+    group="joins",
+    sparql=(
+        f'SELECT ?x ?s ?p WHERE {{ ?x <{predicate_iri(1)}> ?v . ?s ?p ?x FILTER(lang(?v) = "") }}'
+    ),
+)
 
 #: Queries whose cost is dominated by evaluating a numeric FILTER: a typed
 #: range over one variable, and an integer arithmetic band over two (BSBM
@@ -420,6 +437,15 @@ def test_query_file(benchmark, graphs, index_tag, name):
     graph, query = graphs[f"file_{index_tag}"], QUERIES[name]
     assert _consume_query(graph, query) > 0
     benchmark(_consume_query, graph, query)
+
+
+def test_join_keep_scan(benchmark, graphs):
+    """A join step whose per-row probes would each scan the store, on the
+    file-backed unindexed store: ``KEEP_SCAN_JOIN``, its seed's rows joined to
+    a pattern that binds only its object."""
+    graph = graphs["file_noidx"]
+    assert _consume_query(graph, KEEP_SCAN_JOIN) > 0
+    benchmark(_consume_query, graph, KEEP_SCAN_JOIN)
 
 
 # ─── triples::<pattern> — the store's raw service, below SPARQL ─────────────

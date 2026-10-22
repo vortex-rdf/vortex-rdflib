@@ -1089,8 +1089,9 @@ def test_order_by_sequence_equals_default_evaluator(graph, sparql):
 @pytest.mark.parametrize("sparql", QUERIES)
 def test_probe_join_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
     """Same A/B matrix with the probe threshold forced to zero, so every
-    shared-variable join takes the per-binding probe path instead of the
-    hash join — both strategies must be observationally identical."""
+    shared-variable join is planned per row instead of as a hash join —
+    probes where they are point lookups, and a keep-scan in a BGP where they
+    would scan — and every strategy must be observationally identical."""
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
     with_probe, without_pushdown = both_ways(file_graph, sparql)
     assert with_probe == without_pushdown
@@ -1116,13 +1117,26 @@ def test_python_filter_routes_equal_default_evaluator(file_graph, monkeypatch, s
 
 @pytest.mark.parametrize("sparql", QUERIES)
 def test_batched_probe_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
-    """Every probe through the native batch calls, in batches of three —
-    a lone probe included."""
+    """Every probe a scan, through the native batch calls in batches of
+    three — a lone probe included: those of the joins above a BGP, OPTIONAL
+    and EXISTS. A BGP step keep-scans instead."""
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
     monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
     monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
     monkeypatch.setattr(pd, "_SCAN_BATCH_MIN", 1)
     monkeypatch.setattr(pd, "_MEMORY_SCAN_BATCH_MIN", 1)
+    with_pushdown, without_pushdown = both_ways(file_graph, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_batched_cheap_probe_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
+    """Every probe a point lookup, through the native batch calls in batches
+    of three, a lone probe included: BGP steps probe and batch too."""
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
+    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: True)
+    monkeypatch.setattr(pd, "_CHEAP_BATCH_MIN", 1)
     with_pushdown, without_pushdown = both_ways(file_graph, sparql)
     assert with_pushdown == without_pushdown
 
@@ -1204,6 +1218,32 @@ def test_stream_pieces_graph_pattern_equals_default_evaluator(dataset, stream_pi
     assert with_pushdown == without_pushdown
 
 
+@pytest.fixture
+def keep_scan(monkeypatch):
+    """The probe threshold at zero and every probe a scan: every BGP join step
+    that shares a variable keep-scans its pattern."""
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
+
+
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_keep_scan_equals_default_evaluator(graph, keep_scan, sparql):
+    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", ORDER_QUERIES)
+def test_keep_scan_order_by_sequence_equals_default_evaluator(graph, keep_scan, sparql):
+    with_pushdown, without_pushdown = both_ways(graph, sparql, run_ordered)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
+def test_keep_scan_graph_pattern_equals_default_evaluator(dataset, keep_scan, sparql):
+    with_pushdown, without_pushdown = both_ways(dataset, sparql)
+    assert with_pushdown == without_pushdown
+
+
 #: The forced paths of the matrices above, by id: the fixture that forces the
 #: path, and the test of a trace event that shows the path taken.
 FORCED_PATHS = {
@@ -1215,6 +1255,12 @@ FORCED_PATHS = {
     "tier3": (
         "over_budget",
         lambda event: event["event"] == "bgp_plan_complete" and bool(event["rest_pattern_indices"]),
+    ),
+    "keep_scan": (
+        "keep_scan",
+        lambda event: (
+            event["event"] == "bgp_join_step_complete" and event["strategy"] == "keep_scan"
+        ),
     ),
 }
 
@@ -1703,8 +1749,8 @@ def test_traced_batch_does_not_pull_ahead(file_graph, monkeypatch, capsys):
     consumes, and the batch events add up to the probes served."""
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
     monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
-    monkeypatch.setattr(pd, "_SCAN_BATCH_MIN", 1)
+    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: True)
+    monkeypatch.setattr(pd, "_CHEAP_BATCH_MIN", 1)
     native = _PullCountingNative(file_graph.store._store())
     file_graph.store._native = native
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")

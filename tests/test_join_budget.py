@@ -6,7 +6,12 @@ piece at a time, whatever consumes the rows. Any other step over the budget
 is not built: another pattern that provably fits joins first (tier 2), and
 when none does, rdflib finishes the remaining patterns per row of the
 relation so far (tier 3) where the relation goes straight to the emitter —
-otherwise the block goes back to rdflib. Either way the answer is rdflib's."""
+otherwise the block goes back to rdflib. Either way the answer is rdflib's.
+
+A step that would probe its pattern per row with probes that each scan the
+store matches it once instead, narrowed to the relation's codes (a
+keep-scan), and joins that match as a hash step does, under the same
+budget."""
 
 import os
 import subprocess
@@ -20,7 +25,15 @@ from vortex_rdf import U64Column, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
 from test_native_primitives import _spy
-from test_pushdown import _trace_events, both_ways, run, run_ordered
+from test_pushdown import (
+    _EX,
+    PROBE_MULTIPLICITY,
+    PROBE_QUADS,
+    _trace_events,
+    both_ways,
+    run,
+    run_ordered,
+)
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
 
 EX = "http://ex/"
@@ -69,6 +82,68 @@ SPECIALIZED = (
     _PREFIX + "SELECT ?s ?k ?c WHERE { ?s :sa ?k . ?s :sl ?c . ?c :sl ?s "
     "FILTER(STRSTARTS(STR(?c), ?k)) }"
 )
+#: `c0`'s nine keys against every statement that has one as its object: their
+#: nine `has` and nine `ref` statements. Counted at its step up to the nine
+#: rows x 100 + 1, `?f ?p ?k` reaches that cap (the store holds 1,348
+#: statements), so the step joins it per key — with probes that would each
+#: scan the store, binding no subject on a store with no index.
+SCANNED = _PREFIX + "SELECT ?k ?f ?p WHERE { :c0 :has ?k . ?f ?p ?k }"
+#: The anchor against the 170 `owner` statements, 152 of which name it.
+OWNED = _PREFIX + 'SELECT ?n WHERE { ?s :anchor "yes" . ?n :owner ?s }'
+#: The chain's anchor probed into its two `r` keys, then every statement that
+#: has one as its object: `?x ?p ?k` counts the store's 1,348 when planned,
+#: past the two rows x 100, and is joined per key.
+ANCHORED_SCAN = _PREFIX + 'SELECT ?s ?k ?x ?p WHERE { ?s :anchor "yes" . ?s :r ?k . ?x ?p ?k }'
+#: The four `ra` rows hold their two keys twice each. Counted at its step up
+#: to four rows x 100 + 1, `?x ?p ?k` reaches that cap; each key is the object
+#: of its two `ra` statements and of its own `loop`, so the keep-scan reads
+#: six rows, which make twelve pairs with the four.
+KEYED_TWICE = _PREFIX + "SELECT ?r ?k ?x ?p WHERE { ?r :ra ?k . ?x ?p ?k }"
+#: The same keys against their own loops: `?k :loop ?k` repeats `?k`.
+LOOPED = _PREFIX + "SELECT ?r ?k WHERE { ?r :ra ?k . ?k :loop ?k }"
+
+#: Quads for Review Focus 2's shapes beyond `PROBE_MULTIPLICITY`'s, added to
+#: `PROBE_QUADS`, whose cases they leave alone: `?s :q ?v` binds `?v` to `x`
+#: four times and to `y` once, and the `r` statements repeat a code across
+#: their subject and object — `x`'s in two graphs, `y`'s in one, and `z`'s,
+#: which the relation does not bind — or do not (`x :r :y`, `y :r :x`).
+KEEP_SCAN_QUADS = """\
+<http://ex/s5> <http://ex/q> <http://ex/y> <http://ex/g1> .
+<http://ex/x> <http://ex/r> <http://ex/x> <http://ex/g1> .
+<http://ex/x> <http://ex/r> <http://ex/x> <http://ex/g2> .
+<http://ex/x> <http://ex/r> <http://ex/y> <http://ex/g1> .
+<http://ex/y> <http://ex/r> <http://ex/x> <http://ex/g2> .
+<http://ex/y> <http://ex/r> <http://ex/y> <http://ex/g3> .
+<http://ex/z> <http://ex/r> <http://ex/z> <http://ex/g1> .
+"""
+
+#: Per shape, as `PROBE_MULTIPLICITY` has it: whether the default graph is the
+#: union of the graphs, the query and the rows rdflib answers.
+KEEP_SCAN_MULTIPLICITY = {
+    # The shared `?v` sits at both positions of `?v :r ?v`, the pattern a
+    # step keep-scans: of the five rows its keep selects, the three that
+    # repeat a code join, `x`'s four rows with two quads, `y`'s one with one.
+    "shared-twice": (True, _EX + "SELECT ?s ?v WHERE { ?s :q ?v . ?v :r ?v }", 9),
+    # The FILTER's keep on `?s` is on the pattern before the keep-scan
+    # narrows it to the relation's codes: `s1` joins 2 `q` quads with 3 `p`.
+    "keep-before": (
+        True,
+        _EX + "SELECT ?s WHERE { ?s :q :x . ?s :p :o1 FILTER(?s IN (:s1, :s2, :s3)) }",
+        6,
+    ),
+}
+
+#: The shapes whose `p` or `r` pattern is a step of the BGP: forced to probe
+#: with probes that scan, it keep-scans. The others join above a BGP, or
+#: test an OPTIONAL or EXISTS, which keep their probes.
+_KEEP_SCANNED = {
+    "bgp-join",
+    "graph-variable",
+    "named-graph",
+    "default-graph",
+    "shared-twice",
+    "keep-before",
+}
 
 #: The fields every trace event carries; the rest are the event's own.
 _ENVELOPE = ("schema", "event", "sequence", "query_id")
@@ -146,9 +221,38 @@ def tier_quads_vortex(tmp_path_factory):
     return out
 
 
+@pytest.fixture(scope="module")
+def indexed_joins_vortex(tmp_path_factory):
+    """This module's statements with a secondary index, which answers a probe
+    binding a predicate and an object as a point lookup."""
+    d = tmp_path_factory.mktemp("join-budget-indexed")
+    nt = d / "joins.nt"
+    nt.write_text(_statements(), encoding="utf-8")
+    out = d / "joins.vortex"
+    serialize_rdf(str(nt), str(out), layout="dictionary", indexes=["secondary-by-copy"])
+    return out
+
+
+@pytest.fixture(scope="module")
+def multiplicity_vortex(tmp_path_factory):
+    """`PROBE_QUADS` and `KEEP_SCAN_QUADS`."""
+    d = tmp_path_factory.mktemp("join-budget-multiplicity")
+    nq = d / "probe.nq"
+    nq.write_text(PROBE_QUADS + KEEP_SCAN_QUADS, encoding="utf-8")
+    out = d / "probe.vortex"
+    serialize_rdf(str(nq), str(out), layout="dictionary", format="nquads")
+    return out
+
+
 @pytest.fixture(params=[False, True], ids=["file", "mem"])
 def graph(joins_vortex, request):
     return Graph(store=VortexRdflibStore(str(joins_vortex), in_memory=request.param))
+
+
+@pytest.fixture
+def file_graph(joins_vortex):
+    """This module's store, file-backed only: where point lookups batch."""
+    return Graph(store=VortexRdflibStore(str(joins_vortex), in_memory=False))
 
 
 def _traced_both_ways(graph, monkeypatch, capsys, sparql, runner=run):
@@ -343,28 +447,29 @@ class _WatchedBatches:
 
 
 @pytest.mark.parametrize("traced", [False, True], ids=["untraced", "traced"])
-def test_a_probe_step_over_budget_discards_its_rows(graph, monkeypatch, capsys, traced):
-    """The fan's nine keys are probed three to a batch, one row per probe. A
-    budget of 16 lets the probe step make 16 // 4 = 4 rows, which the fifth
-    probe passes, mid-way through the second batch. The step stops there: its
-    batch is released with its last probe never pulled, the rows it made are
-    dropped, and rdflib answers the block with no row of them."""
+def test_a_probe_step_over_budget_discards_its_rows(file_graph, monkeypatch, capsys, traced):
+    """The fan's nine keys are probed three to a batch, one row per probe:
+    point lookups, which a file-backed store batches. A budget of 16 lets the
+    probe step make 16 // 4 = 4 rows, which the fifth probe passes, mid-way
+    through the second batch. The step stops there: its batch is released
+    with its last probe never pulled and the rows it made are dropped. It is
+    planned again as a keep-scan, whose rows are the answer, none twice."""
     monkeypatch.setattr(pd, "_PAIR_BUDGET", 16)
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
     monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
-    watched = _WatchedBatches(graph.store._store())
-    graph.store._native = watched
+    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: True)
+    monkeypatch.setattr(pd, "_CHEAP_BATCH_MIN", 1)
+    watched = _WatchedBatches(file_graph.store._store())
+    file_graph.store._native = watched
     if traced:
         monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
-    with_pushdown, without_pushdown = both_ways(graph, FAN)
+    with_pushdown, without_pushdown = both_ways(file_graph, FAN)
     events = _trace_events(capsys.readouterr().err)
     assert with_pushdown == without_pushdown
     assert len(set(with_pushdown)) == len(with_pushdown) == 9
-    attempts = len(watched.pulls) // 2
-    assert attempts
-    assert watched.pulls == [3, 2] * attempts
-    assert [batch() for batch in watched.batches] == [None] * len(watched.batches)
+    assert watched.pulls == [3, 2]
+    assert [batch() for batch in watched.batches] == [None, None]
     if traced:
         sequence = [
             (event["event"], event.get("returned_rows"))
@@ -373,14 +478,13 @@ def test_a_probe_step_over_budget_discards_its_rows(graph, monkeypatch, capsys, 
             or event["event"] == "native_batch_complete"
             and event["operation"] == "match_codes_many"
         ]
-        # Per attempt: the first batch pulled whole, the second released
-        # after two answers, before the step is traced over budget.
-        attempt = [
+        # The first batch pulled whole, the second released after two
+        # answers, before the step is traced over budget.
+        assert sequence == [
             ("native_batch_complete", 3),
             ("native_batch_complete", 2),
             ("bgp_over_budget", None),
         ]
-        assert sequence == attempt * attempts
         over = {
             "execution_index": 1,
             "original_pattern_index": 1,
@@ -389,7 +493,13 @@ def test_a_probe_step_over_budget_discards_its_rows(graph, monkeypatch, capsys, 
             "input_rows": 9,
             "estimated_rows": 9,
         }
-        assert _fields(events, "bgp_over_budget") == [over] * attempts
+        assert _fields(events, "bgp_over_budget") == [over]
+        [step] = _fields(events, "bgp_join_step_complete")
+        assert (step["strategy"], step["native_probe_call_count"], step["output_rows"]) == (
+            "keep_scan",
+            9,
+            9,
+        )
 
 
 class _ShortBatches:
@@ -418,6 +528,36 @@ def test_a_batch_short_of_answers_raises(graph, monkeypatch):
     answers = iter(pd._run_probes(graph.store, probes, count=False))
     assert len(next(answers)[0]) == 10
     with pytest.raises(ValueError, match="fewer than its 2 probes"):
+        next(answers)
+
+
+class _LongBatches:
+    """A VortexRdfStore stand-in whose ``match_codes_many`` answers one probe
+    more than it is given."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def match_codes_many(self, probes, **options):
+        answers = list(self._inner.match_codes_many(probes, **options))
+        return iter(answers + answers[-1:])
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_a_batch_past_its_probes_raises(graph, monkeypatch):
+    """A batch that answers more probes than it was given raises at its last
+    probe rather than handing that probe an answer the batch may have
+    misplaced."""
+    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
+    monkeypatch.setattr(pd, "_SCAN_BATCH_MIN", 1)
+    monkeypatch.setattr(pd, "_MEMORY_SCAN_BATCH_MIN", 1)
+    graph.store._native = _LongBatches(graph.store._store())
+    probes = [((None, f"<{EX}p>", None, None), {}), ((None, f"<{EX}q>", None, None), {})]
+    answers = iter(pd._run_probes(graph.store, probes, count=False))
+    assert len(next(answers)[0]) == 10
+    with pytest.raises(ValueError, match="more than its 2 probes"):
         next(answers)
 
 
@@ -501,6 +641,22 @@ def test_a_large_unread_pattern_is_fed_in_chunks(graph, monkeypatch, capsys):
         assert rows == run(graph, STAR)
     finally:
         register_sparql_pushdown()
+
+
+def test_a_probed_relation_streams_as_columns(graph, monkeypatch, capsys):
+    """The chain's anchor is probed into its two `r` keys, which leaves the
+    relation as rows. The last step's `t` pattern counts 150 rows, more than a
+    budget of 19 and than those two rows, so it streams from chunks: the two
+    rows are copied into native columns to be grouped."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 19)
+    (with_pushdown, without_pushdown), events = _traced_both_ways(graph, monkeypatch, capsys, CHAIN)
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == 20
+    names = ("strategy", "feed", "input_rows")
+    steps = [tuple(step[n] for n in names) for step in _fields(events, "bgp_join_step_complete")]
+    assert steps == [("probe", None, 1), ("stream", "chunks", 2)]
+    [stream] = _fields(events, "bgp_stream_complete")
+    assert stream["output_rows"] == 20
 
 
 def test_a_fed_pattern_with_a_repeated_variable_is_sliced(graph, monkeypatch, capsys):
@@ -974,3 +1130,297 @@ def test_a_relation_rdflib_finishes_reaches_only_the_emitter():
         pd._rows_of(rel)
     with pytest.raises(AssertionError):
         pd._code_rows(rel)
+
+
+def _keep_scans(events) -> list[dict]:
+    """The join steps that keep-scanned their pattern."""
+    return [
+        step
+        for step in _fields(events, "bgp_join_step_complete")
+        if step["strategy"] == "keep_scan"
+    ]
+
+
+def _keyed_matches(spy) -> list[dict]:
+    """The keywords of the ``match_codes`` calls ``spy`` saw narrowed by a
+    keep."""
+    return [kwargs for name, kwargs in spy.calls if name == "match_codes" and "keep" in kwargs]
+
+
+def _codes(column) -> list[int]:
+    """The codes of a native column, in order."""
+    return memoryview(column).cast("Q").tolist()
+
+
+def test_scan_probes_become_one_keep_scan(file_graph, monkeypatch, capsys):
+    """The nine keys' probes would each scan the store: they bind no subject,
+    and the file-backed store has no index. The step matches `?f ?p ?k` once
+    instead, narrowed at its object to the nine keys, ascending, and
+    hash-joins that match; no probe is made. The pattern's count stopped at
+    its cap, a lower bound, so the match stops one row past the budget."""
+    register_sparql_pushdown()
+    spy = _spy(file_graph)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    rows = run(file_graph, SCANNED)
+    events = _trace_events(capsys.readouterr().err)
+    assert "match_codes_many" not in spy.names()
+    [keyed] = _keyed_matches(spy)
+    assert set(keyed["keep"]) == {2}
+    keys = _codes(keyed["keep"][2])
+    assert len(keys) == 9 and keys == sorted(set(keys))
+    assert keyed["limit"] == pd._PAIR_BUDGET + 1
+    [step] = _fields(events, "bgp_join_step_complete")
+    assert (step["strategy"], step["cardinality_source"], step["output_rows"]) == (
+        "keep_scan",
+        "matched",
+        18,
+    )
+    assert step["native_probe_call_count"] == 0
+    unregister_sparql_pushdown()
+    try:
+        assert rows == run(file_graph, SCANNED)
+    finally:
+        register_sparql_pushdown()
+
+
+def test_an_over_budget_keep_scan_streams_its_chunks(graph, monkeypatch, capsys):
+    """At a budget of 10 the keep-scan reads its match only up to 11 rows,
+    and it comes back full. The step is the last and shares one variable, so
+    it streams: the pattern is fed from ``match_code_chunks`` narrowed by the
+    same keep, never matched whole."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 10)
+    register_sparql_pushdown()
+    spy = _spy(graph)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    rows = run(graph, SCANNED)
+    events = _trace_events(capsys.readouterr().err)
+    [keyed] = _keyed_matches(spy)
+    assert keyed["limit"] == 11
+    chunked = [kwargs for name, kwargs in spy.calls if name == "match_code_chunks"]
+    assert [kwargs["keep"] for kwargs in chunked] == [keyed["keep"]]
+    [over] = _fields(events, "bgp_over_budget")
+    assert (over["strategy"], over["pair_count"]) == ("keep_scan", None)
+    [step] = _streams(events)
+    assert (step["feed"], step["cardinality_source"]) == ("chunks", "chunked")
+    [stream] = _fields(events, "bgp_stream_complete")
+    assert stream["output_rows"] == 18
+    unregister_sparql_pushdown()
+    try:
+        assert rows == run(graph, SCANNED)
+    finally:
+        register_sparql_pushdown()
+
+
+def test_a_probe_step_over_its_tally_replans_as_a_keep_scan(
+    indexed_joins_vortex, monkeypatch, capsys
+):
+    """With a secondary index an `owner` probe binding the object is a point
+    lookup, so the anchor's step probes. At a budget of 200 its tally is 50
+    rows, which the one probe's 152 rows pass: the step is traced over budget
+    and planned again, in the same pass, as a keep-scan — the `owner` match
+    narrowed to the anchor, its 152 rows within the budget, hash-joined."""
+    graph = Graph(store=VortexRdflibStore(str(indexed_joins_vortex), in_memory=False))
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 200)
+    (with_pushdown, without_pushdown), events = _traced_both_ways(graph, monkeypatch, capsys, OWNED)
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == 152
+    names = ("strategy", "pair_count", "input_rows")
+    overs = [tuple(over[n] for n in names) for over in _fields(events, "bgp_over_budget")]
+    assert overs == [("probe", None, 1)]
+    names = ("strategy", "cardinality_source", "native_probe_call_count", "output_rows")
+    steps = [tuple(step[n] for n in names) for step in _fields(events, "bgp_join_step_complete")]
+    assert steps == [("keep_scan", "matched", 1, 152)]
+    assert _fields(events, "eval_part_fallback") == []
+
+
+def test_a_keep_scan_reads_a_relation_of_rows(graph, monkeypatch, capsys):
+    """The anchor's probes leave the relation as rows, of two keys: the next
+    step keep-scans `?x ?p ?k` by the keys those rows hold."""
+    (with_pushdown, without_pushdown), events = _traced_both_ways(
+        graph, monkeypatch, capsys, ANCHORED_SCAN
+    )
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == 2
+    names = ("strategy", "input_rows", "output_rows")
+    steps = [tuple(step[n] for n in names) for step in _fields(events, "bgp_join_step_complete")]
+    assert steps == [("probe", 1, 2), ("keep_scan", 2, 2)]
+
+
+def test_a_keep_scan_over_budget_by_its_pairs_streams_its_match(graph, monkeypatch, capsys):
+    """The keep-scan's six rows are within a budget of 11, but its key is held
+    twice by the relation, so they make twelve pairs. The last step streams
+    the match it read, fed in slices."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 11)
+    (with_pushdown, without_pushdown), events = _traced_both_ways(
+        graph, monkeypatch, capsys, KEYED_TWICE
+    )
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == 12
+    [over] = _fields(events, "bgp_over_budget")
+    assert (over["strategy"], over["pair_count"]) == ("keep_scan", 12)
+    [step] = _streams(events)
+    assert (step["feed"], step["cardinality_source"], step["pattern_match_rows"]) == (
+        "slices",
+        "matched",
+        6,
+    )
+
+
+def test_an_over_budget_keep_scan_short_of_the_last_step_goes_back(graph, monkeypatch, capsys):
+    """Forced to keep-scan, the `?s :tl ?c` step reads its match up to 240
+    rows, one past a budget of 239: it comes back full with a pattern still
+    to join, and goes back as planned. `?x :tl ?d`, which the step would join
+    per row too, can fit only by its product, which does not, so rdflib
+    finishes both patterns per seed row (tier 3)."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 239)
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
+    (with_pushdown, without_pushdown), events = _traced_both_ways(
+        graph, monkeypatch, capsys, REORDER
+    )
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == 10
+    [over] = _fields(events, "bgp_over_budget")
+    assert (over["original_pattern_index"], over["strategy"], over["pair_count"]) == (
+        1,
+        "keep_scan",
+        None,
+    )
+    assert _plans(events) == [[1, 2]]
+    assert _fields(events, "bgp_join_step_complete") == []
+
+
+def test_an_over_budget_keep_scan_needing_whole_columns_goes_back(graph, monkeypatch, capsys):
+    """Forced to keep-scan, `?k :loop ?k` (pattern 0, as rdflib orders the
+    block) comes back full at a budget of 1 on the last step, which shares
+    one variable; but its repeated `?k` asks for a test across two of a
+    row's columns, which chunks do not make. It goes back, and rdflib
+    finishes it per row (tier 3)."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 1)
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
+    spy = _spy(graph)
+    (with_pushdown, without_pushdown), events = _traced_both_ways(
+        graph, monkeypatch, capsys, LOOPED
+    )
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == 4
+    [over] = _fields(events, "bgp_over_budget")
+    assert (over["original_pattern_index"], over["strategy"], over["pair_count"]) == (
+        0,
+        "keep_scan",
+        None,
+    )
+    assert _plans(events) == [[0]]
+    assert "match_code_chunks" not in spy.names()
+
+
+def test_an_over_budget_keep_scan_with_a_deferred_restriction_goes_back(graph, monkeypatch, capsys):
+    """A FILTER over `?f` alone restricts the keep-scanned pattern over its
+    whole match, which chunks do not carry: come back full at a budget of
+    10, the last step goes back, and with the conjunct pushed into the block
+    the FILTER goes back to rdflib too. rdflib offers the block alone, whose
+    keep-scan, full again, streams from chunks."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 10)
+    sparql = (
+        _PREFIX + "SELECT ?k ?f ?p WHERE { :c0 :has ?k . ?f ?p ?k "
+        f'FILTER(STRSTARTS(STR(?f), "{EX}f")) }}'
+    )
+    (with_pushdown, without_pushdown), events = _traced_both_ways(
+        graph, monkeypatch, capsys, sparql
+    )
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == 9
+    assert {over["strategy"] for over in _fields(events, "bgp_over_budget")} == {"keep_scan"}
+    assert "Filter" in [event["algebra_node"] for event in _fields(events, "eval_part_fallback")]
+    assert [step["feed"] for step in _streams(events)] == ["chunks"]
+
+
+@pytest.mark.parametrize("planned", [None, {0: (0, 1 << 40)}], ids=["no-keep", "keep"])
+def test_a_put_back_keep_scan_drops_its_keep(graph, planned):
+    """A keep-scan narrows its pattern's keep to the relation's codes and
+    memoizes its match under that keep. Put back, the pattern has the keep it
+    was planned with again, which the keep-scan left whole, and the match
+    leaves the memo with the narrower keep."""
+    k, f, p = (Variable(name) for name in "kfp")
+    keys = graph.store._store().match_codes(f"<{EX}c0>", f"<{EX}has>", None, None)[2]
+    pat: dict = {
+        "n3": [None, None, None, None],
+        "varpos": {f: [0], p: [1], k: [2]},
+        "unsatisfiable": False,
+        "estimate": 1348,
+    }
+    if planned is not None:
+        pat["nkeep"] = planned
+    whole = None if planned is None else dict(planned)
+    memo: dict = {}
+    pd._keep_scan(graph.store, pat, (k,), (memoryview(keys).cast("Q"),), None, memo)
+    assert pat["nrows"] == 18
+    assert set(pat["nkeep"]) == {2} | set(planned or ())
+    assert list(memo) == [pd._pattern_key(pat)]
+    pd._put_back(pat, None, (), None, (), planned, memo)
+    assert pat.get("nkeep") is planned
+    assert planned == whole
+    assert "cols" not in pat and memo == {}
+
+
+@pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
+@pytest.mark.parametrize("case", [*PROBE_MULTIPLICITY, *KEEP_SCAN_MULTIPLICITY])
+def test_probe_multiplicity_under_keep_scan(
+    multiplicity_vortex, monkeypatch, capsys, case, in_memory
+):
+    """Forced to probe with probes that scan, each step of a BGP keep-scans
+    and joins as many rows as the probes would: one per quad — in the union
+    default graph one per graph holding the triple, in a fixed graph at most
+    one — a shared variable at two positions only where the row repeats its
+    code, and a keep already on the pattern narrowing it further. The joins
+    above a BGP, OPTIONAL and EXISTS still probe."""
+    if case in PROBE_MULTIPLICITY:
+        union, sparql, rows, _, _ = PROBE_MULTIPLICITY[case]
+    else:
+        union, sparql, rows = KEEP_SCAN_MULTIPLICITY[case]
+    store = VortexRdflibStore(str(multiplicity_vortex), in_memory=in_memory)
+    dataset = Dataset(store=store, default_union=union)
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
+    (with_pushdown, without_pushdown), events = _traced_both_ways(
+        dataset, monkeypatch, capsys, sparql
+    )
+    assert with_pushdown == without_pushdown
+    assert len(without_pushdown) == rows
+    assert bool(_keep_scans(events)) == (case in _KEEP_SCANNED)
+
+
+def test_probe_batches_name_their_lookahead(file_graph, monkeypatch):
+    """Each batch of probes names its lookahead. Point lookups run as a whole
+    batch: the star's ten `q` matches and the twin's ten existence counts,
+    each binding its subject, batched on a file-backed store. Probes that
+    scan run a scan per core, up to eight: the nine `ref` probes of an EXISTS
+    and of an OPTIONAL, each binding only its object. The planning counts
+    keep the binding's default."""
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(pd, "_CHEAP_BATCH_MIN", 1)
+    register_sparql_pushdown()
+    spy = _spy(file_graph)
+    scans = min(os.cpu_count() or 1, 8)
+    exists = _PREFIX + "SELECT ?k WHERE { :c0 :has ?k FILTER EXISTS { ?f :ref ?k } }"
+    optional = _PREFIX + "SELECT ?k ?f WHERE { :c0 :has ?k OPTIONAL { ?f :ref ?k } }"
+    cases = {
+        STAR: [("count_quads_many", None, 2), ("match_codes_many", 10, 10)],
+        TWIN: [("count_quads_many", None, 2), ("count_quads_many", 10, 10)],
+        exists: [("count_quads_many", scans, 9)],
+        optional: [("match_codes_many", scans, 9)],
+    }
+    for sparql, expected in cases.items():
+        spy.calls.clear()
+        spy.args.clear()
+        with_pushdown, without_pushdown = both_ways(file_graph, sparql)
+        assert with_pushdown == without_pushdown
+        batches = [
+            (name, kwargs.get("lookahead"), len(args[0]))
+            for (name, kwargs), args in zip(spy.calls, spy.args, strict=True)
+            if name.endswith("_many")
+        ]
+        assert batches == expected, sparql
