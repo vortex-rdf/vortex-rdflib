@@ -2835,17 +2835,18 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
     step whose pattern counts more rows than the budget and than the
     relation streams without reading the pattern whole: it reads it in
     chunks (:func:`_read_in_chunks`). Any other hash step over the budget
-    puts its pattern back, its match left in the memo, and the next step
-    takes the first other pattern sharing a variable with the relation that
-    provably fits (:func:`_fits`), which records the patterns it was
-    reordered around; those are tried again after it. Once none fits, the
-    patterns left are rdflib's to finish per row of the relation so far
-    (``stats["rest"]``, :func:`_finish_with_rdflib`) where its ``evalBGP``
-    evaluates them as the block would: the relation goes straight to the
-    emitter (``stream``, which the caller grants only in the active graph)
-    and no FILTER conjunct was pushed into the patterns, which it would not
-    apply. A probe step over its tally, and a step left over budget
-    otherwise, send the block back to rdflib (``NotImplementedError``).
+    puts its pattern back as it was planned, its match left in the memo
+    (:func:`_put_back`), and the next step takes the first other pattern
+    sharing a variable with the relation that provably fits (:func:`_fits`),
+    which records the patterns it was reordered around; those are tried
+    again after it. Once none fits, the patterns left are rdflib's to finish
+    per row of the relation so far (``stats["rest"]``,
+    :func:`_finish_with_rdflib`) where its ``evalBGP`` evaluates them as the
+    block would: the relation goes straight to the emitter (``stream``,
+    which the caller grants only in the active graph) and no FILTER
+    conjunct was pushed into the patterns, which it would not apply. A probe
+    step over its tally, and a step left over budget otherwise, send the
+    block back to rdflib (``NotImplementedError``).
     """
     counts: dict[tuple, int] = {}
     memo: dict[tuple, tuple] = {}
@@ -2942,8 +2943,11 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
         shared = [v for v in pat["varpos"] if v in schema]
         step_then = time.perf_counter_ns() if traced else 0
         probe_calls = probe_ns = 0
+        specialized = ()
         if tuples and pushed is not None:
-            _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed)
+            specialized = _specialize_tuple_conjuncts(
+                store, pat, schema, cols, rows, tuples, pushed
+            )
             tuples = tuple(c for c in tuples if id(c) not in pushed.applied)
         count_limit = None
         if "estimate" not in pat:
@@ -3025,12 +3029,10 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
             if strategy == "probe":
                 raise NotImplementedError from None
             if not streams:
-                # Back where it was planned and unread: its match stays in
-                # the memo, its restrictions apply again once a step reads it.
-                for key in ("cols", "nrows", "_trace_match_rows"):
-                    pat.pop(key, None)
-                if deferred:
-                    pat["deferred_var_preds"] = deferred
+                # Back where it was planned, as it was before this step: its
+                # match left in the memo, its own restrictions back, and the
+                # tuple conjuncts the step specialized onto it pending again.
+                tuples = _put_back(pat, deferred, specialized, pushed, tuples)
                 remaining.insert(position, pat)
                 put_back.append(pat)
                 continue
@@ -3112,7 +3114,7 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
     return Relation.from_rows(schema, rows), stats
 
 
-def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) -> None:
+def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) -> list:
     """Turn the tuple conjuncts the relation all but decides into
     per-variable conjuncts of ``pat``.
 
@@ -3127,9 +3129,14 @@ def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) 
     the rows its probes reach. Every row the BGP then yields passes the
     conjunct, which is marked applied: neither the mid-join prune nor the
     FILTER above evaluates it again.
+
+    Returns what it specialized, ``(conjunct, variable, per-variable
+    conjunct)`` each: a step that goes back over the budget undoes it
+    (:func:`_put_back`).
     """
+    specialized: list = []
     if not (filters._FAST_ENABLED and filters._NATIVE_ENABLED):
-        return
+        return specialized
     single: dict = {}
     for conjunct in tuples:
         if id(conjunct) in pushed.applied:
@@ -3154,6 +3161,7 @@ def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) 
             deferred = pat.setdefault("deferred_var_preds", {})
             deferred[var] = [*deferred.get(var, ()), proxy]
             pushed.applied.add(id(conjunct))
+            specialized.append((conjunct, var, proxy))
             if _TRACE.get() is not None:
                 _trace_event(
                     "bgp_tuple_specialized",
@@ -3161,6 +3169,7 @@ def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) 
                     variable=str(var),
                     native_predicate=proxy.native.kind,
                 )
+    return specialized
 
 
 def _single_code(cols, rows, index: int) -> int | None:
@@ -3787,6 +3796,40 @@ def _fits(
         assert rows is not None
         key = U64Column([row[index] for row in rows])
     return key.join_count(match[pat["varpos"][var][0]]) <= _PAIR_BUDGET
+
+
+def _put_back(
+    pat: dict, deferred: dict | None, specialized: Sequence[tuple], pushed, tuples: tuple
+) -> tuple:
+    """Undo what a join step did to ``pat`` before it went over the budget,
+    so a later step takes it as planned. It is unread again, its match left
+    in the memo, and its deferred restrictions — ``deferred``, which reading
+    it consumed — are back for the step that reads it, less the
+    per-variable conjuncts this step specialized onto it from tuple
+    conjuncts (``specialized``, :func:`_specialize_tuple_conjuncts`). Those
+    tuple conjuncts are no longer applied: they are pending again among
+    ``tuples``, in the FILTER's order, for the next step whose pattern binds
+    their variable, or for the FILTER above. Returns the pending tuple
+    conjuncts."""
+    for key in ("cols", "nrows", "_trace_match_rows"):
+        pat.pop(key, None)
+    if specialized:
+        assert deferred is not None and pushed is not None
+        for conjunct, var, proxy in specialized:
+            pushed.applied.discard(id(conjunct))
+            kept = [other for other in deferred[var] if other is not proxy]
+            if kept:
+                deferred[var] = kept
+            else:
+                del deferred[var]
+        pending = {id(conjunct) for conjunct in tuples}
+        pending.update(id(conjunct) for conjunct, _, _ in specialized)
+        tuples = tuple(conjunct for conjunct in pushed.tuples if id(conjunct) in pending)
+    if deferred:
+        pat["deferred_var_preds"] = deferred
+    else:
+        pat.pop("deferred_var_preds", None)
+    return tuples
 
 
 def _materialize_eager_restrictions(store, pat, bound) -> None:

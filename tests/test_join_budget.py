@@ -60,6 +60,15 @@ SELF_LOOP = _PREFIX + "SELECT ?s ?k WHERE { ?s :ra ?k . ?k :loop ?k }"
 #: Ten answers.
 _TIER_BODY = "?s :ta ?x . ?s :tl ?c . ?x :tl ?d"
 REORDER = _PREFIX + f"SELECT ?s ?x ?c ?d WHERE {{ {_TIER_BODY} }}"
+#: 120 `sa` rows bind `?k` to one literal, so the FILTER is a prefix test of
+#: `?c` alone for the pattern that binds it. `?c :sl ?s` (pattern 0) comes
+#: first: its 120 `spc` rows that pass make 120 pairs. `?s :sl ?c` (pattern
+#: 1) makes 2 of the seed rows, `sp0`'s two `sl` rows, and one of them fails
+#: the test.
+SPECIALIZED = (
+    _PREFIX + "SELECT ?s ?k ?c WHERE { ?s :sa ?k . ?s :sl ?c . ?c :sl ?s "
+    "FILTER(STRSTARTS(STR(?c), ?k)) }"
+)
 
 #: The fields every trace event carries; the rest are the event's own.
 _ENVELOPE = ("schema", "event", "sequence", "query_id")
@@ -92,6 +101,10 @@ def _statements() -> str:
     lines += [f"<{EX}lk{j}> <{EX}loop> <{EX}lk{j}> ." for j in range(10)]
     lines += [f"<{EX}lk{j}> <{EX}loop> <{EX}lz{j}-{t}> ." for j in range(10) for t in range(10)]
     lines += _tier_statements(120, 5)
+    lines += [f'<{EX}sp{i}> <{EX}sa> "{EX}spc" .' for i in range(120)]
+    lines += [f"<{EX}spc{i}-0> <{EX}sl> <{EX}sp{i}> ." for i in range(120)]
+    lines += [f"<{EX}spd0> <{EX}sl> <{EX}sp0> ."]
+    lines += [f"<{EX}sp0> <{EX}sl> <{EX}{o}> ." for o in ("spc0-0", "spd0")]
     return "\n".join(lines) + "\n"
 
 
@@ -766,6 +779,49 @@ def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 100)
     monkeypatch.setattr(pd, "_PAIR_BUDGET", 4)
     assert [pd._fits(120, (s, x), *body, pat, memo, graph.store) for body in bodies] == [False] * 2
+
+
+def test_tier2_undoes_what_a_put_back_step_specialized(graph, monkeypatch, capsys):
+    """The FILTER is specialized onto pattern 0 as a prefix test of `?c`, and
+    that step is one pair over a budget of 119. Going back, the step takes
+    the specialization with it: the test is pending again and is specialized
+    onto pattern 1, which joins first and binds `?c`, so the `spd0` row that
+    fails it never joins, and pattern 0 then joins the one row left."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 119)
+    (with_pushdown, without_pushdown), events = _traced_both_ways(
+        graph, monkeypatch, capsys, SPECIALIZED
+    )
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == 1
+    [over] = _fields(events, "bgp_over_budget")
+    assert (over["original_pattern_index"], over["pair_count"]) == (0, 120)
+    specialized = [
+        event["original_pattern_index"] for event in _fields(events, "bgp_tuple_specialized")
+    ]
+    assert specialized == [0, 1]
+    names = ("original_pattern_index", "reordered_around", "output_rows")
+    steps = [tuple(step[n] for n in names) for step in _fields(events, "bgp_join_step_complete")]
+    assert steps == [(1, [0], 1), (0, None, 1)]
+
+
+def test_tier2_restricts_a_put_back_pattern_again(graph, monkeypatch, capsys):
+    """A FILTER over `?c` alone restricts `?s :tl ?c` to its 120 `-1` rows as
+    its step reads it, which still make 120 pairs, over a budget of 119: the
+    pattern goes back with its restriction, and once `?x :tl ?d` has joined,
+    its step reads it again from the memo and restricts it again, joining it
+    whole rather than streaming its unrestricted match."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 119)
+    sparql = _PREFIX + f'SELECT ?s ?x ?c ?d WHERE {{ {_TIER_BODY} FILTER(STRENDS(STR(?c), "-1")) }}'
+    (with_pushdown, without_pushdown), events = _traced_both_ways(
+        graph, monkeypatch, capsys, sparql
+    )
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == 5
+    [plan] = _fields(events, "bgp_plan_complete")
+    assert plan["execution_order"] == [0, 2, 1]
+    names = ("original_pattern_index", "strategy", "reordered_around", "output_rows")
+    steps = [tuple(step[n] for n in names) for step in _fields(events, "bgp_join_step_complete")]
+    assert steps == [(2, "hash_columns", [1], 5), (1, "hash_columns", None, 5)]
 
 
 def test_tier3_lets_rdflib_finish_the_rest(graph, monkeypatch, capsys):
