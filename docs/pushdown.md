@@ -284,7 +284,7 @@ the join from the pattern sizes:
      [`_PROBE_FANOUT`](../src/vortex_rdflib/pushdown.py#L2430) (100) times
      smaller than the pattern's count and each probe is a point lookup (a
      bound subject, or a pattern a secondary index serves:
-     [`_cheap_probe`](../src/vortex_rdflib/pushdown.py#L2801)). The pattern is
+     [`_cheap_probe`](../src/vortex_rdflib/pushdown.py#L2802)). The pattern is
      never matched as a whole. Instead, each row's codes are filled into the
      pattern, and that narrower pattern (a **probe**) is matched. Probes are
      sent one by one, except on a file-backed store from 256 at a time, which
@@ -426,10 +426,11 @@ the budget, and is dropped.
 
 `OPTIONAL`, a lazy group join and `EXISTS` keep their probes. A batch of probes
 that each scan is given a lookahead of
-[`_SCAN_LOOKAHEAD`](../src/vortex_rdflib/pushdown.py#L2798) (one per core,
+[`_SCAN_LOOKAHEAD`](../src/vortex_rdflib/pushdown.py#L2799) (one per core,
 eight at most): the native layer runs at most twice that many ahead of the
-pulls ([`_probe_lookahead`](../src/vortex_rdflib/pushdown.py#L2806)). A batch
-of point lookups runs all at once.
+pulls ([`_probe_lookahead`](../src/vortex_rdflib/pushdown.py#L2807)). A batch
+of point lookups names no lookahead and runs under the binding's default
+(twice the machine's parallelism, and at least 64).
 
 ### Tier 3 and the emitter
 
@@ -999,7 +1000,7 @@ vortex-rdf opens a file-backed store memory-mapped.
 | Primitive | Where it is used |
 | --- | --- |
 | `match_codes`, `count_quads` | Every pattern match and count. |
-| `count_quads_many`, `match_codes_many` | Counting several scanning patterns at once ([`_count_patterns`](../src/vortex_rdflib/pushdown.py#L2704)); batched probes for joins, `OPTIONAL` and `EXISTS` ([`_run_probes`](../src/vortex_rdflib/pushdown.py#L2831)), whose answers are pulled one at a time as the join reaches them ([`_batch_answers`](../src/vortex_rdflib/pushdown.py#L2898), or [`_probe_matches`](../src/vortex_rdflib/pushdown.py#L2926) under a cancel token or for a batch of some of the probes). `lookahead=` sets how far ahead of the pulls a batch's probes run ([`_probe_lookahead`](../src/vortex_rdflib/pushdown.py#L2806)). |
+| `count_quads_many`, `match_codes_many` | Counting several scanning patterns at once ([`_count_patterns`](../src/vortex_rdflib/pushdown.py#L2704)); batched probes for joins, `OPTIONAL` and `EXISTS` ([`_run_probes`](../src/vortex_rdflib/pushdown.py#L2831)), whose answers are pulled one at a time as the join reaches them ([`_batch_answers`](../src/vortex_rdflib/pushdown.py#L2898), or [`_probe_matches`](../src/vortex_rdflib/pushdown.py#L2926) under a cancel token or for a batch of some of the probes). `lookahead=` sets how far ahead of the pulls a batch of scans runs; a batch of point lookups keeps the binding's default ([`_probe_lookahead`](../src/vortex_rdflib/pushdown.py#L2807)). |
 | `match_code_chunks` | The chunks a streamed join step is fed from ([`_streamed_step`](../src/vortex_rdflib/pushdown.py#L3973)), and the chunks `Store.triples` reads a large pattern in ([`_code_matches`](../src/vortex_rdflib/store.py#L517)). |
 | `keep=` on a match or count | Kind tests and IRI equality ([`native_restriction`](../src/vortex_rdflib/filters.py#L1028)), dropping the default graph under `GRAPH ?g` ([`_exclude_default_graph`](../src/vortex_rdflib/pushdown.py#L3600)), the codes a keep-scan joins on ([`_keep_scan`](../src/vortex_rdflib/pushdown.py#L4148)), exact `ASK` and `COUNT` answers. |
 | `limit=` on a match or count | `LIMIT` over a single pattern ([`_limit_reaches_match`](../src/vortex_rdflib/pushdown.py#L3023)), `ASK`, `EXISTS` probes, the existence probes of a join in a fixed graph, the counts that only decide probe or match ([`_count_pattern`](../src/vortex_rdflib/pushdown.py#L2677)), a keep-scan's match (one row past the budget) and `Store.triples`' first match of a pattern (one row past a chunk). `offset=` is not used: an `OFFSET` is applied to the code rows. |

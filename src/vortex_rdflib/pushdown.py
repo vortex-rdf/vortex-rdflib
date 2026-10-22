@@ -2794,7 +2794,8 @@ _MEMORY_SCAN_BATCH_MIN = 3
 
 #: The ``lookahead`` of a batch call whose probes scan the store
 #: (:func:`_probe_lookahead`): a scan per core, eight at most. The native
-#: layer runs at most twice that many probes ahead of the caller's pulls.
+#: layer runs at most twice that many probes ahead of the caller's pulls. A
+#: batch of point lookups names none and runs under the binding's default.
 _SCAN_LOOKAHEAD = min(os.cpu_count() or 1, 8)
 
 
@@ -2803,13 +2804,12 @@ def _cheap_probe(store, n3) -> bool:
     return n3[0] is not None or bool(store._indexes) and (n3[1] is not None or n3[2] is not None)
 
 
-def _probe_lookahead(store, batch_n3: Sequence[Sequence[str | None]]) -> int:
+def _probe_lookahead(store, batch_n3: Sequence[Sequence[str | None]]) -> int | None:
     """The ``lookahead`` of one batch call over these probes' quad patterns:
-    the whole batch when every probe is a point lookup
-    (:func:`_cheap_probe`), so all of them run at once, else
-    :data:`_SCAN_LOOKAHEAD`."""
+    ``None``, the binding's default, when every probe is a point lookup
+    (:func:`_cheap_probe`), else :data:`_SCAN_LOOKAHEAD`."""
     if all(_cheap_probe(store, n3) for n3 in batch_n3):
-        return len(batch_n3)
+        return None
     return _SCAN_LOOKAHEAD
 
 

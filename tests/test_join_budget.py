@@ -1452,12 +1452,12 @@ def test_probe_multiplicity_under_keep_scan(
 
 
 def test_probe_batches_name_their_lookahead(file_graph, monkeypatch):
-    """Each batch of probes names its lookahead. Point lookups run as a whole
-    batch: the star's ten `q` matches and the twin's ten existence counts,
+    """A batch of point lookups names no lookahead, so the binding's default
+    applies: the star's ten `q` matches and the twin's ten existence counts,
     each binding its subject, batched on a file-backed store. Probes that
     scan run a scan per core, up to eight: the nine `ref` probes of an EXISTS
     and of an OPTIONAL, each binding only its object. The planning counts
-    keep the binding's default."""
+    name none either."""
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
     monkeypatch.setattr(pd, "_CHEAP_BATCH_MIN", 1)
     register_sparql_pushdown()
@@ -1466,8 +1466,8 @@ def test_probe_batches_name_their_lookahead(file_graph, monkeypatch):
     exists = _PREFIX + "SELECT ?k WHERE { :c0 :has ?k FILTER EXISTS { ?f :ref ?k } }"
     optional = _PREFIX + "SELECT ?k ?f WHERE { :c0 :has ?k OPTIONAL { ?f :ref ?k } }"
     cases = {
-        STAR: [("count_quads_many", None, 2), ("match_codes_many", 10, 10)],
-        TWIN: [("count_quads_many", None, 2), ("count_quads_many", 10, 10)],
+        STAR: [("count_quads_many", None, 2), ("match_codes_many", None, 10)],
+        TWIN: [("count_quads_many", None, 2), ("count_quads_many", None, 10)],
         exists: [("count_quads_many", scans, 9)],
         optional: [("match_codes_many", scans, 9)],
     }
