@@ -102,10 +102,12 @@ at the next point that checks it:
   row, and the string fallback (a layout other than `"dictionary"`, or
   `VORTEX_RDF_DISABLE_CODE_PATH=1`).
 - Between calls: the pieces of a streamed join, the rows rdflib finishes when a
-  join over the pair budget is left to it, and the probes a join sends per row.
+  join over the pair budget is left to it, the probes a join sends per row, and
+  the slices and decode chunks the rows of a result are read in.
 
 A cancel takes effect at the next of these points, so rows that are already
-fetched and are being read in Python are delivered until then.
+fetched are delivered until then: a result whose rows are decoded as they are
+read stops within one decode chunk, at most 4,096 rows.
 
 ```python
 import threading
@@ -131,10 +133,8 @@ A lazy result keeps the token of the query that made it, so the check points it
 still reaches while its rows are produced run under it, and a query started
 outside any block has no token. In the snippet, the one pattern is matched
 inside `graph.query(...)`, where the token is checked or raced; the loop then
-reads rows that are already fetched, and a cancel that arrives during it is not
-observed, because that result has no check point left. A result whose rows
-come from a streamed join, or from rdflib finishing a join, has check points
-left while its rows are read.
+reads the match's rows as they are decoded, and a cancel that arrives during it
+stops the loop at the next decode chunk.
 
 ## Streaming a large answer
 

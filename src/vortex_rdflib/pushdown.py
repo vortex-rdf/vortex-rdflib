@@ -108,10 +108,12 @@ a chunked match, a one-shot call that scans a file-backed store — is given
 it (``cancel=``) and races it; the other one-shot calls — a point lookup, a
 call capped at one row, any call on an in-memory store — check it as they
 are made, as do the loops between calls: the pieces of a streamed join, the
-rows rdflib finishes, the probes of a join. ``token.cancel()``, from any
-thread, stops the query at the next of these with ``vortex_rdf.Cancelled``,
-which reaches the caller and is never a hand-back. A query started outside a
-block has no token, and without one no native call gains a keyword.
+rows rdflib finishes, the probes of a join, and the slices and decode chunks
+a result's rows are read in. ``token.cancel()``, from any thread, stops the
+query at the next of these with ``vortex_rdf.Cancelled``, which reaches the
+caller and is never a hand-back; a result whose rows are decoded as they are
+read stops within one decode chunk. A query started outside a block has no
+token, and without one no native call gains a keyword.
 
 rdflib only catches ``NotImplementedError`` at hook-call time, so every
 capability check and every native call that can decline happens before a
@@ -257,13 +259,15 @@ def cancel_scope(token: CancelToken) -> Iterator[CancelToken]:
     lookup, a call capped at one row, any call on an in-memory store, which
     finishes without waiting — checks it as it is made, as do the loops
     between calls: a streamed join's pieces, the rows rdflib finishes, the
-    per-row probes. So ``token.cancel()``, from any thread, stops the query
-    with ``vortex_rdf.Cancelled`` at its next call, piece, row or probe,
-    while it is planned or while its rows are read. A
-    query keeps the token it started with until its rows end, the rows read
-    after the block included; a query started outside a block has none. A
-    ``triples()`` iteration started inside the block gives its native calls
-    the token too.
+    per-row probes, and the slices and decode chunks of the rows it yields.
+    So ``token.cancel()``, from any thread, stops the query with
+    ``vortex_rdf.Cancelled`` at its next call, piece, finished row, probe,
+    slice or decode chunk, while it is planned or while its rows are read;
+    the rows already decoded, at most one decode chunk of 4,096, are
+    delivered first. A query keeps the token it started with until its rows
+    end, the rows read after the block included; a query started outside a
+    block has none. A ``triples()`` iteration started inside the block gives
+    its native calls the token too.
     """
     reset = _CANCEL.set(token)
     try:
@@ -3949,6 +3953,9 @@ def _gather_pieces(
                 del gathered, piece
                 if traced:
                     resumed = time.perf_counter_ns()
+            # Dropped before the next pull, so the feed's previous chunk is
+            # not held while the next one is read.
+            del part, column
     finally:
         if resumed:
             elapsed_ns += time.perf_counter_ns() - resumed
@@ -4482,12 +4489,15 @@ def _piece_rows(pieces) -> Iterator[tuple]:
 
 def _column_rows(cols, nrows) -> Iterator[tuple]:
     """Zip column views into row tuples a slice at a time, so a consumer that
-    stops early never converts the whole match into Python objects."""
+    stops early never converts the whole match into Python objects. Each
+    slice ends with a check of the query's cancel token
+    (:func:`_check_cancelled`), so a cancel stops a drain within one slice."""
     i, size = 0, _CHUNK_START
     while i < nrows:
         j = min(i + size, nrows)
         yield from zip(*(view[i:j].tolist() for view in cols), strict=True)
         i, size = j, min(size * 4, _CHUNK_MAX)
+        _check_cancelled()
 
 
 def _yield_solutions(ctx, store, rel: Relation, project=None, start=0, stop=None):
@@ -4568,7 +4578,10 @@ def _pushed_graph(ctx) -> bool:
 
 def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, start, stop):
     """Decode code rows over ``schema`` into solutions (see
-    ``_yield_solutions``); ``start``/``stop`` slice the rows first."""
+    ``_yield_solutions``); ``start``/``stop`` slice the rows first. Each
+    decode chunk checks the query's cancel token before its rows are pulled
+    (:func:`_check_cancelled`), so a cancel stops the solutions within one
+    chunk."""
     outer = dict(ctx.bindings.items())
     # Normally every solution carries the caller's own context — no per-row
     # scope, unlike rdflib's `evalBGP`. Under a graph rdflib pushed, each row
@@ -4587,6 +4600,7 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, sta
     yielded = chunks = submitted = 0
     try:
         while True:
+            _check_cancelled()
             chunk = list(islice(rows, size))
             if not chunk:
                 return

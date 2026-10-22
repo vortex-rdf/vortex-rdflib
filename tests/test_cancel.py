@@ -2,13 +2,14 @@
 block passes the token to every native call the token can stop — a batch, a
 chunked match, a one-shot call that scans a file-backed store — and checks
 it before every other one-shot call (a point lookup, a call capped at one
-row, any call on an in-memory store) and in the loops that make none — a
-streamed join's pieces, the rows rdflib finishes, the per-row probes — so
+row, any call on an in-memory store), the per-row probes' among them, and in
+the loops that make none — a streamed join's pieces, the rows rdflib
+finishes, the slices and decode chunks of the rows it yields — so
 ``token.cancel()``, from any thread, stops it with ``vortex_rdf.Cancelled``
-at its next call, piece, row or probe. The token is the query's own: its
-lazy results keep it after the block, and a query started outside a block
-has none, whatever another query's token did. Without a token no native
-call gains a keyword."""
+at its next call, piece, finished row, slice or decode chunk. The token is
+the query's own: its lazy results keep it after the block, and a query
+started outside a block has none, whatever another query's token did.
+Without a token no native call gains a keyword."""
 
 import threading
 from collections.abc import Callable
@@ -321,6 +322,48 @@ def test_a_cancel_during_a_gather_stops_at_the_next_piece(mem_graph, monkeypatch
         with pytest.raises(Cancelled):
             next(rows)
     assert gathers == [1]
+
+
+#: Per case: the query, its pair budget (the default for ``None``), whether
+#: the token is cancelled once the first row is read or while the first
+#: piece of a streamed join is gathered, the rows read before ``Cancelled``,
+#: and the rows of each piece gathered.
+_WITHIN_A_CHUNK = {
+    "probed-rows": (PROBED_TWICE, None, "read", 2, []),
+    "piece": (PAIRED, 60, "read", 2, [60]),
+    "piece-slice": (PAIRED + " OFFSET 1", 60, "gather", 0, [60]),
+}
+
+
+@pytest.mark.parametrize("case", list(_WITHIN_A_CHUNK))
+def test_a_cancel_stops_the_rows_within_one_decode_chunk(mem_graph, monkeypatch, case):
+    """Rows are decoded two, then eight at a time, and a columnar body is
+    read in slices of those sizes. A probe join's six rows, and a streamed
+    join's two pieces of 60 rows (a budget of 60 halves its 120 pairs), are
+    read one row at a time: cancelled once the first row is read, the query
+    delivers the rest of that decode chunk and stops before the next one,
+    inside the first piece. Past an ``OFFSET 1`` the first decode chunk ends
+    inside the first piece's second slice: cancelled while that piece is
+    gathered, the query stops at the end of the piece's first slice, before
+    any row."""
+    sparql, budget, when, read_before, gathered = _WITHIN_A_CHUNK[case]
+    if budget is not None:
+        monkeypatch.setattr(pd, "_PAIR_BUDGET", budget)
+    monkeypatch.setattr(pd, "_CHUNK_START", 2)
+    monkeypatch.setattr(pd, "_CHUNK_MAX", 8)
+    token = CancelToken()
+    gathers = _watch_gathers(monkeypatch, during=token.cancel if when == "gather" else None)
+    register_sparql_pushdown()
+    read = 0
+    with cancel_scope(token):
+        rows = iter(mem_graph.query(sparql))
+        with pytest.raises(Cancelled):
+            for _ in rows:
+                read += 1
+                if when == "read":
+                    token.cancel()
+    assert read == read_before
+    assert gathers == gathered
 
 
 def test_the_token_is_the_query_s_own(graph, monkeypatch):
