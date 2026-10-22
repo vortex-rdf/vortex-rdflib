@@ -957,13 +957,16 @@ def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
     assert [pd._fits(120, (s, x), *body, pat, memo, graph.store) for body in bodies] == [False] * 2
 
 
-def test_tier2_undoes_what_a_put_back_step_specialized(graph, monkeypatch, capsys):
+@pytest.mark.parametrize("budget", [119, 60])
+def test_tier2_undoes_what_a_put_back_step_specialized(graph, monkeypatch, capsys, budget):
     """The FILTER is specialized onto pattern 0 as a prefix test of `?c`, and
-    that step is one pair over a budget of 119. Going back, the step takes
-    the specialization with it: the test is pending again and is specialized
-    onto pattern 1, which joins first and binds `?c`, so the `spd0` row that
-    fails it never joins, and pattern 0 then joins the one row left."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 119)
+    that step's 120 pairs are over the budget: by one pair at 119, by sixty at
+    60, and the count the trace carries is the whole one either way. Going
+    back, the step takes the specialization with it: the test is pending
+    again and is specialized onto pattern 1, which joins first and binds `?c`,
+    so the `spd0` row that fails it never joins, and pattern 0 then joins the
+    one row left."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", budget)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, SPECIALIZED
     )
