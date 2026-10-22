@@ -1212,6 +1212,10 @@ FORCED_PATHS = {
         "stream_pieces",
         lambda event: event["event"] == "bgp_join_step_complete" and event["strategy"] == "stream",
     ),
+    "tier3": (
+        "over_budget",
+        lambda event: event["event"] == "bgp_plan_complete" and bool(event["rest_pattern_indices"]),
+    ),
 }
 
 

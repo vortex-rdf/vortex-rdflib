@@ -125,7 +125,7 @@ from typing import Any
 
 import rdflib.term
 from rdflib.plugins.sparql import CUSTOM_EVALS
-from rdflib.plugins.sparql.evaluate import evalPart
+from rdflib.plugins.sparql.evaluate import evalBGP, evalPart
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
@@ -470,8 +470,10 @@ def _solution(ctx, bindings: dict) -> _Solution:
 
 def _relation_rows(rel: "Relation") -> int | None:
     """The relation's row count where it is known without reading the
-    rows: ``None`` for a columnar body still to be filtered and for a
-    streamed one."""
+    rows: ``None`` for a columnar body still to be filtered, for a streamed
+    one, and for one rdflib still finishes (``rest``)."""
+    if rel.rest:
+        return None
     if rel.rows is not None:
         return len(rel.rows)
     if rel.cols is not None and not rel.preds:
@@ -716,6 +718,12 @@ class Relation:
     negative codes to terms outside the dictionary; ``preds`` are row
     predicates still to be applied while a columnar or streamed body streams
     (``nrows`` counts a columnar body's rows before them).
+
+    ``rest`` holds the triple patterns of a BGP that rdflib's ``evalBGP``
+    still has to join into each row (tier 3, :func:`_finish_with_rdflib`):
+    the body is then the rows to finish, not the block's solutions, and the
+    schema lacks the variables only those patterns bind. Such a relation
+    goes to :func:`_yield_solutions` alone.
     """
 
     schema: tuple
@@ -726,6 +734,7 @@ class Relation:
     foreign: dict = field(default_factory=dict)
     preds: tuple[Callable[[tuple], bool], ...] = ()
     pieces: Iterator[tuple] | None = None
+    rest: tuple = ()
 
     @classmethod
     def from_rows(cls, schema, rows):
@@ -931,8 +940,10 @@ def _eval_head(ctx, store, part):
     )
     # Without an ORDER BY or a DISTINCT between them, a LIMIT bounds the
     # block's rows themselves; a block that is one native match takes it.
-    limit = head.stop if not head.order and not head.distinct else None
-    rel = _solve_block(ctx, store, head.block, limit=limit)
+    # The relation then goes straight to the emitter (``stream``).
+    stream = not head.order and not head.distinct
+    limit = head.stop if stream else None
+    rel = _solve_block(ctx, store, head.block, limit=limit, stream=stream)
     _trace_event(
         "block_solve_complete",
         rows=_relation_rows(rel),
@@ -1535,7 +1546,7 @@ def _columnar_groups(rel: Relation, key_cols, specs, new_group) -> dict:
 
 def _eval_block_node(ctx, store, part):
     _check_block(part)
-    return _yield_solutions(ctx, store, _solve_block(ctx, store, part))
+    return _yield_solutions(ctx, store, _solve_block(ctx, store, part, stream=True))
 
 
 def _eval_ask(ctx, store, part):
@@ -1617,7 +1628,7 @@ class _Pushed(dict):
 
 
 def _solve_block(
-    ctx, store, node, env=frozenset(), var_preds=None, scope=None, limit=None
+    ctx, store, node, env=frozenset(), var_preds=None, scope=None, limit=None, stream=False
 ) -> Relation:
     """Solve a block into a relation.
 
@@ -1632,7 +1643,10 @@ def _solve_block(
     (:class:`_GraphScope`); ``None`` means the graph the context has made
     active. ``limit`` says only that many rows will be read: a block that is
     one native match fetches no more (see :func:`_solve_bgp`); any other
-    ignores it.
+    ignores it. ``stream`` says the relation goes straight to
+    :func:`_yield_solutions`: it reaches a BGP through FILTER and GRAPH nodes
+    only, where rdflib may finish the patterns a join over the pair budget
+    leaves (:func:`_join_incremental_bgp`).
     """
     if scope is None:
         scope = _active_scope(ctx, store)
@@ -1643,9 +1657,9 @@ def _solve_block(
         trace.depth += 1
     try:
         if name == "BGP":
-            rel = _solve_bgp(ctx, store, node.triples, scope, var_preds, limit)
+            rel = _solve_bgp(ctx, store, node.triples, scope, var_preds, limit, stream)
         elif name == "Filter":
-            rel = _solve_filter(ctx, store, node, env, var_preds, scope, limit)
+            rel = _solve_filter(ctx, store, node, env, var_preds, scope, limit, stream)
         elif name == "Join":
             rel = _solve_join(ctx, store, node, env, var_preds, scope)
         elif name == "LeftJoin":
@@ -1658,7 +1672,7 @@ def _solve_block(
             inner = _graph_scope(ctx, node)
             if inner.var is not None and not _carries_graph(node.p, inner.var):
                 raise NotImplementedError
-            rel = _solve_block(ctx, store, node.p, env, var_preds, inner, limit)
+            rel = _solve_block(ctx, store, node.p, env, var_preds, inner, limit, stream)
         else:
             raise NotImplementedError
     finally:
@@ -1745,12 +1759,16 @@ def _constant_codes(store, terms: list) -> list:
     return codes
 
 
-def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None) -> Relation:
+def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None, stream=False) -> Relation:
     """A ``Filter`` over a block: constant conjuncts decide the whole block
     before anything is matched, single-variable conjuncts over variables the
     block always binds restrict the pattern scans and VALUES tables that bind
     them, the rest filters the solved rows. A ``limit`` reaches the block
-    only when nothing is left to filter above it.
+    only when nothing is left to filter above it, and ``stream`` when the
+    filter holds no EXISTS. Where rdflib still finishes the block's rows
+    (``rest``), a conjunct over the variables those rows bind tests them
+    before it does; one over a variable only the rest binds cannot, and the
+    FILTER goes back to rdflib.
 
     The expression's block variables are those its group binds
     (:func:`_group_vars`; see :func:`filters.analyze_filter` for the rest of
@@ -1786,9 +1804,12 @@ def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None) -> Relati
         else:
             pushed[var] = pushed.get(var, []) + conjuncts
     limit = None if residual or plan.exists else limit
-    rel = _solve_block(ctx, store, inner, env, pushed, scope, limit)
+    stream = stream and not plan.exists
+    rel = _solve_block(ctx, store, inner, env, pushed, scope, limit, stream)
     residual = [conjunct for conjunct in residual if id(conjunct) not in pushed.applied]
     if residual:
+        if rel.rest and any(v not in rel.schema for c in residual for v in c.vars):
+            raise NotImplementedError
         positions = [
             [rel.schema.index(variable) for variable in conjunct.vars] for conjunct in residual
         ]
@@ -2000,6 +2021,7 @@ def _rows_of(rel: Relation) -> list:
     """The relation's rows, materialized. A streamed body is drained into
     rows, its ``preds`` applied, and the relation keeps them as its body, so
     a second call returns the same list."""
+    assert not rel.rest, "rdflib finishes this relation's rows: only the emitter reads them"
     if rel.rows is not None:
         return rel.rows
     rows = list(_code_rows(rel))
@@ -2258,7 +2280,8 @@ def _solve_minus(ctx, store, node, env, var_preds, scope) -> Relation:
 
 def _filter_relation(rel: Relation, preds) -> Relation:
     """Apply row predicates: streamed over a columnar or streamed body,
-    eagerly over rows."""
+    eagerly over rows. The patterns rdflib still finishes the rows with
+    (``rest``) stay with them."""
     if rel.rows is None:
         return Relation(
             rel.schema,
@@ -2269,9 +2292,10 @@ def _filter_relation(rel: Relation, preds) -> Relation:
             rel.foreign,
             rel.preds + tuple(preds),
             rel.pieces,
+            rel.rest,
         )
     rows = [row for row in rel.rows if all(pred(row) for pred in preds)]
-    return Relation(rel.schema, None, rows, len(rows), rel.nullable, rel.foreign)
+    return Relation(rel.schema, None, rows, len(rows), rel.nullable, rel.foreign, rest=rel.rest)
 
 
 # Probing beats hash-joining when the running relation is at least this many
@@ -2339,7 +2363,7 @@ def _pattern_trace_shape(ctx, triple) -> dict:
     }
 
 
-def _solve_bgp(ctx, store, triples, scope, var_preds=None, limit=None) -> Relation:
+def _solve_bgp(ctx, store, triples, scope, var_preds=None, limit=None, stream=False) -> Relation:
     """Evaluate a BGP by matching one seed and probing connected patterns.
 
     The filter conjuncts that are native keeps (see
@@ -2350,6 +2374,12 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None, limit=None) -> Relati
     shape first, and only the codes it leaves undecided go to the Python
     routes. A single pattern with no such residual conjunct takes ``limit``
     into its match as well (see :func:`_limit_reaches_match`).
+
+    With ``stream`` (the relation goes straight to the emitter) and the
+    block in the graph the context has made active — the graph rdflib's
+    ``evalBGP`` reads — the planner may leave the patterns past a join over
+    the pair budget to rdflib: the relation then carries their triples as
+    ``rest``.
     """
     trace = _TRACE.get()
     traced = trace is not None
@@ -2456,7 +2486,10 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None, limit=None) -> Relati
 
     then = time.perf_counter_ns() if traced else 0
     stats = {}
-    rel = _join_patterns(store, patterns, stats, var_preds)
+    finishable = stream and scope == _active_scope(ctx, store)
+    rel = _join_patterns(store, patterns, stats, var_preds, finishable)
+    if stats["rest"]:
+        rel.rest = tuple(triples[index] for index in stats["rest"])
     total_join_ns = time.perf_counter_ns() - then if then else 0
     native_ns = stats["native_ns"]
     restriction_ns = stats["restriction_ns"]
@@ -2767,7 +2800,7 @@ def _limit_reaches_match(store, pat, residual) -> bool:
     )
 
 
-def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]:
+def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[Relation, dict]:
     """Seed with the smallest pattern, then extend one connected pattern at
     a time.
 
@@ -2801,8 +2834,18 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
     the relation returned is its pieces, gathered as they are pulled. Such a
     step whose pattern counts more rows than the budget and than the
     relation streams without reading the pattern whole: it reads it in
-    chunks (:func:`_read_in_chunks`). Any other step over the budget sends
-    the block back to rdflib (``NotImplementedError``).
+    chunks (:func:`_read_in_chunks`). Any other hash step over the budget
+    puts its pattern back, its match left in the memo, and the next step
+    takes the first other pattern sharing a variable with the relation that
+    provably fits (:func:`_fits`), which records the patterns it was
+    reordered around; those are tried again after it. Once none fits, the
+    patterns left are rdflib's to finish per row of the relation so far
+    (``stats["rest"]``, :func:`_finish_with_rdflib`) where its ``evalBGP``
+    evaluates them as the block would: the relation goes straight to the
+    emitter (``stream``, which the caller grants only in the active graph)
+    and no FILTER conjunct was pushed into the patterns, which it would not
+    apply. A probe step over its tally, and a step left over budget
+    otherwise, send the block back to rdflib (``NotImplementedError``).
     """
     counts: dict[tuple, int] = {}
     memo: dict[tuple, tuple] = {}
@@ -2812,6 +2855,7 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
         "estimate_calls": 0,
         "native_ns": 0,
         "restriction_ns": 0,
+        "rest": [],
     }
 
     tuples = pushed.tuples if pushed is not None else ()
@@ -2847,6 +2891,7 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
             estimate_calls=stats["estimate_calls"],
             native_initial_match_count=0,
             native_probe_call_count=0,
+            rest_pattern_indices=None,
         )
         return Relation.from_rows(schema, []), stats
 
@@ -2871,14 +2916,30 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
     cols, rows, tuples = _prune_early(store, schema, cols, rows, tuples, remaining, views)
 
     execution_index = 1
+    # The patterns put back over the budget against the relation as it
+    # stands: until a step completes, the next one takes another that fits.
+    put_back: list[dict] = []
+    pieces = None
     while remaining and (len(cols[0]) if cols is not None else len(rows)):
-        pat = next(
-            (pat for pat in remaining if any(v in schema for v in pat["varpos"])), remaining[0]
-        )
-        remaining.remove(pat)
-        order.append(pat.get("index"))
-        shared = [v for v in pat["varpos"] if v in schema]
         running = len(cols[0]) if cols is not None else len(rows)
+        connected = (pat for pat in remaining if any(v in schema for v in pat["varpos"]))
+        if put_back:
+            pat = next(
+                (
+                    pat
+                    for pat in connected
+                    if all(pat is not back for back in put_back)
+                    and _fits(running, schema, cols, rows, pat, memo, store)
+                ),
+                None,
+            )
+            if pat is None:
+                break
+        else:
+            pat = next(connected, remaining[0])
+        position = next(i for i, other in enumerate(remaining) if other is pat)
+        del remaining[position]
+        shared = [v for v in pat["varpos"] if v in schema]
         step_then = time.perf_counter_ns() if traced else 0
         probe_calls = probe_ns = 0
         if tuples and pushed is not None:
@@ -2892,14 +2953,17 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
             count_limit = running * _PROBE_FANOUT + 1
             then = time.perf_counter_ns() if traced else 0
             pat["estimate"] = _count_pattern(store, pat, counts, limit=count_limit)
+            # An answer at the cap is a lower bound of the count (_fits).
+            pat["estimate_capped"] = pat["estimate"] >= count_limit
             stats["native_ns"] += time.perf_counter_ns() - then if then else 0
             stats["estimate_calls"] += 1
         estimate = pat["estimate"]
+        deferred = pat.get("deferred_var_preds")
 
         # Tier 1: the last step, when it shares one variable, streams
         # (_streamed_step) rather than going back to rdflib over the budget.
         streams = not remaining and len(shared) == 1
-        pair_count = pieces = feed = None
+        pair_count = feed = None
         try:
             if shared and running * _PROBE_FANOUT < estimate:
                 strategy, source = "probe", "probed"
@@ -2958,8 +3022,18 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
                 input_rows=running,
                 estimated_rows=estimate,
             )
-            if strategy == "probe" or not streams:
+            if strategy == "probe":
                 raise NotImplementedError from None
+            if not streams:
+                # Back where it was planned and unread: its match stays in
+                # the memo, its restrictions apply again once a step reads it.
+                for key in ("cols", "nrows", "_trace_match_rows"):
+                    pat.pop(key, None)
+                if deferred:
+                    pat["deferred_var_preds"] = deferred
+                remaining.insert(position, pat)
+                put_back.append(pat)
+                continue
             strategy, pair_count = "stream", over.pairs
 
         if strategy == "stream":
@@ -2981,6 +3055,7 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
             original_pattern_index=pat.get("index"),
             strategy=strategy,
             feed=feed,
+            reordered_around=[back.get("index") for back in put_back] or None,
             cardinality_source=source,
             input_rows=running,
             estimated_rows=estimate,
@@ -2998,13 +3073,25 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
             shared_variable_count=len(shared),
             elapsed_ns=time.perf_counter_ns() - step_then if step_then else 0,
         )
+        put_back.clear()
+        order.append(pat.get("index"))
         if pieces is not None:
             break
         cols, rows, tuples = _prune_early(store, schema, cols, rows, tuples, remaining, views)
         execution_index += 1
 
-    for pat in remaining:
-        schema += tuple(v for v in pat["varpos"] if v not in schema)
+    if put_back:
+        # No pattern left fits. rdflib's evalBGP finishes them per row as the
+        # block would only where the rows go straight to the emitter and no
+        # FILTER conjunct was pushed into the patterns: it would not apply it.
+        if not stream or (pushed is not None and (pushed or pushed.tuples)):
+            raise NotImplementedError
+        stats["rest"] = [pat.get("index") for pat in remaining]
+    else:
+        # The relation ran empty before these patterns were joined: the
+        # schema names their variables, which no column carries.
+        for pat in remaining:
+            schema += tuple(v for v in pat["varpos"] if v not in schema)
     _trace_event(
         "bgp_plan_complete",
         pattern_count=len(patterns),
@@ -3014,10 +3101,9 @@ def _join_incremental_bgp(store, patterns, pushed=None) -> tuple[Relation, dict]
         estimate_calls=stats["estimate_calls"],
         native_initial_match_count=stats["initial_calls"],
         native_probe_call_count=stats["probe_calls"],
+        rest_pattern_indices=stats["rest"] or None,
     )
-    if remaining:
-        # The relation ran empty before these patterns were joined: the
-        # schema names their variables, which no column carries.
+    if remaining and not put_back:
         return Relation.from_rows(schema, []), stats
     if pieces is not None:
         return Relation(schema, None, None, 0, pieces=pieces), stats
@@ -3665,6 +3751,44 @@ def _read_in_chunks(pat, running: int) -> bool:
     )
 
 
+def _fits(
+    running: int, schema: tuple, cols: tuple | None, rows: list | None, pat: dict, memo: dict, store
+) -> bool:
+    """Whether joining ``pat`` into the relation — ``running`` rows over
+    ``schema``, its body ``cols`` or ``rows`` — provably stays within
+    :data:`_PAIR_BUDGET`, from what is held already: nothing is counted or
+    matched here.
+
+    It does when the relation's rows times the pattern's count fit, a count
+    that did not stop at a cap: a capped count is a lower bound and proves
+    nothing, while one that leaves out the pattern's keep bounds its match
+    from above. It does too when the step would hash-join the pattern, its
+    match is in ``memo``, and the pairs ``join_count`` counts between that
+    match and the relation on their first shared variable fit: the step
+    makes no more, its restrictions and any other shared variable only
+    narrowing them. A pattern the step would probe qualifies only through
+    the product, and one the step has yet to count not at all.
+    """
+    estimate = pat.get("estimate")
+    if estimate is None:
+        return False
+    if not pat.get("estimate_capped") and running * estimate <= _PAIR_BUDGET:
+        return True
+    if running * _PROBE_FANOUT < estimate:
+        return False
+    match = memo.get(_pattern_key(pat))
+    if match is None:
+        return False
+    var = next(v for v in pat["varpos"] if v in schema)
+    index = schema.index(var)
+    if cols is not None:
+        key = _native_column(cols[index])
+    else:
+        assert rows is not None
+        key = U64Column([row[index] for row in rows])
+    return key.join_count(match[pat["varpos"][var][0]]) <= _PAIR_BUDGET
+
+
 def _materialize_eager_restrictions(store, pat, bound) -> None:
     """Apply a matched pattern's deferred per-variable restrictions — over
     the variables not in ``bound``, the relation it is about to join —
@@ -3679,16 +3803,17 @@ def _materialize_eager_restrictions(store, pat, bound) -> None:
     pat["_trace_match_rows"] = input_rows
 
 
-def _join_patterns(store, patterns, stats=None, pushed=None) -> Relation:
+def _join_patterns(store, patterns, stats=None, pushed=None, stream=False) -> Relation:
     """Join a BGP through the incremental planner.
 
     Keep this function as the observable BGP join boundary: tests and
     diagnostics wrap it. _solve_bgp also passes an optional dictionary to
-    receive physical native-call and timing counters, and the filters a
+    receive physical native-call and timing counters, the filters a
     FILTER above pushed down (:class:`_Pushed`), whose tuple conjuncts may
-    prune the relation mid-join.
+    prune the relation mid-join, and ``stream``, which lets rdflib finish
+    the patterns past a join over the pair budget (``stats["rest"]``).
     """
-    rel, measured = _join_incremental_bgp(store, patterns, pushed)
+    rel, measured = _join_incremental_bgp(store, patterns, pushed, stream)
     if stats is not None:
         stats.update(measured)
     return rel
@@ -3913,6 +4038,13 @@ def _join(schema_a, rows_a, schema_b, rows_b):
 def _code_rows(rel: Relation) -> Iterator[tuple]:
     """The relation's rows as code tuples, lazily for a columnar or streamed
     body."""
+    assert not rel.rest, "rdflib finishes this relation's rows: only the emitter reads them"
+    return _body_rows(rel)
+
+
+def _body_rows(rel: Relation) -> Iterator[tuple]:
+    """The code tuples of the relation's body, its ``preds`` applied: its
+    rows, or the rows rdflib still finishes when it has a ``rest``."""
     if rel.rows is not None:
         rows = iter(rel.rows)
     elif rel.pieces is not None:
@@ -3958,8 +4090,56 @@ def _yield_solutions(ctx, store, rel: Relation, project=None, start=0, stop=None
     carries every schema variable plus the context's own bindings (what
     rdflib's BGP rows contain); with it only the projected variables, the
     way ``Project`` would have narrowed them.
+
+    A relation rdflib still finishes (``rest``) is decoded whole, without
+    projection or window; rdflib extends each row over the rest
+    (:func:`_finish_with_rdflib`), and the solutions it makes are what is
+    projected and windowed.
     """
-    return _yield_rows(ctx, store, rel.schema, _code_rows(rel), rel.foreign, project, start, stop)
+    if not rel.rest:
+        return _yield_rows(
+            ctx, store, rel.schema, _code_rows(rel), rel.foreign, project, start, stop
+        )
+    rows = _yield_rows(ctx, store, rel.schema, _body_rows(rel), rel.foreign, None, 0, None)
+    return _project_window(_finish_with_rdflib(ctx, rows, rel.rest), project, start, stop)
+
+
+def _finish_with_rdflib(ctx, solutions: Iterator, rest: tuple) -> Iterator[FrozenBindings]:
+    """The solutions rdflib's ``evalBGP`` makes of each solution over the
+    triple patterns ``rest`` (tier 3): each is thawed into a context of its
+    own, where the patterns run in the order rdflib's ``evalPart`` gives a
+    BGP (:func:`_most_bound_first`). ``evalBGP`` is called directly, so the
+    hook is not offered the patterns again; it reads them through the
+    store's ``triples()``. ``solutions`` is closed when these end, fail or
+    are closed."""
+    try:
+        for solution in solutions:
+            context = ctx.thaw(solution)
+            yield from evalBGP(context, _most_bound_first(context, rest))
+    finally:
+        close = getattr(solutions, "close", None)
+        if close is not None:
+            close()
+
+
+def _most_bound_first(ctx, triples) -> list:
+    """``triples`` as rdflib's ``evalPart`` orders a BGP in ``ctx``: the
+    fewest terms the context leaves unbound first, ties in their order."""
+    return sorted(triples, key=lambda triple: sum(ctx[term] is None for term in triple))
+
+
+def _project_window(solutions: Iterator, project, start, stop) -> Iterator:
+    """``solutions`` from ``start`` up to ``stop``, each narrowed to the
+    ``project`` variables as rdflib's ``Project`` narrows it (all of it
+    without ``project``); ``solutions`` is closed when these end, fail or
+    are closed."""
+    try:
+        for solution in islice(solutions, start, stop):
+            yield solution if project is None else solution.project(project)
+    finally:
+        close = getattr(solutions, "close", None)
+        if close is not None:
+            close()
 
 
 def _pushed_graph(ctx) -> bool:

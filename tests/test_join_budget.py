@@ -3,8 +3,10 @@ product passes the budget counts its pairs natively before it is built. A
 last step over the budget that shares one variable streams (tier 1): the
 smaller side's key column is grouped and the other side is fed through it a
 piece at a time, whatever consumes the rows. Any other step over the budget
-is not built — the block goes back to rdflib. Either way the answer is
-rdflib's."""
+is not built: another pattern that provably fits joins first (tier 2), and
+when none does, rdflib finishes the remaining patterns per row of the
+relation so far (tier 3) where the relation goes straight to the emitter —
+otherwise the block goes back to rdflib. Either way the answer is rdflib's."""
 
 import os
 import subprocess
@@ -12,7 +14,7 @@ import sys
 import weakref
 
 import pytest
-from rdflib import Graph, Variable
+from rdflib import Dataset, Graph, URIRef, Variable
 from rdflib.plugins.sparql.processor import SPARQLProcessor
 from vortex_rdf import U64Column, serialize_rdf
 
@@ -51,6 +53,13 @@ ONE_KEY = _PREFIX + "SELECT ?h ?z WHERE { ?h :u ?k . ?k :w ?z }"
 #: Four `ra` rows on two keys against `?k :loop ?k`: of the 110 `loop` rows,
 #: the ten that loop a key onto itself pass, and 4 pairs are made.
 SELF_LOOP = _PREFIX + "SELECT ?s ?k WHERE { ?s :ra ?k . ?k :loop ?k }"
+#: 120 `ta` rows seed the relation. Both `tl` patterns count all 245 `tl`
+#: rows, and the `?s` one comes first: its step makes 240 pairs, two `tl`
+#: rows per seed subject. The `?x` one reads the match that step left in the
+#: memo, and its step makes 5, the five seed objects that are `tl` subjects.
+#: Ten answers.
+_TIER_BODY = "?s :ta ?x . ?s :tl ?c . ?x :tl ?d"
+REORDER = _PREFIX + f"SELECT ?s ?x ?c ?d WHERE {{ {_TIER_BODY} }}"
 
 #: The fields every trace event carries; the rest are the event's own.
 _ENVELOPE = ("schema", "event", "sequence", "query_id")
@@ -82,7 +91,19 @@ def _statements() -> str:
     lines += [f"<{EX}rs{i}> <{EX}ra> <{EX}lk{i % 2}> ." for i in range(4)]
     lines += [f"<{EX}lk{j}> <{EX}loop> <{EX}lk{j}> ." for j in range(10)]
     lines += [f"<{EX}lk{j}> <{EX}loop> <{EX}lz{j}-{t}> ." for j in range(10) for t in range(10)]
+    lines += _tier_statements(120, 5)
     return "\n".join(lines) + "\n"
+
+
+def _tier_statements(seeds: int, linked: int) -> list[str]:
+    """``_TIER_BODY``'s data: ``seeds`` `ta` rows `ts{i} :ta tx{i}`, two `tl`
+    rows per `ts{i}`, one `tl` row for each of the first ``linked`` `tx{i}`,
+    and a `tw` row for each of the first three `ts{i}`."""
+    lines = [f"<{EX}ts{i}> <{EX}ta> <{EX}tx{i}> ." for i in range(seeds)]
+    lines += [f"<{EX}ts{i}> <{EX}tl> <{EX}tc{i}-{j}> ." for i in range(seeds) for j in range(2)]
+    lines += [f"<{EX}tx{i}> <{EX}tl> <{EX}td{i}> ." for i in range(linked)]
+    lines += [f"<{EX}ts{i}> <{EX}tw> <{EX}tw{i}> ." for i in range(3)]
+    return lines
 
 
 @pytest.fixture(scope="module")
@@ -95,17 +116,34 @@ def joins_vortex(tmp_path_factory):
     return out
 
 
+@pytest.fixture(scope="module")
+def tier_quads_vortex(tmp_path_factory):
+    """``_TIER_BODY``'s data in two named graphs: all of it in `g1`; in `g2`,
+    that of the first six seeds, two of their objects linked."""
+    d = tmp_path_factory.mktemp("join-budget-quads")
+    nq = d / "tiers.nq"
+    quads = [
+        line[: -len(" .")] + f" <{EX}{name}> ."
+        for name, seeds, linked in (("g1", 120, 5), ("g2", 6, 2))
+        for line in _tier_statements(seeds, linked)
+    ]
+    nq.write_text("\n".join(quads) + "\n", encoding="utf-8")
+    out = d / "tiers.vortex"
+    serialize_rdf(str(nq), str(out), layout="dictionary", format="nquads")
+    return out
+
+
 @pytest.fixture(params=[False, True], ids=["file", "mem"])
 def graph(joins_vortex, request):
     return Graph(store=VortexRdflibStore(str(joins_vortex), in_memory=request.param))
 
 
-def _traced_both_ways(graph, monkeypatch, capsys, sparql):
+def _traced_both_ways(graph, monkeypatch, capsys, sparql, runner=run):
     """Both answers to ``sparql`` (see ``both_ways``) and the trace events of
     the pushdown's run."""
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
-    answers = both_ways(graph, sparql)
+    answers = both_ways(graph, sparql, runner)
     return answers, _trace_events(capsys.readouterr().err)
 
 
@@ -205,55 +243,49 @@ def test_a_join_past_the_product_bound_is_counted_then_built(graph, monkeypatch,
     assert _fields(events, "eval_part_fallback") == []
 
 
-def test_an_over_budget_column_join_hands_the_node_back(graph, monkeypatch, capsys):
-    """The seed's columns meet a last step sharing two variables, which no
-    tier streams: one pair over the budget it is not built, it is traced with
-    the count of its first shared variable, and rdflib answers the block."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 19)
-    (with_pushdown, without_pushdown), events = _traced_both_ways(graph, monkeypatch, capsys, TWIN)
-    assert with_pushdown == without_pushdown
-    over = _fields(events, "bgp_over_budget")
-    assert over
-    assert over == [
-        {
-            "execution_index": 1,
-            "original_pattern_index": 1,
-            "strategy": "hash_rows",
-            "pair_count": 20,
-            "input_rows": 10,
-            "estimated_rows": 20,
-        }
-    ] * len(over)
-    assert _fields(events, "eval_part_fallback")
-    assert _fields(events, "bgp_join_step_complete") == []
+def _plans(events) -> list:
+    """The patterns rdflib was left to finish (tier 3), per completed BGP
+    plan: ``None`` where it was left none."""
+    return [plan["rest_pattern_indices"] for plan in _fields(events, "bgp_plan_complete")]
 
 
-def test_an_over_budget_row_join_hands_the_node_back(graph, monkeypatch, capsys):
-    """The chain's anchor is probed first, which leaves a rows body; its last
-    step shares two variables, which no tier streams, and is counted over the
-    first one's codes copied into native columns — 20 pairs, over a budget of
-    10 — and rdflib answers the block. The probe step keeps to its tally: 2
-    rows of the 10 // 4 it may make."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 10)
-    (with_pushdown, without_pushdown), events = _traced_both_ways(graph, monkeypatch, capsys, LOOP)
+@pytest.mark.parametrize(
+    ("sparql", "budget", "over", "steps"),
+    [
+        (TWIN + " ORDER BY ?s ?x", 19, (1, 1, "hash_rows", 20, 10, 20), []),
+        (LOOP + " ORDER BY ?s ?k", 10, (2, 1, "hash_rows", 20, 2, 170), [("probe", 2, None)]),
+    ],
+    ids=["column", "row"],
+)
+def test_tier3_needs_the_emitter(graph, monkeypatch, capsys, sparql, budget, over, steps):
+    """A last step sharing two variables, which no tier streams, over the
+    budget with no other pattern left to join first: under ORDER BY the
+    relation does not go straight to the emitter, so the head goes back to
+    rdflib, which offers the BGP alone, and there rdflib finishes that
+    pattern per row (tier 3). Each attempt traces the step with the count of
+    its first shared variable: the star's seed columns against the 20 `pq`
+    rows, or the chain's two probed rows (2 of the 10 // 4 the probe step may
+    make) against the 170 `owner` rows, their first variable's codes copied
+    into native columns."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", budget)
+    (with_pushdown, without_pushdown), events = _traced_both_ways(
+        graph, monkeypatch, capsys, sparql, run_ordered
+    )
     assert with_pushdown == without_pushdown
-    over = _fields(events, "bgp_over_budget")
-    assert over
-    assert over == [
-        {
-            "execution_index": 2,
-            "original_pattern_index": 1,
-            "strategy": "hash_rows",
-            "pair_count": 20,
-            "input_rows": 2,
-            "estimated_rows": 170,
-        }
-    ] * len(over)
-    steps = _fields(events, "bgp_join_step_complete")
-    assert [(s["strategy"], s["output_rows"], s["pair_count"]) for s in steps] == [
-        ("probe", 2, None)
-    ] * len(over)
-    assert _fields(events, "eval_part_fallback")
+    names = (
+        "execution_index",
+        "original_pattern_index",
+        "strategy",
+        "pair_count",
+        "input_rows",
+        "estimated_rows",
+    )
+    assert _fields(events, "bgp_over_budget") == [dict(zip(names, over, strict=True))] * 3
+    fallbacks = [event["algebra_node"] for event in _fields(events, "eval_part_fallback")]
+    assert fallbacks == ["Project", "OrderBy"]
+    assert _plans(events) == [[1]]
+    completed = _fields(events, "bgp_join_step_complete")
+    assert [(s["strategy"], s["output_rows"], s["pair_count"]) for s in completed] == steps * 3
 
 
 class _Batch:
@@ -384,8 +416,10 @@ def _streams(events) -> list[dict]:
 
 
 def test_an_over_budget_last_step_streams(graph, monkeypatch, capsys):
-    """One pair over the budget, the star's last step streams: the ten seed
-    rows are grouped and the 20 `q` rows fed four at a time, a piece each."""
+    """The star's `q` pattern counts 20 rows, more than a budget of 19 and
+    than the ten seed rows, so its last step streams without reading it
+    whole: the ten seed rows are grouped and the 20 `q` rows fed four at a
+    time, a piece each."""
     monkeypatch.setattr(pd, "_PAIR_BUDGET", 19)
     monkeypatch.setattr(pd, "_PIECE_ROWS", 4)
     (with_pushdown, without_pushdown), events = _traced_both_ways(graph, monkeypatch, capsys, STAR)
@@ -647,3 +681,240 @@ def test_a_memoized_match_is_sliced(graph):
     )
     assert schema == joined_schema == (s, x, y)
     assert sorted(rows) == sorted(pd._cols_to_rows(joined))
+
+
+def test_tier2_joins_a_fitting_pattern_first(graph, monkeypatch, capsys):
+    """The `?s :tl ?c` step makes 240 pairs of the 120 seed rows, over a
+    budget of 239 with a pattern still to join: it goes back, and
+    `?x :tl ?d`, whose match the memo holds and whose 5 pairs fit, joins
+    first, recording the pattern it was reordered around. It narrows the
+    relation to five rows; the `?s` pattern, now the last step and still
+    counting more rows than the budget, streams them from the memo's match
+    (tier 1)."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 239)
+    (with_pushdown, without_pushdown), events = _traced_both_ways(
+        graph, monkeypatch, capsys, REORDER
+    )
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == 10
+    [over] = _fields(events, "bgp_over_budget")
+    assert (over["original_pattern_index"], over["strategy"], over["pair_count"]) == (
+        1,
+        "hash_columns",
+        240,
+    )
+    [plan] = _fields(events, "bgp_plan_complete")
+    assert (plan["execution_order"], plan["rest_pattern_indices"]) == ([0, 2, 1], None)
+    assert plan["native_initial_match_count"] == 2
+    names = ("original_pattern_index", "strategy", "reordered_around", "input_rows", "output_rows")
+    steps = [tuple(step[n] for n in names) for step in _fields(events, "bgp_join_step_complete")]
+    assert steps == [(2, "hash_columns", [1], 120, 5), (1, "stream", None, 5, None)]
+    [stream] = _fields(events, "bgp_stream_complete")
+    assert stream["output_rows"] == 10
+    assert _fields(events, "eval_part_fallback") == []
+
+
+def test_tier2_does_not_trust_a_capped_estimate(graph, monkeypatch):
+    """`?x :tl ?d` is next to the one-row `ts0 :ta ?x`, so it is counted at
+    its step only up to 1 x 100 + 1 rows: its 245 rows come back as 101, a
+    lower bound, and the pattern is marked capped; the seed, counted when
+    planned, is not. A capped count proves no fit: against a two-row
+    relation 101 rows make a product of 202, within a budget of 202, yet the
+    pattern fits only once its count is known whole."""
+    x, d = Variable("x"), Variable("d")
+    seed = {
+        "n3": [f"<{EX}ts0>", f"<{EX}ta>", None, None],
+        "varpos": {x: [2]},
+        "unsatisfiable": False,
+        "index": 0,
+    }
+    linked = {
+        "n3": [None, f"<{EX}tl>", None, None],
+        "varpos": {x: [0], d: [2]},
+        "unsatisfiable": False,
+        "index": 1,
+    }
+    pd._join_patterns(graph.store, [seed, linked])
+    assert (seed["estimate"], seed.get("estimate_capped", False)) == (1, False)
+    assert (linked["estimate"], linked["estimate_capped"]) == (101, True)
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 202)
+    rows = [(1,), (2,)]
+    assert not pd._fits(2, (x,), None, rows, linked, {}, graph.store)
+    linked["estimate_capped"] = False
+    assert pd._fits(2, (x,), None, rows, linked, {}, graph.store)
+
+
+def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
+    """`?x :tl ?d` counts 245 rows, far past what its product with the 120
+    seed rows needs to fit, but with its match in the memo it fits by the 5
+    pairs it makes on `?x` — whether the relation is columns or rows — and
+    not past a budget of 4. A pattern the step would probe fits only by the
+    product, memo or not."""
+    s, x, d = (Variable(name) for name in "sxd")
+    native = graph.store._store()
+    seed = native.match_codes(None, f"<{EX}ta>", None, None)
+    n3 = [None, f"<{EX}tl>", None, None]
+    pat = {"n3": n3, "varpos": {x: [0], d: [2]}, "unsatisfiable": False, "estimate": 245}
+    memo = {tuple(n3): native.match_codes(*n3)}
+    cols = (memoryview(seed[0]).cast("Q"), memoryview(seed[2]).cast("Q"))
+    bodies = [(cols, None), (None, pd._cols_to_rows(cols))]
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 5)
+    assert [pd._fits(120, (s, x), *body, pat, memo, graph.store) for body in bodies] == [True] * 2
+    assert not pd._fits(120, (s, x), cols, None, pat, {}, graph.store)
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 2)
+    assert not pd._fits(120, (s, x), cols, None, pat, memo, graph.store)
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 100)
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 4)
+    assert [pd._fits(120, (s, x), *body, pat, memo, graph.store) for body in bodies] == [False] * 2
+
+
+def test_tier3_lets_rdflib_finish_the_rest(graph, monkeypatch, capsys):
+    """At a budget of 0 the `?s :tl ?c` step is over it and the 5 pairs of
+    `?x :tl ?d` do not fit either: nothing joins next, so the relation is the
+    120 seed rows, and rdflib's ``evalBGP`` finishes both patterns per row,
+    reading them through the store's ``triples()`` with the row's bindings
+    in place — once per seed row, then once per `?c` that row finds."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+    unregister_sparql_pushdown()
+    try:
+        expected = run(graph, REORDER)
+    finally:
+        register_sparql_pushdown()
+    read = []
+    triples = VortexRdflibStore.triples
+
+    def watched(store, pattern, context=None):
+        read.append(pattern)
+        return triples(store, pattern, context)
+
+    monkeypatch.setattr(VortexRdflibStore, "triples", watched)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    rows = run(graph, REORDER)
+    events = _trace_events(capsys.readouterr().err)
+    assert rows == expected
+    assert len(rows) == 10
+    [plan] = _fields(events, "bgp_plan_complete")
+    assert (plan["execution_order"], plan["rest_pattern_indices"]) == ([0, 1, 2], [1, 2])
+    assert _fields(events, "bgp_join_step_complete") == []
+    assert _fields(events, "eval_part_fallback") == []
+    assert {predicate for _, predicate, _ in read} == {URIRef(f"{EX}tl")}
+    assert all(s is not None and o is None for s, _, o in read)
+    assert len(read) == 120 + 240
+
+
+def test_tier3_projects_and_windows(graph, monkeypatch, capsys):
+    """rdflib finishes the rows before the head projects and windows them:
+    of the 120 seed rows, the five linked ones finish into two solutions
+    each and the others into none, and `LIMIT 3 OFFSET 2` gives the third to
+    fifth solution, each bound to `?c` alone."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+    register_sparql_pushdown()
+    select = _PREFIX + f"SELECT ?c WHERE {{ {_TIER_BODY} }}"
+    every = list(SPARQLProcessor(graph).query(select)["bindings"])
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    window = list(SPARQLProcessor(graph).query(select + " LIMIT 3 OFFSET 2")["bindings"])
+    events = _trace_events(capsys.readouterr().err)
+    assert _plans(events) == [[1, 2]]
+    assert len(every) == 10
+    assert [dict(solution) for solution in window] == [dict(solution) for solution in every[2:5]]
+    assert [set(solution) for solution in window] == [{Variable("c")}] * 3
+
+
+#: Nodes above a BGP whose last patterns rdflib finishes (tier 3), by id: the
+#: query, the node it hands back, how its answer is compared, and whether it
+#: runs over the named graphs. Each keeps the relation from going straight
+#: to the emitter, or the remaining patterns from being rdflib's alone to
+#: evaluate: a conjunct pushed into them or over a variable only they bind,
+#: a GRAPH scope other than the active graph, an OPTIONAL, an ORDER BY.
+TIER3_ABOVE = {
+    "filter-one-var": (
+        f'SELECT ?s ?c ?d WHERE {{ {_TIER_BODY} FILTER(STRENDS(STR(?c), "-1")) }}',
+        "Filter",
+        run,
+        False,
+    ),
+    "filter-two-var": (
+        f"SELECT ?s ?c ?d WHERE {{ {_TIER_BODY} "
+        f'FILTER(CONCAT(STR(?x), STR(?d)) != "{EX}tx0{EX}td0") }}',
+        "Filter",
+        run,
+        False,
+    ),
+    "graph-iri": (f"SELECT ?s ?c ?d WHERE {{ GRAPH :g1 {{ {_TIER_BODY} }} }}", "Graph", run, True),
+    "graph-var": (
+        f"SELECT ?g ?s ?c ?d WHERE {{ GRAPH ?g {{ {_TIER_BODY} }} }}",
+        "Graph",
+        run,
+        True,
+    ),
+    "optional-above": (
+        f"SELECT ?s ?c ?d ?w WHERE {{ {_TIER_BODY} OPTIONAL {{ ?s :tw ?w }} }}",
+        "LeftJoin",
+        run,
+        False,
+    ),
+    "order-above": (
+        f"SELECT ?s ?c ?d WHERE {{ {_TIER_BODY} }} ORDER BY ?c",
+        "OrderBy",
+        run_ordered,
+        False,
+    ),
+}
+
+
+@pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
+@pytest.mark.parametrize("shape", list(TIER3_ABOVE))
+def test_tier3_keeps_the_answer(
+    joins_vortex, tier_quads_vortex, monkeypatch, capsys, shape, in_memory
+):
+    """Where rdflib's evaluation of the remaining patterns would not be the
+    block's, the node above the BGP goes back to rdflib, which offers the BGP
+    alone in the scope it sets, and there rdflib finishes the rest per row.
+    The answer is rdflib's."""
+    sparql, node, runner, named = TIER3_ABOVE[shape]
+    if named:
+        store = VortexRdflibStore(str(tier_quads_vortex), in_memory=in_memory)
+        view = Dataset(store=store, default_union=True)
+    else:
+        view = Graph(store=VortexRdflibStore(str(joins_vortex), in_memory=in_memory))
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+    (with_pushdown, without_pushdown), events = _traced_both_ways(
+        view, monkeypatch, capsys, _PREFIX + sparql, runner
+    )
+    assert with_pushdown == without_pushdown
+    assert with_pushdown
+    assert node in [event["algebra_node"] for event in _fields(events, "eval_part_fallback")]
+    assert [1, 2] in _plans(events)
+
+
+def test_a_filter_over_the_native_rows_keeps_tier3_below_it(graph, monkeypatch, capsys):
+    """A FILTER that pushes nothing into the BGP leaves tier 3 in place under
+    it: its conjunct, over two variables the native rows bind and with no
+    native or fast route, tests those rows before rdflib finishes them, and
+    nothing is handed back."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+    sparql = (
+        _PREFIX + f"SELECT ?s ?c ?d WHERE {{ {_TIER_BODY} "
+        f'FILTER(CONCAT(STR(?s), STR(?x)) != "{EX}ts0{EX}tx0") }}'
+    )
+    (with_pushdown, without_pushdown), events = _traced_both_ways(
+        graph, monkeypatch, capsys, sparql
+    )
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == 8
+    assert _fields(events, "eval_part_fallback") == []
+    assert _plans(events) == [[1, 2]]
+
+
+def test_a_relation_rdflib_finishes_reaches_only_the_emitter():
+    """The rows of a relation rdflib still finishes are not its answers: a
+    consumer that would hold or pull them fails loudly."""
+    x = Variable("x")
+    rest = ((x, URIRef(f"{EX}p"), Variable("y")),)
+    rel = pd.Relation((x,), None, [(1,)], 1, rest=rest)
+    with pytest.raises(AssertionError):
+        pd._rows_of(rel)
+    with pytest.raises(AssertionError):
+        pd._code_rows(rel)
