@@ -44,6 +44,7 @@ store holds one chunk of codes at a time.
 - Triples() tells a large pattern by its first match, not a count (store) ([`d8f9104`](https://github.com/vortex-rdf/vortex-rdflib/commit/d8f91044deebcf73a7fd12ea2bf696d000a7064e) by @julianrojas87)
 - Answer plain probes without the token plumbing (pushdown) ([`a25c846`](https://github.com/vortex-rdf/vortex-rdflib/commit/a25c846259cebb7cfd8b36ceb7a8916bdb96e273) by @julianrojas87)
 - Count a hash step's pairs once (pushdown) ([`6c8af68`](https://github.com/vortex-rdf/vortex-rdflib/commit/6c8af680e400375a0bb698d78fa05c853ff3937e) by @julianrojas87)
+- Point-lookup batches take the binding's default lookahead (pushdown) ([`e3eeab7`](https://github.com/vortex-rdf/vortex-rdflib/commit/e3eeab769535ed9b2b493913f48d16556d25c8b5) by @julianrojas87)
 
 ### Fixed
 
