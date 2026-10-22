@@ -109,6 +109,7 @@ probed, restricted and joined, with row counts and timings.
 """
 
 import abc
+import contextlib
 import heapq
 import json
 import math
@@ -129,7 +130,7 @@ from rdflib.plugins.sparql.evaluate import evalBGP, evalPart
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
-from vortex_rdf import CodeGroups, U64Column
+from vortex_rdf import Cancelled, CancelToken, CodeGroups, U64Column
 
 from . import candidates, filters, query_scope
 from .terms import CANONICAL_INTEGER, INTEGER_SUFFIX, canonical_spelling, unparseable_iri
@@ -208,6 +209,72 @@ class _QueryTrace:
 
 
 _TRACE: ContextVar[_QueryTrace | None] = ContextVar("vortex_rdf_query_trace", default=None)
+
+#: The cancel token of the query being evaluated: set by :func:`cancel_scope`
+#: for the queries started inside it, kept in the query's scope
+#: (``QueryScope.cancel``) and set again around each step of its lazy result
+#: (:func:`_scoped_iterator`).
+_CANCEL: ContextVar[CancelToken | None] = ContextVar("vortex_rdflib_cancel", default=None)
+
+
+@contextlib.contextmanager
+def cancel_scope(token: CancelToken) -> Iterator[CancelToken]:
+    """Run the queries started inside the block under ``token``, which it
+    yields.
+
+    Each native call such a query makes that the token can stop — a batch, a
+    chunked match, a one-shot call that scans a file-backed store — is given
+    it (``cancel=``) and races it; every other one-shot call — a point
+    lookup, a call capped at one row, any call on an in-memory store, which
+    finishes without waiting — checks it as it is made, as do the loops
+    between calls: a streamed join's pieces, the rows rdflib finishes, the
+    per-row probes. So ``token.cancel()``, from any thread, stops the query
+    with ``vortex_rdf.Cancelled`` at its next call, piece, row or probe,
+    while it is planned or while its rows are read. A
+    query keeps the token it started with until its rows end, the rows read
+    after the block included; a query started outside a block has none. A
+    ``triples()`` iteration started inside the block gives its native calls
+    the token too.
+    """
+    reset = _CANCEL.set(token)
+    try:
+        yield token
+    finally:
+        _CANCEL.reset(reset)
+
+
+def _cancel_kw() -> dict:
+    """The keyword that gives a native call the current query's cancel token:
+    ``{"cancel": token}``, or none without a token."""
+    token = _CANCEL.get()
+    return {} if token is None else {"cancel": token}
+
+
+def _check_cancelled() -> None:
+    """Raise ``vortex_rdf.Cancelled`` when the current query's cancel token is
+    cancelled: the check made per step of a loop that makes no native call,
+    and before a one-shot native call that does not race the token
+    (:func:`_cancel_kw_for`)."""
+    token = _CANCEL.get()
+    if token is not None and token.cancelled:
+        raise Cancelled("cancelled through its CancelToken")
+
+
+def _cancel_kw_for(cancel: dict, store, n3, limit: int | None = None) -> dict:
+    """The cancel keyword of one one-shot native call (``match_codes``,
+    ``count_quads``) on ``store`` over the quad pattern ``n3``, given the
+    query's (``cancel``, :func:`_cancel_kw`): ``cancel`` for a call the token
+    can stop — one that can scan a file-backed store — which races it; none
+    for any other — any call on an in-memory store, which finishes without
+    waiting, a point lookup (:func:`_cheap_probe`) or a call capped at one
+    row (``limit``) — which checks the token as it is made
+    (:func:`_check_cancelled`)."""
+    if cancel and (
+        store.in_memory or (limit is not None and limit <= 1) or _cheap_probe(store, n3)
+    ):
+        _check_cancelled()
+        return {}
+    return cancel
 
 
 def _trace_enabled() -> bool:
@@ -542,6 +609,13 @@ def _eval_part(ctx, part):
         if token is not None:
             _TRACE.reset(token)
         raise
+    except Cancelled:
+        _trace_event("eval_part_cancelled", algebra_node=part.name)
+        if active is not None:
+            active.flush()
+        if token is not None:
+            _TRACE.reset(token)
+        raise
     except Exception as error:
         _trace_event("eval_part_failed", algebra_node=part.name, error_type=type(error).__name__)
         if active is not None:
@@ -577,7 +651,9 @@ def _eval_scoped(ctx, part):
     answers it only through a handler for it (``AskQuery`` has one,
     ``SelectQuery`` none) — and evaluates it itself when no entry answers,
     so every node below runs in the scope; a lazy result keeps it current
-    around each step and clears it at the end (:func:`_scoped_iterator`). A
+    around each step and clears it at the end (:func:`_scoped_iterator`). The
+    scope holds the cancel token current when the query starts
+    (:func:`cancel_scope`), which every step of a lazy result runs under. A
     graph whose store is not a VortexRdflibStore is left alone.
     """
     from .store import VortexRdflibStore
@@ -586,6 +662,7 @@ def _eval_scoped(ctx, part):
     if not isinstance(store, VortexRdflibStore):
         raise NotImplementedError
     opened = query_scope.QueryScope()
+    opened.cancel = _CANCEL.get()
     token = query_scope.enter(opened)
     try:
         result = evalPart(ctx, part)
@@ -602,25 +679,35 @@ def _eval_scoped(ctx, part):
 
 
 def _scoped_iterator(iterator, opened):
-    """``iterator`` with the query's scope current around each step; the
-    scope is cleared when the iterator ends, fails or is closed."""
+    """``iterator`` with the query's scope current around each step, and the
+    query's cancel token (``opened.cancel``) the current one; the scope is
+    cleared when the iterator ends, fails or is closed. The token is set
+    only when the current one is another, as it is for a step pulled after
+    the query's :func:`cancel_scope` block."""
+    cancel = opened.cancel
     try:
         while True:
             token = query_scope.enter(opened)
+            reset = _CANCEL.set(cancel) if _CANCEL.get() is not cancel else None
             try:
                 item = next(iterator)
             except StopIteration:
                 return
             finally:
+                if reset is not None:
+                    _CANCEL.reset(reset)
                 query_scope.leave(token)
             yield item
     finally:
         close = getattr(iterator, "close", None)
         if close is not None:
             token = query_scope.enter(opened)
+            reset = _CANCEL.set(cancel) if _CANCEL.get() is not cancel else None
             try:
                 close()
             finally:
+                if reset is not None:
+                    _CANCEL.reset(reset)
                 query_scope.leave(token)
         opened.clear()
 
@@ -1567,6 +1654,7 @@ def _block_nonempty(ctx, store, block) -> bool:
             # Existence needs no rows: a count capped at one, which stops a
             # file-backed scan at its first match.
             narrowing = _narrowing(pat.get("nkeep"), limit=1)
+            _check_cancelled()
             return _native(store).count_quads(*pat["n3"], **narrowing) > 0
     rel = _solve_block(ctx, store, block, scope=scope, limit=1)
     # One row is pulled, and the rows are closed after it: a streamed join
@@ -2569,7 +2657,8 @@ def _count_pattern(store, pat, counts: dict, exact: bool = False, limit: int | N
     key = _pattern_key(pat) if nkeep else tuple(pat["n3"])
     n = counts.get(key)
     if n is None:
-        n = _native(store).count_quads(*pat["n3"], **_narrowing(nkeep, limit))
+        cancel = _cancel_kw_for(_cancel_kw(), store, pat["n3"], limit)
+        n = _native(store).count_quads(*pat["n3"], **_narrowing(nkeep, limit), **cancel)
         if limit is None or n < limit:
             counts[key] = n
     return n
@@ -2628,7 +2717,7 @@ def _count_patterns(store, patterns, counts: dict) -> int:
             rest.append(pat)
     if len({tuple(pat["n3"]) for pat in rest}) >= minimum:
         keys = list(dict.fromkeys(tuple(pat["n3"]) for pat in rest))
-        counts.update(zip(keys, _native(store).count_quads_many(keys), strict=True))
+        counts.update(zip(keys, _native(store).count_quads_many(keys, **_cancel_kw()), strict=True))
         for pat in rest:
             pat["estimate"] = counts[tuple(pat["n3"])]
     else:
@@ -2711,7 +2800,8 @@ def _run_probes(store, probes, count: bool) -> list | Iterator:
     ``count_quads_many`` or ``match_codes_many`` call — every probe parsed
     before any runs, as many running at once on the native runtime as
     :func:`_probe_lookahead` names, a file-backed store overlapping their
-    reads — and the rest through plain calls.
+    reads — and the rest through plain calls. A batch call races the query's
+    cancel token, a plain one as :func:`_cancel_kw_for` decides.
     """
     if not probes:
         return []
@@ -2720,18 +2810,27 @@ def _run_probes(store, probes, count: bool) -> list | Iterator:
     batched = _batched_probes(store, [n3 for n3, _ in probes]) if len(probes) >= minimum else []
     lookahead = _probe_lookahead(store, [probes[i][0] for i in batched])
     if not count:
-        return _probe_matches(native, probes, batched, lookahead)
+        return _probe_matches(store, native, probes, batched, lookahead)
+    cancel = _cancel_kw()
     if not batched:
-        return [native.count_quads(*n3, **narrowing) for n3, narrowing in probes]
+        return [
+            native.count_quads(
+                *n3, **narrowing, **_cancel_kw_for(cancel, store, n3, narrowing.get("limit"))
+            )
+            for n3, narrowing in probes
+        ]
     answers: list = [None] * len(probes)
     batch = [_batch_probe(*probes[i]) for i in batched]
-    counts = native.count_quads_many(batch, lookahead=lookahead)
+    counts = native.count_quads_many(batch, lookahead=lookahead, **cancel)
     for i, answer in zip(batched, counts, strict=True):
         answers[i] = answer
     done = set(batched)
     for i, (n3, narrowing) in enumerate(probes):
         if i not in done:
-            answers[i] = native.count_quads(*n3, **narrowing)
+            limit = narrowing.get("limit")
+            answers[i] = native.count_quads(
+                *n3, **narrowing, **_cancel_kw_for(cancel, store, n3, limit)
+            )
     return answers
 
 
@@ -2748,7 +2847,7 @@ def _batch_probe(n3, narrowing):
 _NO_ANSWER = object()
 
 
-def _probe_matches(native, probes, batched, lookahead: int) -> Iterator:
+def _probe_matches(store, native, probes, batched, lookahead: int) -> Iterator:
     """The code columns of each probe, in order, each made when it is pulled:
     the ``batched`` probes' from the one ``match_codes_many`` call the first
     pull makes, whose probes run, as far ahead as ``lookahead`` lets them,
@@ -2756,19 +2855,26 @@ def _probe_matches(native, probes, batched, lookahead: int) -> Iterator:
     from a ``match_codes`` call at their position. A batch that answers
     fewer probes than it was given raises ``ValueError`` at the first probe
     left without an answer, and one that answers more, with its last probe.
-    Closing the iterator releases the batch's answers, which aborts the
-    probes still in flight."""
+    Each probe checks the query's cancel token first
+    (:func:`_check_cancelled`); the batch races it, a plain call as
+    :func:`_cancel_kw_for` decides. Closing the iterator releases the batch's
+    answers, which aborts the probes still in flight."""
     in_batch = set(batched)
+    cancel = _cancel_kw()
     answers = iter(())
     if batched:
         answers = native.match_codes_many(
-            [_batch_probe(*probes[i]) for i in batched], lookahead=lookahead
+            [_batch_probe(*probes[i]) for i in batched], lookahead=lookahead, **cancel
         )
     unanswered = len(batched)
     try:
         for i, (n3, narrowing) in enumerate(probes):
+            _check_cancelled()
             if i not in in_batch:
-                yield native.match_codes(*n3, **narrowing)
+                limit = narrowing.get("limit")
+                yield native.match_codes(
+                    *n3, **narrowing, **_cancel_kw_for(cancel, store, n3, limit)
+                )
                 continue
             try:
                 answer = next(answers)
@@ -2824,10 +2930,11 @@ def _match_resolved_pattern(store, pat, memo=None, limit=None) -> tuple[int, int
     calls = 0
     if cols is None:
         native = _native(store)
+        cancel = _cancel_kw_for(_cancel_kw(), store, pat["n3"], limit)
         if nkeep or limit is not None:
-            cols = native.match_codes(*pat["n3"], **_narrowing(nkeep, limit))
+            cols = native.match_codes(*pat["n3"], **_narrowing(nkeep, limit), **cancel)
         else:
-            cols = native.match_codes(*pat["n3"])
+            cols = native.match_codes(*pat["n3"], **cancel)
         if cols is None:
             raise NotImplementedError
         if memo is not None and limit is None:
@@ -3733,7 +3840,9 @@ def _gather_pieces(
     counts no pair is skipped. A part is gathered by ``CodeGroups.gather``:
     per pair, in nested-loop order, its other columns at the fed row, then
     ``grouped`` at the grouped row — permuted by ``order`` into the step's
-    schema. The feed is closed when the pieces end, fail or are closed, and
+    schema. Each part checks the query's cancel token before it is counted
+    (:func:`_check_cancelled`), so a cancel stops the pieces at the next
+    one. The feed is closed when the pieces end, fail or are closed, and
     ``bgp_stream_complete`` is traced then: the pieces gathered, their rows,
     and the time spent here (pulling the feed, counting, gathering), not in
     the consumer."""
@@ -3744,6 +3853,7 @@ def _gather_pieces(
         for part in fed:
             parts = [part]
             while parts:
+                _check_cancelled()
                 part = parts.pop()
                 column = part[key]
                 length = len(column)
@@ -3827,6 +3937,7 @@ def _streamed_step(
                 columns=[("s", "p", "o", "g")[varpos[v][0]] for v in pattern_schema],
                 batch_rows=_PIECE_ROWS,
                 **_narrowing(pat.get("nkeep")),
+                **_cancel_kw(),
             )
             if fed is None:
                 raise NotImplementedError
@@ -4337,10 +4448,12 @@ def _finish_with_rdflib(ctx, solutions: Iterator, rest: tuple) -> Iterator[Froze
     own, where the patterns run in the order rdflib's ``evalPart`` gives a
     BGP (:func:`_most_bound_first`). ``evalBGP`` is called directly, so the
     hook is not offered the patterns again; it reads them through the
-    store's ``triples()``. ``solutions`` is closed when these end, fail or
-    are closed."""
+    store's ``triples()``. Each solution checks the query's cancel token
+    before it is extended (:func:`_check_cancelled`). ``solutions`` is
+    closed when these end, fail or are closed."""
     try:
         for solution in solutions:
+            _check_cancelled()
             context = ctx.thaw(solution)
             yield from evalBGP(context, _most_bound_first(context, rest))
     finally:

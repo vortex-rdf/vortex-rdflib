@@ -12,11 +12,11 @@ import pytest
 import rdflib.plugins.sparql.evaluate as rdflib_evaluate
 from rdflib import Graph, URIRef
 from rdflib.plugins.sparql import CUSTOM_EVALS
-from vortex_rdf import serialize_rdf
+from vortex_rdf import Cancelled, CancelToken, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
 from test_pushdown import _counting_term_dict, _row_key, both_ways, is_graph_name_check, run
-from vortex_rdflib import VortexRdflibStore, query_scope, register_sparql_pushdown
+from vortex_rdflib import VortexRdflibStore, cancel_scope, query_scope, register_sparql_pushdown
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 
@@ -99,6 +99,36 @@ def test_a_query_scope_is_released_with_its_results(tmp_path, monkeypatch):
     gc.collect()
     assert len(opened) == 2
     assert all(ref() is None for ref in opened)
+
+
+def test_a_query_scope_holds_its_token_and_drops_it(tmp_path, monkeypatch):
+    """A query started inside ``cancel_scope`` keeps the block's token in its
+    scope while its results are read, after the block too, and the scope
+    drops it with the rest once they end; a query started outside a block
+    holds none."""
+    graph = Graph(store=_store(tmp_path))
+    opened = []
+
+    class _Tracked(query_scope.QueryScope):
+        __slots__ = ()
+
+        def __init__(self):
+            super().__init__()
+            opened.append(self)
+
+    monkeypatch.setattr(query_scope, "QueryScope", _Tracked)
+    register_sparql_pushdown()
+    query = "SELECT ?s ?o WHERE { ?s <http://ex.org/knows> ?o }"
+    token = CancelToken()
+    with cancel_scope(token):
+        rows = iter(graph.query(query))
+    [scope] = opened
+    assert scope.cancel is token
+    assert len(list(rows)) == 50
+    assert scope.cancel is None
+    rows = iter(graph.query(query))
+    assert opened[1].cancel is None
+    assert len(list(rows)) == 50
 
 
 def test_each_query_has_a_scope_of_its_own(tmp_path, monkeypatch):
@@ -291,6 +321,30 @@ def test_a_query_failing_mid_iteration_releases_its_scope(tmp_path, tracked):
         for row in graph.query(query):
             rows.append(row)
     assert len(rows) == pd._CHUNK_START
+    _assert_released(store, before, tracked)
+
+
+def test_a_cancelled_query_releases_its_scope(tmp_path, tracked, monkeypatch):
+    """A query cancelled while its rows are read — rdflib's evaluator reads
+    the store once per binding, each read given the token — raises
+    ``Cancelled`` at the next read and releases its scope and its token as
+    any failure does."""
+    store = _store(tmp_path)
+    graph = Graph(store=store)
+    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset())
+    register_sparql_pushdown()
+    query = "SELECT ?a ?c WHERE { ?a <http://ex.org/knows> ?b . ?b <http://ex.org/knows> ?c }"
+    assert len(run(graph, query)) == 50
+    before = _footprint(store)
+    token = CancelToken()
+    with cancel_scope(token):
+        rows = iter(graph.query(query))
+        assert next(rows)
+        token.cancel()
+        with pytest.raises(Cancelled):
+            next(rows)
+    del rows
+    assert pd._CANCEL.get() is None
     _assert_released(store, before, tracked)
 
 
