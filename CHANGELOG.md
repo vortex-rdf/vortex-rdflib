@@ -17,9 +17,11 @@ patterns row by row. A probe join whose probes would each scan the store is a
 keep-scan instead: the pattern is matched once, narrowed to the codes the
 relation binds. `vortex_rdflib.cancel_scope(token)` gives the queries started
 inside it a `vortex_rdf.CancelToken`, and cancelling it, from any thread,
-raises `vortex_rdf.Cancelled` at the query's next call into vortex-rdf or its
-next pull. `triples()` reads a pattern of more than 65,536 rows in chunks of
-that many, so a scan of a large store holds one chunk of codes at a time.
+raises `vortex_rdf.Cancelled` at the next point that checks it: a native call
+that races the token, the check before every other one-shot call, a piece of a
+streamed join, a row rdflib finishes, or a per-row probe. `triples()` reads a
+pattern of more than 65,536 rows in chunks of that many, so a scan of a large
+store holds one chunk of codes at a time.
 
 ### Breaking changes
 

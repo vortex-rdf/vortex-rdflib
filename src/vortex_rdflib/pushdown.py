@@ -116,7 +116,9 @@ block has no token, and without one no native call gains a keyword.
 rdflib only catches ``NotImplementedError`` at hook-call time, so every
 capability check and every native call that can decline happens before a
 generator is handed back; the generators decode, pull iterators created
-while planning, and run kernels. The hook applies when the active graph's
+while planning, run kernels and, where a plan leaves patterns to rdflib
+(tier 3), run rdflib's own evaluation of them, which makes new
+``triples()`` calls. The hook applies when the active graph's
 store is a VortexRdflibStore with the code path available (Dictionary layout,
 its dictionary memory-mapped from the file or loaded with the store);
 behaviour is identical to rdflib's default evaluation, only faster, and the

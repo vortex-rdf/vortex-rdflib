@@ -93,8 +93,19 @@ from Python — it enables the SPARQL pushdowns described below.
 
 `cancel_scope` gives the queries started inside it a `vortex_rdf.CancelToken`.
 Cancel the token, from any thread, and the query raises `vortex_rdf.Cancelled`
-at its next call into vortex-rdf or its next pull, while it is planned or while
-its rows are read:
+at the next point that checks it:
+
+- A call into vortex-rdf that races the token: every batch and chunk call, and
+  each one-shot call that can scan a file-backed store.
+- Every other one-shot call, which checks the token before it starts and then
+  runs to completion: an in-memory call, a point lookup, a call capped at one
+  row, and the string fallback (a layout other than `"dictionary"`, or
+  `VORTEX_RDF_DISABLE_CODE_PATH=1`).
+- Between calls: the pieces of a streamed join, the rows rdflib finishes when a
+  join over the pair budget is left to it, and the probes a join sends per row.
+
+A cancel takes effect at the next of these points, so rows that are already
+fetched and are being read in Python are delivered until then.
 
 ```python
 import threading
@@ -108,7 +119,7 @@ deadline.start()
 try:
     with cancel_scope(token):
         result = graph.query("SELECT ?s ?o WHERE { ?s ?p ?o }")
-    for row in result:  # a lazy result keeps the token of the query that made it
+    for row in result:
         print(row.s, row.o)
 except Cancelled:
     print("cancelled")
@@ -116,12 +127,14 @@ finally:
     deadline.cancel()
 ```
 
-A lazy result keeps the token of the query that made it, so the calls it still
-makes while its rows are read run under it, and a query started outside any
-block has no token. A call that vortex-rdf cannot interrupt once it has started
-is checked before it starts and runs to completion: an in-memory one-shot call,
-a point lookup, a call capped at one row, and the string fallback of a layout
-other than `"dictionary"`.
+A lazy result keeps the token of the query that made it, so the check points it
+still reaches while its rows are produced run under it, and a query started
+outside any block has no token. In the snippet, the one pattern is matched
+inside `graph.query(...)`, where the token is checked or raced; the loop then
+reads rows that are already fetched, and a cancel that arrives during it is not
+observed, because that result has no check point left. A result whose rows
+come from a streamed join, or from rdflib finishing a join, has check points
+left while its rows are read.
 
 ## Streaming a large answer
 
@@ -134,13 +147,17 @@ produces instead of a `Result`:
 from rdflib import Variable
 from rdflib.plugins.sparql.processor import SPARQLProcessor
 
-answer = SPARQLProcessor(graph).query("SELECT ?s ?o WHERE { ?s ?p ?o }")
+query = "SELECT ?s ?o WHERE { ?s ?p ?o }"
+answer = SPARQLProcessor(graph).query(query, initNs=dict(graph.namespaces()))
 for binding in answer["bindings"]:  # one row at a time; nothing keeps it
     print(binding[Variable("s")], binding[Variable("o")])
 ```
 
-`answer["vars_"]` lists the projected variables, in order. `Graph.query` wraps
-the same dictionary in a `Result`.
+`initNs` is what `Graph.query` hands the processor: the graph's namespace
+bindings (a graph over a `VortexRdflibStore` holds none, so a query reads the
+same prefixes either way). `answer["vars_"]` lists the projected variables, in
+order. `Graph.query` makes the same call and wraps the dictionary in a
+`Result`.
 
 ## How it works
 
@@ -197,16 +214,17 @@ The pair budget (`VORTEX_RDF_PAIR_BUDGET`, 16,777,216 row pairs by default)
 bounds what one join step of a basic graph pattern builds at once. A step that
 could pass it is counted natively before it is built, and one over the budget
 is not built whole: the last step is joined a piece at a time while the rows
-are read, so the join holds one piece; or another pattern that fits is joined
-first; or rdflib finishes the remaining patterns row by row. On a 10.9M-row
-file-backed store, the benchmark campaign's WatDiv query T051 (`SELECT *` over
-five patterns whose last join makes 4.17 G pairs) made 0.3.0 ask for a 33 GB
-index column before its first row; 0.4 yields its first row in 0.2 s, with
-native memory at about 1 GiB at the default budget (about 220 MiB at
-`VORTEX_RDF_PAIR_BUDGET=4194304`). `triples()`, which rdflib's own evaluator
-calls, reads a pattern of up to 65,536 rows as one match and a larger one in
-chunks of 65,536 rows, so a scan of a large store holds one chunk of codes at a
-time; that size is the module constant
+are read, so a consumer that reads its rows as they come holds one piece
+(`ORDER BY`, group joins, `OPTIONAL`, `MINUS` and `EXISTS` read the pieces into
+rows first); or another pattern that fits is joined first; or rdflib finishes
+the remaining patterns row by row. On a 10.9M-row file-backed store, a WatDiv
+query, T051 (`SELECT *` over five patterns whose last join makes 4.17 G pairs),
+made 0.3.0 ask for a 33 GB index column before its first row; 0.4 yields its
+first row in 0.2 s, with native memory at about 1 GiB at the default budget
+(about 220 MiB at `VORTEX_RDF_PAIR_BUDGET=4194304`). `triples()`, which
+rdflib's own evaluator calls, reads a pattern of up to 65,536 rows as one match
+and a larger one in chunks of 65,536 rows, so a scan of a large store holds one
+chunk of codes at a time; that size is the module constant
 `vortex_rdflib.store._TRIPLES_CHUNK_ROWS`, not an environment variable. How the
 budget works is described in [docs/pushdown.md](docs/pushdown.md#the-pair-budget).
 
