@@ -2835,8 +2835,8 @@ def _run_probes(store, probes, count: bool) -> list | Iterator:
 
     The probes :func:`_batched_probes` picks go through one
     ``count_quads_many`` or ``match_codes_many`` call — every probe parsed
-    before any runs, as many running at once on the native runtime as
-    :func:`_probe_lookahead` names, a file-backed store overlapping their
+    before any runs, running as far ahead on the native runtime as
+    :func:`_probe_lookahead` lets them, a file-backed store overlapping their
     reads — and the rest through plain calls. The query's cancel token is
     read once: a batch call races it, a plain call races or checks it as
     :func:`_cancel_kw_for` decides, and without a token no call is given a
@@ -4250,8 +4250,8 @@ def _probe_join(
     re-matching natively keeps the work proportional to the small side. The
     probes go to the native layer in batches (``match_codes_many``, or
     ``count_quads_many`` for an existence probe, a pattern with no free
-    position): one call each, every probe of a batch running concurrently — a
-    file-backed store overlaps their reads. An existence probe keeps its row
+    position): one call each, a batch's probes running as far ahead as
+    :func:`_probe_lookahead` lets them. An existence probe keeps its row
     once per quad it matches: a fixed graph (a named graph, the default graph
     alone, a bound ``GRAPH ?g``) holds at most one, so the count stops at one
     row; the union default graph holds a triple once per graph that has it,
