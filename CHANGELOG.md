@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.3.0...v0.4.0) - 2026-10-22
 
-Requires vortex-rdf 0.13 (`vortex-rdf>=0.13,<0.14`, up from 0.12.1): joins are
-budgeted, long native calls can be cancelled, and large reads stream. A join
-step of a basic graph pattern has a pair budget (`VORTEX_RDF_PAIR_BUDGET`,
+Requires vortex-rdf 0.13.1 (`vortex-rdf>=0.13.1,<0.14`, up from 0.12.1): joins
+are budgeted, long native calls can be cancelled, and large reads stream. A
+join step of a basic graph pattern has a pair budget (`VORTEX_RDF_PAIR_BUDGET`,
 16,777,216 row pairs by default), and a step over it is not built whole: the
 last step streams its pairs a piece at a time as the rows are read, or another
 pattern that provably fits is joined first, or rdflib finishes the remaining
@@ -23,12 +23,15 @@ streamed join, a row rdflib finishes, a per-row probe, or a slice or decode
 chunk of the rows being read, so a result whose rows are decoded as they are
 read stops within one decode chunk, at most 4,096 rows. `triples()` reads a
 pattern of more than 65,536 rows in chunks of that many, so a scan of a large
-store holds one chunk of codes at a time.
+store holds one chunk of codes at a time. The floor is 0.13.1 because that
+first chunk is a limited match, and 0.13.1 reads a limited match that the limit
+cannot cut as it reads the match without one (vortex-rdf
+[#104](https://github.com/vortex-rdf/vortex-rdf/issues/104)).
 
 ### Breaking changes
 
-- vortex-rdf 0.12 is no longer supported: the dependency is
-  `vortex-rdf>=0.13,<0.14`.
+- vortex-rdf 0.12 and 0.13.0 are no longer supported: the dependency is
+  `vortex-rdf>=0.13.1,<0.14`.
 
 ### Added
 
