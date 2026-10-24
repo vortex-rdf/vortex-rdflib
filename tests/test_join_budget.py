@@ -919,7 +919,7 @@ def test_tier2_does_not_trust_a_capped_estimate(graph, monkeypatch):
     x, d = Variable("x"), Variable("d")
     seed = pd.Pattern([f"<{EX}ts0>", f"<{EX}ta>", None, None], {x: [2]}, index=0)
     linked = pd.Pattern([None, f"<{EX}tl>", None, None], {x: [0], d: [2]}, index=1)
-    pd._join_patterns(graph.store, [seed, linked])
+    pd._join_incremental_bgp(graph.store, [seed, linked], pd._BgpStats())
     assert (seed.estimate, seed.estimate_capped) == (1, False)
     assert (linked.estimate, linked.estimate_capped) == (101, True)
     monkeypatch.setattr(SETTINGS, "pair_budget", 202)

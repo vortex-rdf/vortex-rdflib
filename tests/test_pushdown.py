@@ -1494,8 +1494,10 @@ def test_hash_joined_bgp_keeps_a_columnar_body(graph, monkeypatch):
     """A hash-joined BGP's relation is columns, not row tuples — tuples
     appear only as rows are consumed."""
     rels = []
-    original = pd._join_patterns
-    monkeypatch.setattr(pd, "_join_patterns", lambda *a: rels.append(original(*a)) or rels[-1])
+    original = pd._join_incremental_bgp
+    monkeypatch.setattr(
+        pd, "_join_incremental_bgp", lambda *a: rels.append(original(*a)) or rels[-1]
+    )
     register_sparql_pushdown()
     rows = run(
         graph,
@@ -1553,8 +1555,10 @@ def test_tuple_filtered_bgp_keeps_a_columnar_body(
     values, so 25 rows over two patterns and 50 over three."""
     graph = _three_predicate_graph(tmp_path, "s", lambda i: i + 1000 if i % 2 == 0 else i - 1000)
     rels = []
-    original = pd._join_patterns
-    monkeypatch.setattr(pd, "_join_patterns", lambda *a: rels.append(original(*a)) or rels[-1])
+    original = pd._join_incremental_bgp
+    monkeypatch.setattr(
+        pd, "_join_incremental_bgp", lambda *a: rels.append(original(*a)) or rels[-1]
+    )
     register_sparql_pushdown()
     rows = run(
         graph,
