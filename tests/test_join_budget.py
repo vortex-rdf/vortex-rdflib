@@ -1361,10 +1361,10 @@ def test_an_over_budget_keep_scan_with_a_deferred_restriction_goes_back(graph, m
 
 @pytest.mark.parametrize("planned", [None, {0: (0, 1 << 40)}], ids=["no-keep", "keep"])
 def test_a_put_back_keep_scan_drops_its_keep(graph, planned):
-    """A keep-scan narrows its pattern's keep to the relation's codes and
-    memoizes its match under that keep. Put back, the pattern has the keep it
-    was planned with again, which the keep-scan left whole, and the match
-    leaves the memo with the narrower keep."""
+    """A keep-scan narrows its step's copy of the pattern to the relation's
+    codes and memoizes its match under that keep. Put back, the pattern
+    still has the keep it was planned with, which the keep-scan left whole,
+    and the match leaves the memo with the copy's narrower keep."""
     k, f, p = (Variable(name) for name in "kfp")
     keys = graph.store._store().match_codes(f"<{EX}c0>", f"<{EX}has>", None, None)[2]
     pat = pd.Pattern([None, None, None, None], {f: [0], p: [1], k: [2]}, estimate=1348)
@@ -1372,11 +1372,12 @@ def test_a_put_back_keep_scan_drops_its_keep(graph, planned):
     whole = None if planned is None else dict(planned)
     memo: dict = {}
     relation = pd.Relation.from_cols((k,), (memoryview(keys).cast("Q"),))
-    pd._keep_scan(graph.store, pat, relation, memo)
-    assert pat.nrows == 18
-    assert pat.nkeep is not None and set(pat.nkeep) == {2} | set(planned or ())
-    assert list(memo) == [pd._pattern_key(pat)]
-    pd._put_back(pat, None, (), None, (), planned, memo)
+    work = pat.copy()
+    pd._keep_scan(graph.store, work, relation, memo)
+    assert work.nrows == 18
+    assert work.nkeep is not None and set(work.nkeep) == {2} | set(planned or ())
+    assert list(memo) == [pd._pattern_key(work)]
+    pd._discard_step(pat, work, memo)
     assert pat.nkeep is planned
     assert planned == whole
     assert not pat.matched and memo == {}

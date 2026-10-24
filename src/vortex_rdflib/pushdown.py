@@ -811,10 +811,10 @@ class Pattern:
     predicate position, an IRI the parser rejects, a keep left empty).
     ``index`` is its place in the BGP, ``None`` outside one. ``nkeep``
     narrows its native match per position (a code range, or an ascending
-    code column); narrowing it further replaces the mapping, never mutates
-    it (:func:`_set_native_keep`), so a keep taken before stays whole.
-    ``deferred`` maps variables to the conjuncts still to be evaluated over
-    the codes the pattern brings.
+    code column). ``deferred`` maps variables to the conjuncts still to be
+    evaluated over the codes the pattern brings. Both mappings are replaced
+    when they change, never mutated (:func:`_set_native_keep`), so a keep
+    taken before stays whole and a copy (:meth:`copy`) shares them safely.
 
     Planning sets ``estimate`` (its count, ``None`` while uncounted; a lower
     bound when ``estimate_capped``) or marks it ``probe`` (left uncounted
@@ -846,6 +846,12 @@ class Pattern:
     def set_match(self, cols: tuple, nrows: int) -> None:
         """Hold a match: its columns and row count."""
         self.cols, self.nrows, self.matched = cols, nrows, True
+
+    def copy(self) -> "Pattern":
+        """A copy for a join step to work on. The mappings a step changes
+        (``nkeep``, ``deferred``) are replaced when they change, never
+        mutated, so the copy may share them."""
+        return replace(self)
 
     def clear_match(self) -> None:
         """Let go of the match: the pattern is unread again."""
@@ -2990,10 +2996,12 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
     whose keep-scan came back over the budget, streams without reading the
     pattern whole: it reads it in chunks narrowed by its native keep
     (:func:`_read_in_chunks`), which a pattern that needs its whole columns
-    cannot be (:func:`_chunkable`). Any other step over the budget puts its
-    pattern back as it was planned (:func:`_put_back`) — its match left in
-    the memo, a keep-scan's dropped with the keep that narrowed it — and the
-    next step takes the first other pattern sharing a variable with the
+    cannot be (:func:`_chunkable`). A step works on a copy of its pattern
+    and keeps it only once it completes, so any other step over the budget
+    puts the pattern back as it was planned (:func:`_discard_step`) — its
+    match left in the memo, a keep-scan's dropped with the keep that
+    narrowed it — and the next step takes the first other pattern sharing a
+    variable with the
     relation that provably fits (:func:`_fits`), which records the patterns
     it was reordered around; those are tried again after it. Once none
     fits, the patterns left are rdflib's to finish per row of the relation
@@ -3081,27 +3089,32 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
         del remaining[position]
         shared = [v for v in pat.varpos if v in rel.schema]
         elapsed = _stopwatch()
+        # The step works on a copy and keeps it only once it completes: a
+        # step over the budget leaves the pattern as it was planned — unread,
+        # its keep and deferred restrictions its own — for a later step.
+        work = pat.copy()
         specialized = ()
         if tuples and pushed is not None:
-            specialized = _specialize_tuple_conjuncts(store, pat, rel, tuples, pushed)
+            # Another block of the group may have applied some since.
             tuples = tuple(c for c in tuples if id(c) not in pushed.applied)
+            specialized = _specialize_tuple_conjuncts(store, work, rel, tuples, pushed)
         count_limit = None
         if pat.estimate is None:
             # Next to a pattern of at most SETTINGS.probe_fanout rows, so not
             # counted when planned: counted here, only as far as the
-            # probe-or-match decision needs; a capped answer means probe.
+            # probe-or-match decision needs; a capped answer means probe. The
+            # count is the pattern's, kept whether or not the step completes.
             count_limit = running * SETTINGS.probe_fanout + 1
             clock = _stopwatch()
             estimate = pat.estimate = _count_pattern(store, pat, counts, limit=count_limit)
             # An answer at the cap is a lower bound of the count (_fits).
             pat.estimate_capped = estimate >= count_limit
+            work.estimate, work.estimate_capped = pat.estimate, pat.estimate_capped
             stats.native_ns += clock()
             stats.estimate_calls += 1
         else:
             estimate = pat.estimate
-        deferred = pat.deferred
-        nkeep = pat.nkeep
-        step = _JoinStep(execution_index, pat, running, estimate, count_limit, len(shared))
+        step = _JoinStep(execution_index, work, running, estimate, count_limit, len(shared))
 
         # Tier 1: the last step, when it shares one variable, streams
         # (_streamed_step) rather than going back to rdflib over the budget.
@@ -3109,9 +3122,9 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
         if shared and running * SETTINGS.probe_fanout < estimate:
             # Joined per row of the relation: by probes where each is a point
             # lookup, else by one keep-scan rather than a scan per row.
-            cheap = store._point_lookup(_probe_shape(pat, shared))
+            cheap = store._point_lookup(_probe_shape(work, shared))
             step.strategy = "probe" if cheap else "keep_scan"
-        elif streams and _read_in_chunks(pat, running):
+        elif streams and _read_in_chunks(work, running):
             step.strategy = "stream"
         else:
             step.strategy = "hash_columns"
@@ -3122,7 +3135,7 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
                 clock = _stopwatch()
                 try:
                     probed = _probe_join(
-                        store, rel.schema, rel.row_list(), pat, max_rows=SETTINGS.pair_budget // 4
+                        store, rel.schema, rel.row_list(), work, max_rows=SETTINGS.pair_budget // 4
                     )
                 except _OverBudget as over:
                     # Only the probes sent before the tally passed count.
@@ -3137,23 +3150,22 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
                 else:
                     rel = Relation.from_rows(*probed)
                     step.match_rows = estimate
-                    step.restricted_rows = rel.nrows if pat.probe_rows is None else pat.probe_rows
-                    pat.probe_rows = None
+                    step.restricted_rows = rel.nrows if work.probe_rows is None else work.probe_rows
             if step.strategy == "stream":
                 step.source = "chunked"
             elif step.strategy != "probe":
                 step.source = "matched"
                 if step.strategy == "keep_scan":
-                    calls, native_ns = _keep_scan(store, pat, rel, memo)
+                    calls, native_ns = _keep_scan(store, work, rel, memo)
                 else:
-                    calls, native_ns = _match_resolved_pattern(store, pat, memo)
+                    calls, native_ns = _match_resolved_pattern(store, work, memo)
                 stats.initial_calls += calls
                 stats.native_ns += native_ns
                 clock = _stopwatch()
-                _materialize_eager_restrictions(store, pat, rel.schema)
+                _materialize_eager_restrictions(store, work, rel.schema)
                 stats.restriction_ns += clock()
-                step.match_rows, step.restricted_rows = pat.match_rows, pat.nrows
-                right = _rel_from_pattern(pat)
+                step.match_rows, step.restricted_rows = work.match_rows, work.nrows
+                right = _rel_from_pattern(work)
                 joined = (
                     _join_columns(rel.schema, rel.cols, right.schema, right.cols)
                     if rel.cols is not None and right.cols is not None
@@ -3177,23 +3189,22 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
             # A keep-scan that came back over the budget left its pattern
             # unread, so it streams from chunks, which only the native keep
             # narrows: a pattern that needs more goes back too.
-            if not streams or not pat.matched and not _chunkable(pat):
-                # Back where it was planned, as it was before this step: its
-                # match left in the memo, its own restrictions and keep back,
-                # and the tuple conjuncts the step specialized onto it
-                # pending again.
-                tuples = _put_back(pat, deferred, specialized, pushed, tuples, nkeep, memo)
+            if not streams or not work.matched and not _chunkable(work):
+                # Back where it was planned, as it was: its match left in the
+                # memo, and the tuple conjuncts the step specialized onto its
+                # copy still pending.
+                _discard_step(pat, work, memo)
                 remaining.insert(position, pat)
                 put_back.append(pat)
                 continue
             step.strategy, step.pair_count = "stream", over.pairs
 
         if step.strategy == "stream":
-            schema, pieces = _streamed_step(store, rel, pat, memo)
+            schema, pieces = _streamed_step(store, rel, work, memo)
             rel = Relation(schema, None, None, 0, pieces=pieces)
             # _streamed_step reads an unread pattern out of the memo when the
             # memo holds its match: whether it is matched says how it is fed.
-            if not pat.matched:
+            if not work.matched:
                 step.feed, step.source = "chunks", "chunked"
                 step.match_rows = step.restricted_rows = None
                 stats.initial_calls += 1
@@ -3202,7 +3213,12 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
                 if step.source == "chunked":
                     # The memo held the pattern's match: it was read whole.
                     step.source = "matched"
-                    step.match_rows = step.restricted_rows = pat.nrows
+                    step.match_rows = step.restricted_rows = work.nrows
+        # The step completed: the tuple conjuncts it specialized are applied.
+        if specialized:
+            assert pushed is not None
+            pushed.applied.update(id(conjunct) for conjunct, _, _ in specialized)
+            tuples = tuple(c for c in tuples if id(c) not in pushed.applied)
         _trace_join_step(step, rel, put_back, elapsed())
         put_back.clear()
         order.append(pat.index)
@@ -3242,12 +3258,13 @@ def _specialize_tuple_conjuncts(store, pat: Pattern, rel: Relation, tuples, push
     (:func:`filters.specialize`) joins ``pat``'s deferred restrictions and is
     evaluated over the codes ``pat`` brings — the rows its match returns, or
     the rows its probes reach. Every row the BGP then yields passes the
-    conjunct, which is marked applied: neither the mid-join prune nor the
-    FILTER above evaluates it again.
+    conjunct, which the step marks applied once it completes: neither the
+    mid-join prune nor the FILTER above evaluates it again. ``pat`` is the
+    step's copy, so a step that goes back over the budget leaves the
+    pattern without them.
 
     Returns what it specialized, ``(conjunct, variable, per-variable
-    conjunct)`` each: a step that goes back over the budget undoes it
-    (:func:`_put_back`).
+    conjunct)`` each.
     """
     specialized: list = []
     if not (SETTINGS.fast_filters and SETTINGS.native_filters):
@@ -3273,10 +3290,8 @@ def _specialize_tuple_conjuncts(store, pat: Pattern, rel: Relation, tuples, push
             proxy = filters.specialize(conjunct, var, consts)
             if proxy is None or proxy.native is None:
                 continue
-            if pat.deferred is None:
-                pat.deferred = {}
-            pat.deferred[var] = [*pat.deferred.get(var, ()), proxy]
-            pushed.applied.add(id(conjunct))
+            deferred = pat.deferred or {}
+            pat.deferred = {**deferred, var: [*deferred.get(var, ()), proxy]}
             specialized.append((conjunct, var, proxy))
             if _TRACE.get() is not None:
                 _trace_event(
@@ -3903,47 +3918,16 @@ def _fits(rel: Relation, pat: Pattern, memo: dict, store) -> bool:
     return key.join_count(match[pat.varpos[var][0]]) <= SETTINGS.pair_budget
 
 
-def _put_back(
-    pat: Pattern,
-    deferred: dict | None,
-    specialized: Sequence[tuple],
-    pushed,
-    tuples: tuple,
-    nkeep: dict | None,
-    memo: dict,
-) -> tuple:
-    """Undo what a join step did to ``pat`` before it went over the budget,
-    so a later step takes it as planned. It is unread again, with its match
-    left in the memo, and its native keep is ``nkeep``, the keep it was
-    planned with: a keep-scan's narrower keep (:func:`_keep_scan`) goes, and
-    the match memoized under it leaves the memo with it — no step reads it
-    again, and it would hold the match's columns until the plan ends. Its
-    deferred restrictions — ``deferred``, which reading it consumed — are
-    back for the step that reads it, less the per-variable conjuncts this
-    step specialized onto it from tuple conjuncts (``specialized``,
-    :func:`_specialize_tuple_conjuncts`). Those
-    tuple conjuncts are no longer applied: they are pending again among
-    ``tuples``, in the FILTER's order, for the next step whose pattern binds
-    their variable, or for the FILTER above. Returns the pending tuple
-    conjuncts."""
-    if pat.nkeep is not nkeep:
-        memo.pop(_pattern_key(pat), None)
-        pat.nkeep = nkeep
-    pat.clear_match()
-    if specialized:
-        assert deferred is not None and pushed is not None
-        for conjunct, var, proxy in specialized:
-            pushed.applied.discard(id(conjunct))
-            kept = [other for other in deferred[var] if other is not proxy]
-            if kept:
-                deferred[var] = kept
-            else:
-                del deferred[var]
-        pending = {id(conjunct) for conjunct in tuples}
-        pending.update(id(conjunct) for conjunct, _, _ in specialized)
-        tuples = tuple(conjunct for conjunct in pushed.tuples if id(conjunct) in pending)
-    pat.deferred = deferred or None
-    return tuples
+def _discard_step(pat: Pattern, work: Pattern, memo: dict) -> None:
+    """Let go of ``work``, a step's copy of ``pat``, when the step goes over
+    the budget. ``pat`` is as it was planned — unread, its keep and its
+    deferred restrictions its own — so only the memo is the step's: a match
+    a keep-scan memoized under its narrower keep leaves it with the copy (no
+    step reads it again, and it would hold its columns until the plan
+    ends), while a match under the planned keep stays for the step that
+    reads the pattern."""
+    if work.nkeep is not pat.nkeep:
+        memo.pop(_pattern_key(work), None)
 
 
 def _probe_shape(pat: Pattern, shared: Sequence) -> list:
