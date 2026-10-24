@@ -742,3 +742,112 @@ def test_a_query_that_raises_is_recorded_up_to_the_raise(tmp_path, tiny_store, m
     for line in lines[1:]:
         assert [c[1] for c in json.loads(line)["calls"]] == ["count_quads"]
     assert f"({len(measured)} raised)" in capsys.readouterr().err
+
+
+def test_recording_drops_the_cancel_token(tmp_path, tiny_store, monkeypatch):
+    """A token is a per-query control, not native work: the trace records the
+    other keywords of the call and replays without it."""
+    from vortex_rdf import CancelToken
+
+    def native_calls_with_a_token(graph, text, **kwargs):
+        native = graph.store._store()  # through the proxy once the measured stream runs
+        native.count_quads(limit=3, cancel=CancelToken())
+        list(native.match_codes_many([(None, None, None, None)], lookahead=2, cancel=CancelToken()))
+
+    monkeypatch.setattr(record_native, "run_instance", native_calls_with_a_token)
+    warmup, measured = tiny_streams(1, 1)
+    trace = tmp_path / "trace.jsonl"
+    record_native.record(str(tiny_store), False, warmup, measured, str(trace))
+    calls = [c for line in trace.read_text().splitlines()[1:] for c in json.loads(line)["calls"]]
+    assert [(c[1], c[3]) for c in calls] == [
+        ("count_quads", {"limit": 3}),
+        ("match_codes_many", {"lookahead": 2}),
+    ] * len(measured)
+
+
+class _Clock:
+    """A clock the stand-in store advances: ``replay`` times its calls by it."""
+
+    def __init__(self):
+        self.now = 0
+
+    def perf_counter_ns(self) -> int:
+        return self.now
+
+
+class _SlowIterators:
+    """A store whose batch calls return iterators, each pull of which takes a
+    millisecond of the fake clock: the call itself takes none."""
+
+    def __init__(self, clock: _Clock):
+        self._clock = clock
+
+    def term_dict(self):
+        return None
+
+    def _pulls(self, count: int):
+        for pull in range(count):
+            self._clock.now += 1_000_000
+            yield pull
+
+    def match_codes_many(self, probes):
+        return self._pulls(3)
+
+    def match_code_chunks(self, *pattern, **options):
+        return self._pulls(2)
+
+
+def test_replay_drains_batch_iterators_inside_the_timer(tmp_path, tiny_store, monkeypatch):
+    """The work of ``match_codes_many`` and ``match_code_chunks`` happens as
+    their iterators are pulled, so a call is timed to the end of its pulls."""
+    clock = _Clock()
+    monkeypatch.setattr(replay_native, "time", clock)
+    monkeypatch.setattr(replay_native, "_open", lambda path, in_memory: _SlowIterators(clock))
+    probes = record_native.encode_value([[(None, None, None, None)]])
+    calls = [
+        ["store", "match_codes_many", probes, {}, 0],
+        ["store", "match_code_chunks", [], {"batch_rows": 2}, 0],
+    ]
+    trace = _trace_with(tmp_path, tiny_store, calls)
+    out = replay_native.replay(str(tiny_store), trace, False, skip=set(), passes=1)
+    assert out["methods"]["match_codes_many"]["ms"] == 3.0
+    assert out["methods"]["match_code_chunks"]["ms"] == 2.0
+    assert out["templates"][1]["ms"] == 5.0
+    assert all(m["errors"] == 0 for m in out["methods"].values())
+
+
+@pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
+def test_batch_calls_replay_against_the_installed_vortex_rdf(tmp_path, tiny_store, in_memory):
+    probes = record_native.encode_value(
+        [[(None, None, None, None), ("<urn:none>", None, None, None)]]
+    )
+    calls = [
+        ["store", "match_codes_many", probes, {"lookahead": 2}, 0],
+        ["store", "count_quads_many", probes, {"lookahead": 2}, 0],
+        ["store", "match_code_chunks", [], {"batch_rows": 7, "columns": ["s", "o"]}, 0],
+        ["store", "match_code_chunks", [], {"limit": 0}, 0],
+    ]
+    out = replay_native.replay(
+        str(tiny_store), _trace_with(tmp_path, tiny_store, calls), in_memory, skip=set(), passes=1
+    )
+    assert {name: m["calls"] for name, m in out["methods"].items()} == {
+        "match_codes_many": 1,
+        "count_quads_many": 1,
+        "match_code_chunks": 2,
+    }
+    assert all(m["errors"] == 0 for m in out["methods"].values()), out["methods"]
+
+
+@pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
+def test_replay_does_not_pass_max_resident_bytes(tiny_store, monkeypatch, in_memory):
+    import vortex_rdf
+
+    opened = []
+
+    class _Store:
+        def __init__(self, path, **options):
+            opened.append((path, options))
+
+    monkeypatch.setattr(vortex_rdf, "VortexRdfStore", _Store)
+    replay_native._open(str(tiny_store), in_memory)
+    assert opened == [(str(tiny_store), {"in_memory": in_memory})]

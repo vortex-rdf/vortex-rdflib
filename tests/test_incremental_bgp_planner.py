@@ -230,6 +230,8 @@ def test_disconnected_pattern_uses_complete_match(tmp_path, monkeypatch, capsys)
     step = next(e for e in payloads if e["event"] == "bgp_join_step_complete")
     assert step["strategy"] in {"hash_columns", "hash_rows"}
     assert step["cardinality_source"] == "matched"
+    # A product of 4 rows is within the pair budget: nothing is counted.
+    assert step["pair_count"] is None
 
 
 @pytest.mark.parametrize("fanout", [100, 10**9])
@@ -304,9 +306,11 @@ def test_patterns_next_to_a_small_count_are_not_counted_when_planned(
         ("<http://ex/tag>", 101),
     ]
     steps = [e for e in payloads if e["event"] == "bgp_join_step_complete"]
-    assert [(e["strategy"], e["estimated_rows"], e["estimate_limit"]) for e in steps] == [
-        ("probe", 101, 101),
-        ("probe", 101, 101),
+    assert [
+        (e["strategy"], e["estimated_rows"], e["estimate_limit"], e["pair_count"]) for e in steps
+    ] == [
+        ("probe", 101, 101, None),
+        ("probe", 101, 101, None),
     ]
     assert next(e for e in payloads if e["event"] == "bgp_plan_complete")["estimate_calls"] == 3
     monkeypatch.delenv("VORTEX_RDF_TRACE_QUERY")
@@ -334,7 +338,7 @@ def test_a_decision_count_under_its_cap_matches_and_hash_joins(tmp_path, monkeyp
     ]
     [step] = [e for e in payloads if e["event"] == "bgp_join_step_complete"]
     assert step["strategy"] in {"hash_columns", "hash_rows"}
-    assert (step["estimated_rows"], step["estimate_limit"]) == (300, 5001)
+    assert (step["estimated_rows"], step["estimate_limit"], step["pair_count"]) == (300, 5001, None)
 
 
 def test_a_scan_next_to_a_small_point_pattern_is_not_counted_when_planned(tmp_path):

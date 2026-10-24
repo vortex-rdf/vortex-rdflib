@@ -1,7 +1,7 @@
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 
-from .pushdown import register_sparql_pushdown, unregister_sparql_pushdown
+from .pushdown import cancel_scope, register_sparql_pushdown, unregister_sparql_pushdown
 from .store import VortexRdflibStore
 
 try:
@@ -11,6 +11,7 @@ except PackageNotFoundError:  # source tree without an install
 
 __all__ = [
     "VortexRdflibStore",
+    "cancel_scope",
     "register_sparql_pushdown",
     "unregister_sparql_pushdown",
     "__version__",

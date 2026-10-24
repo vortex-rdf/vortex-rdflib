@@ -89,6 +89,77 @@ opening
 auto-detects the layout. The `"dictionary"` layout is the fastest to query
 from Python — it enables the SPARQL pushdowns described below.
 
+## Cancelling a query
+
+`cancel_scope` gives the queries started inside it a `vortex_rdf.CancelToken`.
+Cancel the token, from any thread, and the query raises `vortex_rdf.Cancelled`
+at the next point that checks it:
+
+- A call into vortex-rdf that races the token: every batch and chunk call, and
+  each one-shot call that can scan a file-backed store.
+- Every other one-shot call, which checks the token before it starts and then
+  runs to completion: an in-memory call, a point lookup, a call capped at one
+  row, and the string fallback (a layout other than `"dictionary"`, or
+  `VORTEX_RDF_DISABLE_CODE_PATH=1`). The probes a join sends per row are calls
+  of one kind or the other, so each probe is a check point of its own.
+- Between calls: the pieces of a streamed join, the rows rdflib finishes when a
+  join over the pair budget is left to it, and the slices and decode chunks the
+  rows of a result are read in.
+
+A cancel takes effect at the next of these points, so rows that are already
+fetched are delivered until then: a result whose rows are decoded as they are
+read stops within one decode chunk, at most 4,096 rows.
+
+```python
+import threading
+
+from vortex_rdf import Cancelled, CancelToken
+from vortex_rdflib import cancel_scope
+
+token = CancelToken()
+deadline = threading.Timer(30.0, token.cancel)  # or cancel from any other thread
+deadline.start()
+try:
+    with cancel_scope(token):
+        result = graph.query("SELECT ?s ?o WHERE { ?s ?p ?o }")
+    for row in result:
+        print(row.s, row.o)
+except Cancelled:
+    print("cancelled")
+finally:
+    deadline.cancel()
+```
+
+A lazy result keeps the token of the query that made it, so the check points it
+still reaches while its rows are produced run under it, and a query started
+outside any block has no token. In the snippet, the one pattern is matched
+inside `graph.query(...)`, where the token is checked or raced; the loop then
+reads the match's rows as they are decoded, and a cancel that arrives during it
+stops the loop at the next decode chunk.
+
+## Streaming a large answer
+
+rdflib's `Result` keeps every row it yields (iterating it appends each binding
+to its `bindings` list, so that it can be iterated again). A consumer that
+streams a large answer and must stay flat in memory reads the bindings the query
+produces instead of a `Result`:
+
+```python
+from rdflib import Variable
+from rdflib.plugins.sparql.processor import SPARQLProcessor
+
+query = "SELECT ?s ?o WHERE { ?s ?p ?o }"
+answer = SPARQLProcessor(graph).query(query, initNs=dict(graph.namespaces()))
+for binding in answer["bindings"]:  # one row at a time; nothing keeps it
+    print(binding[Variable("s")], binding[Variable("o")])
+```
+
+`initNs` is what `Graph.query` hands the processor: the graph's namespace
+bindings (a graph over a `VortexRdflibStore` holds none, so a query reads the
+same prefixes either way). `answer["vars_"]` lists the projected variables, in
+order. `Graph.query` makes the same call and wraps the dictionary in a
+`Result`.
+
 ## How it works
 
 **Dictionary-encoded terms.** For vortex-rdf Dictionary-layout stores, matched rows cross the native boundary as zero-copy `u64` term-code columns
@@ -139,6 +210,25 @@ query, so it does not grow with the number of queries. Stores are read-only;
 truncating or rewriting a store file in place while a store has it open is
 unsupported, and so is opening a store from a network filesystem.
 
+**Join memory.** A join can make far more rows than either of its sides holds.
+The pair budget (`VORTEX_RDF_PAIR_BUDGET`, 16,777,216 row pairs by default)
+bounds what one join step of a basic graph pattern builds at once. A step that
+could pass it is counted natively before it is built, and one over the budget
+is not built whole: the last step is joined a piece at a time while the rows
+are read, so a consumer that reads its rows as they come holds one piece
+(`ORDER BY`, group joins, `OPTIONAL`, `MINUS` and `EXISTS` read the pieces into
+rows first); or another pattern that fits is joined first; or rdflib finishes
+the remaining patterns row by row. On a 10.9M-row file-backed store, a WatDiv
+query, T051 (`SELECT *` over five patterns whose last join makes 4.17 G pairs),
+made 0.3.0 ask for a 33 GB index column before its first row; 0.4 yields its
+first row in 0.2 s, with native memory at about 1 GiB at the default budget
+(about 220 MiB at `VORTEX_RDF_PAIR_BUDGET=4194304`). `triples()`, which
+rdflib's own evaluator calls, reads a pattern of up to 65,536 rows as one match
+and a larger one in chunks of 65,536 rows, so a scan of a large store holds one
+chunk of codes at a time; that size is the module constant
+`vortex_rdflib.store._TRIPLES_CHUNK_ROWS`, not an environment variable. How the
+budget works is described in [docs/pushdown.md](docs/pushdown.md#the-pair-budget).
+
 ## Environment variables
 
 | Variable | Effect |
@@ -149,6 +239,7 @@ unsupported, and so is opening a store from a network filesystem.
 | `VORTEX_RDF_PUSHDOWN_OPS=<list>` | Only push down the listed algebra nodes (`bgp` = basic graph patterns only) |
 | `VORTEX_RDF_FILTER_FAST=0` | Evaluate every FILTER value through rdflib's expression evaluator (still once per distinct value) |
 | `VORTEX_RDF_NATIVE_FILTERS=0` | Evaluate no FILTER conjunct inside vortex-rdf (no `filter_codes` calls, no kind-test or IRI-equality keeps on the scans): every value goes through the Python routes |
+| `VORTEX_RDF_PAIR_BUDGET=<n>` | The most row pairs one join step of a basic graph pattern builds at once: an integer of at least 0, 16,777,216 by default. A step over it is streamed, reordered around or left to rdflib (see [docs/pushdown.md](docs/pushdown.md#the-pair-budget)) |
 | `VORTEX_RDF_TRACE_TRIPLES=1` | Print every `triples()` pattern (debugging) |
 | `VORTEX_RDF_TRACE_QUERY=1` | Print the pushdown's query plan as JSON lines on stderr — counts, matches, probes, restrictions, joins, mid-join FILTER prunes and every native call, with row counts and timings (debugging; `VORTEX_RDF_TRACE_QUERY_ID` labels the lines) |
 

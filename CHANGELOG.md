@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.3.0...v0.4.0) - 2026-10-24
+
+Requires vortex-rdf 0.13.1 (`vortex-rdf>=0.13.1,<0.14`, up from 0.12.1): joins
+are budgeted, long native calls can be cancelled, and large reads stream. A
+join step of a basic graph pattern has a pair budget (`VORTEX_RDF_PAIR_BUDGET`,
+16,777,216 row pairs by default), and a step over it is not built whole: the
+last step streams its pairs a piece at a time as the rows are read, or another
+pattern that provably fits is joined first, or rdflib finishes the remaining
+patterns row by row. A probe join whose probes would each scan the store is a
+keep-scan instead: the pattern is matched once, narrowed to the codes the
+relation binds. `vortex_rdflib.cancel_scope(token)` gives the queries started
+inside it a `vortex_rdf.CancelToken`, and cancelling it, from any thread,
+raises `vortex_rdf.Cancelled` at the next point that checks it: a native call
+that races the token, the check before every other one-shot call, a piece of a
+streamed join, a row rdflib finishes, a per-row probe, or a slice or decode
+chunk of the rows being read, so a result whose rows are decoded as they are
+read stops within one decode chunk, at most 4,096 rows. `triples()` reads a
+pattern of more than 65,536 rows in chunks of that many, so a scan of a large
+store holds one chunk of codes at a time. The floor is 0.13.1 because that
+first chunk is a limited match, and 0.13.1 reads a limited match that the limit
+cannot cut as it reads the match without one (vortex-rdf
+[#104](https://github.com/vortex-rdf/vortex-rdf/issues/104)).
+
+### Breaking changes
+
+- vortex-rdf 0.12 and 0.13.0 are no longer supported: the dependency is
+  `vortex-rdf>=0.13.1,<0.14`.
+
+### Added
+
+- A pair budget guards every BGP join step (pushdown) ([`d34a54e`](https://github.com/vortex-rdf/vortex-rdflib/commit/d34a54e85db9b5ebbcf9f2624974eac244f51f36) by @julianrojas87)
+- Stream an over-budget last join step through CodeGroups (pushdown) ([`e37db53`](https://github.com/vortex-rdf/vortex-rdflib/commit/e37db53e917aefd61a5a2b7f875c3041003a9924) by @julianrojas87)
+- Reorder around an over-budget step, else let rdflib finish the rest per row (pushdown) ([`439d828`](https://github.com/vortex-rdf/vortex-rdflib/commit/439d8287fab91df1a01a9c77ac31e523a541c7ca) by @julianrojas87)
+- A per-query cancel token for every long native call ([`b71d6ff`](https://github.com/vortex-rdf/vortex-rdflib/commit/b71d6ff6dba7280eba41697f4c4f31691f60481e) by @julianrojas87)
+- Triples() reads a large pattern one chunk at a time (store) ([`a9ffe48`](https://github.com/vortex-rdf/vortex-rdflib/commit/a9ffe482b65288d21320adefd903f92e85fe36fe) by @julianrojas87)
+
+### Changed
+
+- One keep-scan instead of a scan per row, and an explicit probe lookahead (pushdown) ([`5f6457a`](https://github.com/vortex-rdf/vortex-rdflib/commit/5f6457ae42b7e7634f80f52a1bb37d9da926a717) by @julianrojas87)
+- Triples() tells a large pattern by its first match, not a count (store) ([`d8f9104`](https://github.com/vortex-rdf/vortex-rdflib/commit/d8f91044deebcf73a7fd12ea2bf696d000a7064e) by @julianrojas87)
+- Answer plain probes without the token plumbing (pushdown) ([`a25c846`](https://github.com/vortex-rdf/vortex-rdflib/commit/a25c846259cebb7cfd8b36ceb7a8916bdb96e273) by @julianrojas87)
+- Count a hash step's pairs once (pushdown) ([`6c8af68`](https://github.com/vortex-rdf/vortex-rdflib/commit/6c8af680e400375a0bb698d78fa05c853ff3937e) by @julianrojas87)
+- Point-lookup batches take the binding's default lookahead (pushdown) ([`e3eeab7`](https://github.com/vortex-rdf/vortex-rdflib/commit/e3eeab769535ed9b2b493913f48d16556d25c8b5) by @julianrojas87)
+
+### Fixed
+
+- Record and replay vortex-rdf 0.13 batch iterators (bench) ([`323c97c`](https://github.com/vortex-rdf/vortex-rdflib/commit/323c97c2b8bdd04843821ac7a8d2800f0be9a24d) by @julianrojas87)
+- Undo a put-back step's specialized conjuncts (pushdown) ([`9b69fa9`](https://github.com/vortex-rdf/vortex-rdflib/commit/9b69fa919eec72d65470a1b8e51e1078a832ed66) by @julianrojas87)
+- Count the probes a tripped step sent, and key the memo by the keep column (pushdown) ([`9868e2a`](https://github.com/vortex-rdf/vortex-rdflib/commit/9868e2aa5c318f3cd1f6c98acdf0ca6ebc24451c) by @julianrojas87)
+- Check the cancel token before a string-fallback read (store) ([`4409609`](https://github.com/vortex-rdf/vortex-rdflib/commit/44096098ac1c8679e22bcc7e8f94c1cceb95ea55) by @julianrojas87)
+- Triples() lets go of every column of a chunk before the next pull (store) ([`7452b04`](https://github.com/vortex-rdf/vortex-rdflib/commit/7452b04a264eb0b8af54f5eae0a75740d0b9ee1e) by @julianrojas87)
+- Check the cancel token per slice and per decode chunk (pushdown) ([`49c062f`](https://github.com/vortex-rdf/vortex-rdflib/commit/49c062f7669777644b67334ef5ca77132079774d) by @julianrojas87)
+
 ## [0.3.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.2.0...v0.3.0) - 2026-10-13
 
 Requires vortex-rdf 0.12.1 (`vortex-rdf>=0.12.1,<0.13`, up from 0.11): file-backed

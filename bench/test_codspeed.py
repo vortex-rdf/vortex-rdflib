@@ -38,6 +38,11 @@ move the number:
                         value goes through rdflib's evaluator instead
   fresh constants       the same two FILTER queries with a new constant on
                         every call: per-constant work is paid every time
+  streamed join         one join query whose join step is over a lowered
+                        pair budget, so it is gathered piece by piece
+  keep-scan join        one join on the file-backed unindexed store whose
+                        per-row probes would each scan the store, so its
+                        pattern is matched once, narrowed to the seed's codes
   residency + index     file-backed stores, where the per-call native floor
                         dominates and secondary indexes earn their keep:
                         the two lookups they target, per index config, plus
@@ -66,6 +71,7 @@ which keeps the fixtures and query set honest even when nothing is measured.
 from __future__ import annotations
 
 import itertools
+import json
 import os
 from collections.abc import Callable, Iterator
 from dataclasses import replace
@@ -91,6 +97,7 @@ from bench.queries import Query, build_queries
 from vortex_rdflib import (
     VortexRdflibStore,
     filters,
+    pushdown,
     register_sparql_pushdown,
     unregister_sparql_pushdown,
 )
@@ -149,6 +156,29 @@ FILES: dict[str, dict] = {
 #: `test_query_no_pushdown` runs this group under rdflib's own evaluator, on
 #: which that query is too slow to benchmark.
 JOIN_QUERIES = ("star-2", "star-3", "chain-2", "optional", "filter-probe")
+
+#: The join query whose join step `test_join_streamed` streams: on the primary
+#: configuration a hash join of two matches of one pattern, the relation
+#: grouped and the pattern fed.
+STREAMED_JOIN = "chain-2"
+
+#: The fed rows of each slice a streamed join step gathers in
+#: `test_join_streamed`.
+STREAMED_PIECE_ROWS = 256
+
+#: The join `test_join_keep_scan` runs on the file-backed unindexed store: the
+#: `p1` subjects whose value is a literal with no language tag — a few hundred
+#: at the default size — against every statement that has one of them as its
+#: object. A probe per seed row would bind only its object, so each would scan
+#: the store; the step matches the pattern once instead, narrowed to the
+#: seed's codes. Not a dashboard query.
+KEEP_SCAN_JOIN = Query(
+    name="keep-scan",
+    group="joins",
+    sparql=(
+        f'SELECT ?x ?s ?p WHERE {{ ?x <{predicate_iri(1)}> ?v . ?s ?p ?x FILTER(lang(?v) = "") }}'
+    ),
+)
 
 #: Queries whose cost is dominated by evaluating a numeric FILTER: a typed
 #: range over one variable, and an integer arithmetic band over two (BSBM
@@ -225,6 +255,22 @@ def _consume_query(graph: Graph, query: Query) -> int:
     if query.is_ask:
         return 1 if result.askAnswer else 0
     return sum(1 for _ in result)
+
+
+def _traced_run(graph: Graph, query: Query, monkeypatch, capsys) -> list[dict]:
+    """The query-trace events of one run of ``query``, which yields rows."""
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    try:
+        assert _consume_query(graph, query) > 0
+    finally:
+        monkeypatch.delenv("VORTEX_RDF_TRACE_QUERY")
+    prefix = pushdown._TRACE_PREFIX
+    return [
+        json.loads(line[len(prefix) :])
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith(prefix)
+    ]
 
 
 def _consume_fresh(graph: Graph, query: Query, fresh: Callable[[int], str]) -> int:
@@ -329,6 +375,25 @@ def test_query(benchmark, graphs, name):
     benchmark(_consume_query, graph, query)
 
 
+def test_join_streamed(benchmark, graphs, monkeypatch, capsys):
+    """A join step gathered piece by piece (the pushdown's tier 1):
+    ``STREAMED_JOIN`` on the primary configuration, with the pair budget one
+    pair under its join step's pairs and the fed side cut into slices of
+    ``STREAMED_PIECE_ROWS`` rows, each gathered as one piece. The step's
+    pairs are read once from the trace of a run at a budget of 0, and a
+    second traced run checks that the step streams."""
+    graph, query = graphs["mem_noidx"], QUERIES[STREAMED_JOIN]
+    monkeypatch.setattr(pushdown, "_PIECE_ROWS", STREAMED_PIECE_ROWS)
+    monkeypatch.setattr(pushdown, "_PAIR_BUDGET", 0)
+    events = _traced_run(graph, query, monkeypatch, capsys)
+    [pairs] = [event["pair_count"] for event in events if event["event"] == "bgp_over_budget"]
+    monkeypatch.setattr(pushdown, "_PAIR_BUDGET", pairs - 1)
+    events = _traced_run(graph, query, monkeypatch, capsys)
+    steps = [event["strategy"] for event in events if event["event"] == "bgp_join_step_complete"]
+    assert steps == ["stream"]
+    benchmark(_consume_query, graph, query)
+
+
 @pytest.mark.usefixtures("without_pushdown")
 @pytest.mark.parametrize("name", JOIN_QUERIES + GRAPH_QUERIES)
 def test_query_no_pushdown(benchmark, graphs, name):
@@ -373,6 +438,15 @@ def test_query_file(benchmark, graphs, index_tag, name):
     graph, query = graphs[f"file_{index_tag}"], QUERIES[name]
     assert _consume_query(graph, query) > 0
     benchmark(_consume_query, graph, query)
+
+
+def test_join_keep_scan(benchmark, graphs):
+    """A join step whose per-row probes would each scan the store, on the
+    file-backed unindexed store: ``KEEP_SCAN_JOIN``, its seed's rows joined to
+    a pattern that binds only its object."""
+    graph = graphs["file_noidx"]
+    assert _consume_query(graph, KEEP_SCAN_JOIN) > 0
+    benchmark(_consume_query, graph, KEEP_SCAN_JOIN)
 
 
 # ─── triples::<pattern> — the store's raw service, below SPARQL ─────────────

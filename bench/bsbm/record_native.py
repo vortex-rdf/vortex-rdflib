@@ -11,7 +11,8 @@ vortex-rdf build, separating native time from Python time.
 
 Not recorded: operations on the ``U64Column`` results the proxies return
 (``join_indices``, ``take``, ``distinct``, ``value_counts``), ``len()`` on the
-proxies, and calls that raise (a call is logged once it has returned).
+proxies, calls that raise (a call is logged once it has returned) and the
+``cancel`` token of a call, a per-query control rather than native work.
 """
 
 import argparse
@@ -48,7 +49,8 @@ class _Sink:
 
     def add(self, obj, method, args, kwargs, ns) -> None:
         if self.on:
-            self.calls.append([obj, method, encode_value(list(args)), encode_value(kwargs), ns])
+            recorded = {key: value for key, value in kwargs.items() if key != "cancel"}
+            self.calls.append([obj, method, encode_value(list(args)), encode_value(recorded), ns])
 
 
 class _Recorder:

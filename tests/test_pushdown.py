@@ -2,6 +2,7 @@
 evaluator — every query shape is run both ways and compared exactly, on a
 file-backed and on an in-memory store."""
 
+import contextlib
 import io
 import json
 import sys
@@ -11,7 +12,7 @@ from typing import Any
 import pytest
 from rdflib import Dataset, Graph, Literal, URIRef, Variable
 from rdflib.plugins.sparql.sparql import QueryContext
-from vortex_rdf import serialize_rdf
+from vortex_rdf import Cancelled, CancelToken, VortexRdfStore, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
 from vortex_rdflib import (
@@ -1088,8 +1089,9 @@ def test_order_by_sequence_equals_default_evaluator(graph, sparql):
 @pytest.mark.parametrize("sparql", QUERIES)
 def test_probe_join_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
     """Same A/B matrix with the probe threshold forced to zero, so every
-    shared-variable join takes the per-binding probe path instead of the
-    hash join — both strategies must be observationally identical."""
+    shared-variable join is planned per row instead of as a hash join —
+    probes where they are point lookups, and a keep-scan in a BGP where they
+    would scan — and every strategy must be observationally identical."""
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
     with_probe, without_pushdown = both_ways(file_graph, sparql)
     assert with_probe == without_pushdown
@@ -1115,13 +1117,26 @@ def test_python_filter_routes_equal_default_evaluator(file_graph, monkeypatch, s
 
 @pytest.mark.parametrize("sparql", QUERIES)
 def test_batched_probe_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
-    """Every probe through the native batch calls, in batches of three —
-    a lone probe included."""
+    """Every probe a scan, through the native batch calls in batches of
+    three — a lone probe included: those of the joins above a BGP, OPTIONAL
+    and EXISTS. A BGP step keep-scans instead."""
     monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
     monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
     monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
     monkeypatch.setattr(pd, "_SCAN_BATCH_MIN", 1)
     monkeypatch.setattr(pd, "_MEMORY_SCAN_BATCH_MIN", 1)
+    with_pushdown, without_pushdown = both_ways(file_graph, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_batched_cheap_probe_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
+    """Every probe a point lookup, through the native batch calls in batches
+    of three, a lone probe included: BGP steps probe and batch too."""
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
+    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: True)
+    monkeypatch.setattr(pd, "_CHEAP_BATCH_MIN", 1)
     with_pushdown, without_pushdown = both_ways(file_graph, sparql)
     assert with_pushdown == without_pushdown
 
@@ -1144,6 +1159,143 @@ def test_generic_filter_route_equals_default_evaluator(file_graph, monkeypatch, 
     assert generic == without_pushdown
 
 
+@pytest.fixture
+def over_budget(monkeypatch):
+    """A pair budget of 0: every BGP join step that makes a row is over it."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+
+
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_over_budget_equals_default_evaluator(graph, over_budget, sparql):
+    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", ORDER_QUERIES)
+def test_over_budget_order_by_sequence_equals_default_evaluator(graph, over_budget, sparql):
+    with_pushdown, without_pushdown = both_ways(graph, sparql, run_ordered)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
+def test_over_budget_graph_pattern_equals_default_evaluator(dataset, over_budget, sparql):
+    with_pushdown, without_pushdown = both_ways(dataset, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.fixture
+def stream_pieces(request, monkeypatch):
+    """A pair budget of 0 and pieces of ``request.param`` rows (1 unless the
+    test sets it): every last hash join step that shares one variable and
+    makes a row streams, its fed side cut into pieces that small."""
+    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+    monkeypatch.setattr(pd, "_PIECE_ROWS", getattr(request, "param", 1))
+
+
+_PIECE_SIZES = pytest.mark.parametrize(
+    "stream_pieces", [1, 3], indirect=True, ids=["pieces1", "pieces3"]
+)
+
+
+@_PIECE_SIZES
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_stream_pieces_equals_default_evaluator(graph, stream_pieces, sparql):
+    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@_PIECE_SIZES
+@pytest.mark.parametrize("sparql", ORDER_QUERIES)
+def test_stream_pieces_order_by_sequence_equals_default_evaluator(graph, stream_pieces, sparql):
+    with_pushdown, without_pushdown = both_ways(graph, sparql, run_ordered)
+    assert with_pushdown == without_pushdown
+
+
+@_PIECE_SIZES
+@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
+def test_stream_pieces_graph_pattern_equals_default_evaluator(dataset, stream_pieces, sparql):
+    with_pushdown, without_pushdown = both_ways(dataset, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.fixture
+def keep_scan(monkeypatch):
+    """The probe threshold at zero and every probe a scan: every BGP join step
+    that shares a variable keep-scans its pattern."""
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
+
+
+@pytest.mark.parametrize("sparql", QUERIES)
+def test_keep_scan_equals_default_evaluator(graph, keep_scan, sparql):
+    with_pushdown, without_pushdown = both_ways(graph, sparql)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", ORDER_QUERIES)
+def test_keep_scan_order_by_sequence_equals_default_evaluator(graph, keep_scan, sparql):
+    with_pushdown, without_pushdown = both_ways(graph, sparql, run_ordered)
+    assert with_pushdown == without_pushdown
+
+
+@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
+def test_keep_scan_graph_pattern_equals_default_evaluator(dataset, keep_scan, sparql):
+    with_pushdown, without_pushdown = both_ways(dataset, sparql)
+    assert with_pushdown == without_pushdown
+
+
+#: The forced paths of the matrices above, by id: the fixture that forces the
+#: path, and the test of a trace event that shows the path taken.
+FORCED_PATHS = {
+    "budget0": ("over_budget", lambda event: event["event"] == "bgp_over_budget"),
+    "stream": (
+        "stream_pieces",
+        lambda event: event["event"] == "bgp_join_step_complete" and event["strategy"] == "stream",
+    ),
+    "tier3": (
+        "over_budget",
+        lambda event: event["event"] == "bgp_plan_complete" and bool(event["rest_pattern_indices"]),
+    ),
+    "keep_scan": (
+        "keep_scan",
+        lambda event: (
+            event["event"] == "bgp_join_step_complete" and event["strategy"] == "keep_scan"
+        ),
+    ),
+}
+
+
+@pytest.mark.parametrize("forcing", list(FORCED_PATHS))
+def test_forcing_reaches_the_path(
+    request, dict_vortex, dict_vortex_quads, monkeypatch, capsys, forcing
+):
+    """A forced matrix passes for nothing unless the planner reads what its
+    fixture sets: under each forcing, a query of the matrix traces the path,
+    file-backed and in memory. The stores are built before the forcing is
+    applied, as the matrices build theirs."""
+    fixture, taken = FORCED_PATHS[forcing]
+    matrices = {}
+    for in_memory in (False, True):
+        graph = Graph(store=VortexRdflibStore(str(dict_vortex), in_memory=in_memory))
+        dataset = Dataset(
+            store=VortexRdflibStore(str(dict_vortex_quads), in_memory=in_memory),
+            default_union=True,
+        )
+        matrix = [(graph, sparql) for sparql in QUERIES + ORDER_QUERIES]
+        matrices[in_memory] = matrix + [(dataset, sparql) for sparql in GRAPH_QUERIES]
+    request.getfixturevalue(fixture)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    register_sparql_pushdown()
+    capsys.readouterr()
+
+    def reaches(view, sparql) -> bool:
+        run(view, sparql)
+        return any(taken(event) for event in _trace_events(capsys.readouterr().err))
+
+    for in_memory, matrix in matrices.items():
+        assert any(reaches(view, sparql) for view, sparql in matrix), (forcing, in_memory)
+
+
 def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
     """A 1-row anchor joined against a 300-row predicate must take the probe
     path under the real threshold, and still produce the right rows."""
@@ -1160,7 +1312,7 @@ def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
 
     probes = []
     original = pd._probe_join
-    monkeypatch.setattr(pd, "_probe_join", lambda *a: probes.append(1) or original(*a))
+    monkeypatch.setattr(pd, "_probe_join", lambda *a, **k: probes.append(1) or original(*a, **k))
     graph = Graph(store=VortexRdflibStore(str(out)))
     register_sparql_pushdown()
     rows = run(
@@ -1530,6 +1682,23 @@ def _trace_events(text: str) -> list[dict]:
     ]
 
 
+@contextlib.contextmanager
+def _tracing():
+    """A query trace around the native wrapper under test; the events it
+    emits wait in the trace's pending lines (:func:`_pending_events`)."""
+    trace = pd._QueryTrace(query_id=None)
+    token = pd._TRACE.set(trace)
+    try:
+        yield trace
+    finally:
+        pd._TRACE.reset(token)
+
+
+def _pending_events(trace) -> list[dict]:
+    """The events a trace holds, not yet flushed to stderr."""
+    return _trace_events("\n".join(trace.pending))
+
+
 _PRUNED_SQL = """SELECT ?c WHERE {
     ?s <http://ex.org/p> ?a .
     ?s <http://ex.org/q> ?b .
@@ -1563,6 +1732,113 @@ def test_trace_records_every_native_call(tmp_path, monkeypatch, capsys):
     assert (native.counts, native.matches, native.batches) == (3, 3, 1)
     assert [e["operation"] for e in batches] == ["count_quads_many"]
     assert len(calls) + sum(e["probe_count"] for e in batches) == native.counts + native.matches
+
+
+_STAR_SQL = """SELECT ?x ?n ?a WHERE {
+    ?x <http://ex.org/name> ?n .
+    ?x <http://ex.org/age> ?a }"""
+
+_FOUR_PROBES = [
+    (None, f"<http://ex.org/{name}>", None, None) for name in ("name", "knows", "age", "likes")
+]
+
+
+def test_traced_batch_does_not_pull_ahead(file_graph, monkeypatch, capsys):
+    """A traced ``match_codes_many`` hands its caller the native iterator, not
+    the rows it drained from it: the probe join pulls exactly the answers it
+    consumes, and the batch events add up to the probes served."""
+    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
+    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: True)
+    monkeypatch.setattr(pd, "_CHEAP_BATCH_MIN", 1)
+    native = _PullCountingNative(file_graph.store._store())
+    file_graph.store._native = native
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    with_pushdown, without_pushdown = both_ways(file_graph, _STAR_SQL)
+    assert with_pushdown == without_pushdown
+    batches = [
+        e
+        for e in _trace_events(capsys.readouterr().err)
+        if e["event"] == "native_batch_complete" and e["operation"] == "match_codes_many"
+    ]
+    assert len(native.answers) == len(batches) > 1
+    assert [a.pulls for a in native.answers] == [len(a) for a in native.answers]
+    assert [e["probe_count"] for e in batches] == [len(a) for a in native.answers]
+    assert [e["returned_rows"] for e in batches] == [a.rows for a in native.answers]
+
+
+def test_closing_a_traced_batch_reports_the_pulls_it_made(file_graph):
+    """A batch closed early has pulled only what its caller took, and reports
+    that once: its probe count is the batch's, its rows the pulled answers'."""
+    native = _PullCountingNative(file_graph.store._store())
+    with _tracing() as trace:
+        answers = pd._TracedNative(native).match_codes_many(_FOUR_PROBES)
+        assert len(answers) == len(_FOUR_PROBES)
+        pulled = [next(answers), next(answers)]
+        assert native.answers[0].pulls == 2 and _pending_events(trace) == []
+        answers.close()
+        answers.close()
+        assert list(answers) == [] and native.answers[0].pulls == 2
+    (event,) = _pending_events(trace)
+    assert (event["event"], event["operation"]) == ("native_batch_complete", "match_codes_many")
+    assert event["probe_count"] == len(_FOUR_PROBES)
+    assert event["first_pattern"] == list(_FOUR_PROBES[0])
+    assert event["returned_rows"] == sum(len(answer[0]) for answer in pulled)
+    assert event["elapsed_ns"] > 0
+
+
+def test_traced_chunks_report_the_chunks_pulled(file_graph):
+    """A chunk iterator reports once, when it is exhausted: the pattern, its
+    keep, the columns and the chunks and rows pulled."""
+    store = file_graph.store._store()
+    pattern = (None, "<http://ex.org/knows>", None, None)
+    keep = {"o": (0, 1_000_000)}
+    rows = store.count_quads(*pattern)
+    with _tracing() as trace:
+        chunks = pd._TracedNative(store).match_code_chunks(
+            *pattern, keep=keep, columns=("s", "o"), batch_rows=4
+        )
+        pulled = [next(chunks)]
+        assert _pending_events(trace) == []
+        pulled.extend(chunks)
+        assert len(_pending_events(trace)) == 1
+        chunks.close()
+    (event,) = _pending_events(trace)
+    assert (event["event"], event["operation"]) == ("native_chunks_complete", "match_code_chunks")
+    assert (event["pattern"], event["keep"]) == (list(pattern), {"o": {"range": [0, 1_000_000]}})
+    assert event["columns"] == ["s", "o"]
+    assert (event["chunks"], event["returned_rows"]) == (len(pulled), rows)
+    assert len(pulled) > 1 and all(len(chunk) == 2 for chunk in pulled)
+    assert event["elapsed_ns"] > 0
+
+
+def test_a_traced_chunk_call_without_codes_returns_none(tmp_path):
+    source = tmp_path / "plain.nt"
+    source.write_text(FIXTURE_NT, encoding="utf-8")
+    out = tmp_path / "plain.vortex"
+    serialize_rdf(str(source), str(out), layout="default")
+    with _tracing():
+        assert pd._TracedNative(VortexRdfStore(str(out))).match_code_chunks() is None
+
+
+def test_the_traced_native_forwards_the_native_keywords(file_graph):
+    traced = pd._TracedNative(file_graph.store._store())
+    token = CancelToken()
+    with _tracing():
+        counts = traced.count_quads_many(_FOUR_PROBES, lookahead=1, cancel=token)
+        answers = traced.match_codes_many(_FOUR_PROBES, lookahead=1, cancel=token)
+        assert counts == [len(answer[0]) for answer in answers]
+        for many in (traced.count_quads_many, traced.match_codes_many):
+            with pytest.raises(ValueError, match="lookahead"):
+                many(_FOUR_PROBES, lookahead=0)
+        token.cancel()
+        for single in (traced.count_quads, traced.match_codes, traced.match_code_chunks):
+            with pytest.raises(Cancelled):
+                single(cancel=token)
+        for many in (traced.count_quads_many, traced.match_codes_many):
+            with pytest.raises(Cancelled):
+                many(_FOUR_PROBES, cancel=token)
 
 
 def test_trace_reports_a_mid_join_prune_between_the_steps_it_links(tmp_path, monkeypatch, capsys):
@@ -1623,7 +1899,7 @@ def test_tuple_filter_prunes_a_bgp_so_a_remaining_pattern_is_probed(
     )
     probes = []
     original = pd._probe_join
-    monkeypatch.setattr(pd, "_probe_join", lambda *a: probes.append(1) or original(*a))
+    monkeypatch.setattr(pd, "_probe_join", lambda *a, **k: probes.append(1) or original(*a, **k))
     register_sparql_pushdown()
     patterns = "?s <http://ex.org/p> ?a . ?s <http://ex.org/q> ?b . ?s <http://ex.org/r> ?c"
     body = f"GRAPH <http://ex.org/g> {{ {patterns} }}" if in_graph else patterns
@@ -1679,9 +1955,10 @@ def test_columnar_join_matches_row_join():
     cols_b = (array("Q", kb), array("Q", vb))
     joined = pd._join_columns(schema_a, cols_a, schema_b, cols_b)
     assert joined is not None
-    schema, cols = joined
+    schema, cols, pairs = joined
     assert schema == ("k", "x", "y")
     assert pd._cols_to_rows(cols) == expected
+    assert pairs is None  # within the product bound: built uncounted
     # Several shared variables decline: the row join handles them.
     assert pd._join_columns(("k", "x"), cols_a, ("k", "x"), cols_a) is None
 
@@ -1853,15 +2130,15 @@ class _CountingNative:
         self.matches += 1
         return self._inner.match_codes(*args, **kwargs)
 
-    def count_quads_many(self, probes):
+    def count_quads_many(self, probes, **options):
         self.counts += len(probes)
         self.batches += 1
-        return self._inner.count_quads_many(probes)
+        return self._inner.count_quads_many(probes, **options)
 
-    def match_codes_many(self, probes):
+    def match_codes_many(self, probes, **options):
         self.matches += len(probes)
         self.batches += 1
-        return self._inner.match_codes_many(probes)
+        return self._inner.match_codes_many(probes, **options)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -1873,6 +2150,60 @@ def _counting_native(graph) -> _CountingNative:
     native = _CountingNative(graph.store._store())
     graph.store._native = native
     return native
+
+
+class _PullCounter:
+    """The answers a ``match_codes_many`` stand-in returns: the native
+    iterator's, counting the answers pulled and the rows they hold."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.pulls = 0
+        self.rows = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        answer = next(self._inner)
+        self.pulls += 1
+        self.rows += 0 if answer is None else len(answer[0])
+        return answer
+
+    def __len__(self):
+        return len(self._inner)
+
+
+class _PullCountingNative:
+    """A VortexRdfStore stand-in whose ``match_codes_many`` hands out a
+    :class:`_PullCounter` per batch, kept in call order."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.answers: list[_PullCounter] = []
+
+    def match_codes_many(self, probes, **options):
+        answers = _PullCounter(self._inner.match_codes_many(probes, **options))
+        self.answers.append(answers)
+        return answers
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_batch_stand_ins_accept_keywords(graph):
+    """The counting stand-in passes the native batch keywords on, as the real
+    store takes them."""
+    native = _counting_native(graph)
+    token = CancelToken()
+    probes = [
+        (None, "<http://ex.org/name>", None, None),
+        ("<http://ex.org/alice>", None, None, None),
+    ]
+    counts = native.count_quads_many(probes, lookahead=2, cancel=token)
+    answers = native.match_codes_many(probes, lookahead=2, cancel=token)
+    assert counts == [len(answer[0]) for answer in answers]
+    assert (native.counts, native.matches, native.batches) == (2, 2, 2)
 
 
 def test_ask_over_one_pattern_counts_instead_of_matching(graph):

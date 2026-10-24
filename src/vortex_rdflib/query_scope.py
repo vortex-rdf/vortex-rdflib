@@ -18,6 +18,7 @@ is produced or the result is closed. A call outside any query (rdflib's
 from contextvars import ContextVar, Token
 
 from rdflib.term import Node
+from vortex_rdf import CancelToken
 
 
 class QueryTerms:
@@ -53,12 +54,15 @@ class QueryTerms:
 
 
 class QueryScope:
-    """The term state of one query, per store it reads (one, in practice)."""
+    """The term state of one query, per store it reads (one, in practice),
+    and the query's cancel token (``pushdown.cancel_scope``), ``None`` for a
+    query started outside a block."""
 
-    __slots__ = ("_by_store", "__weakref__")
+    __slots__ = ("_by_store", "cancel", "__weakref__")
 
     def __init__(self) -> None:
         self._by_store: dict[int, tuple[object, QueryTerms]] = {}
+        self.cancel: CancelToken | None = None
 
     def terms(self, store) -> QueryTerms:
         entry = self._by_store.get(id(store))
@@ -67,8 +71,9 @@ class QueryScope:
         return entry[1]
 
     def clear(self) -> None:
-        """Drop everything the query learned."""
+        """Drop everything the query learned, and its cancel token."""
         self._by_store.clear()
+        self.cancel = None
 
 
 _CURRENT: ContextVar[QueryScope | None] = ContextVar("vortex_rdflib_query_scope", default=None)
