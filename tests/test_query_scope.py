@@ -17,6 +17,7 @@ from vortex_rdf import Cancelled, CancelToken, serialize_rdf
 import vortex_rdflib.pushdown as pd
 from test_pushdown import _counting_term_dict, _row_key, both_ways, is_graph_name_check, run
 from vortex_rdflib import VortexRdflibStore, cancel_scope, query_scope, register_sparql_pushdown
+from vortex_rdflib.settings import SETTINGS
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 
@@ -170,7 +171,7 @@ def test_triples_inside_a_query_share_the_query_decodes(tmp_path, monkeypatch):
     per pattern and binding; inside the query they share its decodes: the 50
     subjects and the predicate are decoded once each."""
     graph = Graph(store=_store(tmp_path))
-    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset())
+    monkeypatch.setattr(SETTINGS, "enabled_ops", frozenset())
     register_sparql_pushdown()
     list(graph.store.contexts())  # one context per graph: store state, decoded once
     counting = _counting_term_dict(graph)
@@ -320,7 +321,7 @@ def test_a_query_failing_mid_iteration_releases_its_scope(tmp_path, tracked):
     with pytest.raises(RuntimeError, match="part-way"):
         for row in graph.query(query):
             rows.append(row)
-    assert len(rows) == pd._CHUNK_START
+    assert len(rows) == SETTINGS.chunk_start
     _assert_released(store, before, tracked)
 
 
@@ -331,7 +332,7 @@ def test_a_cancelled_query_releases_its_scope(tmp_path, tracked, monkeypatch):
     token as any failure does."""
     store = _store(tmp_path)
     graph = Graph(store=store)
-    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset())
+    monkeypatch.setattr(SETTINGS, "enabled_ops", frozenset())
     register_sparql_pushdown()
     query = "SELECT ?a ?c WHERE { ?a <http://ex.org/knows> ?b . ?b <http://ex.org/knows> ?c }"
     assert len(run(graph, query)) == 50
@@ -352,7 +353,7 @@ def test_rdflibs_own_limit_releases_the_scope(tmp_path, tracked, monkeypatch):
     the scope goes when the islice ends, those rows left unread."""
     store = _store(tmp_path)
     graph = Graph(store=store)
-    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
+    monkeypatch.setattr(SETTINGS, "enabled_ops", frozenset({"BGP"}))
     register_sparql_pushdown()
     sliced = []
     original = rdflib_evaluate.evalSlice

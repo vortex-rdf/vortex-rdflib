@@ -27,6 +27,7 @@ import vortex_rdflib.pushdown as pd
 from test_native_primitives import _trace
 from test_pushdown import both_ways, run
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
+from vortex_rdflib.settings import SETTINGS
 
 # Two named graphs and the default graph: a first hop (p), a second and third
 # hop for the nested groups, OPTIONAL and MINUS (q, r), a subject with a first
@@ -1121,9 +1122,9 @@ def route(request, monkeypatch):
     """The default planning; every one-pattern side probed per row; every
     FILTER value through rdflib's evaluator."""
     if request.param == "probe":
-        monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+        monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     elif request.param == "generic":
-        monkeypatch.setattr(filters, "_FAST_ENABLED", False)
+        monkeypatch.setattr(SETTINGS, "fast_filters", False)
     return request.param
 
 

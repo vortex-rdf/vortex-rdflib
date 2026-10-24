@@ -20,10 +20,10 @@ from rdflib.graph import DATASET_DEFAULT_GRAPH_ID
 from vortex_rdf import Cancelled, CancelToken, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-import vortex_rdflib.store as store_mod
 from test_native_primitives import _spy
 from test_pushdown import _trace_events, run
 from vortex_rdflib import VortexRdflibStore, cancel_scope, register_sparql_pushdown
+from vortex_rdflib.settings import SETTINGS
 
 EX = "http://ex/"
 _PREFIX = f"PREFIX : <{EX}> "
@@ -158,11 +158,11 @@ _WAITING_CALLS = ("count_quads_many", "match_codes_many", "match_code_chunks")
 def _races(store, name: str, args: tuple, kwargs: dict) -> bool:
     """Whether a native call races the token: a batch or a chunked match
     always; a one-shot call only on a file-backed store, when it is no point
-    lookup (``_cheap_probe``) and is not capped at one row."""
+    lookup (``VortexRdflibStore._point_lookup``) and is not capped at one row."""
     if name in _WAITING_CALLS:
         return True
     limit = kwargs.get("limit")
-    return not store.in_memory and (limit is None or limit > 1) and not pd._cheap_probe(store, args)
+    return not store.in_memory and (limit is None or limit > 1) and not store._point_lookup(args)
 
 
 def _run_shape(graph, monkeypatch, shape: str) -> list[tuple[str, tuple, dict]]:
@@ -170,7 +170,7 @@ def _run_shape(graph, monkeypatch, shape: str) -> list[tuple[str, tuple, dict]]:
     the shape's own call among them."""
     work, budget, own, _ = SHAPES[shape]
     if budget is not None:
-        monkeypatch.setattr(pd, "_PAIR_BUDGET", budget)
+        monkeypatch.setattr(SETTINGS, "pair_budget", budget)
     register_sparql_pushdown()
     spy = _spy(graph)
     if callable(work):
@@ -244,9 +244,9 @@ def _one_row_pieces(monkeypatch) -> None:
     """Tier 1 with a piece per row, the first decoded alone: a budget of 0,
     slices and chunks of one row, and a first decode chunk of one row, so a
     pull past the first row asks for the next piece."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
-    monkeypatch.setattr(pd, "_PIECE_ROWS", 1)
-    monkeypatch.setattr(pd, "_CHUNK_START", 1)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
+    monkeypatch.setattr(SETTINGS, "piece_rows", 1)
+    monkeypatch.setattr(SETTINGS, "chunk_start", 1)
 
 
 class _Groups:
@@ -348,9 +348,9 @@ def test_a_cancel_stops_the_rows_within_one_decode_chunk(mem_graph, monkeypatch,
     any row."""
     sparql, budget, when, read_before, gathered = _WITHIN_A_CHUNK[case]
     if budget is not None:
-        monkeypatch.setattr(pd, "_PAIR_BUDGET", budget)
-    monkeypatch.setattr(pd, "_CHUNK_START", 2)
-    monkeypatch.setattr(pd, "_CHUNK_MAX", 8)
+        monkeypatch.setattr(SETTINGS, "pair_budget", budget)
+    monkeypatch.setattr(SETTINGS, "chunk_start", 2)
+    monkeypatch.setattr(SETTINGS, "chunk_max", 8)
     token = CancelToken()
     gathers = _watch_gathers(monkeypatch, during=token.cancel if when == "gather" else None)
     register_sparql_pushdown()
@@ -397,7 +397,7 @@ def test_tier3_rows_stop_on_cancel(mem_graph, monkeypatch):
     a budget of 0), each row making one solution. Cancelled once the first
     solution is read, the query stops at the next row of the relation,
     which rdflib never extends."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
     extended = []
     eval_bgp = pd.evalBGP
 
@@ -466,17 +466,17 @@ def test_probes_stop_on_cancel(mem_graph):
 def test_triples_carries_the_token(graph, monkeypatch, chunk_rows):
     """Inside ``cancel_scope`` the match ``triples()`` makes for a pattern
     that scans a file-backed store carries the token, and on an in-memory
-    store takes none; it asks for one row more than ``_TRIPLES_CHUNK_ROWS``.
+    store takes none; it asks for one row more than ``SETTINGS.triples_chunk_rows``.
     A pattern of more rows is read in chunks, every pull of which waits for
     the native layer: the chunk call carries the token on any store."""
     if chunk_rows is not None:
-        monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", chunk_rows)
+        monkeypatch.setattr(SETTINGS, "triples_chunk_rows", chunk_rows)
     spy = _spy(graph)
     token = CancelToken()
     with cancel_scope(token):
         assert list(graph.store.triples((None, URIRef(f"{EX}p"), None)))
     raced = {} if graph.store.in_memory else {"cancel": token}
-    first = ("match_codes", {"limit": store_mod._TRIPLES_CHUNK_ROWS + 1, **raced})
+    first = ("match_codes", {"limit": SETTINGS.triples_chunk_rows + 1, **raced})
     if chunk_rows is None:
         assert spy.calls == [first]
     else:
@@ -488,7 +488,7 @@ def test_a_cancel_stops_a_chunked_triples_read_at_its_next_pull(graph, monkeypat
     """A pattern read in chunks keeps the token it started with: once the
     token is cancelled, after the block too, the read yields the rest of the
     chunk it holds and raises ``Cancelled`` at its next pull."""
-    monkeypatch.setattr(store_mod, "_TRIPLES_CHUNK_ROWS", 7)
+    monkeypatch.setattr(SETTINGS, "triples_chunk_rows", 7)
     token = CancelToken()
     with cancel_scope(token):
         rows = graph.store.triples((None, URIRef(f"{EX}p"), None))
@@ -514,7 +514,7 @@ def test_an_in_memory_one_shot_call_checks_the_token_itself(mem_graph):
         token.cancel()
         with pytest.raises(Cancelled):
             list(mem_graph.store.triples(scan))
-    assert spy.calls == [("match_codes", {"limit": store_mod._TRIPLES_CHUNK_ROWS + 1})]
+    assert spy.calls == [("match_codes", {"limit": SETTINGS.triples_chunk_rows + 1})]
 
 
 S0, P, X0 = URIRef(f"{EX}s0"), URIRef(f"{EX}p"), URIRef(f"{EX}x0")
@@ -544,7 +544,7 @@ def test_a_point_read_checks_the_token_itself(graph, pattern, in_default_graph, 
             list(store.triples(pattern, context))
     # A pattern with a free position is matched asking for one row more than
     # one match of ``triples()`` holds; a ground one is not.
-    limited = {"limit": store_mod._TRIPLES_CHUNK_ROWS + 1} if None in pattern else {}
+    limited = {"limit": SETTINGS.triples_chunk_rows + 1} if None in pattern else {}
     assert spy.calls == [(call, limited)]
 
 

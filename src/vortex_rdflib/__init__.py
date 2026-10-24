@@ -1,7 +1,8 @@
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 
-from .pushdown import cancel_scope, register_sparql_pushdown, unregister_sparql_pushdown
+from .cancel import cancel_scope
+from .pushdown import register_sparql_pushdown, unregister_sparql_pushdown
 from .store import VortexRdflibStore
 
 try:

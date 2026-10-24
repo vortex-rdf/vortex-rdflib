@@ -3,7 +3,8 @@ import json
 from rdflib import Graph
 from vortex_rdf import serialize_rdf
 
-from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
+from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
+from vortex_rdflib.settings import SETTINGS
 
 PREFIX = "VORTEX_RDF_QUERY_TRACE "
 
@@ -18,7 +19,7 @@ def _events(captured):
 
 def test_restriction_trace_reports_distinct_bindings_and_rows(tmp_path, capsys, monkeypatch):
     # The Python restriction route, whatever the native layer could decide.
-    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
+    monkeypatch.setattr(SETTINGS, "native_filters", False)
     source = tmp_path / "restriction.nt"
     source.write_text(
         '<http://ex/s1> <http://ex/anchor> "yes" .\n'

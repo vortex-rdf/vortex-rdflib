@@ -15,6 +15,7 @@ from test_native_filters import _Recording
 from test_native_primitives import _native_calls, _products, _spy, _store_file, _trace
 from test_pushdown import FIXTURE_NT, both_ways, run
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
+from vortex_rdflib.settings import SETTINGS
 from vortex_rdflib.terms import parse_spelling
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
@@ -68,7 +69,7 @@ def test_a_join_step_evaluates_the_codes_it_binds(tmp_path, monkeypatch, fanout)
     its variable: a hash-joined pattern's matched column, or the rows a probed
     pattern's probes reached — here every product, so 200 prices either way."""
     graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=True))
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
     register_sparql_pushdown()
     expected = sorted(_price_code(graph.store, i) for i in range(200))
     spy = _spy_filters(graph)
@@ -83,7 +84,7 @@ def test_a_join_step_evaluates_the_codes_it_binds(tmp_path, monkeypatch, fanout)
 def test_a_probe_join_evaluates_only_the_codes_its_probes_reached(tmp_path, monkeypatch):
     store = VortexRdflibStore(_products(tmp_path), in_memory=True)
     graph = Graph(store=store)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 1)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 1)
     register_sparql_pushdown()
     spy = _spy_filters(graph)
     query = f"""SELECT ?s ?v WHERE {{
@@ -135,7 +136,7 @@ def test_the_native_filters_switch_sends_no_candidates(
     filter_codes — neither a pattern's own conjunct nor a band specialized
     from a tuple conjunct — and the answer is rdflib's."""
     graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=True))
-    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
+    monkeypatch.setattr(SETTINGS, "native_filters", False)
     register_sparql_pushdown()
     spy = _spy_filters(graph)
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
@@ -268,7 +269,7 @@ def test_both_restriction_modes_trace_the_same_fields(tmp_path, monkeypatch, cap
         ?s {PRICE} ?v FILTER(?v < 300) }}"""
     records = {}
     for mode, fanout in (("match", 10**9), ("probe", 0)):
-        monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+        monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
         capsys.readouterr()
         run(graph, query)
         [record] = [e for e in _trace(capsys) if e["event"] == "bgp_restriction_complete"]
@@ -446,7 +447,7 @@ def test_in_the_empty_list_is_false_even_for_rdf_nil(tmp_path, monkeypatch):
         ("SELECT ?o WHERE { ?s ?p ?o FILTER(?o NOT IN ()) }", [(URIRef(nil),)]),
     ]
     for native in (True, False):
-        monkeypatch.setattr(filters, "_NATIVE_ENABLED", native)
+        monkeypatch.setattr(SETTINGS, "native_filters", native)
         for query, expected in cases:
             with_pushdown, without_pushdown = both_ways(graph, query)
             assert with_pushdown == without_pushdown == expected, (native, query)
@@ -456,7 +457,7 @@ def test_values_only_rdflib_answers_are_decoded_in_one_batch(tmp_path, monkeypat
     """A conjunct rdflib's evaluator answers decodes the values it reads in
     one decode_many, not one decode per value."""
     graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=True))
-    monkeypatch.setattr(filters, "_FAST_ENABLED", False)
+    monkeypatch.setattr(SETTINGS, "fast_filters", False)
     register_sparql_pushdown()
     inner = graph.store._dict  # ty: ignore[unresolved-attribute]
     calls: list[str] = []

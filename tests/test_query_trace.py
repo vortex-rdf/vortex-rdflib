@@ -4,8 +4,7 @@ import pytest
 from rdflib import Graph
 from vortex_rdf import serialize_rdf
 
-import vortex_rdflib.pushdown as pd
-from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
+from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, settings
 
 PREFIX = "VORTEX_RDF_QUERY_TRACE "
 
@@ -77,7 +76,7 @@ def test_trace_reports_bounded_order_and_decoding(traced_graph, capsys, monkeypa
 def test_trace_rejects_invalid_switch(monkeypatch):
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "yes")
     with pytest.raises(ValueError, match="must be 0 or 1"):
-        pd._trace_enabled()
+        settings.trace_enabled()
 
 
 def test_trace_reports_native_call_shape_and_rows(traced_graph, capsys, monkeypatch):

@@ -13,6 +13,7 @@ from vortex_rdf import serialize_rdf
 import vortex_rdflib.pushdown as pd
 from test_pushdown import both_ways, is_graph_name_check, run
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
+from vortex_rdflib.settings import SETTINGS
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 
@@ -214,7 +215,7 @@ def test_probes_that_scan_are_batched(tmp_path, monkeypatch):
     lookups, which plain calls answer faster than a batch can be scheduled."""
     graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=True))
     register_sparql_pushdown()
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     spy = _spy(graph)
     values = """SELECT ?s ?o WHERE {
         VALUES ?o { "product 1"@en "product 3"@en "product 4"@fr }

@@ -1,4 +1,4 @@
-"""The pair budget (``_PAIR_BUDGET``): a join step of a BGP whose two sides'
+"""The pair budget (``SETTINGS.pair_budget``): a join step of a BGP whose two sides'
 product passes the budget counts its pairs natively before it is built. A
 last step over the budget that shares one variable streams (tier 1): the
 smaller side's key column is grouped and the other side is fed through it a
@@ -42,6 +42,7 @@ from vortex_rdflib import (
     register_sparql_pushdown,
     unregister_sparql_pushdown,
 )
+from vortex_rdflib.settings import SETTINGS
 
 EX = "http://ex/"
 _PREFIX = f"PREFIX : <{EX}> "
@@ -281,13 +282,17 @@ def _fields(events, name) -> list[dict]:
 
 
 def _budget_in_a_fresh_interpreter(value: str | None) -> subprocess.CompletedProcess:
-    """``_PAIR_BUDGET`` as a new interpreter imports it, with
+    """``SETTINGS.pair_budget`` as a new interpreter imports it, with
     ``VORTEX_RDF_PAIR_BUDGET`` set to ``value`` (unset for ``None``)."""
     env = {key: item for key, item in os.environ.items() if key != "VORTEX_RDF_PAIR_BUDGET"}
     if value is not None:
         env["VORTEX_RDF_PAIR_BUDGET"] = value
     return subprocess.run(
-        [sys.executable, "-c", "import vortex_rdflib.pushdown as p; print(p._PAIR_BUDGET)"],
+        [
+            sys.executable,
+            "-c",
+            "from vortex_rdflib.settings import SETTINGS; print(SETTINGS.pair_budget)",
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -313,9 +318,9 @@ def test_the_pair_count_skips_a_product_within_the_budget(monkeypatch):
     """Keys 1, 1, 2 against 1, 2, 2, 3: a product of 12 that makes 4 pairs,
     counted only once the product passes the budget."""
     left, right = U64Column([1, 1, 2]), U64Column([1, 2, 2, 3])
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 12)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 12)
     assert pd._pair_count(left, right) is None
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 11)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 11)
     assert pd._pair_count(left, right) == 4
 
 
@@ -326,18 +331,18 @@ def test_a_row_step_counts_its_first_shared_variable(monkeypatch):
     k, x, y, z = (Variable(name) for name in "kxyz")
     rows_a = [(1, 5), (1, 6), (2, 7)]
     rows_b = [(1, 5, 0), (2, 9, 0), (3, 7, 0)]
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
     assert pd._row_step_pairs((k, x), rows_a, (k, x, y), rows_b) == 3
     assert len(pd._join((k, x), rows_a, (k, x, y), rows_b)[1]) == 1
     assert pd._row_step_pairs((z,), [(1,), (2,)], (k, x, y), rows_b) == 6
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 6)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 6)
     assert pd._row_step_pairs((z,), [(1,), (2,)], (k, x, y), rows_b) is None
 
 
 def test_small_joins_make_no_count(graph, monkeypatch, capsys):
     """Every join step of this module's queries has a product far within the
     default budget: none counts its pairs, whatever its strategy."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 1 << 24)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 1 << 24)
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     capsys.readouterr()
@@ -353,7 +358,7 @@ def test_a_join_past_the_product_bound_is_counted_then_built(graph, monkeypatch,
     """The star's step has a product of 200 and makes 20 pairs: a budget from
     the pairs to just under the product counts the step, which fits and is
     built."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", budget)
+    monkeypatch.setattr(SETTINGS, "pair_budget", budget)
     (with_pushdown, without_pushdown), events = _traced_both_ways(graph, monkeypatch, capsys, STAR)
     assert with_pushdown == without_pushdown
     [step] = _fields(events, "bgp_join_step_complete")
@@ -391,7 +396,7 @@ def test_tier3_needs_the_emitter(graph, monkeypatch, capsys, sparql, budget, ove
     rows, or the chain's two probed rows (2 of the 10 // 4 the probe step may
     make) against the 170 `owner` rows, their first variable's codes copied
     into native columns."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", budget)
+    monkeypatch.setattr(SETTINGS, "pair_budget", budget)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, sparql, run_ordered
     )
@@ -462,11 +467,11 @@ def test_a_probe_step_over_budget_discards_its_rows(file_graph, monkeypatch, cap
     with its last probe never pulled, the third batch is never sent, and the
     rows it made are dropped. It is planned again as a keep-scan, whose rows
     are the answer, none twice; its statistics count the six probes sent."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 16)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: True)
-    monkeypatch.setattr(pd, "_CHEAP_BATCH_MIN", 1)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 16)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
+    monkeypatch.setattr(SETTINGS, "probe_batch", 3)
+    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: True)
+    monkeypatch.setattr(SETTINGS, "cheap_batch_min", 1)
     watched = _WatchedBatches(file_graph.store._store())
     file_graph.store._native = watched
     if traced:
@@ -537,9 +542,9 @@ def test_a_batch_short_of_answers_raises(graph, monkeypatch, tokened):
     token or without one: a batch that answers fewer probes than it was
     given raises at the first probe left without an answer rather than
     handing another probe's answer on."""
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
-    monkeypatch.setattr(pd, "_SCAN_BATCH_MIN", 1)
-    monkeypatch.setattr(pd, "_MEMORY_SCAN_BATCH_MIN", 1)
+    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
+    monkeypatch.setattr(SETTINGS, "scan_batch_min", 1)
+    monkeypatch.setattr(SETTINGS, "memory_scan_batch_min", 1)
     graph.store._native = _ShortBatches(graph.store._store())
     probes = [((None, f"<{EX}p>", None, None), {}), ((None, f"<{EX}q>", None, None), {})]
     with _scope(tokened):
@@ -569,9 +574,9 @@ def test_a_batch_past_its_probes_raises(graph, monkeypatch, tokened):
     """A batch that answers more probes than it was given, under a cancel
     token or without one, raises at its last probe rather than handing that
     probe an answer the batch may have misplaced."""
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
-    monkeypatch.setattr(pd, "_SCAN_BATCH_MIN", 1)
-    monkeypatch.setattr(pd, "_MEMORY_SCAN_BATCH_MIN", 1)
+    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
+    monkeypatch.setattr(SETTINGS, "scan_batch_min", 1)
+    monkeypatch.setattr(SETTINGS, "memory_scan_batch_min", 1)
     graph.store._native = _LongBatches(graph.store._store())
     probes = [((None, f"<{EX}p>", None, None), {}), ((None, f"<{EX}q>", None, None), {})]
     with _scope(tokened):
@@ -593,8 +598,8 @@ def test_an_over_budget_last_step_streams(graph, monkeypatch, capsys):
     than the ten seed rows, so its last step streams without reading it
     whole: the ten seed rows are grouped and the 20 `q` rows fed four at a
     time, a piece each."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 19)
-    monkeypatch.setattr(pd, "_PIECE_ROWS", 4)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 19)
+    monkeypatch.setattr(SETTINGS, "piece_rows", 4)
     (with_pushdown, without_pushdown), events = _traced_both_ways(graph, monkeypatch, capsys, STAR)
     assert with_pushdown == without_pushdown
     [step] = _fields(events, "bgp_join_step_complete")
@@ -616,7 +621,7 @@ def test_groups_go_on_the_smaller_side(
     grouped rows, and the other side is fed in slices: the ten-row relation
     against a pattern of 20, or a pattern of 20 rows against the 50 rows the
     fan-out made of the relation."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", budget)
+    monkeypatch.setattr(SETTINGS, "pair_budget", budget)
     grouped = []
     gather_pieces = pd._gather_pieces
 
@@ -638,8 +643,8 @@ def test_a_large_unread_pattern_is_fed_in_chunks(graph, monkeypatch, capsys):
     """The star's `q` pattern counts 20 rows, more than a budget of 15 and
     than the ten seed rows: the last step reads it through
     ``match_code_chunks``, a piece at a time, and never matches it whole."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 15)
-    monkeypatch.setattr(pd, "_PIECE_ROWS", 8)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 15)
+    monkeypatch.setattr(SETTINGS, "piece_rows", 8)
     register_sparql_pushdown()
     spy = _spy(graph)
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
@@ -668,7 +673,7 @@ def test_a_probed_relation_streams_as_columns(graph, monkeypatch, capsys):
     relation as rows. The last step's `t` pattern counts 150 rows, more than a
     budget of 19 and than those two rows, so it streams from chunks: the two
     rows are copied into native columns to be grouped."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 19)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 19)
     (with_pushdown, without_pushdown), events = _traced_both_ways(graph, monkeypatch, capsys, CHAIN)
     assert with_pushdown == without_pushdown
     assert len(with_pushdown) == 20
@@ -684,7 +689,7 @@ def test_a_fed_pattern_with_a_repeated_variable_is_sliced(graph, monkeypatch, ca
     four seed rows, but its repeated variable is a test across two of a
     row's columns, which chunks do not carry: the pattern is matched whole,
     its ten passing rows are fed in slices, and its answers are rdflib's."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 3)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 3)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, SELF_LOOP
     )
@@ -699,7 +704,7 @@ def test_a_row_over_budget_alone_is_gathered_whole(graph, monkeypatch, capsys):
     """At a budget of 1 each fed `w` row matches the three grouped `u` rows of
     its key: halving stops at the single row, which is gathered whole, so the
     step ends with a piece per fed row."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 1)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 1)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, ONE_KEY
     )
@@ -712,8 +717,8 @@ def test_a_row_over_budget_alone_is_gathered_whole(graph, monkeypatch, capsys):
 def test_limit_stops_a_streamed_join(graph, monkeypatch, capsys):
     """A LIMIT stops pulling pieces: its two rows come from the first piece
     of four, and no other piece is gathered."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 19)
-    monkeypatch.setattr(pd, "_PIECE_ROWS", 4)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 19)
+    monkeypatch.setattr(SETTINGS, "piece_rows", 4)
     unregister_sparql_pushdown()
     try:
         every = run(graph, STAR)
@@ -736,9 +741,9 @@ def test_an_early_stop_releases_the_feed(graph, monkeypatch, traced):
     """A result closed after its first row drops the chunk iterator its
     streamed step reads, with nine of the `q` pattern's ten chunks never
     pulled."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
-    monkeypatch.setattr(pd, "_PIECE_ROWS", 2)
-    monkeypatch.setattr(pd, "_CHUNK_START", 1)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
+    monkeypatch.setattr(SETTINGS, "piece_rows", 2)
+    monkeypatch.setattr(SETTINGS, "chunk_start", 1)
     if traced:
         monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
@@ -756,8 +761,8 @@ def test_a_filter_residual_rides_the_pieces(graph, monkeypatch, capsys):
     """A FILTER over two of a streamed step's variables is a predicate of the
     streamed rows: the Filter's relation is still the stream, and its rows
     are tested as they are pulled."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
-    monkeypatch.setattr(pd, "_PIECE_ROWS", 4)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
+    monkeypatch.setattr(SETTINGS, "piece_rows", 4)
     sparql = (
         _PREFIX
         + """SELECT ?s ?x ?y WHERE { ?s :p ?x . ?s :q ?y
@@ -804,8 +809,8 @@ def test_over_budget_under_a_row_consumer_drains_the_pieces(graph, monkeypatch, 
     over-budget last step still streams: the consumer takes its rows piece by
     piece, and nothing of the block is handed back."""
     sparql, runner, kept_by_rdflib = DRAINED[consumer]
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
-    monkeypatch.setattr(pd, "_PIECE_ROWS", 2)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
+    monkeypatch.setattr(SETTINGS, "piece_rows", 2)
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
     with_pushdown, without_pushdown = both_ways(graph, _PREFIX + sparql, runner)
@@ -821,8 +826,8 @@ def test_over_budget_under_a_row_consumer_drains_the_pieces(graph, monkeypatch, 
 def test_an_ask_gathers_one_piece(graph, monkeypatch, capsys):
     """ASK pulls one row of the streamed star, every fed row of which
     matches: one piece is gathered, and the stream is closed after it."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
-    monkeypatch.setattr(pd, "_PIECE_ROWS", 2)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
+    monkeypatch.setattr(SETTINGS, "piece_rows", 2)
     sparql = _PREFIX + f"ASK {{ {_STAR_BODY} }}"
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, sparql
@@ -880,7 +885,7 @@ def test_tier2_joins_a_fitting_pattern_first(graph, monkeypatch, capsys):
     relation to five rows; the `?s` pattern, now the last step and still
     counting more rows than the budget, streams them from the memo's match
     (tier 1)."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 239)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 239)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, REORDER
     )
@@ -926,7 +931,7 @@ def test_tier2_does_not_trust_a_capped_estimate(graph, monkeypatch):
     pd._join_patterns(graph.store, [seed, linked])
     assert (seed["estimate"], seed.get("estimate_capped", False)) == (1, False)
     assert (linked["estimate"], linked["estimate_capped"]) == (101, True)
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 202)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 202)
     rows = [(1,), (2,)]
     assert not pd._fits(2, (x,), None, rows, linked, {}, graph.store)
     linked["estimate_capped"] = False
@@ -947,13 +952,13 @@ def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
     memo = {tuple(n3): native.match_codes(*n3)}
     cols = (memoryview(seed[0]).cast("Q"), memoryview(seed[2]).cast("Q"))
     bodies = [(cols, None), (None, pd._cols_to_rows(cols))]
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 5)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 5)
     assert [pd._fits(120, (s, x), *body, pat, memo, graph.store) for body in bodies] == [True] * 2
     assert not pd._fits(120, (s, x), cols, None, pat, {}, graph.store)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 2)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 2)
     assert not pd._fits(120, (s, x), cols, None, pat, memo, graph.store)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 100)
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 4)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 100)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 4)
     assert [pd._fits(120, (s, x), *body, pat, memo, graph.store) for body in bodies] == [False] * 2
 
 
@@ -966,7 +971,7 @@ def test_tier2_undoes_what_a_put_back_step_specialized(graph, monkeypatch, capsy
     again and is specialized onto pattern 1, which joins first and binds `?c`,
     so the `spd0` row that fails it never joins, and pattern 0 then joins the
     one row left."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", budget)
+    monkeypatch.setattr(SETTINGS, "pair_budget", budget)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, SPECIALIZED
     )
@@ -989,7 +994,7 @@ def test_tier2_restricts_a_put_back_pattern_again(graph, monkeypatch, capsys):
     pattern goes back with its restriction, and once `?x :tl ?d` has joined,
     its step reads it again from the memo and restricts it again, joining it
     whole rather than streaming its unrestricted match."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 119)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 119)
     sparql = _PREFIX + f'SELECT ?s ?x ?c ?d WHERE {{ {_TIER_BODY} FILTER(STRENDS(STR(?c), "-1")) }}'
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, sparql
@@ -1009,7 +1014,7 @@ def test_tier3_lets_rdflib_finish_the_rest(graph, monkeypatch, capsys):
     120 seed rows, and rdflib's ``evalBGP`` finishes both patterns per row,
     reading them through the store's ``triples()`` with the row's bindings
     in place — once per seed row, then once per `?c` that row finds."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
     unregister_sparql_pushdown()
     try:
         expected = run(graph, REORDER)
@@ -1043,7 +1048,7 @@ def test_tier3_projects_and_windows(graph, monkeypatch, capsys):
     of the 120 seed rows, the five linked ones finish into two solutions
     each and the others into none, and `LIMIT 3 OFFSET 2` gives the third to
     fifth solution, each bound to `?c` alone."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
     register_sparql_pushdown()
     select = _PREFIX + f"SELECT ?c WHERE {{ {_TIER_BODY} }}"
     every = list(SPARQLProcessor(graph).query(select)["bindings"])
@@ -1114,7 +1119,7 @@ def test_tier3_keeps_the_answer(
         view = Dataset(store=store, default_union=True)
     else:
         view = Graph(store=VortexRdflibStore(str(joins_vortex), in_memory=in_memory))
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         view, monkeypatch, capsys, _PREFIX + sparql, runner
     )
@@ -1129,7 +1134,7 @@ def test_a_filter_over_the_native_rows_keeps_tier3_below_it(graph, monkeypatch, 
     it: its conjunct, over two variables the native rows bind and with no
     native or fast route, tests those rows before rdflib finishes them, and
     nothing is handed back."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
     sparql = (
         _PREFIX + f"SELECT ?s ?c ?d WHERE {{ {_TIER_BODY} "
         f'FILTER(CONCAT(STR(?s), STR(?x)) != "{EX}ts0{EX}tx0") }}'
@@ -1192,7 +1197,7 @@ def test_scan_probes_become_one_keep_scan(file_graph, monkeypatch, capsys):
     assert set(keyed["keep"]) == {2}
     keys = _codes(keyed["keep"][2])
     assert len(keys) == 9 and keys == sorted(set(keys))
-    assert keyed["limit"] == pd._PAIR_BUDGET + 1
+    assert keyed["limit"] == SETTINGS.pair_budget + 1
     [step] = _fields(events, "bgp_join_step_complete")
     assert (step["strategy"], step["cardinality_source"], step["output_rows"]) == (
         "keep_scan",
@@ -1212,7 +1217,7 @@ def test_an_over_budget_keep_scan_streams_its_chunks(graph, monkeypatch, capsys)
     and it comes back full. The step is the last and shares one variable, so
     it streams: the pattern is fed from ``match_code_chunks`` narrowed by the
     same keep, never matched whole."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 10)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 10)
     register_sparql_pushdown()
     spy = _spy(graph)
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
@@ -1245,7 +1250,7 @@ def test_a_probe_step_over_its_tally_replans_as_a_keep_scan(
     and planned again, in the same pass, as a keep-scan — the `owner` match
     narrowed to the anchor, its 152 rows within the budget, hash-joined."""
     graph = Graph(store=VortexRdflibStore(str(indexed_joins_vortex), in_memory=False))
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 200)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 200)
     (with_pushdown, without_pushdown), events = _traced_both_ways(graph, monkeypatch, capsys, OWNED)
     assert with_pushdown == without_pushdown
     assert len(with_pushdown) == 152
@@ -1275,7 +1280,7 @@ def test_a_keep_scan_over_budget_by_its_pairs_streams_its_match(graph, monkeypat
     """The keep-scan's six rows are within a budget of 11, but its key is held
     twice by the relation, so they make twelve pairs. The last step streams
     the match it read, fed in slices."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 11)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 11)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, KEYED_TWICE
     )
@@ -1297,9 +1302,9 @@ def test_an_over_budget_keep_scan_short_of_the_last_step_goes_back(graph, monkey
     to join, and goes back as planned. `?x :tl ?d`, which the step would join
     per row too, can fit only by its product, which does not, so rdflib
     finishes both patterns per seed row (tier 3)."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 239)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 239)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
+    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, REORDER
     )
@@ -1321,9 +1326,9 @@ def test_an_over_budget_keep_scan_needing_whole_columns_goes_back(graph, monkeyp
     one variable; but its repeated `?k` asks for a test across two of a
     row's columns, which chunks do not make. It goes back, and rdflib
     finishes it per row (tier 3)."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 1)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 1)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
+    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
     spy = _spy(graph)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, LOOPED
@@ -1346,7 +1351,7 @@ def test_an_over_budget_keep_scan_with_a_deferred_restriction_goes_back(graph, m
     10, the last step goes back, and with the conjunct pushed into the block
     the FILTER goes back to rdflib too. rdflib offers the block alone, whose
     keep-scan, full again, streams from chunks."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 10)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 10)
     sparql = (
         _PREFIX + "SELECT ?k ?f ?p WHERE { :c0 :has ?k . ?f ?p ?k "
         f'FILTER(STRSTARTS(STR(?f), "{EX}f")) }}'
@@ -1441,8 +1446,8 @@ def test_probe_multiplicity_under_keep_scan(
         union, sparql, rows = KEEP_SCAN_MULTIPLICITY[case]
     store = VortexRdflibStore(str(multiplicity_vortex), in_memory=in_memory)
     dataset = Dataset(store=store, default_union=union)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
+    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         dataset, monkeypatch, capsys, sparql
     )
@@ -1458,8 +1463,8 @@ def test_probe_batches_name_their_lookahead(file_graph, monkeypatch):
     scan run a scan per core, up to eight: the nine `ref` probes of an EXISTS
     and of an OPTIONAL, each binding only its object. The planning counts
     name none either."""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    monkeypatch.setattr(pd, "_CHEAP_BATCH_MIN", 1)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
+    monkeypatch.setattr(SETTINGS, "cheap_batch_min", 1)
     register_sparql_pushdown()
     spy = _spy(file_graph)
     scans = min(os.cpu_count() or 1, 8)

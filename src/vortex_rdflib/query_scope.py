@@ -56,7 +56,7 @@ class QueryTerms:
 
 class QueryScope:
     """The term state of one query, per store it reads (one, in practice),
-    and the query's cancel token (``pushdown.cancel_scope``), ``None`` for a
+    and the query's cancel token (``cancel.cancel_scope``), ``None`` for a
     query started outside a block."""
 
     __slots__ = ("_by_store", "cancel", "__weakref__")

@@ -21,6 +21,7 @@ from test_native_filters import _outcome
 from test_pushdown import both_ways
 from vortex_rdflib import VortexRdflibStore, candidates, filters, register_sparql_pushdown
 from vortex_rdflib.candidates import NativeShape
+from vortex_rdflib.settings import SETTINGS
 from vortex_rdflib.terms import canonical_spelling, parse_spelling
 
 V = Variable("v")
@@ -352,7 +353,7 @@ def test_a_pattern_re_cannot_compile_answers_as_rdflib_does(
     out = tmp_path / "objects.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
     graph = Graph(store=VortexRdflibStore(str(out), in_memory=True))
-    monkeypatch.setattr(filters, "_NATIVE_ENABLED", native)
+    monkeypatch.setattr(SETTINGS, "native_filters", native)
     query = f'SELECT ?s ?o WHERE {{ ?s <http://ex.org/p> ?o FILTER(regex(?o, "{pattern}")) }}'
     with_pushdown, without_pushdown = both_ways(graph, query, runner=_outcome)
     assert without_pushdown == (error if string else [])

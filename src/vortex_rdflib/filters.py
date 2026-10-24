@@ -53,16 +53,8 @@ from vortex_rdf import U64Column
 
 from . import candidates
 from .candidates import IRI_IN, NativeShape
+from .settings import SETTINGS
 from .terms import BLANK, IRI, LITERAL, TermView, canonical_spelling, kind_of, parse_spelling
-
-# Force the generic route everywhere (VORTEX_RDF_FILTER_FAST=0): the
-# equivalence tests run the matrix both ways.
-_FAST_ENABLED: bool = True
-# Decide the conjuncts that have a native shape inside vortex-rdf: kind tests
-# as code ranges, IRI equalities as code sets, the others over the codes a
-# query produced (VORTEX_RDF_NATIVE_FILTERS=0 keeps them on the Python
-# routes, for A/B measurements; the generic route above disables them too).
-_NATIVE_ENABLED: bool = True
 
 
 class _Sentinel:
@@ -1031,7 +1023,7 @@ def native_restriction(store, conjuncts: list) -> tuple:
     (:func:`candidates.keep_of`) — ``None`` when there is none — and
     ``residual`` are the other conjuncts, evaluated over the codes the query
     produces (:func:`evaluate_column`)."""
-    if not (_FAST_ENABLED and _NATIVE_ENABLED):
+    if not (SETTINGS.fast_filters and SETTINGS.native_filters):
         return None, conjuncts
     keeps, residual = [], []
     for conjunct in conjuncts:
@@ -1239,7 +1231,7 @@ def _compile_conjunct(
     reads nothing but term kinds. ``native`` is the predicate vortex-rdf
     decides it by, if any."""
     fast = None
-    if _FAST_ENABLED:
+    if SETTINGS.fast_filters:
         try:
             const_views = {v: view_of_node(term) for v, term in consts.items()}
         except _NotFast:
@@ -1273,7 +1265,7 @@ def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
         variables = tuple(v for v in referenced if v in block_set)
         consts = {v: visible[v] for v in referenced if v in visible and v not in block_set}
         native = None
-        if len(variables) == 1 and _FAST_ENABLED and _NATIVE_ENABLED:
+        if len(variables) == 1 and SETTINGS.fast_filters and SETTINGS.native_filters:
             native = native_shape(expr, variables[0], consts)
         conjunct = _compile_conjunct(expr, variables, consts, ctx, native)
         if shape is not None:
@@ -1330,7 +1322,7 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
         passed: set = set()
         unknown: list = []
         pending = remaining
-        if conjunct.native is not None and not conjunct.kind_only and _NATIVE_ENABLED:
+        if conjunct.native is not None and not conjunct.kind_only and SETTINGS.native_filters:
             passed, pending = candidates.evaluate(store, conjunct.native, remaining)
         if not pending:
             pass

@@ -14,7 +14,7 @@ What runs in code space:
   *counted* natively first, one at a time, the scans after them in one
   concurrent batch (a count is a fraction of a match's cost and moves no
   columns); a pattern sharing a variable with one that counts at most
-  ``_PROBE_FANOUT`` rows is not counted until its join step, and then only as
+  ``SETTINGS.probe_fanout`` rows is not counted until its join step, and then only as
   far as the probe-or-match decision needs; the smallest counted pattern is
   matched and seeds the relation, and each further pattern — smallest first
   among those sharing a variable with the relation — is joined per row of
@@ -24,7 +24,7 @@ What runs in code space:
   scan, ``_keep_scan``) or matched once and hash-joined by the native
   ``join_indices``/``take`` kernels; a pattern that counts to nothing empties
   the block before anything is matched, and the join itself never decodes a
-  term. A join step whose pairs would pass ``_PAIR_BUDGET``
+  term. A join step whose pairs would pass ``SETTINGS.pair_budget``
   (``VORTEX_RDF_PAIR_BUDGET``) is not built whole: a hash step has its pairs
   counted natively once its sides' product passes the budget, a probe step
   stops once its rows pass a quarter of it, and a keep-scan once its match
@@ -143,11 +143,9 @@ probed, restricted and joined, with row counts and timings.
 """
 
 import abc
-import contextlib
 import heapq
 import json
 import math
-import os
 import re
 import sys
 import time
@@ -164,9 +162,11 @@ from rdflib.plugins.sparql.evaluate import evalBGP, evalPart
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
-from vortex_rdf import Cancelled, CancelToken, CodeGroups, JoinTooLarge, U64Column
+from vortex_rdf import Cancelled, CodeGroups, JoinTooLarge, U64Column
 
-from . import candidates, filters, query_scope
+from . import candidates, filters, query_scope, settings
+from .cancel import CANCEL_TOKEN, cancel_kw, cancel_kw_for, check_cancelled
+from .settings import SETTINGS
 from .terms import CANONICAL_INTEGER, INTEGER_SUFFIX, canonical_spelling, unparseable_iri
 
 _EVAL_KEY = "vortex_rdflib_bgp"
@@ -191,19 +191,10 @@ _HANDLER_NAMES = {
     "AggregateJoin": "_eval_aggregate",
     "AskQuery": "_eval_ask",
 }
-_ALL_OPS = frozenset(_HANDLER_NAMES)
-_ENABLED_OPS = _ALL_OPS
-
-# Solutions decode in chunks that grow geometrically: the first chunk keeps a
-# LIMIT (or any consumer that stops early) from decoding more than a few
-# dozen rows, the cap keeps a full scan to a handful of decode_many calls.
-_CHUNK_START = 64
-_CHUNK_MAX = 4096
+assert _HANDLER_NAMES.keys() == settings.ALL_OPS
 
 _TRACE_PREFIX = "VORTEX_RDF_QUERY_TRACE "
 _TRACE_SCHEMA = "vortex-rdf-query-trace-v1"
-_TRACE_ENV = "VORTEX_RDF_TRACE_QUERY"
-_TRACE_ID_ENV = "VORTEX_RDF_TRACE_QUERY_ID"
 
 
 @dataclass(slots=True)
@@ -243,83 +234,6 @@ class _QueryTrace:
 
 
 _TRACE: ContextVar[_QueryTrace | None] = ContextVar("vortex_rdf_query_trace", default=None)
-
-#: The cancel token of the query being evaluated: set by :func:`cancel_scope`
-#: for the queries started inside it, kept in the query's scope
-#: (``QueryScope.cancel``) and set again around each step of its lazy result
-#: (:func:`_scoped_iterator`).
-_CANCEL: ContextVar[CancelToken | None] = ContextVar("vortex_rdflib_cancel", default=None)
-
-
-@contextlib.contextmanager
-def cancel_scope(token: CancelToken) -> Iterator[CancelToken]:
-    """Run the queries started inside the block under ``token``, which it
-    yields.
-
-    Each native call such a query makes that the token can stop — a batch, a
-    chunked match, a one-shot call that scans a file-backed store — is given
-    it (``cancel=``) and races it; every other one-shot call — a point
-    lookup, a call capped at one row, any call on an in-memory store, which
-    finishes without waiting — checks it as it is made (a join's per-row
-    probes are calls of either kind), as do the loops between calls: a
-    streamed join's pieces, the rows rdflib finishes, and the slices and decode
-    chunks of the rows it yields. So ``token.cancel()``, from any thread, stops
-    the query with ``vortex_rdf.Cancelled`` at its next call, piece, finished
-    row, slice or decode chunk, while it is planned or while its rows are read;
-    the rows already decoded, at most one decode chunk of 4,096, are
-    delivered first. A query keeps the token it started with until its rows
-    end, the rows read after the block included; a query started outside a
-    block has none. A ``triples()`` iteration started inside the block gives
-    its native calls the token too.
-    """
-    reset = _CANCEL.set(token)
-    try:
-        yield token
-    finally:
-        _CANCEL.reset(reset)
-
-
-def _cancel_kw() -> dict:
-    """The keyword that gives a native call the current query's cancel token:
-    ``{"cancel": token}``, or none without a token."""
-    token = _CANCEL.get()
-    return {} if token is None else {"cancel": token}
-
-
-def _check_cancelled() -> None:
-    """Raise ``vortex_rdf.Cancelled`` when the current query's cancel token is
-    cancelled: the check made per step of a loop that makes no native call,
-    and before a one-shot native call that does not race the token
-    (:func:`_cancel_kw_for`)."""
-    token = _CANCEL.get()
-    if token is not None and token.cancelled:
-        raise Cancelled("cancelled through its CancelToken")
-
-
-def _cancel_kw_for(cancel: dict, store, n3, limit: int | None = None) -> dict:
-    """The cancel keyword of one one-shot native call (``match_codes``,
-    ``count_quads``) on ``store`` over the quad pattern ``n3``, given the
-    query's (``cancel``, :func:`_cancel_kw`): ``cancel`` for a call the token
-    can stop — one that can scan a file-backed store — which races it; none
-    for any other — any call on an in-memory store, which finishes without
-    waiting, a point lookup (:func:`_cheap_probe`) or a call capped at one
-    row (``limit``) — which checks the token as it is made
-    (:func:`_check_cancelled`)."""
-    if cancel and (
-        store.in_memory or (limit is not None and limit <= 1) or _cheap_probe(store, n3)
-    ):
-        _check_cancelled()
-        return {}
-    return cancel
-
-
-def _trace_enabled() -> bool:
-    value = os.environ.get(_TRACE_ENV)
-    if value is None or value == "0":
-        return False
-    if value != "1":
-        raise ValueError(f"{_TRACE_ENV} must be 0 or 1, got {value!r}")
-    return True
 
 
 def _trace_event(event: str, **fields) -> None:
@@ -585,17 +499,11 @@ def _relation_rows(rel: "Relation") -> int | None:
 
 
 def register_sparql_pushdown():
-    """Install the hook into rdflib's CUSTOM_EVALS (idempotent)."""
-    global _ENABLED_OPS
-    if os.environ.get("VORTEX_RDF_DISABLE_PUSHDOWN") == "1":
+    """Install the hook into rdflib's CUSTOM_EVALS (idempotent), narrowed by
+    the environment's switches (:func:`.settings.apply_switches`)."""
+    if settings.pushdown_disabled():
         return
-    spec = os.environ.get("VORTEX_RDF_PUSHDOWN_OPS")
-    if spec is not None:
-        _ENABLED_OPS = _parse_ops(spec)
-    if os.environ.get("VORTEX_RDF_FILTER_FAST") == "0":
-        filters._FAST_ENABLED = False
-    if os.environ.get("VORTEX_RDF_NATIVE_FILTERS") == "0":
-        filters._NATIVE_ENABLED = False
+    settings.apply_switches()
     CUSTOM_EVALS.setdefault(_EVAL_KEY, _eval_part)
 
 
@@ -603,25 +511,11 @@ def unregister_sparql_pushdown():
     CUSTOM_EVALS.pop(_EVAL_KEY, None)
 
 
-def _parse_ops(spec: str) -> frozenset[str]:
-    """``VORTEX_RDF_PUSHDOWN_OPS``: ``bgp`` or a comma-separated node list."""
-    if spec.strip().lower() == "bgp":
-        return frozenset({"BGP"})
-    names = frozenset(name.strip() for name in spec.split(",") if name.strip())
-    unknown = names - _ALL_OPS
-    if unknown:
-        raise ValueError(
-            f"VORTEX_RDF_PUSHDOWN_OPS names unknown algebra nodes {sorted(unknown)}; "
-            f"known: {sorted(_ALL_OPS)}"
-        )
-    return names
-
-
 def _eval_part(ctx, part):
     if query_scope.current() is None:
         return _eval_scoped(ctx, part)
     handler = _HANDLER_NAMES.get(part.name)
-    if handler is None or part.name not in _ENABLED_OPS:
+    if handler is None or part.name not in SETTINGS.enabled_ops:
         raise NotImplementedError
 
     from .store import VortexRdflibStore
@@ -631,11 +525,13 @@ def _eval_part(ctx, part):
         raise NotImplementedError
     active = _TRACE.get()
     token = None
-    if active is None and _trace_enabled():
-        active = _QueryTrace(os.environ.get(_TRACE_ID_ENV))
+    if active is None and settings.trace_enabled():
+        active = _QueryTrace(settings.trace_query_id())
         token = _TRACE.set(active)
     started = time.perf_counter_ns() if active is not None else 0
-    _trace_event("eval_part_start", algebra_node=part.name, enabled_ops=sorted(_ENABLED_OPS))
+    _trace_event(
+        "eval_part_start", algebra_node=part.name, enabled_ops=sorted(SETTINGS.enabled_ops)
+    )
     try:
         result = globals()[handler](ctx, store, part)
     except NotImplementedError:
@@ -689,7 +585,7 @@ def _eval_scoped(ctx, part):
     so every node below runs in the scope; a lazy result keeps it current
     around each step and clears it at the end (:func:`_scoped_iterator`). The
     scope holds the cancel token current when the query starts
-    (:func:`cancel_scope`), which every step of a lazy result runs under. A
+    (:func:`~.cancel.cancel_scope`), which every step of a lazy result runs under. A
     graph whose store is not a VortexRdflibStore is left alone.
     """
     from .store import VortexRdflibStore
@@ -698,7 +594,7 @@ def _eval_scoped(ctx, part):
     if not isinstance(store, VortexRdflibStore):
         raise NotImplementedError
     opened = query_scope.QueryScope()
-    opened.cancel = _CANCEL.get()
+    opened.cancel = CANCEL_TOKEN.get()
     token = query_scope.enter(opened)
     try:
         result = evalPart(ctx, part)
@@ -719,10 +615,10 @@ def _scoped_iterator(iterator, opened):
     query's cancel token (``opened.cancel``) the current one; the scope is
     cleared when the iterator ends, fails or is closed. The token is set
     only when the current one is another, as it is for a step pulled after
-    the query's :func:`cancel_scope` block."""
+    the query's :func:`~.cancel.cancel_scope` block."""
     cancel = opened.cancel
     enter, leave = query_scope.enter, query_scope.leave
-    get_cancel, set_cancel, reset_cancel = _CANCEL.get, _CANCEL.set, _CANCEL.reset
+    get_cancel, set_cancel, reset_cancel = CANCEL_TOKEN.get, CANCEL_TOKEN.set, CANCEL_TOKEN.reset
     try:
         while True:
             token = enter(opened)
@@ -740,12 +636,12 @@ def _scoped_iterator(iterator, opened):
         close = getattr(iterator, "close", None)
         if close is not None:
             token = query_scope.enter(opened)
-            reset = _CANCEL.set(cancel) if _CANCEL.get() is not cancel else None
+            reset = CANCEL_TOKEN.set(cancel) if CANCEL_TOKEN.get() is not cancel else None
             try:
                 close()
             finally:
                 if reset is not None:
-                    _CANCEL.reset(reset)
+                    CANCEL_TOKEN.reset(reset)
                 query_scope.leave(token)
         opened.clear()
 
@@ -1265,7 +1161,7 @@ def _term_distinct(store, tuples: Iterator[tuple], foreign: dict) -> Iterator[tu
     """Drop the code tuples whose decoded terms equal an earlier tuple's."""
     seen: set = set()
     aliases: dict = {}
-    size = _CHUNK_START
+    size = SETTINGS.chunk_start
     while True:
         chunk = list(islice(tuples, size))
         if not chunk:
@@ -1276,7 +1172,7 @@ def _term_distinct(store, tuples: Iterator[tuple], foreign: dict) -> Iterator[tu
             if key not in seen:
                 seen.add(key)
                 yield row
-        size = min(size * 4, _CHUNK_MAX)
+        size = min(size * 4, SETTINGS.chunk_max)
 
 
 def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
@@ -1606,12 +1502,6 @@ def _aggregate_rows(ctx, store, rel: Relation, group_vars, counts, samples, impl
     return solutions()
 
 
-#: Groups up to which COUNT(DISTINCT) gathers each group's rows natively
-#: (one ``join_indices`` over the key column per group); past it, one pass
-#: over the distinct (key, value) pairs.
-_NATIVE_GROUPS_MAX = 64
-
-
 def _columnar_groups(rel: Relation, key_cols, specs, new_group) -> dict:
     """The groups of a columnar body by at most one key column, counted a
     column at a time.
@@ -1652,7 +1542,7 @@ def _columnar_groups(rel: Relation, key_cols, specs, new_group) -> dict:
             column = _native_column(cols[spec.col])
             if key_col is None:
                 groups[()].sets[j] = set(_distinct_codes(column))
-            elif len(groups) <= _NATIVE_GROUPS_MAX:
+            elif len(groups) <= SETTINGS.native_groups_max:
                 if members is None:
                     members = {key: key_col.join_indices(U64Column([key[0]]))[0] for key in groups}
                 for key, rows in members.items():
@@ -1692,7 +1582,7 @@ def _block_nonempty(ctx, store, block) -> bool:
             # Existence needs no rows: a count capped at one, which stops a
             # file-backed scan at its first match.
             narrowing = _narrowing(pat.get("nkeep"), limit=1)
-            _check_cancelled()
+            check_cancelled()
             return _native(store).count_quads(*pat["n3"], **narrowing) > 0
     rel = _solve_block(ctx, store, block, scope=scope, limit=1)
     # One row is pulled, and the rows are closed after it: a streamed join
@@ -2016,8 +1906,8 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
             repeated_free = any(
                 len(pos) > 1 for v, pos in pat["varpos"].items() if v not in rel.schema
             )
-            if not repeated_free and len(rows) * _PROBE_FANOUT < _count_pattern(
-                store, pat, {}, limit=len(rows) * _PROBE_FANOUT + 1
+            if not repeated_free and len(rows) * SETTINGS.probe_fanout < _count_pattern(
+                store, pat, {}, limit=len(rows) * SETTINGS.probe_fanout + 1
             ):
                 flags = _probe_exists(store, rel.schema, rows, pat)
                 kept = [row for row, found in zip(rows, flags, strict=True) if found != negate]
@@ -2063,8 +1953,8 @@ def _probe_exists(store, schema, rows, pat) -> list:
     narrowing = _narrowing(keep, limit=1)
     patterns = _substituted_patterns(store, rows, pat, bound)
     out = []
-    for start in range(0, len(rows), _PROBE_BATCH):
-        batch = patterns[start : start + _PROBE_BATCH]
+    for start in range(0, len(rows), SETTINGS.probe_batch):
+        batch = patterns[start : start + SETTINGS.probe_batch]
         probes = [(n3, narrowing) for n3 in batch if n3 is not None]
         answers = iter(_run_probes(store, probes, count=True))
         out.extend(n3 is not None and next(answers) > 0 for n3 in batch)
@@ -2424,44 +2314,10 @@ def _filter_relation(rel: Relation, preds) -> Relation:
     return Relation(rel.schema, None, rows, len(rows), rel.nullable, rel.foreign, rest=rel.rest)
 
 
-# Probing beats hash-joining when the running relation is at least this many
-# times smaller than the next pattern's match. The value trades the fixed cost
-# of a native match, which does not depend on how selective it is, against the
-# cost of materializing a matched row into Python: one probe is worth skipping
-# that for this many rows.
-_PROBE_FANOUT = 100
-
-_PAIR_BUDGET_ENV = "VORTEX_RDF_PAIR_BUDGET"
-
-
-def _pair_budget() -> int:
-    """``VORTEX_RDF_PAIR_BUDGET``, an integer of at least 0, or ``1 << 24``
-    when it is unset."""
-    value = os.environ.get(_PAIR_BUDGET_ENV)
-    if value is None:
-        return 1 << 24
-    try:
-        budget = int(value)
-    except ValueError:
-        budget = None
-    if budget is None or budget < 0:
-        raise ValueError(f"{_PAIR_BUDGET_ENV} must be an integer >= 0, got {value!r}")
-    return budget
-
-
-#: The most row pairs one join step of a BGP may make, set when the module is
-#: imported (:func:`_pair_budget`). A step whose two sides' product is within
-#: it is built uncounted; past that, its pairs are counted natively before
-#: any is built (by ``join_indices`` capped at the budget in
-#: :func:`_join_columns`, by :func:`_pair_count` for a join of rows), and a
-#: step that counts more is not built (:class:`_OverBudget`). A probe step,
-#: which has no pairs to count, stops once its rows pass a quarter of the
-#: budget; a keep-scan, once its match passes the budget.
-_PAIR_BUDGET = _pair_budget()
-
-
 class _OverBudget(Exception):
-    """A join step of a BGP over :data:`_PAIR_BUDGET`, raised before the step
+    """A join step of a BGP over the pair budget (``SETTINGS.pair_budget``:
+    counted by ``join_indices`` capped at the budget in :func:`_join_columns`,
+    by :func:`_pair_count` for a join of rows), raised before the step
     is built. ``pairs`` is the step's pair count, ``None`` for a probe step
     or a keep-scan, which stop on their rows. ``calls`` are the native calls
     the step made before it stopped — a probe step's probes, a keep-scan's
@@ -2473,13 +2329,6 @@ class _OverBudget(Exception):
         self.pairs = pairs
         self.calls = calls
         self.native_ns = native_ns
-
-
-#: The most rows of its fed side a streamed join step (:func:`_streamed_step`)
-#: takes at a time: a slice of a side it holds, or a chunk of a match it
-#: reads in chunks. A piece over :data:`_PAIR_BUDGET` is halved before it is
-#: gathered.
-_PIECE_ROWS = 65_536
 
 
 def _pattern_trace_shape(ctx, triple) -> dict:
@@ -2696,8 +2545,8 @@ def _count_pattern(store, pat, counts: dict, exact: bool = False, limit: int | N
     key = _pattern_key(pat) if nkeep else tuple(pat["n3"])
     n = counts.get(key)
     if n is None:
-        token = _CANCEL.get()
-        cancel = {} if token is None else _cancel_kw_for({"cancel": token}, store, pat["n3"], limit)
+        token = CANCEL_TOKEN.get()
+        cancel = {} if token is None else cancel_kw_for({"cancel": token}, store, pat["n3"], limit)
         n = _native(store).count_quads(*pat["n3"], **_narrowing(nkeep, limit), **cancel)
         if limit is None or n < limit:
             counts[key] = n
@@ -2710,21 +2559,21 @@ def _count_patterns(store, patterns, counts: dict) -> int:
     hold yet, in static rank order, and stop at the first zero, which
     empties the block: the patterns left uncounted get no ``"estimate"``.
 
-    Once a pattern counts at most ``_PROBE_FANOUT`` rows, every pattern not
+    Once a pattern counts at most ``SETTINGS.probe_fanout`` rows, every pattern not
     yet counted that shares a variable with it is marked ``"probe"`` and is
     not counted at all: joined after it, it is probed unless it is small,
     which a count capped at the decision's threshold settles at its join
     step (:func:`_join_incremental_bgp`).
 
     The patterns are counted one at a time, except the scans: enough of them
-    (``_SCAN_BATCH_MIN``, ``_MEMORY_SCAN_BATCH_MIN``) are counted last, in
+    (``SETTINGS.scan_batch_min``, ``SETTINGS.memory_scan_batch_min``) are counted last, in
     one ``count_quads_many`` batch that runs them concurrently, one GIL
-    release for all — after the point counts (:func:`_cheap_probe`: those
+    release for all — after the point counts (``store._point_lookup``: those
     the native layer answers without a scan), any of which may still end the
     block first. Returns the counts made."""
     before = len(counts)
     ordered = sorted(patterns, key=_pattern_static_rank)
-    minimum = _MEMORY_SCAN_BATCH_MIN if store.in_memory else _SCAN_BATCH_MIN
+    minimum = SETTINGS.memory_scan_batch_min if store.in_memory else SETTINGS.scan_batch_min
     scans: list = []
     if len(patterns) >= minimum:
         scans = [
@@ -2732,12 +2581,12 @@ def _count_patterns(store, patterns, counts: dict) -> int:
             for pat in ordered
             if not pat["unsatisfiable"]
             and tuple(pat["n3"]) not in counts
-            and not _cheap_probe(store, pat["n3"])
+            and not store._point_lookup(pat["n3"])
         ]
         if len({tuple(pat["n3"]) for pat in scans}) < minimum:
             scans = []
     batched = {id(pat) for pat in scans}
-    small: set = set()  # the variables of the patterns counted at most _PROBE_FANOUT rows
+    small: set = set()  # the variables of the patterns counted at most SETTINGS.probe_fanout rows
     for pat in ordered:
         if id(pat) in batched:
             continue
@@ -2747,7 +2596,7 @@ def _count_patterns(store, patterns, counts: dict) -> int:
         pat["estimate"] = _count_pattern(store, pat, counts)
         if pat["estimate"] == 0:
             return len(counts) - before
-        if pat["estimate"] <= _PROBE_FANOUT:
+        if pat["estimate"] <= SETTINGS.probe_fanout:
             small.update(pat["varpos"])
     rest = []
     for pat in scans:
@@ -2757,7 +2606,7 @@ def _count_patterns(store, patterns, counts: dict) -> int:
             rest.append(pat)
     if len({tuple(pat["n3"]) for pat in rest}) >= minimum:
         keys = list(dict.fromkeys(tuple(pat["n3"]) for pat in rest))
-        counts.update(zip(keys, _native(store).count_quads_many(keys, **_cancel_kw()), strict=True))
+        counts.update(zip(keys, _native(store).count_quads_many(keys, **cancel_kw()), strict=True))
         for pat in rest:
             pat["estimate"] = counts[tuple(pat["n3"])]
     else:
@@ -2779,54 +2628,26 @@ def _narrowing(keep=None, limit=None) -> dict:
     return narrowing
 
 
-#: A batch call (``count_quads_many``/``match_codes_many``) pays a fixed cost
-#: of native task scheduling before its probes run concurrently. That pays
-#: off for probes that scan the store, but not for a handful of cheap point
-#: probes, which plain calls in a loop answer in less time than the batch
-#: costs. A probe is cheap when its subject is bound (a binary search in the
-#: subject-ordered base) or a secondary index serves its predicate or object.
-#: Cheap probes are batched only on a file-backed store and from this many on,
-#: where overlapping their reads wins.
-_CHEAP_BATCH_MIN = 256
-
-#: Scanning probes batch from two on a file-backed store, whose scans
-#: overlap their reads. An in-memory scan is pure CPU, so overlapping two of
-#: them gains less than the batch costs; they batch from three on.
-_SCAN_BATCH_MIN = 2
-_MEMORY_SCAN_BATCH_MIN = 3
-
-#: The ``lookahead`` of a batch call whose probes scan the store
-#: (:func:`_probe_lookahead`): a scan per core, eight at most. The native
-#: layer runs at most twice that many probes ahead of the caller's pulls. A
-#: batch of point lookups names none and runs under the binding's default.
-_SCAN_LOOKAHEAD = min(os.cpu_count() or 1, 8)
-
-
-def _cheap_probe(store, n3) -> bool:
-    """Whether the native layer answers a probe without a scan."""
-    return n3[0] is not None or bool(store._indexes) and (n3[1] is not None or n3[2] is not None)
-
-
 def _probe_lookahead(store, batch_n3: Sequence[Sequence[str | None]]) -> int | None:
     """The ``lookahead`` of one batch call over these probes' quad patterns:
     ``None``, the binding's default, when every probe is a point lookup
-    (:func:`_cheap_probe`), else :data:`_SCAN_LOOKAHEAD`."""
-    if all(_cheap_probe(store, n3) for n3 in batch_n3):
+    (``store._point_lookup``), else ``SETTINGS.scan_lookahead``."""
+    if all(store._point_lookup(n3) for n3 in batch_n3):
         return None
-    return _SCAN_LOOKAHEAD
+    return SETTINGS.scan_lookahead
 
 
 def _batched_probes(store, patterns) -> list[int]:
     """The indexes of the quad patterns :func:`_run_probes` answers through
     one batch call: those that scan, when there are enough of them
-    (``_SCAN_BATCH_MIN``, ``_MEMORY_SCAN_BATCH_MIN``), or all of them when
+    (``SETTINGS.scan_batch_min``, ``SETTINGS.memory_scan_batch_min``), or all of them when
     enough cheap ones are probing a file-backed store
-    (``_CHEAP_BATCH_MIN``)."""
-    minimum = _MEMORY_SCAN_BATCH_MIN if store.in_memory else _SCAN_BATCH_MIN
+    (``SETTINGS.cheap_batch_min``)."""
+    minimum = SETTINGS.memory_scan_batch_min if store.in_memory else SETTINGS.scan_batch_min
     if len(patterns) < minimum:
         return []
-    batched = [i for i, n3 in enumerate(patterns) if not _cheap_probe(store, n3)]
-    if not store.in_memory and len(patterns) - len(batched) >= _CHEAP_BATCH_MIN:
+    batched = [i for i, n3 in enumerate(patterns) if not store._point_lookup(n3)]
+    if not store.in_memory and len(patterns) - len(batched) >= SETTINGS.cheap_batch_min:
         return list(range(len(patterns)))
     return batched if len(batched) >= minimum else []
 
@@ -2842,7 +2663,7 @@ def _run_probes(store, probes, count: bool) -> list | Iterator:
     :func:`_probe_lookahead` lets them, a file-backed store overlapping their
     reads — and the rest through plain calls. The query's cancel token is
     read once: a batch call races it, a plain call races or checks it as
-    :func:`_cancel_kw_for` decides, and without a token no call is given a
+    :func:`cancel_kw_for` decides, and without a token no call is given a
     keyword. The matches come from :func:`_probe_matches` under a token or
     when only some probes are batched; otherwise from a generator over the
     plain calls, or from the batch's own native iterator
@@ -2851,9 +2672,9 @@ def _run_probes(store, probes, count: bool) -> list | Iterator:
     if not probes:
         return []
     native = _native(store)
-    minimum = _MEMORY_SCAN_BATCH_MIN if store.in_memory else _SCAN_BATCH_MIN
+    minimum = SETTINGS.memory_scan_batch_min if store.in_memory else SETTINGS.scan_batch_min
     batched = _batched_probes(store, [n3 for n3, _ in probes]) if len(probes) >= minimum else []
-    cancel = _cancel_kw()
+    cancel = cancel_kw()
     if not count:
         if cancel or 0 < len(batched) < len(probes):
             return _probe_matches(store, native, probes, batched, cancel)
@@ -2865,7 +2686,7 @@ def _run_probes(store, probes, count: bool) -> list | Iterator:
             return [native.count_quads(*n3, **narrowing) for n3, narrowing in probes]
         return [
             native.count_quads(
-                *n3, **narrowing, **_cancel_kw_for(cancel, store, n3, narrowing.get("limit"))
+                *n3, **narrowing, **cancel_kw_for(cancel, store, n3, narrowing.get("limit"))
             )
             for n3, narrowing in probes
         ]
@@ -2880,7 +2701,7 @@ def _run_probes(store, probes, count: bool) -> list | Iterator:
         if i not in done:
             limit = narrowing.get("limit")
             answers[i] = native.count_quads(
-                *n3, **narrowing, **_cancel_kw_for(cancel, store, n3, limit)
+                *n3, **narrowing, **cancel_kw_for(cancel, store, n3, limit)
             )
     return answers
 
@@ -2932,8 +2753,8 @@ def _probe_matches(store, native, probes, batched, cancel: dict) -> Iterator:
     pull makes, whose probes run, as far ahead as :func:`_probe_lookahead`
     lets them, while the consumer works through the answers before theirs;
     the others from a ``match_codes`` call at their position. ``cancel`` is
-    the query's cancel keyword (:func:`_cancel_kw`): the batch is given it,
-    and a plain call races or checks the token as :func:`_cancel_kw_for`
+    the query's cancel keyword (:func:`cancel_kw`): the batch is given it,
+    and a plain call races or checks the token as :func:`cancel_kw_for`
     decides. A batch that answers fewer probes than it was given raises
     ``ValueError`` at the first probe left without an answer, and one that
     answers more, with its last probe. Closing the iterator releases the
@@ -2952,7 +2773,7 @@ def _probe_matches(store, native, probes, batched, cancel: dict) -> Iterator:
             if i not in in_batch:
                 limit = narrowing.get("limit")
                 yield native.match_codes(
-                    *n3, **narrowing, **_cancel_kw_for(cancel, store, n3, limit)
+                    *n3, **narrowing, **cancel_kw_for(cancel, store, n3, limit)
                 )
                 continue
             try:
@@ -3009,8 +2830,8 @@ def _match_resolved_pattern(store, pat, memo=None, limit=None) -> tuple[int, int
     calls = 0
     if cols is None:
         native = _native(store)
-        token = _CANCEL.get()
-        cancel = {} if token is None else _cancel_kw_for({"cancel": token}, store, pat["n3"], limit)
+        token = CANCEL_TOKEN.get()
+        cancel = {} if token is None else cancel_kw_for({"cancel": token}, store, pat["n3"], limit)
         if nkeep or limit is not None:
             cols = native.match_codes(*pat["n3"], **_narrowing(nkeep, limit), **cancel)
         else:
@@ -3049,17 +2870,17 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
     order up to the first zero — the scans together, in one concurrent
     native batch, when there are enough of them (:func:`_count_patterns`) —
     so a counted pattern that selects nothing ends the block before any
-    match. A pattern sharing a variable with one of at most ``_PROBE_FANOUT``
+    match. A pattern sharing a variable with one of at most ``SETTINGS.probe_fanout``
     rows is left uncounted until its step, where it is counted only up to
-    ``running * _PROBE_FANOUT + 1`` rows: a count that reaches the cap is
+    ``running * SETTINGS.probe_fanout + 1`` rows: a count that reaches the cap is
     large, and probes. The smallest counted pattern is matched and is the
     seed. Each further step takes the smallest pattern sharing a variable
     with the relation so far (the smallest of all for a cross product; an
     uncounted pattern ranks last). When the relation is at least
-    ``_PROBE_FANOUT`` times smaller than the pattern's count, the step joins
+    ``SETTINGS.probe_fanout`` times smaller than the pattern's count, the step joins
     the pattern per row of the relation: it re-probes it natively per row
     (``_probe_join``) where each probe is a point lookup
-    (:func:`_cheap_probe`), and where each would scan the store it matches
+    (``store._point_lookup``), and where each would scan the store it matches
     the pattern once, narrowed to the codes the relation binds its shared
     variables to (a keep-scan, :func:`_keep_scan`). Any other pattern is
     matched once. A matched pattern is hash-joined — columnar while the
@@ -3072,7 +2893,7 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
     of may become a restriction of the pattern binding that one
     (:func:`_specialize_tuple_conjuncts`).
 
-    A step over :data:`_PAIR_BUDGET` — a step whose pairs, counted once its
+    A step over ``SETTINGS.pair_budget`` — a step whose pairs, counted once its
     two sides' product passes the budget, are more than the budget, a
     keep-scan whose match passes the budget, or a probe step whose rows pass
     a quarter of it — is traced as ``bgp_over_budget`` and is not built. A
@@ -3201,10 +3022,10 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
             tuples = tuple(c for c in tuples if id(c) not in pushed.applied)
         count_limit = None
         if "estimate" not in pat:
-            # Next to a pattern of at most _PROBE_FANOUT rows, so not counted
+            # Next to a pattern of at most SETTINGS.probe_fanout rows, so not counted
             # when planned: counted here, only as far as the probe-or-match
             # decision needs; a capped answer means probe.
-            count_limit = running * _PROBE_FANOUT + 1
+            count_limit = running * SETTINGS.probe_fanout + 1
             then = time.perf_counter_ns() if traced else 0
             pat["estimate"] = _count_pattern(store, pat, counts, limit=count_limit)
             # An answer at the cap is a lower bound of the count (_fits).
@@ -3219,10 +3040,10 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
         # (_streamed_step) rather than going back to rdflib over the budget.
         streams = not remaining and len(shared) == 1
         pair_count = feed = None
-        if shared and running * _PROBE_FANOUT < estimate:
+        if shared and running * SETTINGS.probe_fanout < estimate:
             # Joined per row of the relation: by probes where each is a point
             # lookup, else by one keep-scan rather than a scan per row.
-            cheap = _cheap_probe(store, _probe_shape(pat, shared))
+            cheap = store._point_lookup(_probe_shape(pat, shared))
             strategy = "probe" if cheap else "keep_scan"
         elif streams and _read_in_chunks(pat, running):
             strategy = "stream"
@@ -3239,7 +3060,7 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
                         schema,
                         _cols_to_rows(cols) if cols is not None else rows,
                         pat,
-                        max_rows=_PAIR_BUDGET // 4,
+                        max_rows=SETTINGS.pair_budget // 4,
                     )
                 except _OverBudget as over:
                     # Only the probes sent before the tally passed count.
@@ -3286,7 +3107,7 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
                     if rows_b is None:
                         rows_b = _cols_to_rows(cols_b)
                     pair_count = _row_step_pairs(schema, rows_a, schema_b, rows_b)
-                    if pair_count is not None and pair_count > _PAIR_BUDGET:
+                    if pair_count is not None and pair_count > SETTINGS.pair_budget:
                         raise _OverBudget(pair_count)
                     cols = None
                     schema, rows = _join(schema, rows_a, schema_b, rows_b)
@@ -3408,7 +3229,7 @@ def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) 
     (:func:`_put_back`).
     """
     specialized: list = []
-    if not (filters._FAST_ENABLED and filters._NATIVE_ENABLED):
+    if not (SETTINGS.fast_filters and SETTINGS.native_filters):
         return specialized
     single: dict = {}
     for conjunct in tuples:
@@ -3460,7 +3281,7 @@ def _prune_early(store, schema, cols, rows, pending, remaining, views):
     schema covers, when that pays. Evaluating a conjunct costs more per row
     than a join step spends on the row, so pruning pays only by letting a
     remaining pattern be probed instead of matched whole — the planner's own
-    test, `survivors * _PROBE_FANOUT < estimate`. The rows stream, evaluation
+    test, `survivors * SETTINGS.probe_fanout < estimate`. The rows stream, evaluation
     stops once too many survive for that, and the conjunct is left to the
     FILTER above the BGP, which streams it over a columnar body, so a LIMIT
     stops it early.
@@ -3482,7 +3303,7 @@ def _prune_early(store, schema, cols, rows, pending, remaining, views):
         ),
         default=0,
     )
-    if _PROBE_FANOUT >= probeable:  # not even one survivor would be probed
+    if SETTINGS.probe_fanout >= probeable:  # not even one survivor would be probed
         return cols, rows, pending
     started = time.perf_counter_ns() if _TRACE.get() is not None else 0
     predicates = tuple(
@@ -3499,7 +3320,7 @@ def _prune_early(store, schema, cols, rows, pending, remaining, views):
         evaluated += 1
         if all(predicate(row) for predicate in predicates):
             kept.append(row)
-            if len(kept) * _PROBE_FANOUT >= probeable:
+            if len(kept) * SETTINGS.probe_fanout >= probeable:
                 deferred = True
                 break
     _trace_event(
@@ -3522,10 +3343,10 @@ def _plan_pattern_side(ctx, store, triple, scope, left: Relation, left_rows, var
     before it is matched.
 
     Returns ``(pat, estimate, probe)``. The count stops at
-    ``len(left_rows) * _PROBE_FANOUT + 1``, as far as the decision needs:
+    ``len(left_rows) * SETTINGS.probe_fanout + 1``, as far as the decision needs:
     ``estimate`` is exact below that and a lower bound at it. When the
     pattern shares a variable with the left relation and the relation is at
-    least ``_PROBE_FANOUT`` times smaller than the pattern's count, ``probe``
+    least ``SETTINGS.probe_fanout`` times smaller than the pattern's count, ``probe``
     is true and ``pat`` is left unmatched — the caller re-probes it per left
     row, and the per-variable restrictions over its free variables travel
     with it. Otherwise ``pat`` is matched, restricted on its free variables,
@@ -3541,8 +3362,8 @@ def _plan_pattern_side(ctx, store, triple, scope, left: Relation, left_rows, var
     )
     if free_preds:
         free_preds = _push_native_restrictions(store, pat, free_preds)
-    estimate = _count_pattern(store, pat, {}, limit=len(left_rows) * _PROBE_FANOUT + 1)
-    if shared and len(left_rows) * _PROBE_FANOUT < estimate:
+    estimate = _count_pattern(store, pat, {}, limit=len(left_rows) * SETTINGS.probe_fanout + 1)
+    if shared and len(left_rows) * SETTINGS.probe_fanout < estimate:
         _shared_key_ok(left, Relation((), None, [], 0), shared)
         if free_preds:
             pat["deferred_var_preds"] = free_preds
@@ -3832,9 +3653,9 @@ def _cols_to_rows(cols) -> list:
 def _pair_count(left: U64Column, right: U64Column) -> int | None:
     """The row pairs a join of the two key columns makes, counted natively
     (``join_count``, no pair built) — or ``None``, uncounted, when the
-    columns' product is within :data:`_PAIR_BUDGET`: the count a join of
+    columns' product is within ``SETTINGS.pair_budget``: the count a join of
     rows makes before it is built (:func:`_row_step_pairs`)."""
-    if len(left) * len(right) <= _PAIR_BUDGET:
+    if len(left) * len(right) <= SETTINGS.pair_budget:
         return None
     return left.join_count(right)
 
@@ -3842,11 +3663,11 @@ def _pair_count(left: U64Column, right: U64Column) -> int | None:
 def _row_step_pairs(schema_a, rows_a, schema_b, rows_b) -> int | None:
     """The pairs :func:`_join` makes of two row relations, as
     :func:`_pair_count` counts them: ``None`` while their product is within
-    :data:`_PAIR_BUDGET`; past it, the pairs of the first shared variable's
+    ``SETTINGS.pair_budget``; past it, the pairs of the first shared variable's
     codes, copied into native columns (with several shared variables an
     upper bound of the joined rows), or the product when none is shared."""
     product = len(rows_a) * len(rows_b)
-    if product <= _PAIR_BUDGET:
+    if product <= SETTINGS.pair_budget:
         return None
     shared = [v for v in schema_b if v in schema_a]
     if not shared:
@@ -3868,7 +3689,7 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
     key columns in nested-loop order (the left rows in order, each with its
     right matches in theirs) and ``take`` gathers every output column by
     those indices. Within the product bound the join is built uncounted.
-    Past it, ``join_indices`` has :data:`_PAIR_BUDGET` as its cap, so it
+    Past it, ``join_indices`` has ``SETTINGS.pair_budget`` as its cap, so it
     counts the pairs before it builds any: a join over the budget is refused
     (``JoinTooLarge``) and raises :class:`_OverBudget` with that count, and
     one within it is built, its pair count the pairs it made.
@@ -3883,11 +3704,11 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
     left = [_native_column(col) for col in cols_a]
     key = _native_column(cols_b[ib])
     pairs = None
-    if len(left[ia]) * len(key) <= _PAIR_BUDGET:
+    if len(left[ia]) * len(key) <= SETTINGS.pair_budget:
         a_idx, b_idx = left[ia].join_indices(key)
     else:
         try:
-            a_idx, b_idx = left[ia].join_indices(key, max_pairs=_PAIR_BUDGET)
+            a_idx, b_idx = left[ia].join_indices(key, max_pairs=SETTINGS.pair_budget)
         except JoinTooLarge as refused:
             raise _OverBudget(refused.pairs) from None
         pairs = len(a_idx)
@@ -3898,9 +3719,9 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
 
 def _slices(cols: Sequence[U64Column], nrows: int) -> Iterator[tuple[U64Column, ...]]:
     """The columns in consecutive zero-copy slices (``U64Column.slice``) of
-    at most ``_PIECE_ROWS`` rows."""
-    for start in range(0, nrows, _PIECE_ROWS):
-        stop = min(start + _PIECE_ROWS, nrows)
+    at most ``SETTINGS.piece_rows`` rows."""
+    for start in range(0, nrows, SETTINGS.piece_rows):
+        stop = min(start + SETTINGS.piece_rows, nrows)
         yield tuple(col.slice(start, stop) for col in cols)
 
 
@@ -3915,14 +3736,14 @@ def _gather_pieces(
 
     Each column tuple ``fed`` yields is joined on its column ``key`` with the
     grouped rows (``groups``, over the key column of ``grouped``). While a
-    part counts more than :data:`_PAIR_BUDGET` pairs and holds more than one
+    part counts more than ``SETTINGS.pair_budget`` pairs and holds more than one
     row it is split in halves; a single row is gathered whatever its count,
     its pairs at most the grouped rows, which are held already. A part that
     counts no pair is skipped. A part is gathered by ``CodeGroups.gather``:
     per pair, in nested-loop order, its other columns at the fed row, then
     ``grouped`` at the grouped row — permuted by ``order`` into the step's
     schema. Each part checks the query's cancel token before it is counted
-    (:func:`_check_cancelled`), so a cancel stops the pieces at the next
+    (:func:`check_cancelled`), so a cancel stops the pieces at the next
     one. The feed is closed when the pieces end, fail or are closed, and
     ``bgp_stream_complete`` is traced then: the pieces gathered, their rows,
     and the time spent here (pulling the feed, counting, gathering), not in
@@ -3934,12 +3755,12 @@ def _gather_pieces(
         for part in fed:
             parts = [part]
             while parts:
-                _check_cancelled()
+                check_cancelled()
                 part = parts.pop()
                 column = part[key]
                 length = len(column)
                 pairs = groups.count(column)
-                if pairs > _PAIR_BUDGET and length > 1:
+                if pairs > SETTINGS.pair_budget and length > 1:
                     half = length // 2
                     parts.append(tuple(col.slice(half, length) for col in part))
                     parts.append(tuple(col.slice(0, half) for col in part))
@@ -3979,14 +3800,14 @@ def _streamed_step(
 ) -> tuple[tuple, Iterator[tuple[memoryview, ...]]]:
     """The join of a relation (``schema``, a column per entry) with ``pat``,
     sharing one variable, as pieces gathered while they are pulled: tier 1,
-    the last step of a BGP over :data:`_PAIR_BUDGET` or with a pattern too
+    the last step of a BGP over ``SETTINGS.pair_budget`` or with a pattern too
     large to read whole (:func:`_read_in_chunks`).
 
     A pattern whose match is read — by this step, or into ``memo`` by
     another — and the relation are two held sides: the one with fewer rows
     is grouped on its key column (``U64Column.groups``), and the other is fed
     through the groups in slices (:func:`_slices`). A pattern left unread is
-    fed through the relation's groups in chunks of at most ``_PIECE_ROWS``
+    fed through the relation's groups in chunks of at most ``SETTINGS.piece_rows``
     rows of ``match_code_chunks`` narrowed by its native keep, opened here,
     so a store that cannot serve them raises ``NotImplementedError`` while
     the query is planned. Returns the step's schema — the relation's, then
@@ -4019,9 +3840,9 @@ def _streamed_step(
             fed = _native(store).match_code_chunks(
                 *pat["n3"],
                 columns=[("s", "p", "o", "g")[varpos[v][0]] for v in pattern_schema],
-                batch_rows=_PIECE_ROWS,
+                batch_rows=SETTINGS.piece_rows,
                 **_narrowing(pat.get("nkeep")),
-                **_cancel_kw(),
+                **cancel_kw(),
             )
             if fed is None:
                 raise NotImplementedError
@@ -4034,10 +3855,10 @@ def _streamed_step(
 
 def _read_in_chunks(pat, running: int) -> bool:
     """Whether a last hash step streams ``pat`` from chunks instead of
-    matching it whole: its count is more than :data:`_PAIR_BUDGET` rows and
+    matching it whole: its count is more than ``SETTINGS.pair_budget`` rows and
     more than the relation's ``running`` rows, and its chunks are enough to
     join it (:func:`_chunkable`)."""
-    return pat["estimate"] > max(_PAIR_BUDGET, running) and _chunkable(pat)
+    return pat["estimate"] > max(SETTINGS.pair_budget, running) and _chunkable(pat)
 
 
 def _chunkable(pat) -> bool:
@@ -4055,7 +3876,7 @@ def _fits(
 ) -> bool:
     """Whether joining ``pat`` into the relation — ``running`` rows over
     ``schema``, its body ``cols`` or ``rows`` — provably stays within
-    :data:`_PAIR_BUDGET`, from what is held already: no pattern is counted or
+    ``SETTINGS.pair_budget``, from what is held already: no pattern is counted or
     matched here.
 
     It does when the relation's rows times the pattern's count fit, a count
@@ -4071,9 +3892,9 @@ def _fits(
     estimate = pat.get("estimate")
     if estimate is None:
         return False
-    if not pat.get("estimate_capped") and running * estimate <= _PAIR_BUDGET:
+    if not pat.get("estimate_capped") and running * estimate <= SETTINGS.pair_budget:
         return True
-    if running * _PROBE_FANOUT < estimate:
+    if running * SETTINGS.probe_fanout < estimate:
         return False
     match = memo.get(_pattern_key(pat))
     if match is None:
@@ -4085,7 +3906,7 @@ def _fits(
     else:
         assert rows is not None
         key = U64Column([row[index] for row in rows])
-    return key.join_count(match[pat["varpos"][var][0]]) <= _PAIR_BUDGET
+    return key.join_count(match[pat["varpos"][var][0]]) <= SETTINGS.pair_budget
 
 
 def _put_back(
@@ -4141,7 +3962,7 @@ def _put_back(
 def _probe_shape(pat: dict, shared: Sequence) -> list:
     """``pat``'s quad pattern as each probe of a row binds it: a placeholder
     at every position a ``shared`` variable takes, where the row's code goes.
-    It tells :func:`_cheap_probe` whether the probes would scan."""
+    It tells ``store._point_lookup`` whether the probes would scan."""
     shape = list(pat["n3"])
     for var in shared:
         for position in pat["varpos"][var]:
@@ -4163,7 +3984,7 @@ def _keep_scan(
     the relation joins, and the join pairs the others, quad by quad, as the
     probes would have. The match goes through :func:`_match_resolved_pattern`:
     a whole match is memoized under that keep, a limited one never is. A
-    pattern whose count may pass :data:`_PAIR_BUDGET` — one over it, or a
+    pattern whose count may pass ``SETTINGS.pair_budget`` — one over it, or a
     count stopped at its cap, a lower bound — is matched only up to one row
     past the budget: a match that reaches it is over the budget and is
     dropped, the pattern left unread, raising :class:`_OverBudget` with the
@@ -4181,9 +4002,9 @@ def _keep_scan(
         keep = U64Column(sorted(codes))
         for position in positions:
             _set_native_keep(pat, position, keep)
-    if not pat.get("estimate_capped") and pat["estimate"] <= _PAIR_BUDGET:
+    if not pat.get("estimate_capped") and pat["estimate"] <= SETTINGS.pair_budget:
         return _match_resolved_pattern(store, pat, memo)
-    limit = _PAIR_BUDGET + 1
+    limit = SETTINGS.pair_budget + 1
     calls, native_ns = _match_resolved_pattern(store, pat, memo, limit=limit)
     if pat["nrows"] == limit:
         del pat["cols"], pat["nrows"]
@@ -4194,7 +4015,7 @@ def _keep_scan(
 def _trace_over_budget(
     execution_index: int, pat: dict, strategy: str, pairs: int | None, running: int, estimate: int
 ) -> None:
-    """Trace a join step over :data:`_PAIR_BUDGET` as ``bgp_over_budget``:
+    """Trace a join step over ``SETTINGS.pair_budget`` as ``bgp_over_budget``:
     its place in the plan, its strategy, its pair count (``None`` where it
     stopped on its rows), the relation's rows and the pattern's count."""
     _trace_event(
@@ -4238,17 +4059,13 @@ def _join_patterns(store, patterns, stats=None, pushed=None, stream=False) -> Re
     return rel
 
 
-#: Probes per native batch call: bounds the columns one batch holds at once.
-_PROBE_BATCH = 4096
-
-
 def _probe_join(
     store, schema, rows, pat, keep_unmatched=False, row_preds=(), max_rows: int | None = None
 ):
     """Join the relation against a pattern by re-matching it per binding.
 
     The adaptive half of the join strategy: when the running relation is far
-    smaller than the pattern's match (``_PROBE_FANOUT``), materializing
+    smaller than the pattern's match (``SETTINGS.probe_fanout``), materializing
     thousands of pattern rows to hash-join against a handful is the wrong
     trade. Substituting each relation row's codes into the pattern and
     re-matching natively keeps the work proportional to the small side. The
@@ -4289,8 +4106,8 @@ def _probe_join(
 
     pad = (None,) * len(free)
     out = []
-    for start in range(0, len(rows), _PROBE_BATCH):
-        batch = range(start, min(start + _PROBE_BATCH, len(rows)))
+    for start in range(0, len(rows), SETTINGS.probe_batch):
+        batch = range(start, min(start + SETTINGS.probe_batch, len(rows)))
         # An existence probe counts whole where its graph position is open
         # (the union default graph), capped where it is fixed — a `GRAPH ?g`
         # the row binds is substituted, so it is fixed.
@@ -4498,13 +4315,13 @@ def _column_rows(cols, nrows) -> Iterator[tuple]:
     """Zip column views into row tuples a slice at a time, so a consumer that
     stops early never converts the whole match into Python objects. Each
     slice ends with a check of the query's cancel token
-    (:func:`_check_cancelled`), so a cancel stops a drain within one slice."""
-    i, size = 0, _CHUNK_START
+    (:func:`check_cancelled`), so a cancel stops a drain within one slice."""
+    i, size = 0, SETTINGS.chunk_start
     while i < nrows:
         j = min(i + size, nrows)
         yield from zip(*(view[i:j].tolist() for view in cols), strict=True)
-        i, size = j, min(size * 4, _CHUNK_MAX)
-        _check_cancelled()
+        i, size = j, min(size * 4, SETTINGS.chunk_max)
+        check_cancelled()
 
 
 def _yield_solutions(ctx, store, rel: Relation, project=None, start=0, stop=None):
@@ -4536,11 +4353,11 @@ def _finish_with_rdflib(ctx, solutions: Iterator, rest: tuple) -> Iterator[Froze
     BGP (:func:`_most_bound_first`). ``evalBGP`` is called directly, so the
     hook is not offered the patterns again; it reads them through the
     store's ``triples()``. Each solution checks the query's cancel token
-    before it is extended (:func:`_check_cancelled`). ``solutions`` is
+    before it is extended (:func:`check_cancelled`). ``solutions`` is
     closed when these end, fail or are closed."""
     try:
         for solution in solutions:
-            _check_cancelled()
+            check_cancelled()
             context = ctx.thaw(solution)
             yield from evalBGP(context, _most_bound_first(context, rest))
     finally:
@@ -4587,7 +4404,7 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, sta
     """Decode code rows over ``schema`` into solutions (see
     ``_yield_solutions``); ``start``/``stop`` slice the rows first. Each
     decode chunk checks the query's cancel token before its rows are pulled
-    (:func:`_check_cancelled`), so a cancel stops the solutions within one
+    (:func:`check_cancelled`), so a cancel stops the solutions within one
     chunk."""
     outer = dict(ctx.bindings.items())
     # Normally every solution carries the caller's own context — no per-row
@@ -4601,13 +4418,13 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, sta
         idx = [schema.index(v) for v in keys]
         base = {v: outer[v] for v in project if v not in schema and v in outer}
     rows = islice(rows, start, stop)
-    size = _CHUNK_START
+    size = SETTINGS.chunk_start
     traced = _TRACE.get() is not None
     started = time.perf_counter_ns() if traced else 0
     yielded = chunks = submitted = 0
     try:
         while True:
-            _check_cancelled()
+            check_cancelled()
             chunk = list(islice(rows, size))
             if not chunk:
                 return
@@ -4624,7 +4441,7 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, sta
                         solution[v] = cached[c] if c >= 0 else foreign[c]
                 yielded += 1
                 yield _solution(ctx.push() if own_context else ctx, solution)
-            size = min(size * 4, _CHUNK_MAX)
+            size = min(size * 4, SETTINGS.chunk_max)
     finally:
         if traced:
             _trace_event(

@@ -19,8 +19,10 @@ from vortex_rdflib import (
     VortexRdflibStore,
     filters,
     register_sparql_pushdown,
+    settings,
     unregister_sparql_pushdown,
 )
+from vortex_rdflib.settings import SETTINGS
 
 FIXTURE_NT = """\
 <http://ex.org/alice> <http://ex.org/name> "Alice" .
@@ -554,7 +556,7 @@ ORDER_QUERIES += [
 
 #: Two-variable FILTERs over composite blocks. Their fast conjuncts reach
 #: every BGP the single-variable ones do, as a mid-join pre-filter (always
-#: applied under the probe-forcing runs, `_PROBE_FANOUT = 0`): a group
+#: applied under the probe-forcing runs, `SETTINGS.probe_fanout = 0`): a group
 #: join's sides and an OPTIONAL's or a MINUS's left side, never their right
 #: side, where dropping a row would change the answer.
 QUERIES += [
@@ -885,7 +887,7 @@ def test_graph_pattern_equals_default_evaluator(dataset, sparql):
 
 @pytest.mark.parametrize("sparql", GRAPH_QUERIES)
 def test_graph_pattern_probe_path_equals_default_evaluator(file_dataset, monkeypatch, sparql):
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     with_probe, without_pushdown = both_ways(file_dataset, sparql)
     assert with_probe == without_pushdown
 
@@ -896,14 +898,14 @@ def test_graph_pattern_bgp_only_equals_default_evaluator(file_dataset, monkeypat
     and walks the store's graphs — so each block is pushed down under a
     *constant* scope instead of binding the graph from the column. Both
     routes must answer identically."""
-    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
+    monkeypatch.setattr(SETTINGS, "enabled_ops", frozenset({"BGP"}))
     bgp_only, without_pushdown = both_ways(file_dataset, sparql)
     assert bgp_only == without_pushdown
 
 
 @pytest.mark.parametrize("sparql", GRAPH_QUERIES)
 def test_graph_pattern_generic_filter_equals_default_evaluator(file_dataset, monkeypatch, sparql):
-    monkeypatch.setattr(filters, "_FAST_ENABLED", False)
+    monkeypatch.setattr(SETTINGS, "fast_filters", False)
     generic, without_pushdown = both_ways(file_dataset, sparql)
     assert generic == without_pushdown
 
@@ -914,7 +916,7 @@ def test_solutions_do_not_share_a_context_under_a_pushed_graph(dataset, monkeypa
     ``OPTIONAL`` itself over rows this module produced, so one context shared
     across those rows would carry that write forward and send the OPTIONAL's
     right side to the union instead of the row's graph."""
-    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
+    monkeypatch.setattr(SETTINGS, "enabled_ops", frozenset({"BGP"}))
     active = []
     original = pd._active_scope
     monkeypatch.setattr(
@@ -1010,7 +1012,7 @@ def _answer_in_mode(monkeypatch, mode, path, view, sparql):
     """``sparql`` over ``view`` of the file-backed store at ``path``, with the
     pushdown on, limited to BGPs (``VORTEX_RDF_PUSHDOWN_OPS=bgp``) or
     unregistered."""
-    monkeypatch.setattr(pd, "_ENABLED_OPS", pd._ENABLED_OPS)
+    monkeypatch.setattr(SETTINGS, "enabled_ops", SETTINGS.enabled_ops)
     if mode == "bgp":
         monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "bgp")
     # Building the store registers the pushdown, so it is built first.
@@ -1092,7 +1094,7 @@ def test_probe_join_path_equals_default_evaluator(file_graph, monkeypatch, sparq
     shared-variable join is planned per row instead of as a hash join —
     probes where they are point lookups, and a keep-scan in a BGP where they
     would scan — and every strategy must be observationally identical."""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     with_probe, without_pushdown = both_ways(file_graph, sparql)
     assert with_probe == without_pushdown
 
@@ -1101,7 +1103,7 @@ def test_probe_join_path_equals_default_evaluator(file_graph, monkeypatch, sparq
 def test_bgp_only_mode_equals_default_evaluator(file_graph, monkeypatch, sparql):
     """``VORTEX_RDF_PUSHDOWN_OPS=bgp``: only basic graph patterns are solved
     here, every head is rdflib's own operator over the rows we hand back."""
-    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
+    monkeypatch.setattr(SETTINGS, "enabled_ops", frozenset({"BGP"}))
     bgp_only, without_pushdown = both_ways(file_graph, sparql)
     assert bgp_only == without_pushdown
 
@@ -1110,7 +1112,7 @@ def test_bgp_only_mode_equals_default_evaluator(file_graph, monkeypatch, sparql)
 def test_python_filter_routes_equal_default_evaluator(file_graph, monkeypatch, sparql):
     """With the native term predicates off, every conjunct the native layer
     would decide runs on the Python fast route instead."""
-    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
+    monkeypatch.setattr(SETTINGS, "native_filters", False)
     with_pushdown, without_pushdown = both_ways(file_graph, sparql)
     assert with_pushdown == without_pushdown
 
@@ -1120,11 +1122,11 @@ def test_batched_probe_path_equals_default_evaluator(file_graph, monkeypatch, sp
     """Every probe a scan, through the native batch calls in batches of
     three — a lone probe included: those of the joins above a BGP, OPTIONAL
     and EXISTS. A BGP step keep-scans instead."""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
-    monkeypatch.setattr(pd, "_SCAN_BATCH_MIN", 1)
-    monkeypatch.setattr(pd, "_MEMORY_SCAN_BATCH_MIN", 1)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
+    monkeypatch.setattr(SETTINGS, "probe_batch", 3)
+    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
+    monkeypatch.setattr(SETTINGS, "scan_batch_min", 1)
+    monkeypatch.setattr(SETTINGS, "memory_scan_batch_min", 1)
     with_pushdown, without_pushdown = both_ways(file_graph, sparql)
     assert with_pushdown == without_pushdown
 
@@ -1133,10 +1135,10 @@ def test_batched_probe_path_equals_default_evaluator(file_graph, monkeypatch, sp
 def test_batched_cheap_probe_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
     """Every probe a point lookup, through the native batch calls in batches
     of three, a lone probe included: BGP steps probe and batch too."""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: True)
-    monkeypatch.setattr(pd, "_CHEAP_BATCH_MIN", 1)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
+    monkeypatch.setattr(SETTINGS, "probe_batch", 3)
+    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: True)
+    monkeypatch.setattr(SETTINGS, "cheap_batch_min", 1)
     with_pushdown, without_pushdown = both_ways(file_graph, sparql)
     assert with_pushdown == without_pushdown
 
@@ -1145,7 +1147,7 @@ def test_batched_cheap_probe_path_equals_default_evaluator(file_graph, monkeypat
 def test_grouped_counts_over_pairs_equal_default_evaluator(dataset, monkeypatch, sparql):
     """COUNT(DISTINCT) groups from the distinct (key, value) pairs rather
     than one native gather per group."""
-    monkeypatch.setattr(pd, "_NATIVE_GROUPS_MAX", 0)
+    monkeypatch.setattr(SETTINGS, "native_groups_max", 0)
     with_pushdown, without_pushdown = both_ways(dataset, sparql)
     assert with_pushdown == without_pushdown
 
@@ -1154,7 +1156,7 @@ def test_grouped_counts_over_pairs_equal_default_evaluator(dataset, monkeypatch,
 def test_generic_filter_route_equals_default_evaluator(file_graph, monkeypatch, sparql):
     """``VORTEX_RDF_FILTER_FAST=0``: every FILTER value goes through rdflib's
     own expression evaluator, once per distinct value."""
-    monkeypatch.setattr(filters, "_FAST_ENABLED", False)
+    monkeypatch.setattr(SETTINGS, "fast_filters", False)
     generic, without_pushdown = both_ways(file_graph, sparql)
     assert generic == without_pushdown
 
@@ -1162,7 +1164,7 @@ def test_generic_filter_route_equals_default_evaluator(file_graph, monkeypatch, 
 @pytest.fixture
 def over_budget(monkeypatch):
     """A pair budget of 0: every BGP join step that makes a row is over it."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
@@ -1188,8 +1190,8 @@ def stream_pieces(request, monkeypatch):
     """A pair budget of 0 and pieces of ``request.param`` rows (1 unless the
     test sets it): every last hash join step that shares one variable and
     makes a row streams, its fed side cut into pieces that small."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
-    monkeypatch.setattr(pd, "_PIECE_ROWS", getattr(request, "param", 1))
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
+    monkeypatch.setattr(SETTINGS, "piece_rows", getattr(request, "param", 1))
 
 
 _PIECE_SIZES = pytest.mark.parametrize(
@@ -1222,8 +1224,8 @@ def test_stream_pieces_graph_pattern_equals_default_evaluator(dataset, stream_pi
 def keep_scan(monkeypatch):
     """The probe threshold at zero and every probe a scan: every BGP join step
     that shares a variable keep-scans its pattern."""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
+    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
@@ -1462,7 +1464,7 @@ def test_a_probe_join_keeps_the_multiplicity_rdflib_reads(probe_quads, monkeypat
     holding the triple; where it is fixed, at most one; an EXISTS test adds
     none."""
     union, sparql, rows, probed, _ = PROBE_MULTIPLICITY[case]
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
     probes = []
     for name in ("_probe_join", "_probe_exists"):
         monkeypatch.setattr(pd, name, _recording(probes, name))
@@ -1480,7 +1482,7 @@ def test_an_existence_probe_asks_for_one_row_unless_the_graph_is_open(
     A fixed graph holds at most one and an EXISTS test is boolean in any
     graph, so both ask for one row."""
     union, sparql, _, _, expected = PROBE_MULTIPLICITY[case]
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     dataset = _probe_dataset(probe_quads, union)
     native = _counting_native(dataset)
     register_sparql_pushdown()
@@ -1747,10 +1749,10 @@ def test_traced_batch_does_not_pull_ahead(file_graph, monkeypatch, capsys):
     """A traced ``match_codes_many`` hands its caller the native iterator, not
     the rows it drained from it: the probe join pulls exactly the answers it
     consumes, and the batch events add up to the probes served."""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: True)
-    monkeypatch.setattr(pd, "_CHEAP_BATCH_MIN", 1)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
+    monkeypatch.setattr(SETTINGS, "probe_batch", 3)
+    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: True)
+    monkeypatch.setattr(SETTINGS, "cheap_batch_min", 1)
     native = _PullCountingNative(file_graph.store._store())
     file_graph.store._native = native
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
@@ -2105,7 +2107,7 @@ def test_limit_decodes_only_the_first_chunk(tmp_path):
     counting = _counting_term_dict(graph)
     rows = run(graph, "SELECT * WHERE { ?s ?p ?o } LIMIT 10")
     assert len(rows) == 10
-    assert counting.decoded <= 3 * pd._CHUNK_START
+    assert counting.decoded <= 3 * SETTINGS.chunk_start
 
 
 class _CountingNative:
@@ -2234,13 +2236,13 @@ def test_native_none_falls_back_at_call_time(graph):
 
 
 def test_pushdown_ops_env_switch(dict_vortex, monkeypatch):
-    monkeypatch.setattr(pd, "_ENABLED_OPS", pd._ALL_OPS)
+    monkeypatch.setattr(SETTINGS, "enabled_ops", settings.ALL_OPS)
     monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "bgp")
     VortexRdflibStore(str(dict_vortex))
-    assert pd._ENABLED_OPS == {"BGP"}
+    assert SETTINGS.enabled_ops == {"BGP"}
     monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "BGP, Project")
     VortexRdflibStore(str(dict_vortex))
-    assert pd._ENABLED_OPS == {"BGP", "Project"}
+    assert SETTINGS.enabled_ops == {"BGP", "Project"}
     monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "Bogus")
     with pytest.raises(ValueError, match="Bogus"):
         VortexRdflibStore(str(dict_vortex))
@@ -2249,10 +2251,10 @@ def test_pushdown_ops_env_switch(dict_vortex, monkeypatch):
 def test_native_filters_env_switch(dict_vortex, monkeypatch):
     """`VORTEX_RDF_NATIVE_FILTERS=0` keeps every conjunct on the Python
     routes: no conjunct carries a native predicate, and the answer stands."""
-    monkeypatch.setattr(filters, "_NATIVE_ENABLED", True)
+    monkeypatch.setattr(SETTINGS, "native_filters", True)
     monkeypatch.setenv("VORTEX_RDF_NATIVE_FILTERS", "0")
     graph = Graph(store=VortexRdflibStore(str(dict_vortex)))
-    assert filters._NATIVE_ENABLED is False
+    assert SETTINGS.native_filters is False
     with_pushdown, without_pushdown = both_ways(
         graph, "SELECT ?s WHERE { ?s ?p ?o FILTER(isIRI(?o)) }"
     )
@@ -2372,7 +2374,7 @@ IRI_KEEP_PATHS = {
 )
 def test_iri_keep_paths_agree_with_rdflib(file_graph, monkeypatch, fanout, sparql, init, expected):
     """The paths an IRI keep takes, each with a query whose answer changes if
-    the path breaks, hash-joined (``_PROBE_FANOUT`` 100) and probed (0):
+    the path breaks, hash-joined (``SETTINGS.probe_fanout`` 100) and probed (0):
 
     - a probed pattern's free variable tests the keep's codes on the rows each
       probe returns (``keep_member``);
@@ -2382,7 +2384,7 @@ def test_iri_keep_paths_agree_with_rdflib(file_graph, monkeypatch, fanout, sparq
     - an IRI that is no N-Triples IRIREF makes no keep (``_SPELLABLE_IRI``):
       a bound variable's here, which ``encode_many`` would read as another
       IRI."""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
     bindings = None if init is None else {name: URIRef(iri) for name, iri in init.items()}
 
     def answer(graph, sparql):
@@ -2492,11 +2494,11 @@ def test_left_join_probe_and_hash_paths_are_ours(graph, monkeypatch):
     sparql = (
         "SELECT ?x ?a WHERE { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }"
     )
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     assert len(run(graph, sparql)) == 8
     assert left_joins and probes and len(bgps) == 1
     left_joins.clear(), probes.clear(), bgps.clear()
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 10**9)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 10**9)
     assert len(run(graph, sparql)) == 8
     assert left_joins and not probes and len(bgps) == 1
 
@@ -2556,10 +2558,10 @@ def test_exists_is_a_semi_join_in_code_space(graph, monkeypatch):
     register_sparql_pushdown()
     sparql = """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
         FILTER NOT EXISTS { ?x <http://ex.org/age> ?a } }"""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     assert len(run(graph, sparql)) == 3 and applied and probes and not generic_calls
     applied.clear(), probes.clear()
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 10**9)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 10**9)
     assert len(run(graph, sparql)) == 3 and applied and not probes and not generic_calls
     # a body FILTER that sees the block's bindings: rdflib's evaluator, per distinct tuple
     rows = run(

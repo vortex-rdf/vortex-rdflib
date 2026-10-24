@@ -3,9 +3,9 @@ import json
 from rdflib import Graph, URIRef
 from vortex_rdf import serialize_rdf
 
-import vortex_rdflib.pushdown as pd
 from test_pushdown import _counting_native, is_graph_name_check
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
+from vortex_rdflib.settings import SETTINGS
 
 PREFIX = "VORTEX_RDF_QUERY_TRACE "
 
@@ -139,7 +139,7 @@ def test_exists_counts_its_pattern_only_as_far_as_the_probe_decision_needs(tmp_p
 
 def test_probe_optional_preserves_unmatched_padding(tmp_path, monkeypatch):
     graph = _graph(tmp_path)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     register_sparql_pushdown()
     rows = list(
         graph.query("""SELECT ?s ?o WHERE {
@@ -152,7 +152,7 @@ def test_probe_optional_preserves_unmatched_padding(tmp_path, monkeypatch):
 
 def test_hash_optional_still_materializes_right_pattern(tmp_path, monkeypatch, capsys):
     graph = _graph(tmp_path, size=3)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 10**9)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 10**9)
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     rows = list(

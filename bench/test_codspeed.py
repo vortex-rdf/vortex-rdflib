@@ -96,11 +96,11 @@ from bench.dataset import (
 from bench.queries import Query, build_queries
 from vortex_rdflib import (
     VortexRdflibStore,
-    filters,
     pushdown,
     register_sparql_pushdown,
     unregister_sparql_pushdown,
 )
+from vortex_rdflib.settings import SETTINGS
 
 # ─── Dataset shape ──────────────────────────────────────────────────────────
 # Small by default: instrumentation runs under Valgrind, so the dashboard's
@@ -357,9 +357,9 @@ def generic_filter() -> Iterator[None]:
     """Force every FILTER value through rdflib's own evaluator for one task —
     the `VORTEX_RDF_FILTER_FAST=0` route, which the env switch sets at store
     construction and these stores are built once per session."""
-    filters._FAST_ENABLED = False
+    SETTINGS.fast_filters = False
     yield
-    filters._FAST_ENABLED = True
+    SETTINGS.fast_filters = True
 
 
 # ─── query::<name> — the full set on the primary configuration ──────────────
@@ -383,11 +383,11 @@ def test_join_streamed(benchmark, graphs, monkeypatch, capsys):
     pairs are read once from the trace of a run at a budget of 0, and a
     second traced run checks that the step streams."""
     graph, query = graphs["mem_noidx"], QUERIES[STREAMED_JOIN]
-    monkeypatch.setattr(pushdown, "_PIECE_ROWS", STREAMED_PIECE_ROWS)
-    monkeypatch.setattr(pushdown, "_PAIR_BUDGET", 0)
+    monkeypatch.setattr(SETTINGS, "piece_rows", STREAMED_PIECE_ROWS)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
     events = _traced_run(graph, query, monkeypatch, capsys)
     [pairs] = [event["pair_count"] for event in events if event["event"] == "bgp_over_budget"]
-    monkeypatch.setattr(pushdown, "_PAIR_BUDGET", pairs - 1)
+    monkeypatch.setattr(SETTINGS, "pair_budget", pairs - 1)
     events = _traced_run(graph, query, monkeypatch, capsys)
     steps = [event["strategy"] for event in events if event["event"] == "bgp_join_step_complete"]
     assert steps == ["stream"]

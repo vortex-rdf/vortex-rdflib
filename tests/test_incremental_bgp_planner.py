@@ -7,6 +7,7 @@ from vortex_rdf import serialize_rdf
 import vortex_rdflib.pushdown as pd
 from test_pushdown import _counting_native, both_ways
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
+from vortex_rdflib.settings import SETTINGS
 
 PREFIX = "VORTEX_RDF_QUERY_TRACE "
 
@@ -191,8 +192,8 @@ def test_bound_variable_is_not_restricted_again(tmp_path, monkeypatch, fanout):
     or hash-joined — inherits the codes and does not evaluate it over its
     own column."""
     graph = graph_of(tmp_path)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
-    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
+    monkeypatch.setattr(SETTINGS, "native_filters", False)
     seen = []
     original = filters.evaluate_column
 
@@ -240,7 +241,7 @@ def test_native_filter_narrows_every_pattern_it_reaches(tmp_path, monkeypatch, c
     the native match of every pattern binding its variable, counted and
     matched (or probed) narrowed: nothing is evaluated in Python."""
     graph = graph_of(tmp_path)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
     seen = []
     original = filters.evaluate_column
 
@@ -269,7 +270,7 @@ def test_native_filter_narrows_every_pattern_it_reaches(tmp_path, monkeypatch, c
 
 def indexed_graph_of(tmp_path, anchors=1, size=300, in_memory=True):
     """``graph_of``'s data behind a secondary-by-copy index, where every
-    pattern with a bound predicate is a point pattern (`_cheap_probe`); the
+    pattern with a bound predicate is a point pattern (`VortexRdflibStore._point_lookup`); the
     anchor rows are subjects s0 to s{anchors - 1}."""
     source = tmp_path / "indexed.nt"
     source.write_text(
@@ -287,7 +288,7 @@ def indexed_graph_of(tmp_path, anchors=1, size=300, in_memory=True):
 def test_patterns_next_to_a_small_count_are_not_counted_when_planned(
     tmp_path, monkeypatch, capsys, in_memory
 ):
-    """The anchor counts 1 row, at most _PROBE_FANOUT: name and tag share ?s
+    """The anchor counts 1 row, at most SETTINGS.probe_fanout: name and tag share ?s
     with it, so planning leaves them uncounted. At its join step each is
     counted only as far as the decision needs — capped at 1 x 100 + 1 rows —
     and the capped answer says probe."""
