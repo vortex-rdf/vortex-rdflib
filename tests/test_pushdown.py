@@ -969,7 +969,7 @@ def test_graph_scope_reaches_the_native_match(dataset, monkeypatch):
 
     def spy(*args, **kwargs):
         pattern = original(*args, **kwargs)
-        patterns.append(pattern["n3"][3])
+        patterns.append(pattern.n3[3])
         return pattern
 
     monkeypatch.setattr(pd, "_pattern_terms", spy)
@@ -1332,10 +1332,9 @@ def test_probe_join_pads_rows_when_the_pattern_shares_no_variable(graph):
     padded with None — also when the pattern shares no variable with the
     relation, so nothing is substituted per row. No caller probes such a
     pattern today, but `_probe_join` must not rely on that."""
-    pattern = {
-        "n3": [None, "<http://ex.org/nothing>", None, None],
-        "varpos": {Variable("x"): [0], Variable("a"): [2]},
-    }
+    pattern = pd.Pattern(
+        [None, "<http://ex.org/nothing>", None, None], {Variable("x"): [0], Variable("a"): [2]}
+    )
     schema, rows = pd._probe_join(
         graph.store, (Variable("z"),), [(0,), (1,)], pattern, keep_unmatched=True
     )

@@ -349,7 +349,8 @@ def test_compacting_a_match_keeps_the_allowed_rows_in_match_order(varpos, keep, 
     kept variable's first position is allowed, in match order; the columns of
     constant positions are dropped, and the match's own columns are untouched."""
     columns = tuple(U64Column(column) for column in MATCH)
-    pat: dict = {"varpos": varpos, "cols": columns, "nrows": len(MATCH[0])}
+    pat = pd.Pattern([None] * 4, varpos)
+    pat.set_match(columns, len(MATCH[0]))
     kept = [
         i
         for i in range(len(MATCH[0]))
@@ -357,13 +358,13 @@ def test_compacting_a_match_keeps_the_allowed_rows_in_match_order(varpos, keep, 
     ]
     assert kept == remaining
     pd._compact_pattern(pat, keep)
-    assert pat["nrows"] == len(kept)
+    assert pat.nrows == len(kept)
     read = {idx for positions in varpos.values() for idx in positions}
     for idx in range(4):
         if idx in read:
-            assert memoryview(pat["cols"][idx]).cast("Q").tolist() == [MATCH[idx][i] for i in kept]
+            assert memoryview(pat.cols[idx]).cast("Q").tolist() == [MATCH[idx][i] for i in kept]
         else:
-            assert pat["cols"][idx] is None
+            assert pat.cols[idx] is None
     assert [memoryview(column).cast("Q").tolist() for column in columns] == MATCH
 
 
@@ -378,18 +379,19 @@ def test_restricting_a_match_compacts_it_to_the_rows_that_pass(tmp_path, limit, 
     columns = _price_match(store)
     subjects, prices = (memoryview(columns[i]).cast("Q").tolist() for i in (0, 2))
     passing = {_price_code(store, i) for i in range(200) if (i * 37) % 1000 < limit}
-    pat: dict = {"varpos": {S: [0], V: [2]}, "cols": columns, "nrows": len(subjects), "index": 0}
+    pat = pd.Pattern([None] * 4, {S: [0], V: [2]}, index=0)
+    pat.set_match(columns, len(subjects))
     [conjunct] = filters.analyze_expr(filter_expr(f"?v < {limit}"), [V], CTX, {}).per_var[V]
     pd._restrict_pattern(store, pat, {V: [conjunct]})
     rows = [i for i, price in enumerate(prices) if price in passing]
     assert 0 < len(rows) and (len(rows) < len(subjects)) == compacted
-    assert pat["nrows"] == len(rows)
-    assert memoryview(pat["cols"][0]).cast("Q").tolist() == [subjects[i] for i in rows]
-    assert memoryview(pat["cols"][2]).cast("Q").tolist() == [prices[i] for i in rows]
+    assert pat.nrows == len(rows)
+    assert memoryview(pat.cols[0]).cast("Q").tolist() == [subjects[i] for i in rows]
+    assert memoryview(pat.cols[2]).cast("Q").tolist() == [prices[i] for i in rows]
     if compacted:
-        assert pat["cols"][1] is None and pat["cols"][3] is None
+        assert pat.cols[1] is None and pat.cols[3] is None
     else:
-        assert pat["cols"] is columns
+        assert pat.cols is columns
 
 
 def test_iri_equality_is_a_keep_on_the_match(tmp_path, monkeypatch, capsys):

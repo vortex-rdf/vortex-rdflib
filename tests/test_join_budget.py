@@ -863,10 +863,11 @@ def test_a_memoized_match_is_sliced(graph):
     seed = native.match_codes(None, f"<{EX}p>", None, None)
     n3 = [None, f"<{EX}q>", None, None]
     match = native.match_codes(*n3)
-    pat = {"n3": n3, "varpos": {s: [0], y: [2]}, "unsatisfiable": False, "estimate": 20}
+    pat = pd.Pattern(n3, {s: [0], y: [2]}, estimate=20)
     spy = _spy(graph)
     columns = (seed[0], seed[2])
-    schema, pieces = pd._streamed_step(graph.store, (s, x), columns, pat, {tuple(n3): match})
+    relation = pd.Relation.from_cols((s, x), columns)
+    schema, pieces = pd._streamed_step(graph.store, relation, pat, {tuple(n3): match})
     rows = pd._rows_of(pd.Relation(schema, None, None, 0, pieces=pieces))
     assert spy.names() == []
     views = tuple(memoryview(column).cast("Q") for column in columns)
@@ -916,26 +917,16 @@ def test_tier2_does_not_trust_a_capped_estimate(graph, monkeypatch):
     relation 101 rows make a product of 202, within a budget of 202, yet the
     pattern fits only once its count is known whole."""
     x, d = Variable("x"), Variable("d")
-    seed = {
-        "n3": [f"<{EX}ts0>", f"<{EX}ta>", None, None],
-        "varpos": {x: [2]},
-        "unsatisfiable": False,
-        "index": 0,
-    }
-    linked = {
-        "n3": [None, f"<{EX}tl>", None, None],
-        "varpos": {x: [0], d: [2]},
-        "unsatisfiable": False,
-        "index": 1,
-    }
+    seed = pd.Pattern([f"<{EX}ts0>", f"<{EX}ta>", None, None], {x: [2]}, index=0)
+    linked = pd.Pattern([None, f"<{EX}tl>", None, None], {x: [0], d: [2]}, index=1)
     pd._join_patterns(graph.store, [seed, linked])
-    assert (seed["estimate"], seed.get("estimate_capped", False)) == (1, False)
-    assert (linked["estimate"], linked["estimate_capped"]) == (101, True)
+    assert (seed.estimate, seed.estimate_capped) == (1, False)
+    assert (linked.estimate, linked.estimate_capped) == (101, True)
     monkeypatch.setattr(SETTINGS, "pair_budget", 202)
-    rows = [(1,), (2,)]
-    assert not pd._fits(2, (x,), None, rows, linked, {}, graph.store)
-    linked["estimate_capped"] = False
-    assert pd._fits(2, (x,), None, rows, linked, {}, graph.store)
+    relation = pd.Relation.from_rows((x,), [(1,), (2,)])
+    assert not pd._fits(relation, linked, {}, graph.store)
+    linked.estimate_capped = False
+    assert pd._fits(relation, linked, {}, graph.store)
 
 
 def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
@@ -948,18 +939,20 @@ def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
     native = graph.store._store()
     seed = native.match_codes(None, f"<{EX}ta>", None, None)
     n3 = [None, f"<{EX}tl>", None, None]
-    pat = {"n3": n3, "varpos": {x: [0], d: [2]}, "unsatisfiable": False, "estimate": 245}
+    pat = pd.Pattern(n3, {x: [0], d: [2]}, estimate=245)
     memo = {tuple(n3): native.match_codes(*n3)}
     cols = (memoryview(seed[0]).cast("Q"), memoryview(seed[2]).cast("Q"))
-    bodies = [(cols, None), (None, pd._cols_to_rows(cols))]
+    columnar = pd.Relation.from_cols((s, x), cols)
+    assert columnar.nrows == 120
+    bodies = [columnar, pd.Relation.from_rows((s, x), pd._cols_to_rows(cols))]
     monkeypatch.setattr(SETTINGS, "pair_budget", 5)
-    assert [pd._fits(120, (s, x), *body, pat, memo, graph.store) for body in bodies] == [True] * 2
-    assert not pd._fits(120, (s, x), cols, None, pat, {}, graph.store)
+    assert [pd._fits(body, pat, memo, graph.store) for body in bodies] == [True] * 2
+    assert not pd._fits(columnar, pat, {}, graph.store)
     monkeypatch.setattr(SETTINGS, "probe_fanout", 2)
-    assert not pd._fits(120, (s, x), cols, None, pat, memo, graph.store)
+    assert not pd._fits(columnar, pat, memo, graph.store)
     monkeypatch.setattr(SETTINGS, "probe_fanout", 100)
     monkeypatch.setattr(SETTINGS, "pair_budget", 4)
-    assert [pd._fits(120, (s, x), *body, pat, memo, graph.store) for body in bodies] == [False] * 2
+    assert [pd._fits(body, pat, memo, graph.store) for body in bodies] == [False] * 2
 
 
 @pytest.mark.parametrize("budget", [119, 60])
@@ -1374,24 +1367,19 @@ def test_a_put_back_keep_scan_drops_its_keep(graph, planned):
     leaves the memo with the narrower keep."""
     k, f, p = (Variable(name) for name in "kfp")
     keys = graph.store._store().match_codes(f"<{EX}c0>", f"<{EX}has>", None, None)[2]
-    pat: dict = {
-        "n3": [None, None, None, None],
-        "varpos": {f: [0], p: [1], k: [2]},
-        "unsatisfiable": False,
-        "estimate": 1348,
-    }
-    if planned is not None:
-        pat["nkeep"] = planned
+    pat = pd.Pattern([None, None, None, None], {f: [0], p: [1], k: [2]}, estimate=1348)
+    pat.nkeep = planned
     whole = None if planned is None else dict(planned)
     memo: dict = {}
-    pd._keep_scan(graph.store, pat, (k,), (memoryview(keys).cast("Q"),), None, memo)
-    assert pat["nrows"] == 18
-    assert set(pat["nkeep"]) == {2} | set(planned or ())
+    relation = pd.Relation.from_cols((k,), (memoryview(keys).cast("Q"),))
+    pd._keep_scan(graph.store, pat, relation, memo)
+    assert pat.nrows == 18
+    assert pat.nkeep is not None and set(pat.nkeep) == {2} | set(planned or ())
     assert list(memo) == [pd._pattern_key(pat)]
     pd._put_back(pat, None, (), None, (), planned, memo)
-    assert pat.get("nkeep") is planned
+    assert pat.nkeep is planned
     assert planned == whole
-    assert "cols" not in pat and memo == {}
+    assert not pat.matched and memo == {}
 
 
 def test_a_memo_key_holds_its_keep_column():
@@ -1401,9 +1389,9 @@ def test_a_memo_key_holds_its_keep_column():
     the entry."""
     n3 = [None, f"<{EX}q>", None, None]
     keep = U64Column([1, 2])
-    key = pd._pattern_key({"n3": n3, "nkeep": {2: keep}})
-    assert key == pd._pattern_key({"n3": n3, "nkeep": {2: keep}})
-    assert key != pd._pattern_key({"n3": n3, "nkeep": {2: U64Column([1, 2])}})
+    key = pd._pattern_key(pd.Pattern(n3, {}, nkeep={2: keep}))
+    assert key == pd._pattern_key(pd.Pattern(n3, {}, nkeep={2: keep}))
+    assert key != pd._pattern_key(pd.Pattern(n3, {}, nkeep={2: U64Column([1, 2])}))
     [(position, (kind, held))] = key[-1]
     assert (position, kind) == (2, "codes")
     assert held is keep
