@@ -721,18 +721,20 @@ def _scoped_iterator(iterator, opened):
     only when the current one is another, as it is for a step pulled after
     the query's :func:`cancel_scope` block."""
     cancel = opened.cancel
+    enter, leave = query_scope.enter, query_scope.leave
+    get_cancel, set_cancel, reset_cancel = _CANCEL.get, _CANCEL.set, _CANCEL.reset
     try:
         while True:
-            token = query_scope.enter(opened)
-            reset = _CANCEL.set(cancel) if _CANCEL.get() is not cancel else None
+            token = enter(opened)
+            reset = set_cancel(cancel) if get_cancel() is not cancel else None
             try:
                 item = next(iterator)
             except StopIteration:
                 return
             finally:
                 if reset is not None:
-                    _CANCEL.reset(reset)
-                query_scope.leave(token)
+                    reset_cancel(reset)
+                leave(token)
             yield item
     finally:
         close = getattr(iterator, "close", None)
@@ -2694,7 +2696,8 @@ def _count_pattern(store, pat, counts: dict, exact: bool = False, limit: int | N
     key = _pattern_key(pat) if nkeep else tuple(pat["n3"])
     n = counts.get(key)
     if n is None:
-        cancel = _cancel_kw_for(_cancel_kw(), store, pat["n3"], limit)
+        token = _CANCEL.get()
+        cancel = {} if token is None else _cancel_kw_for({"cancel": token}, store, pat["n3"], limit)
         n = _native(store).count_quads(*pat["n3"], **_narrowing(nkeep, limit), **cancel)
         if limit is None or n < limit:
             counts[key] = n
@@ -3006,7 +3009,8 @@ def _match_resolved_pattern(store, pat, memo=None, limit=None) -> tuple[int, int
     calls = 0
     if cols is None:
         native = _native(store)
-        cancel = _cancel_kw_for(_cancel_kw(), store, pat["n3"], limit)
+        token = _CANCEL.get()
+        cancel = {} if token is None else _cancel_kw_for({"cancel": token}, store, pat["n3"], limit)
         if nkeep or limit is not None:
             cols = native.match_codes(*pat["n3"], **_narrowing(nkeep, limit), **cancel)
         else:

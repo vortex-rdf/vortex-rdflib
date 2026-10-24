@@ -15,6 +15,7 @@ is produced or the result is closed. A call outside any query (rdflib's
 ``Store.triples()`` API, ``len()``) gets fresh state for that call alone.
 """
 
+from collections.abc import Callable
 from contextvars import ContextVar, Token
 
 from rdflib.term import Node
@@ -84,12 +85,11 @@ def current() -> QueryScope | None:
     return _CURRENT.get()
 
 
-def enter(scope: QueryScope) -> Token:
-    return _CURRENT.set(scope)
-
-
-def leave(token: Token) -> None:
-    _CURRENT.reset(token)
+# Make ``scope`` the current query's, answering the token that ``leave``
+# takes to restore the previous one; the context variable's own methods, so
+# a loop that enters and leaves per row pays no Python frame for either.
+enter: Callable[[QueryScope], Token] = _CURRENT.set
+leave: Callable[[Token], None] = _CURRENT.reset
 
 
 def terms_for(store) -> QueryTerms:
