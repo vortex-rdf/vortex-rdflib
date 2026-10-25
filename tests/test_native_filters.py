@@ -9,10 +9,11 @@ value model treats specially: decimals against doubles, integers past 2^53,
 
 import pytest
 from rdflib.term import Variable
+from tests.corpus import SPELLINGS
+from tests.support import RecordingTermDict, filter_expr, outcome, rdflib_answer, typed
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_filters import SPELLINGS, filter_expr, rdflib_answer, typed
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 from vortex_rdflib.filters import native
 from vortex_rdflib.filters.native import NativeShape
@@ -283,37 +284,14 @@ def test_wide_integers_are_left_undecided(spelling_store):
         assert not passed and set(undecided) == wide
 
 
-class _Recording:
-    """A TermDict that records every filter_codes call as ``(kind, arg,
-    options, candidate codes)`` (or refuses every argument, with
-    ``refuse``)."""
-
-    def __init__(self, inner, refuse: bool = False):
-        self._inner = inner
-        self.refuse = refuse
-        self.calls: list[tuple] = []
-
-    @property
-    def sent(self) -> list[list[int]]:
-        """The candidate codes of each call."""
-        return [codes for _, _, _, codes in self.calls]
-
-    def filter_codes(self, kind, arg, codes, **options):
-        self.calls.append((kind, arg, options, memoryview(codes).cast("Q").tolist()))
-        if self.refuse:
-            raise ValueError(f"refused: {kind} {arg}")
-        return self._inner.filter_codes(kind, arg, codes, **options)
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-
 def test_a_refused_argument_leaves_every_candidate_to_the_python_routes(
     spelling_store, monkeypatch
 ):
     codes = _all_codes(spelling_store)
     lo, hi = spelling_store._kind_ranges()[LITERAL]
-    monkeypatch.setattr(spelling_store, "_dict", _Recording(spelling_store._dict, refuse=True))
+    monkeypatch.setattr(
+        spelling_store, "_dict", RecordingTermDict(spelling_store._dict, refuse=True)
+    )
     shape = NativeShape("num_lt", f'"1e400"^^<{XSD}double>')
     passed, undecided = native.evaluate(spelling_store, shape, codes)
     assert not passed
@@ -329,7 +307,7 @@ def test_only_the_codes_a_predicate_reads_are_sent(spelling_store, monkeypatch):
     lo, hi = spelling_store._kind_ranges()[LITERAL]
     nonliterals = {code for code in codes if not lo <= code < hi}
     assert nonliterals
-    recording = _Recording(spelling_store._dict)
+    recording = RecordingTermDict(spelling_store._dict)
     monkeypatch.setattr(spelling_store, "_dict", recording)
     five = f'"5"^^<{XSD}integer>'
     passed_ne, _ = native.evaluate(spelling_store, NativeShape("num_ne", five), codes)
@@ -350,7 +328,7 @@ def test_str_of_a_blank_node_is_left_to_the_python_routes(spelling_store, monkey
     blanks = {c for c in codes if ranges[BLANK][0] <= c < ranges[BLANK][1]}
     iris = {c for c in codes if ranges[IRI][0] <= c < ranges[IRI][1]}
     assert blanks and iris
-    recording = _Recording(spelling_store._dict)
+    recording = RecordingTermDict(spelling_store._dict)
     monkeypatch.setattr(spelling_store, "_dict", recording)
     _, undecided = native.evaluate(spelling_store, NativeShape("str_prefix", "a"), codes)
     assert blanks <= set(undecided)
@@ -461,20 +439,8 @@ def test_pushed_filter_query_equals_default_evaluator(spelling_store, in_memory,
         f"SELECT ?s ?v WHERE {{ ?s <http://ex.org/p> ?v FILTER({sparql_expr}) }}"
     )
     register_sparql_pushdown()
-    with_pushdown, without_pushdown = both_ways(graph, query, runner=_outcome)
+    with_pushdown, without_pushdown = both_ways(graph, query, runner=outcome)
     assert with_pushdown == without_pushdown
-
-
-def _outcome(graph, sparql):
-    """The answer, or the exception rdflib raises — a NaN double against a
-    decimal raises `decimal.InvalidOperation` in rdflib's own comparator,
-    and the pushdown, which leaves that value to rdflib, raises it too."""
-    from test_pushdown import run
-
-    try:
-        return run(graph, sparql)
-    except Exception as error:  # noqa: BLE001 - the exception is the answer
-        return type(error)
 
 
 def test_a_mid_size_code_set_goes_to_the_native_layer_whole(tmp_path, monkeypatch, capsys):

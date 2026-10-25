@@ -6,79 +6,17 @@ a pattern scan) and every ordered pair of spellings for two (the row
 predicate applied to joined rows)."""
 
 import pytest
-from rdflib import Graph
-from rdflib.plugins.sparql.algebra import translateQuery
 from rdflib.plugins.sparql.evalutils import _ebv
-from rdflib.plugins.sparql.parser import parseQuery
-from rdflib.plugins.sparql.sparql import FrozenBindings, QueryContext
+from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import Variable
+from tests.corpus import SPELLINGS
+from tests.support import CTX, RAISES, V, W, filter_expr, rdflib_answer, typed
 
 from vortex_rdflib import VortexRdflibStore, filters
 from vortex_rdflib.terms import BLANK, IRI, LITERAL, TermView, kind_bounds, kind_of, parse_spelling
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
-PREFIXES = (
-    f"PREFIX xsd: <{XSD}> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> "
-    "PREFIX ex: <http://ex.org/> "
-)
-V = Variable("v")
-W = Variable("w")
 
-
-def typed(lexical: str, datatype: str) -> str:
-    return f'"{lexical}"^^<{XSD}{datatype}>'
-
-
-#: Data-side spellings, as the store's dictionary holds them (lowercase
-#: language tags, minimal escapes); None is an unbound variable.
-SPELLINGS = [
-    typed("5", "integer"),
-    typed("01", "integer"),
-    typed("+7", "integer"),
-    typed(" 7", "integer"),
-    typed("1_0", "integer"),
-    typed("1.5", "integer"),
-    typed("abc", "integer"),
-    typed("0x10", "integer"),
-    typed("99999999999999999999", "integer"),
-    typed("-3", "integer"),
-    typed("1.5", "decimal"),
-    typed("5", "decimal"),
-    typed("NaN", "double"),
-    typed("INF", "double"),
-    typed("-INF", "double"),
-    typed("1e2", "double"),
-    typed("5", "float"),
-    typed("7", "byte"),
-    typed("300", "byte"),
-    typed("5", "int"),
-    typed("5", "short"),
-    typed("5", "unsignedByte"),
-    typed("-1", "nonNegativeInteger"),
-    typed("5", "positiveInteger"),
-    typed("true", "boolean"),
-    typed("True", "boolean"),
-    typed("1", "boolean"),
-    typed("maybe", "boolean"),
-    typed("2020-01-01T00:00:00", "dateTime"),
-    typed("2020-01-01", "date"),
-    '"5"',
-    '"05"',
-    '""',
-    '"abc"',
-    '"Abc"',
-    '"abc"@en',
-    '"abc"@en-us',
-    '"5"@en',
-    '"a\\"b"',
-    '"a\\nb"',
-    '"x"^^<http://ex.org/dt>',
-    "<http://ex.org/x>",
-    "<http://ex.org/y>",
-    "_:b0",
-    "<http://www.w3.org/1999/02/22-rdf-syntax-ns#nil>",
-    None,
-]
 
 EXPRESSIONS = [
     "?v < 5",
@@ -177,31 +115,6 @@ TWO_VAR_EXPRESSIONS = [
     "?v = ?w",
     "sameTerm(?v, ?w)",
 ]
-
-
-def filter_expr(sparql_expr: str):
-    query = translateQuery(
-        parseQuery(f"{PREFIXES}SELECT * WHERE {{ ?s ?p ?v FILTER({sparql_expr}) }}")
-    )
-    node = query.algebra.p.p
-    assert node.name == "Filter"
-    return node.expr
-
-
-# rdflib's own contexts always carry an initBindings mapping; an unbound
-# variable is looked up there last (Graph.query defaults it to {}).
-CTX = QueryContext(graph=Graph(), initBindings={})
-
-
-RAISES = "rdflib raises"
-
-
-def rdflib_answer(expr, spelling):
-    bindings = {} if spelling is None else {V: VortexRdflibStore._from_n3_safe(spelling)}
-    try:
-        return _ebv(expr, FrozenBindings(CTX, bindings))
-    except Exception:  # noqa: BLE001 - rdflib's own bugs (e.g. NaN vs Decimal) are the oracle
-        return RAISES
 
 
 def fast_answer(predicate, spelling):

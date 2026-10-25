@@ -17,11 +17,10 @@ from collections.abc import Callable
 import pytest
 from rdflib import Dataset, Graph, URIRef
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID
+from tests.support import native_spy, run, trace_events
 from vortex_rdf import Cancelled, CancelToken, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_native_primitives import _spy
-from test_pushdown import _trace_events, run
 from vortex_rdflib import VortexRdflibStore, cancel_scope, register_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
 
@@ -172,7 +171,7 @@ def _run_shape(graph, monkeypatch, shape: str) -> list[tuple[str, tuple, dict]]:
     if budget is not None:
         monkeypatch.setattr(SETTINGS, "pair_budget", budget)
     register_sparql_pushdown()
-    spy = _spy(graph)
+    spy = native_spy(graph)
     if callable(work):
         work(graph)
     else:
@@ -225,14 +224,14 @@ def test_a_cancelled_token_stops_the_query_at_its_first_call(
     store = VortexRdflibStore(str(cancel_vortex), in_memory=in_memory)
     graph = Dataset(store=store, default_union=True)
     register_sparql_pushdown()
-    spy = _spy(graph)
+    spy = native_spy(graph)
     token = CancelToken()
     token.cancel()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
     with cancel_scope(token), pytest.raises(Cancelled):
         graph.query(sparql)
-    events = _trace_events(capsys.readouterr().err)
+    events = trace_events(capsys.readouterr().err)
     assert [kwargs for _, kwargs in spy.calls] == [{"cancel": token}] * refused_calls
     assert [(e["event"], e["algebra_node"]) for e in events if "algebra_node" in e] == [
         ("eval_part_start", node),
@@ -379,7 +378,7 @@ def test_the_token_is_the_query_s_own(graph, monkeypatch):
         rows = iter(graph.query(PAIRED))
     assert next(rows)
     token.cancel()
-    spy = _spy(graph)
+    spy = native_spy(graph)
     assert len(run(graph, PAIRED)) == SUBJECTS
     assert spy.calls and all("cancel" not in kwargs for _, kwargs in spy.calls)
     seen = len(spy.calls)
@@ -471,7 +470,7 @@ def test_triples_carries_the_token(graph, monkeypatch, chunk_rows):
     the native layer: the chunk call carries the token on any store."""
     if chunk_rows is not None:
         monkeypatch.setattr(SETTINGS, "triples_chunk_rows", chunk_rows)
-    spy = _spy(graph)
+    spy = native_spy(graph)
     token = CancelToken()
     with cancel_scope(token):
         assert list(graph.store.triples((None, URIRef(f"{EX}p"), None)))
@@ -506,7 +505,7 @@ def test_an_in_memory_one_shot_call_checks_the_token_itself(mem_graph):
     race the token, whatever its shape: inside ``cancel_scope`` the match
     ``triples()`` makes for a pattern that scans takes no token, and once
     the token is cancelled it raises ``Cancelled`` before any native call."""
-    spy = _spy(mem_graph)
+    spy = native_spy(mem_graph)
     token = CancelToken()
     scan = (None, URIRef(f"{EX}p"), None)
     with cancel_scope(token):
@@ -535,7 +534,7 @@ def test_a_point_read_checks_the_token_itself(graph, pattern, in_default_graph, 
     cancelled it raises ``Cancelled`` before any native call."""
     store = graph.store
     context = Graph(store=store, identifier=DATASET_DEFAULT_GRAPH_ID) if in_default_graph else None
-    spy = _spy(graph)
+    spy = native_spy(graph)
     token = CancelToken()
     with cancel_scope(token):
         assert list(store.triples(pattern, context))
@@ -576,7 +575,7 @@ def test_the_string_fallback_checks_the_token(default_vortex, in_memory, read):
     ``cancel_scope`` a read goes through, and once the token is cancelled
     the next raises ``Cancelled`` before any native call."""
     graph = Graph(store=VortexRdflibStore(str(default_vortex), in_memory=in_memory))
-    spy = _spy(graph)
+    spy = native_spy(graph)
     token = CancelToken()
     with cancel_scope(token):
         assert read(graph.store)

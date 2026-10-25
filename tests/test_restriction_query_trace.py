@@ -1,20 +1,9 @@
-import json
-
 from rdflib import Graph
+from tests.support import trace_events
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
-
-PREFIX = "VORTEX_RDF_QUERY_TRACE "
-
-
-def _events(captured):
-    return [
-        json.loads(line.removeprefix(PREFIX))
-        for line in captured.err.splitlines()
-        if line.startswith(PREFIX)
-    ]
 
 
 def test_restriction_trace_reports_distinct_bindings_and_rows(tmp_path, capsys, monkeypatch):
@@ -41,12 +30,12 @@ def test_restriction_trace_reports_distinct_bindings_and_rows(tmp_path, capsys, 
 
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "0")
     expected = list(graph.query(query))
-    assert _events(capsys.readouterr()) == []
+    assert trace_events(capsys.readouterr().err) == []
 
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY_ID", "restriction-test")
     actual = list(graph.query(query))
-    payloads = _events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
 
     assert actual == expected
     records = [e for e in payloads if e["event"] == "bgp_restriction_complete"]
@@ -86,7 +75,7 @@ def test_native_candidate_trace(tmp_path, capsys, monkeypatch):
             'SELECT ?s WHERE { ?s <http://ex/name> ?n FILTER(langMatches(lang(?n), "FR")) }'
         )
     )
-    payloads = _events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert len(rows) == 10
     [call] = [e for e in payloads if e["event"] == "native_filter_complete"]
     assert (call["kind"], call["candidate_codes"]) == ("lang_matches", 30)

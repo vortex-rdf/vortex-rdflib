@@ -12,10 +12,10 @@ import pytest
 import rdflib.plugins.sparql.evaluate as rdflib_evaluate
 from rdflib import Graph, URIRef
 from rdflib.plugins.sparql import CUSTOM_EVALS
+from tests.support import both_ways, counting_term_dict, is_graph_name_check, row_key, run
 from vortex_rdf import Cancelled, CancelToken, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_pushdown import _counting_term_dict, _row_key, both_ways, is_graph_name_check, run
 from vortex_rdflib import VortexRdflibStore, cancel_scope, query_scope, register_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
 
@@ -157,7 +157,7 @@ def test_each_query_has_a_scope_of_its_own(tmp_path, monkeypatch):
 def test_triples_outside_a_query_keep_their_decodes_for_the_call(tmp_path):
     graph = Graph(store=_store(tmp_path))
     list(graph.store.contexts())  # one context per graph: store state, decoded once
-    counting = _counting_term_dict(graph)
+    counting = counting_term_dict(graph)
     first = sorted(graph.triples((None, None, None)))
     once = counting.decoded
     second = sorted(graph.triples((None, None, None)))
@@ -174,7 +174,7 @@ def test_triples_inside_a_query_share_the_query_decodes(tmp_path, monkeypatch):
     monkeypatch.setattr(SETTINGS, "enabled_ops", frozenset())
     register_sparql_pushdown()
     list(graph.store.contexts())  # one context per graph: store state, decoded once
-    counting = _counting_term_dict(graph)
+    counting = counting_term_dict(graph)
     rows = run(
         graph,
         """SELECT ?a ?c WHERE {
@@ -460,7 +460,7 @@ def test_interleaved_queries_keep_their_own_foreign_codes(tmp_path, tracked, mon
             else:
                 rows[i].append(tuple(row))
     del results
-    assert [sorted(answer, key=_row_key) for answer in rows] == alone
+    assert [sorted(answer, key=row_key) for answer in rows] == alone
     # a1 and b1 share one negative code, a2 and b2 another.
     assert len({term for _, term in given}) == 4 and len({code for code, _ in given}) == 2
     _assert_released(store, before, tracked)

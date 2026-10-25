@@ -14,11 +14,9 @@ import signal
 import pytest
 from rdflib import Graph, Literal
 from rdflib.term import Variable
+from tests.support import both_ways, filter_expr, outcome, rdflib_answer
 from vortex_rdf import serialize_rdf
 
-from test_filters import filter_expr, rdflib_answer
-from test_native_filters import _outcome
-from test_pushdown import both_ways
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 from vortex_rdflib.filters import native
 from vortex_rdflib.filters.native import NativeShape
@@ -356,6 +354,6 @@ def test_a_pattern_re_cannot_compile_answers_as_rdflib_does(
     graph = Graph(store=VortexRdflibStore(str(out), in_memory=True))
     monkeypatch.setattr(SETTINGS, "native_filters", native)
     query = f'SELECT ?s ?o WHERE {{ ?s <http://ex.org/p> ?o FILTER(regex(?o, "{pattern}")) }}'
-    with_pushdown, without_pushdown = both_ways(graph, query, runner=_outcome)
+    with_pushdown, without_pushdown = both_ways(graph, query, runner=outcome)
     assert without_pushdown == (error if string else [])
     assert with_pushdown == without_pushdown

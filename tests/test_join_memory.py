@@ -12,9 +12,8 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.support import trace_events
 from vortex_rdf import serialize_rdf
-
-from test_pushdown import _trace_events
 
 ROOT = Path(__file__).resolve().parents[1]
 EX = "http://ex/"
@@ -83,7 +82,7 @@ def _consume(path: Path, budget: str | None) -> tuple[int, int, list[str]]:
     rows, growth = (int(field) for field in done.stdout.split())
     steps = [
         event["strategy"]
-        for event in _trace_events(done.stderr)
+        for event in trace_events(done.stderr)
         if event["event"] == "bgp_join_step_complete"
     ]
     return rows, growth, steps

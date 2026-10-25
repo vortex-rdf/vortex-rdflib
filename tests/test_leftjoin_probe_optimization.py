@@ -1,13 +1,9 @@
-import json
-
 from rdflib import Graph, URIRef
+from tests.support import counting_native, is_graph_name_check, trace_events
 from vortex_rdf import serialize_rdf
 
-from test_pushdown import _counting_native, is_graph_name_check
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
-
-PREFIX = "VORTEX_RDF_QUERY_TRACE "
 
 
 def _graph(tmp_path, size=300):
@@ -22,14 +18,6 @@ def _graph(tmp_path, size=300):
     artifact = tmp_path / "leftjoin.vortex"
     serialize_rdf(str(source), str(artifact), layout="dictionary")
     return Graph(store=VortexRdflibStore(str(artifact), in_memory=True))
-
-
-def _events(captured):
-    return [
-        json.loads(line.removeprefix(PREFIX))
-        for line in captured.err.splitlines()
-        if line.startswith(PREFIX)
-    ]
 
 
 def test_probe_optional_counts_before_match_and_skips_complete_match(tmp_path, monkeypatch, capsys):
@@ -60,7 +48,7 @@ def test_probe_optional_counts_before_match_and_skips_complete_match(tmp_path, m
         OPTIONAL { ?s <http://ex/optional> ?o }
     }""")
     )
-    payloads = _events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert rows == [(URIRef("http://ex/s0"), URIRef("http://ex/o0"))]
     # One full match for the left BGP and one selective probe. There is no
     # full match for the 300-row OPTIONAL predicate.
@@ -107,7 +95,7 @@ def test_lazy_join_counts_before_match_and_probes(tmp_path, monkeypatch, capsys)
         { ?s <http://ex/optional> ?o }
     }""")
     )
-    payloads = _events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert rows == [(URIRef("http://ex/s0"), URIRef("http://ex/o0"))]
     assert len(matches) == 2
     assert [kwargs.get("limit") for _, kwargs in counts] == [101]
@@ -122,7 +110,7 @@ def test_exists_counts_its_pattern_only_as_far_as_the_probe_decision_needs(tmp_p
     is counted up to 1 x 100 + 1 rows, the capped answer says probe, and the
     row is probed with a count capped at one row."""
     graph = _graph(tmp_path)
-    counting = _counting_native(graph)
+    counting = counting_native(graph)
     register_sparql_pushdown()
     rows = list(
         graph.query("""SELECT ?s WHERE {
@@ -161,7 +149,7 @@ def test_hash_optional_still_materializes_right_pattern(tmp_path, monkeypatch, c
         OPTIONAL { ?s <http://ex/optional> ?o }
     }""")
     )
-    payloads = _events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert rows == [(URIRef("http://ex/s0"), URIRef("http://ex/o0"))]
     event = next(item for item in payloads if item["event"] == "left_join_plan_complete")
     assert event["strategy"] == "hash"

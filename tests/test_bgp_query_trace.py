@@ -1,19 +1,8 @@
-import json
-
 from rdflib import Graph
+from tests.support import trace_events
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
-
-PREFIX = "VORTEX_RDF_QUERY_TRACE "
-
-
-def _events(captured):
-    return [
-        json.loads(line.removeprefix(PREFIX))
-        for line in captured.err.splitlines()
-        if line.startswith(PREFIX)
-    ]
 
 
 def test_bgp_pattern_trace_reconciles_and_preserves_results(tmp_path, capsys, monkeypatch):
@@ -32,11 +21,11 @@ def test_bgp_pattern_trace_reconciles_and_preserves_results(tmp_path, capsys, mo
     register_sparql_pushdown()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "0")
     expected = list(graph.query(query))
-    assert _events(capsys.readouterr()) == []
+    assert trace_events(capsys.readouterr().err) == []
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY_ID", "bgp-test")
     actual = list(graph.query(query))
-    payloads = _events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert actual == expected
     assert sum(e["event"] == "bgp_start" for e in payloads) == 1
     assert sum(e["event"] == "bgp_pattern_start" for e in payloads) == 2

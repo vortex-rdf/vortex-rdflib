@@ -21,11 +21,10 @@ A conjunct on a variable a VALUES table binds holds on the table's rows."""
 
 import pytest
 from rdflib import Dataset, Variable
+from tests.support import both_ways, captured_trace, run
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_native_primitives import _trace
-from test_pushdown import both_ways, run
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
 
@@ -1150,7 +1149,7 @@ def test_a_filter_on_a_variable_the_graph_group_binds_stays_native(
         monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
         capsys.readouterr()
         rows = run(dataset, query)
-        native = [e for e in _trace(capsys) if e["event"] == "native_filter_complete"]
+        native = [e for e in captured_trace(capsys) if e["event"] == "native_filter_complete"]
         monkeypatch.delenv("VORTEX_RDF_TRACE_QUERY")
         assert [(e["kind"], e["candidate_codes"], e["passed_codes"]) for e in native] == [
             ("str_prefix", 2, 2)
@@ -1301,7 +1300,7 @@ def test_the_pushdown_answers_these_shapes_whole(
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
     run(dataset, PREFIX + sparql)
-    events = _trace(capsys)
+    events = captured_trace(capsys)
     assert any(e["event"] == "eval_part_complete" for e in events)
     assert {e["algebra_node"] for e in events if e["event"] == "eval_part_fallback"}.isdisjoint(
         _BLOCK_NODES

@@ -13,12 +13,11 @@ from rdflib import BNode, Dataset, Graph, Literal, URIRef
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, ConjunctiveGraph
 from rdflib.plugins.parsers import ntriples
 from rdflib.term import Node
+from tests.support import both_ways, counting_term_dict, native_spy
 from vortex_rdf import U64Column, serialize_rdf
 
 import vortex_rdflib.terms as terms_mod
 from conftest import GRAPH_1, GRAPH_2, LAYOUTS
-from test_native_primitives import _spy
-from test_pushdown import _counting_term_dict, both_ways
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
 from vortex_rdflib.terms import escape, parse_spelling
@@ -703,7 +702,7 @@ def test_a_suspended_triples_call_stays_on_its_file(tmp_path, monkeypatch, in_me
     expected = read(store.triples((None, None, None)))
     if chunk_rows is not None:
         monkeypatch.setattr(SETTINGS, "triples_chunk_rows", chunk_rows)
-    spy = _spy(Graph(store=store))
+    spy = native_spy(Graph(store=store))
     rows = store.triples((None, None, None))
     got = read([next(rows)])
     pulls = [sum(spy.pulls)]
@@ -787,8 +786,8 @@ def test_an_early_stop_decodes_a_chunk_not_the_match(chunked_quads, monkeypatch,
         monkeypatch.setattr(SETTINGS, "triples_chunk_rows", chunk_rows)
     graph = Graph(store=VortexRdflibStore(str(chunked_quads)))
     list(graph.store.contexts())  # one context per graph: store state, decoded once
-    counting = _counting_term_dict(graph)
-    spy = _spy(graph)
+    counting = counting_term_dict(graph)
+    spy = native_spy(graph)
     queries = [
         ("SELECT ?s ?o WHERE { ?s <http://ex.org/p0> ?o } LIMIT 3", 3),
         ("SELECT * WHERE { ?s ?p ?o } LIMIT 10", 10),
@@ -880,7 +879,7 @@ def test_a_large_pattern_reads_in_chunks(indexed_quads, monkeypatch, index, in_m
     expected = [read(pattern, context) for context, pattern in reads]
     assert min(rows.total() for rows in expected) > 7
     monkeypatch.setattr(SETTINGS, "triples_chunk_rows", 7)
-    spy = _spy(Graph(store=store))
+    spy = native_spy(Graph(store=store))
     for (context, pattern), want in zip(reads, expected, strict=True):
         seen = len(spy.calls)
         assert read(pattern, context) == want, (context, pattern)
@@ -902,7 +901,7 @@ def test_a_small_pattern_keeps_one_match(indexed_quads, monkeypatch, chunk_rows)
     if chunk_rows is not None:
         monkeypatch.setattr(SETTINGS, "triples_chunk_rows", chunk_rows)
     limit = SETTINGS.triples_chunk_rows
-    spy = _spy(Graph(store=store))
+    spy = native_spy(Graph(store=store))
     assert len(list(store.triples((None, None, None)))) == 300 <= limit
     assert spy.calls == [("match_codes", {"limit": limit + 1})]
 

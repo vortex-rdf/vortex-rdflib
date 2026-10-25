@@ -1074,8 +1074,15 @@ The tests check that the hook never changes an answer:
   forces a pair budget of 0, which puts every join step that makes a row over
   it; the same with pieces of one and of three rows, which streams every last
   step that shares one variable; and keep-scans for every join step that
-  shares a variable. A test checks in the trace that each of these forcings
-  reaches its path.
+  shares a variable. Each forcing is one row of a table,
+  [`FORCINGS`](../tests/test_pushdown.py#L161): the settings it overrides and
+  the corpora and stores it runs over. A test checks in the trace that each of
+  these forcings reaches its path.
+- [`tests/support.py`](../tests/support.py) holds what the test modules share:
+  [`both_ways`](../tests/support.py#L41), the trace reader, and the spies over
+  the native store and its term dictionary.
+  [`tests/corpus.py`](../tests/corpus.py) holds the shared fixture data and
+  query corpora.
 - [`tests/test_filters.py`](../tests/test_filters.py) checks each piece of the
   fast FILTER route against rdflib's evaluator, over many literal spellings
   (ill-typed numbers, NaN, out-of-range values, language tags, custom

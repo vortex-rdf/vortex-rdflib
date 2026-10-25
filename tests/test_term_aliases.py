@@ -13,10 +13,10 @@ import pytest
 import rdflib
 from rdflib import Graph, Literal, URIRef
 from rdflib.term import _toPythonMapping
+from tests.support import both_ways, run
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_pushdown import both_ways, run
 from vortex_rdflib import VortexRdflibStore, query_scope
 from vortex_rdflib.terms import LITERAL, canonical_spelling, escape, parse_spelling
 
