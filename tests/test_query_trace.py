@@ -1,13 +1,9 @@
-import json
-
 import pytest
 from rdflib import Graph
+from tests.support import trace_events
 from vortex_rdf import serialize_rdf
 
-import vortex_rdflib.pushdown as pd
-from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
-
-PREFIX = "VORTEX_RDF_QUERY_TRACE "
+from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, settings
 
 
 @pytest.fixture
@@ -26,20 +22,12 @@ def traced_graph(tmp_path):
     return Graph(store=VortexRdflibStore(str(output), in_memory=True))
 
 
-def events(captured):
-    return [
-        json.loads(line.removeprefix(PREFIX))
-        for line in captured.err.splitlines()
-        if line.startswith(PREFIX)
-    ]
-
-
 def test_trace_disabled_is_silent_and_preserves_results(traced_graph, capsys, monkeypatch):
     monkeypatch.delenv("VORTEX_RDF_TRACE_QUERY", raising=False)
     register_sparql_pushdown()
     rows = list(traced_graph.query("SELECT ?s WHERE { ?s <http://ex.org/name> ?n } LIMIT 3"))
     assert len(rows) == 3
-    assert events(capsys.readouterr()) == []
+    assert trace_events(capsys.readouterr().err) == []
 
 
 def test_trace_reports_bounded_order_and_decoding(traced_graph, capsys, monkeypatch):
@@ -51,7 +39,7 @@ def test_trace_reports_bounded_order_and_decoding(traced_graph, capsys, monkeypa
         ?s <http://ex.org/name> ?n
     } ORDER BY DESC(?d) LIMIT 5"""
     traced = list(traced_graph.query(query))
-    payloads = events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert len(traced) == 5
     assert payloads
     assert all(item["schema"] == "vortex-rdf-query-trace-v1" for item in payloads)
@@ -77,7 +65,7 @@ def test_trace_reports_bounded_order_and_decoding(traced_graph, capsys, monkeypa
 def test_trace_rejects_invalid_switch(monkeypatch):
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "yes")
     with pytest.raises(ValueError, match="must be 0 or 1"):
-        pd._trace_enabled()
+        settings.trace_enabled()
 
 
 def test_trace_reports_native_call_shape_and_rows(traced_graph, capsys, monkeypatch):
@@ -87,7 +75,9 @@ def test_trace_reports_native_call_shape_and_rows(traced_graph, capsys, monkeypa
     list(traced_graph.query("SELECT ?s WHERE { ?s <http://ex.org/name> ?n } LIMIT 1"))
 
     native_calls = [
-        event for event in events(capsys.readouterr()) if event["event"] == "native_call_complete"
+        event
+        for event in trace_events(capsys.readouterr().err)
+        if event["event"] == "native_call_complete"
     ]
     assert native_calls
     assert "match_codes" in {event["operation"] for event in native_calls}

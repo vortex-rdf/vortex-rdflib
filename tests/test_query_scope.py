@@ -12,11 +12,12 @@ import pytest
 import rdflib.plugins.sparql.evaluate as rdflib_evaluate
 from rdflib import Graph, URIRef
 from rdflib.plugins.sparql import CUSTOM_EVALS
+from tests.support import both_ways, counting_term_dict, is_graph_name_check, row_key, run
 from vortex_rdf import Cancelled, CancelToken, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_pushdown import _counting_term_dict, _row_key, both_ways, is_graph_name_check, run
 from vortex_rdflib import VortexRdflibStore, cancel_scope, query_scope, register_sparql_pushdown
+from vortex_rdflib.settings import SETTINGS
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 
@@ -156,7 +157,7 @@ def test_each_query_has_a_scope_of_its_own(tmp_path, monkeypatch):
 def test_triples_outside_a_query_keep_their_decodes_for_the_call(tmp_path):
     graph = Graph(store=_store(tmp_path))
     list(graph.store.contexts())  # one context per graph: store state, decoded once
-    counting = _counting_term_dict(graph)
+    counting = counting_term_dict(graph)
     first = sorted(graph.triples((None, None, None)))
     once = counting.decoded
     second = sorted(graph.triples((None, None, None)))
@@ -170,10 +171,10 @@ def test_triples_inside_a_query_share_the_query_decodes(tmp_path, monkeypatch):
     per pattern and binding; inside the query they share its decodes: the 50
     subjects and the predicate are decoded once each."""
     graph = Graph(store=_store(tmp_path))
-    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset())
+    monkeypatch.setattr(SETTINGS, "enabled_ops", frozenset())
     register_sparql_pushdown()
     list(graph.store.contexts())  # one context per graph: store state, decoded once
-    counting = _counting_term_dict(graph)
+    counting = counting_term_dict(graph)
     rows = run(
         graph,
         """SELECT ?a ?c WHERE {
@@ -243,7 +244,7 @@ def test_later_custom_evaluators_are_offered_the_query_node(tmp_path):
     CUSTOM_EVALS["test_query_scope_recorder"] = record
     try:
         order = list(CUSTOM_EVALS)
-        assert order.index(pd._EVAL_KEY) < order.index("test_query_scope_recorder")
+        assert order.index(pd.hook._EVAL_KEY) < order.index("test_query_scope_recorder")
         assert len(run(graph, "SELECT ?s WHERE { ?s <http://ex.org/knows> ?o }")) == 50
         built = graph.query(
             "CONSTRUCT { ?o <http://ex.org/known> ?s } WHERE { ?s <http://ex.org/knows> ?o }"
@@ -320,7 +321,7 @@ def test_a_query_failing_mid_iteration_releases_its_scope(tmp_path, tracked):
     with pytest.raises(RuntimeError, match="part-way"):
         for row in graph.query(query):
             rows.append(row)
-    assert len(rows) == pd._CHUNK_START
+    assert len(rows) == SETTINGS.chunk_start
     _assert_released(store, before, tracked)
 
 
@@ -331,7 +332,7 @@ def test_a_cancelled_query_releases_its_scope(tmp_path, tracked, monkeypatch):
     token as any failure does."""
     store = _store(tmp_path)
     graph = Graph(store=store)
-    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset())
+    monkeypatch.setattr(SETTINGS, "enabled_ops", frozenset())
     register_sparql_pushdown()
     query = "SELECT ?a ?c WHERE { ?a <http://ex.org/knows> ?b . ?b <http://ex.org/knows> ?c }"
     assert len(run(graph, query)) == 50
@@ -352,7 +353,7 @@ def test_rdflibs_own_limit_releases_the_scope(tmp_path, tracked, monkeypatch):
     the scope goes when the islice ends, those rows left unread."""
     store = _store(tmp_path)
     graph = Graph(store=store)
-    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
+    monkeypatch.setattr(SETTINGS, "enabled_ops", frozenset({"BGP"}))
     register_sparql_pushdown()
     sliced = []
     original = rdflib_evaluate.evalSlice
@@ -459,7 +460,7 @@ def test_interleaved_queries_keep_their_own_foreign_codes(tmp_path, tracked, mon
             else:
                 rows[i].append(tuple(row))
     del results
-    assert [sorted(answer, key=_row_key) for answer in rows] == alone
+    assert [sorted(answer, key=row_key) for answer in rows] == alone
     # a1 and b1 share one negative code, a2 and b2 another.
     assert len({term for _, term in given}) == 4 and len({code for code, _ in given}) == 2
     _assert_released(store, before, tracked)

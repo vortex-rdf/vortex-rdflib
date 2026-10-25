@@ -225,8 +225,8 @@ first row in 0.2 s, with native memory at about 1 GiB at the default budget
 (about 220 MiB at `VORTEX_RDF_PAIR_BUDGET=4194304`). `triples()`, which
 rdflib's own evaluator calls, reads a pattern of up to 65,536 rows as one match
 and a larger one in chunks of 65,536 rows, so a scan of a large store holds one
-chunk of codes at a time; that size is the module constant
-`vortex_rdflib.store._TRIPLES_CHUNK_ROWS`, not an environment variable. How the
+chunk of codes at a time; that size is
+`vortex_rdflib.settings.SETTINGS.triples_chunk_rows`, not an environment variable. How the
 budget works is described in [docs/pushdown.md](docs/pushdown.md#the-pair-budget).
 
 ## Environment variables

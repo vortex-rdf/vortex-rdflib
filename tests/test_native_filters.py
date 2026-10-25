@@ -1,7 +1,7 @@
 """The native term predicates (``TermDict.filter_codes``) must agree with
 rdflib's own evaluator wherever they give a definite answer: a FILTER
-conjunct mapped to one (``filters.native_shape``) is answered by vortex-rdf
-over the codes a query produced (``candidates.evaluate``), so a
+conjunct mapped to one (``filters.native.native_shape``) is answered by vortex-rdf
+over the codes a query produced (``native.evaluate``), so a
 disagreement would be a wrong answer, not a slow one. The matrix of
 spellings is the fast route's (``test_filters``) plus the shapes the native
 value model treats specially: decimals against doubles, integers past 2^53,
@@ -9,12 +9,15 @@ value model treats specially: decimals against doubles, integers past 2^53,
 
 import pytest
 from rdflib.term import Variable
+from tests.corpus import SPELLINGS
+from tests.support import RecordingTermDict, filter_expr, outcome, rdflib_answer, typed
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_filters import SPELLINGS, filter_expr, rdflib_answer, typed
-from vortex_rdflib import VortexRdflibStore, candidates, filters, register_sparql_pushdown
-from vortex_rdflib.candidates import NativeShape
+from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
+from vortex_rdflib.filters import native
+from vortex_rdflib.filters.native import NativeShape
+from vortex_rdflib.terms import BLANK, IRI, LITERAL
 
 V = Variable("v")
 XSD = "http://www.w3.org/2001/XMLSchema#"
@@ -80,7 +83,7 @@ MAPPED: list[tuple[str, tuple]] = [
     ("datatype(?v) = xsd:integer", ("datatype", XSD + "integer")),
     ("xsd:integer = datatype(?v)", ("datatype", XSD + "integer")),
     ("datatype(?v) = xsd:string", ("datatype", XSD + "string")),
-    ("datatype(?v) = rdf:langString", ("datatype", f"{filters._RDF_LANGSTRING}")),
+    ("datatype(?v) = rdf:langString", ("datatype", f"{filters.values._RDF_LANGSTRING}")),
     ("datatype(?v) = <http://ex.org/dt>", ("datatype", "http://ex.org/dt")),
     ('lang(?v) = "en"', ("lang", "en")),
     ('"en" = lang(?v)', ("lang", "en")),
@@ -99,9 +102,9 @@ MAPPED: list[tuple[str, tuple]] = [
     ('strstarts(str(?v), "b"^^xsd:string)', ("str_prefix", "b")),
 ]
 _INT = f'"5"^^<{XSD}integer>'
-for _op, _kind in filters._NUM_KINDS.items():
+for _op, _kind in filters.native._NUM_KINDS.items():
     MAPPED.append((f"?v {_op} 5", (_kind, _INT)))
-    MAPPED.append((f"5 {filters._SWAPPED[_op]} ?v", (_kind, _INT)))
+    MAPPED.append((f"5 {filters.native._SWAPPED[_op]} ?v", (_kind, _INT)))
 for _constant, _spelled in [
     ("5.5", f'"5.5"^^<{XSD}decimal>'),
     ("1e1", f'"10.0"^^<{XSD}double>'),
@@ -230,12 +233,12 @@ def spelling_store(tmp_path_factory):
 
 @pytest.mark.parametrize(("sparql_expr", "expected"), MAPPED, ids=[m[0] for m in MAPPED])
 def test_expression_maps_to_its_native_predicate(sparql_expr, expected):
-    assert filters.native_shape(filter_expr(sparql_expr), V, {}) == NativeShape(*expected)
+    assert filters.native.native_shape(filter_expr(sparql_expr), V, {}) == NativeShape(*expected)
 
 
 @pytest.mark.parametrize("sparql_expr", UNMAPPED)
 def test_expression_outside_the_native_shapes_is_not_mapped(sparql_expr):
-    assert filters.native_shape(filter_expr(sparql_expr), V, {}) is None
+    assert filters.native.native_shape(filter_expr(sparql_expr), V, {}) is None
 
 
 def _all_codes(store) -> set:
@@ -249,10 +252,10 @@ def test_native_candidates_agree_with_rdflib(spelling_store, sparql_expr):
     each code vortex-rdf decides gets rdflib's answer; the codes it leaves
     undecided go to the Python routes."""
     expr = filter_expr(sparql_expr)
-    shape = filters.native_shape(expr, V, {})
+    shape = filters.native.native_shape(expr, V, {})
     assert shape is not None
     codes = _all_codes(spelling_store)
-    passed, undecided = candidates.evaluate(spelling_store, shape, codes)
+    passed, undecided = native.evaluate(spelling_store, shape, codes)
     undecided = set(undecided)
     assert passed <= codes and undecided <= codes and not passed & undecided
     decided = 0
@@ -277,43 +280,20 @@ def test_wide_integers_are_left_undecided(spelling_store):
     }
     for kind in ("num_lt", "num_gt", "num_eq"):
         shape = NativeShape(kind, f'"1e+100"^^<{XSD}double>')
-        passed, undecided = candidates.evaluate(spelling_store, shape, wide)
+        passed, undecided = native.evaluate(spelling_store, shape, wide)
         assert not passed and set(undecided) == wide
-
-
-class _Recording:
-    """A TermDict that records every filter_codes call as ``(kind, arg,
-    options, candidate codes)`` (or refuses every argument, with
-    ``refuse``)."""
-
-    def __init__(self, inner, refuse: bool = False):
-        self._inner = inner
-        self.refuse = refuse
-        self.calls: list[tuple] = []
-
-    @property
-    def sent(self) -> list[list[int]]:
-        """The candidate codes of each call."""
-        return [codes for _, _, _, codes in self.calls]
-
-    def filter_codes(self, kind, arg, codes, **options):
-        self.calls.append((kind, arg, options, memoryview(codes).cast("Q").tolist()))
-        if self.refuse:
-            raise ValueError(f"refused: {kind} {arg}")
-        return self._inner.filter_codes(kind, arg, codes, **options)
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
 
 
 def test_a_refused_argument_leaves_every_candidate_to_the_python_routes(
     spelling_store, monkeypatch
 ):
     codes = _all_codes(spelling_store)
-    lo, hi = spelling_store._kind_ranges()[filters.LITERAL]
-    monkeypatch.setattr(spelling_store, "_dict", _Recording(spelling_store._dict, refuse=True))
+    lo, hi = spelling_store._kind_ranges()[LITERAL]
+    monkeypatch.setattr(
+        spelling_store, "_dict", RecordingTermDict(spelling_store._dict, refuse=True)
+    )
     shape = NativeShape("num_lt", f'"1e400"^^<{XSD}double>')
-    passed, undecided = candidates.evaluate(spelling_store, shape, codes)
+    passed, undecided = native.evaluate(spelling_store, shape, codes)
     assert not passed
     assert set(undecided) == {code for code in codes if lo <= code < hi}
 
@@ -324,14 +304,14 @@ def test_only_the_codes_a_predicate_reads_are_sent(spelling_store, monkeypatch):
     `!=` passes every IRI and blank node, `<` fails them — and what is sent is
     sorted and unique, as filter_codes requires."""
     codes = _all_codes(spelling_store)
-    lo, hi = spelling_store._kind_ranges()[filters.LITERAL]
+    lo, hi = spelling_store._kind_ranges()[LITERAL]
     nonliterals = {code for code in codes if not lo <= code < hi}
     assert nonliterals
-    recording = _Recording(spelling_store._dict)
+    recording = RecordingTermDict(spelling_store._dict)
     monkeypatch.setattr(spelling_store, "_dict", recording)
     five = f'"5"^^<{XSD}integer>'
-    passed_ne, _ = candidates.evaluate(spelling_store, NativeShape("num_ne", five), codes)
-    passed_lt, _ = candidates.evaluate(spelling_store, NativeShape("num_lt", five), codes)
+    passed_ne, _ = native.evaluate(spelling_store, NativeShape("num_ne", five), codes)
+    passed_lt, _ = native.evaluate(spelling_store, NativeShape("num_lt", five), codes)
     assert nonliterals <= passed_ne
     assert not nonliterals & passed_lt
     assert len(recording.sent) == 2
@@ -345,12 +325,12 @@ def test_str_of_a_blank_node_is_left_to_the_python_routes(spelling_store, monkey
     sent, they come back undecided, while the IRIs are sent."""
     codes = _all_codes(spelling_store)
     ranges = spelling_store._kind_ranges()
-    blanks = {c for c in codes if ranges[filters.BLANK][0] <= c < ranges[filters.BLANK][1]}
-    iris = {c for c in codes if ranges[filters.IRI][0] <= c < ranges[filters.IRI][1]}
+    blanks = {c for c in codes if ranges[BLANK][0] <= c < ranges[BLANK][1]}
+    iris = {c for c in codes if ranges[IRI][0] <= c < ranges[IRI][1]}
     assert blanks and iris
-    recording = _Recording(spelling_store._dict)
+    recording = RecordingTermDict(spelling_store._dict)
     monkeypatch.setattr(spelling_store, "_dict", recording)
-    _, undecided = candidates.evaluate(spelling_store, NativeShape("str_prefix", "a"), codes)
+    _, undecided = native.evaluate(spelling_store, NativeShape("str_prefix", "a"), codes)
     assert blanks <= set(undecided)
     [sent] = recording.sent
     assert not set(sent) & blanks and iris <= set(sent)
@@ -362,17 +342,17 @@ def test_an_argument_vortex_rdf_cannot_take_leaves_every_candidate_undecided(spe
     read goes to the Python routes, for every string kind and for IRI
     equality."""
     codes = _all_codes(spelling_store)
-    lo, hi = spelling_store._kind_ranges()[filters.LITERAL]
+    lo, hi = spelling_store._kind_ranges()[LITERAL]
     literals = {code for code in codes if lo <= code < hi}
     for shape in (
         NativeShape("regex", "a|\ud800"),
         NativeShape("contains", '"\ud800"'),
         NativeShape("strstarts", '"\ud800"', as_str=True),
     ):
-        passed, undecided = candidates.evaluate(spelling_store, shape, codes)
+        passed, undecided = native.evaluate(spelling_store, shape, codes)
         assert not passed and literals <= set(undecided), shape
     shape = NativeShape("iri_in", ("<http://ex.org/\ud800>",))
-    passed, undecided = candidates.evaluate(spelling_store, shape, codes)
+    passed, undecided = native.evaluate(spelling_store, shape, codes)
     assert not passed and set(undecided) == codes
 
 
@@ -410,8 +390,8 @@ def test_a_code_that_is_no_term_is_left_undecided_under_every_shape(spelling_sto
     assert dictionary.decode(0) == ""
     not_terms = {0, len(dictionary), len(dictionary) + 7, -1}
     codes = _all_codes(spelling_store)
-    passed, undecided = candidates.evaluate(spelling_store, shape, codes)
-    passed_with, undecided_with = candidates.evaluate(spelling_store, shape, codes | not_terms)
+    passed, undecided = native.evaluate(spelling_store, shape, codes)
+    passed_with, undecided_with = native.evaluate(spelling_store, shape, codes | not_terms)
     assert passed_with == passed
     assert sorted(undecided_with) == sorted([*undecided, *not_terms])
 
@@ -422,11 +402,11 @@ def test_ctx_bound_constant_side_is_evaluated_by_rdflib():
     from rdflib import Literal
 
     expr = filter_expr("?v < ?w + 10")
-    shape = filters.native_shape(expr, V, {Variable("w"): Literal(5)})
+    shape = filters.native.native_shape(expr, V, {Variable("w"): Literal(5)})
     assert shape == NativeShape("num_lt", f'"15"^^<{XSD}integer>')
     # an error on the constant side is no constant
-    assert filters.native_shape(expr, V, {Variable("w"): Literal("x")}) is None
-    assert filters.native_shape(expr, V, {}) is None
+    assert filters.native.native_shape(expr, V, {Variable("w"): Literal("x")}) is None
+    assert filters.native.native_shape(expr, V, {}) is None
 
 
 QUERY_CONJUNCTS = [m[0] for m in MAPPED] + [
@@ -459,20 +439,8 @@ def test_pushed_filter_query_equals_default_evaluator(spelling_store, in_memory,
         f"SELECT ?s ?v WHERE {{ ?s <http://ex.org/p> ?v FILTER({sparql_expr}) }}"
     )
     register_sparql_pushdown()
-    with_pushdown, without_pushdown = both_ways(graph, query, runner=_outcome)
+    with_pushdown, without_pushdown = both_ways(graph, query, runner=outcome)
     assert with_pushdown == without_pushdown
-
-
-def _outcome(graph, sparql):
-    """The answer, or the exception rdflib raises — a NaN double against a
-    decimal raises `decimal.InvalidOperation` in rdflib's own comparator,
-    and the pushdown, which leaves that value to rdflib, raises it too."""
-    from test_pushdown import run
-
-    try:
-        return run(graph, sparql)
-    except Exception as error:  # noqa: BLE001 - the exception is the answer
-        return type(error)
 
 
 def test_a_mid_size_code_set_goes_to_the_native_layer_whole(tmp_path, monkeypatch, capsys):
@@ -502,9 +470,9 @@ def test_a_mid_size_code_set_goes_to_the_native_layer_whole(tmp_path, monkeypatc
     assert with_pushdown == without_pushdown
     assert len(with_pushdown) == 100
     trace = [
-        json.loads(line[len(pd._TRACE_PREFIX) :])
+        json.loads(line[len(pd.tracing._TRACE_PREFIX) :])
         for line in capsys.readouterr().err.splitlines()
-        if line.startswith(pd._TRACE_PREFIX)
+        if line.startswith(pd.tracing._TRACE_PREFIX)
     ]
     match = next(
         e for e in trace if e["event"] == "native_call_complete" and e["operation"] == "match_codes"

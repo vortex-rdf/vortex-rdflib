@@ -1,22 +1,11 @@
-import json
-
 import pytest
 from rdflib import Graph, URIRef
+from tests.support import both_ways, counting_native, trace_events
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_pushdown import _counting_native, both_ways
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
-
-PREFIX = "VORTEX_RDF_QUERY_TRACE "
-
-
-def events(captured):
-    return [
-        json.loads(line.removeprefix(PREFIX))
-        for line in captured.err.splitlines()
-        if line.startswith(PREFIX)
-    ]
+from vortex_rdflib.settings import SETTINGS
 
 
 def graph_from(tmp_path, name, ntriples, in_memory=True):
@@ -64,7 +53,7 @@ def test_connected_patterns_are_probed_without_complete_matches(tmp_path, monkey
         ?s <http://ex/tag> ?tag
     }""")
     )
-    payloads = events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert rows == [(URIRef("http://ex/s0"), rows[0][1], URIRef("http://ex/t0"))]
     done = next(e for e in payloads if e["event"] == "bgp_complete")
     assert done["native_initial_match_count"] == 1
@@ -128,7 +117,7 @@ def test_seed_is_the_smallest_count_not_the_most_selective_shape(tmp_path, monke
         ?s ?p <http://ex/target>
     }""")
     )
-    payloads = events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert rows == [(URIRef("http://ex/s0"), URIRef("http://ex/rare"), URIRef("http://ex/o0"))]
     assert matched_rows == [1, 1], "the 300-row scan was matched whole"
     plan = next(e for e in payloads if e["event"] == "bgp_plan_complete")
@@ -165,7 +154,7 @@ def test_pattern_selecting_nothing_ends_the_block_before_any_match(
         ?s <http://ex/anchor> "no"
     }""")
     )
-    payloads = events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert rows == []
     assert matches == []
     plan = next(e for e in payloads if e["event"] == "bgp_plan_complete")
@@ -191,8 +180,8 @@ def test_bound_variable_is_not_restricted_again(tmp_path, monkeypatch, fanout):
     or hash-joined — inherits the codes and does not evaluate it over its
     own column."""
     graph = graph_of(tmp_path)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
-    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
+    monkeypatch.setattr(SETTINGS, "native_filters", False)
     seen = []
     original = filters.evaluate_column
 
@@ -225,7 +214,7 @@ def test_disconnected_pattern_uses_complete_match(tmp_path, monkeypatch, capsys)
         ?x <http://ex/name> ?name
     }""")
     )
-    payloads = events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert len(rows) == 4
     step = next(e for e in payloads if e["event"] == "bgp_join_step_complete")
     assert step["strategy"] in {"hash_columns", "hash_rows"}
@@ -240,7 +229,7 @@ def test_native_filter_narrows_every_pattern_it_reaches(tmp_path, monkeypatch, c
     the native match of every pattern binding its variable, counted and
     matched (or probed) narrowed: nothing is evaluated in Python."""
     graph = graph_of(tmp_path)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
     seen = []
     original = filters.evaluate_column
 
@@ -258,7 +247,7 @@ def test_native_filter_narrows_every_pattern_it_reaches(tmp_path, monkeypatch, c
         FILTER(isIRI(?s))
     }""")
     )
-    payloads = events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert len(rows) == 1
     assert rows[0][0] == URIRef("http://ex/s0")
     assert seen == []
@@ -269,7 +258,7 @@ def test_native_filter_narrows_every_pattern_it_reaches(tmp_path, monkeypatch, c
 
 def indexed_graph_of(tmp_path, anchors=1, size=300, in_memory=True):
     """``graph_of``'s data behind a secondary-by-copy index, where every
-    pattern with a bound predicate is a point pattern (`_cheap_probe`); the
+    pattern with a bound predicate is a point pattern (`VortexRdflibStore._point_lookup`); the
     anchor rows are subjects s0 to s{anchors - 1}."""
     source = tmp_path / "indexed.nt"
     source.write_text(
@@ -287,18 +276,18 @@ def indexed_graph_of(tmp_path, anchors=1, size=300, in_memory=True):
 def test_patterns_next_to_a_small_count_are_not_counted_when_planned(
     tmp_path, monkeypatch, capsys, in_memory
 ):
-    """The anchor counts 1 row, at most _PROBE_FANOUT: name and tag share ?s
+    """The anchor counts 1 row, at most SETTINGS.probe_fanout: name and tag share ?s
     with it, so planning leaves them uncounted. At its join step each is
     counted only as far as the decision needs — capped at 1 x 100 + 1 rows —
     and the capped answer says probe."""
     graph = indexed_graph_of(tmp_path, in_memory=in_memory)
-    counting = _counting_native(graph)
+    counting = counting_native(graph)
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     query = """SELECT ?s ?name ?tag WHERE {
         ?s <http://ex/anchor> "yes" . ?s <http://ex/name> ?name . ?s <http://ex/tag> ?tag }"""
     rows = list(graph.query(query))
-    payloads = events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert len(rows) == 1
     assert [(args[1], limit) for args, limit in counting.count_calls] == [
         ("<http://ex/anchor>", None),
@@ -323,14 +312,14 @@ def test_a_decision_count_under_its_cap_matches_and_hash_joins(tmp_path, monkeyp
     its 300 rows come back exact, under the cap, and are matched and
     hash-joined."""
     graph = indexed_graph_of(tmp_path, anchors=50)
-    counting = _counting_native(graph)
+    counting = counting_native(graph)
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     rows = list(
         graph.query("""SELECT ?s ?name WHERE {
         ?s <http://ex/anchor> "yes" . ?s <http://ex/name> ?name }""")
     )
-    payloads = events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert len(rows) == 50
     assert [(args[1], limit) for args, limit in counting.count_calls] == [
         ("<http://ex/anchor>", None),
@@ -347,7 +336,7 @@ def test_a_scan_next_to_a_small_point_pattern_is_not_counted_when_planned(tmp_pa
     batch: it is counted at its step, capped at 1 x 100 + 1 rows, and the
     other scan is counted on its own, not as a batch of one."""
     graph = graph_of(tmp_path, in_memory=False)
-    counting = _counting_native(graph)
+    counting = counting_native(graph)
     register_sparql_pushdown()
     query = """SELECT ?x ?n ?t WHERE {
         <http://ex/s5> <http://ex/name> ?n . ?x <http://ex/name> ?n . ?x <http://ex/tag> ?t }"""
@@ -365,7 +354,7 @@ def test_a_scan_next_to_a_small_point_pattern_is_not_counted_when_planned(tmp_pa
 
 def test_a_zero_point_count_still_ends_the_block_first(tmp_path):
     graph = indexed_graph_of(tmp_path)
-    counting = _counting_native(graph)
+    counting = counting_native(graph)
     register_sparql_pushdown()
     rows = list(
         graph.query("""SELECT ?s ?name WHERE {
@@ -393,9 +382,9 @@ def test_a_capped_count_is_not_remembered_as_exact(tmp_path):
     """A capped answer is a lower bound: it is never shared with a pattern
     that needs the count itself."""
     graph = indexed_graph_of(tmp_path)
-    pat = {"n3": [None, "<http://ex/name>", None, None], "varpos": {}, "unsatisfiable": False}
+    pat = pd.matching.Pattern([None, "<http://ex/name>", None, None], {})
     counts: dict = {}
-    assert pd._count_pattern(graph.store, pat, counts, limit=11) == 11
+    assert pd.matching._count_pattern(graph.store, pat, counts, limit=11) == 11
     assert counts == {}
-    assert pd._count_pattern(graph.store, pat, counts) == 300
-    assert pd._count_pattern(graph.store, pat, counts, limit=11) == 300
+    assert pd.matching._count_pattern(graph.store, pat, counts) == 300
+    assert pd.matching._count_pattern(graph.store, pat, counts, limit=11) == 300

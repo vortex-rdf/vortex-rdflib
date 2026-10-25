@@ -1,4 +1,3 @@
-import os
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -7,16 +6,11 @@ from rdflib.store import NO_STORE, VALID_STORE, Store
 from rdflib.term import BNode, IdentifiedNode, Node, URIRef
 from vortex_rdf import VortexRdfStore
 
-from . import query_scope
-from .pushdown import (
-    _CHUNK_MAX,
-    _CHUNK_START,
-    _cancel_kw,
-    _cancel_kw_for,
-    _check_cancelled,
-    register_sparql_pushdown,
-)
+from . import query_scope, settings
+from .cancel import cancel_kw, cancel_kw_for, check_cancelled
+from .pushdown import register_sparql_pushdown
 from .query_scope import QueryTerms
+from .settings import SETTINGS
 from .terms import (
     BLANK,
     IRI,
@@ -34,12 +28,6 @@ _UNRESOLVED = object()
 #: no ``GRAPH`` names is the empty string, and ``""`` is also how a pattern
 #: selects those rows — ``None`` being the wildcard over every graph.
 DEFAULT_GRAPH = ""
-
-#: The most rows :meth:`VortexRdflibStore.triples` reads as one match: a
-#: pattern that matches more is read through ``match_code_chunks`` in
-#: chunks of at most this many rows, so a scan of a large store holds one
-#: chunk of codes, not its whole match.
-_TRIPLES_CHUNK_ROWS = 65_536
 
 
 class _NoGraph(NotImplementedError):
@@ -119,9 +107,9 @@ class VortexRdflibStore(Store):
         # it reads; the OS page cache holds the rest. in_memory loads the whole
         # store up front instead. Env override for benchmark sweeps.
         if in_memory is None:
-            in_memory = os.environ.get("VORTEX_RDF_IN_MEMORY") == "1"
+            in_memory = settings.in_memory_by_default()
         self.in_memory = in_memory
-        self._use_codes = os.environ.get("VORTEX_RDF_DISABLE_CODE_PATH") != "1"
+        self._use_codes = settings.code_path_enabled()
         self._native: VortexRdfStore | None = None
         self._dict = None
         # Everything a query learns about terms lives in its scope
@@ -200,6 +188,12 @@ class VortexRdflibStore(Store):
         assert self._native is not None  # open() either sets it or raises
         return self._native
 
+    def _point_lookup(self, n3) -> bool:
+        """Whether the native layer answers the quad pattern ``n3`` without a
+        scan: its subject is bound (a binary search in the subject-ordered
+        base), or a secondary index serves its bound predicate or object."""
+        return n3[0] is not None or bool(self._indexes) and (n3[1] is not None or n3[2] is not None)
+
     def _graph_n3(self, context) -> str | None:
         """The native graph spelling a context selects, ``None`` for the union.
 
@@ -245,7 +239,7 @@ class VortexRdflibStore(Store):
             raise _NoGraph
         spelling = canonical_spelling(identifier)
         if spelling not in self._contexts_by_spelling:
-            _check_cancelled()
+            check_cancelled()
             try:
                 self._store().count_quads(None, None, None, spelling, limit=0)
             except ValueError:
@@ -269,7 +263,7 @@ class VortexRdflibStore(Store):
         names_a_graph = known.get(spelling)
         if names_a_graph is None:
             pattern = (None, None, None, spelling)
-            cancel = _cancel_kw_for(_cancel_kw(), self, pattern)
+            cancel = cancel_kw_for(cancel_kw(), self, pattern)
             names_a_graph = known[spelling] = self._store().count_quads(*pattern, **cancel) > 0
         return spelling if names_a_graph else None
 
@@ -324,22 +318,22 @@ class VortexRdflibStore(Store):
         yielded once per graph; a context that names no graph the file can
         hold yields nothing. The store streams the quads it holds rather than
         building the RDF merge of the union, which would mean a set the size
-        of the result. A pattern of more than ``_TRIPLES_CHUNK_ROWS`` rows is
+        of the result. A pattern of more than ``SETTINGS.triples_chunk_rows`` rows is
         read from the native layer in chunks of at most that many rows
         (:meth:`_code_matches`), so a scan of a large store holds one chunk of
         codes at a time. A match or chunk is decoded a slice at a time, the
         first of 64 rows, so a consumer that stops early decodes only the
         slices, and pulls only the chunks, it reached. The query's cancel
-        token (``pushdown.cancel_scope``) is read once, when the iteration
+        token (``cancel.cancel_scope``) is read once, when the iteration
         starts: a one-shot native match or count races it where the token
         can stop that call — a scan of a file-backed store — and checks it
-        before the call otherwise (``pushdown._cancel_kw_for``), every pull
+        before the call otherwise (``cancel.cancel_kw_for``), every pull
         of a chunk races it, and a read through the string fallback, which
         takes no token, checks it before the call.
         """
         if self.path is None:
             return
-        cancel = _cancel_kw()
+        cancel = cancel_kw()
 
         s, p, o = triple_pattern
 
@@ -367,7 +361,7 @@ class VortexRdflibStore(Store):
         # that matches nothing leaves no state behind.
         fixed = None
 
-        if os.environ.get("VORTEX_RDF_TRACE_TRIPLES") == "1":
+        if settings.trace_triples():
             print(
                 "[VortexRdflibStore.triples:start] "
                 f"layout={self.layout} "
@@ -380,7 +374,7 @@ class VortexRdflibStore(Store):
         pattern = (s_n3, p_n3, o_n3, g_n3)
         # The keyword of the one native call below, decided once for the
         # store's residency and the pattern's shape.
-        one_shot = _cancel_kw_for(cancel, self, pattern)
+        one_shot = cancel_kw_for(cancel, self, pattern)
 
         # Fully-ground pattern: no term needs materializing. In one graph it
         # is an existence check — counting from the row selection preserves
@@ -404,7 +398,7 @@ class VortexRdflibStore(Store):
                     for code in memoryview(cols[3]).cast("Q").tolist():
                         yield triple, self._context_of_code(code, term_dict, by_code, by_spelling)
                     return
-            _check_cancelled()
+            check_cancelled()
             *_, graphs = store.match_columns(s_n3, p_n3, o_n3, None)
             by_spelling = self._contexts_by_spelling
             for g_raw in graphs:
@@ -448,7 +442,7 @@ class VortexRdflibStore(Store):
                     # consumer that stops early (rdflib's LIMIT, ASK) decodes
                     # only the slices it reached.
                     views = [memoryview(column).cast("Q") for column in cols]
-                    start, size = 0, _CHUNK_START
+                    start, size = 0, SETTINGS.chunk_start
                     while start < rows:
                         stop = min(start + size, rows)
                         # A match or chunk that is one slice is read from the
@@ -481,7 +475,7 @@ class VortexRdflibStore(Store):
                         if shared is not None:
                             for row in zip(s_codes, p_codes, o_codes, strict=True):
                                 yield (cache[row[0]], cache[row[1]], cache[row[2]]), shared
-                        start, size = stop, min(size * 4, _CHUNK_MAX)
+                        start, size = stop, min(size * 4, SETTINGS.chunk_max)
                     # Let go of this chunk's columns before the next pull.
                     del cols, column, views, part
             finally:
@@ -496,7 +490,7 @@ class VortexRdflibStore(Store):
         # term, so memoizing the parse by string turns per-row term
         # construction into per-distinct-term construction. It takes no
         # cancel token, so the token is checked before it.
-        _check_cancelled()
+        check_cancelled()
         subjects, predicates, objects, graphs = store.match_columns(s_n3, p_n3, o_n3, g_n3)
         if g_n3 is not None and subjects:
             fixed = self._context_tuple(g_n3, by_spelling)
@@ -519,19 +513,19 @@ class VortexRdflibStore(Store):
     ) -> Iterable[tuple] | None:
         """The code columns :meth:`triples` reads for the quad pattern
         ``pattern``, as matches to read in turn: ``match_codes``'s one match of
-        a pattern of at most ``_TRIPLES_CHUNK_ROWS`` rows, or, for a pattern of
+        a pattern of at most ``SETTINGS.triples_chunk_rows`` rows, or, for a pattern of
         more, ``match_code_chunks``'s chunks of at most that many rows, of the
         columns ``s``, ``p``, ``o`` and, under the union, ``g``. ``None`` when
         the store has no term codes.
 
-        The match is asked for one row more than ``_TRIPLES_CHUNK_ROWS``: one
+        The match is asked for one row more than ``SETTINGS.triples_chunk_rows``: one
         that holds at most that many is the whole pattern, and a full one is
         dropped before the chunks are read. It races the query's token where
-        the token can stop it (``one_shot``, ``pushdown._cancel_kw_for``); the
+        the token can stop it (``one_shot``, ``cancel.cancel_kw_for``); the
         chunk call is given ``cancel`` as it is, since every pull of a chunk
         waits for the native layer, in memory as on file.
         """
-        chunk_rows = _TRIPLES_CHUNK_ROWS
+        chunk_rows = SETTINGS.triples_chunk_rows
         cols = store.match_codes(*pattern, limit=chunk_rows + 1, **one_shot)
         if cols is None:
             return None
@@ -570,7 +564,7 @@ class VortexRdflibStore(Store):
         store = self._store()
         if self._dict is not None:
             pattern = (s_n3, p_n3, o_n3, None)
-            cols = store.match_codes(*pattern, **_cancel_kw_for(_cancel_kw(), self, pattern))
+            cols = store.match_codes(*pattern, **cancel_kw_for(cancel_kw(), self, pattern))
             if cols is not None:
                 # Native distinct, in first-seen order.
                 codes = memoryview(cols[3].distinct()).cast("Q").tolist()
@@ -580,7 +574,7 @@ class VortexRdflibStore(Store):
                     self._context_of_code(code, term_dict, by_code, by_spelling)[0]
                     for code in codes
                 ]
-        _check_cancelled()
+        check_cancelled()
         *_spo, graphs = store.match_columns(s_n3, p_n3, o_n3, None)
         return [self._context_tuple(name)[0] for name in dict.fromkeys(graphs)]
 
@@ -697,7 +691,7 @@ class VortexRdflibStore(Store):
         if g_n3 is None:
             return len(self._store())
         pattern = (None, None, None, g_n3)
-        return self._store().count_quads(*pattern, **_cancel_kw_for(_cancel_kw(), self, pattern))
+        return self._store().count_quads(*pattern, **cancel_kw_for(cancel_kw(), self, pattern))
 
     def add(self, triple, context=None, quoted=False):
         raise NotImplementedError("VortexRdflibStore is read-only")

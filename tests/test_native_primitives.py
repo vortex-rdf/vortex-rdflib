@@ -3,119 +3,29 @@ used: what reaches the native layer, and that the answer is rdflib's. The
 equivalence matrix in ``test_pushdown`` covers the answers of every shape;
 these say *how* they are reached."""
 
-import json
-import weakref
-
 import pytest
 from rdflib import Graph, Literal, URIRef
+from tests.support import (
+    both_ways,
+    captured_trace,
+    native_call_events,
+    native_spy,
+    products_file,
+    run,
+)
 from vortex_rdf import serialize_rdf
 
-import vortex_rdflib.pushdown as pd
-from test_pushdown import both_ways, is_graph_name_check, run
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
+from vortex_rdflib.settings import SETTINGS
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
-
-
-def _store_file(tmp_path, lines, name="data", indexes=()) -> str:
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    source = tmp_path / f"{name}.nt"
-    source.write_text("".join(lines), encoding="utf-8")
-    out = tmp_path / f"{name}.vortex"
-    serialize_rdf(str(source), str(out), layout="dictionary", indexes=list(indexes))
-    return str(out)
-
-
-def _products(tmp_path, n=200, indexes=()) -> str:
-    """`n` products, each with an integer price, a label in English or
-    French, and a type; product 0 is the reference the band queries use."""
-    lines = []
-    for i in range(n):
-        s = f"<http://ex.org/p{i}>"
-        lines.append(f'{s} <http://ex.org/price> "{(i * 37) % 1000}"^^<{XSD}integer> .\n')
-        lines.append(f'{s} <http://ex.org/label> "product {i}"@{"en" if i % 2 else "fr"} .\n')
-        lines.append(f"{s} <http://ex.org/type> <http://ex.org/Product> .\n")
-    return _store_file(tmp_path, lines, "products", indexes)
-
-
-def _trace(capsys) -> list[dict]:
-    return [
-        json.loads(line[len(pd._TRACE_PREFIX) :])
-        for line in capsys.readouterr().err.splitlines()
-        if line.startswith(pd._TRACE_PREFIX)
-    ]
-
-
-def _native_calls(trace, operation) -> list[dict]:
-    return [
-        e for e in trace if e["event"] == "native_call_complete" and e["operation"] == operation
-    ]
-
-
-class _Chunks:
-    """A chunk iterator the spy handed out, counting in ``pulls[slot]`` the
-    chunks pulled from it."""
-
-    def __init__(self, inner, pulls: list[int]):
-        self._inner = inner
-        self._pulls = pulls
-        self._slot = len(pulls)
-        pulls.append(0)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        chunk = next(self._inner)
-        self._pulls[self._slot] += 1
-        return chunk
-
-
-class _Spy:
-    """The native store with every call recorded by name. The chunk
-    iterators ``match_code_chunks`` returns count their pulls (``pulls``)
-    and are watched by weak references (``feeds``), so a test sees whether
-    they were released."""
-
-    def __init__(self, inner):
-        self._inner = inner
-        self.calls: list[tuple[str, dict]] = []
-        self.args: list[tuple] = []
-        self.pulls: list[int] = []
-        self.feeds: list[weakref.ref] = []
-
-    def __getattr__(self, name):
-        attribute = getattr(self._inner, name)
-        if not callable(attribute):
-            return attribute
-
-        def call(*args, **kwargs):
-            if not (name == "count_quads" and is_graph_name_check(args)):
-                self.calls.append((name, kwargs))
-                self.args.append(args)
-            result = attribute(*args, **kwargs)
-            if name == "match_code_chunks" and result is not None:
-                result = _Chunks(result, self.pulls)
-                self.feeds.append(weakref.ref(result))
-            return result
-
-        return call
-
-    def names(self) -> list[str]:
-        return [name for name, _ in self.calls]
-
-
-def _spy(graph) -> _Spy:
-    spy = _Spy(graph.store._store())
-    graph.store._native = spy
-    return spy
 
 
 @pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
 def test_limit_stops_a_single_pattern_match(tmp_path, monkeypatch, capsys, in_memory):
     """A LIMIT over one pattern — with a FILTER the native match decides,
     too — fetches only the rows it reads; an OFFSET reads past them."""
-    graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=in_memory))
+    graph = Graph(store=VortexRdflibStore(products_file(tmp_path), in_memory=in_memory))
     register_sparql_pushdown()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     for query, limit in [
@@ -126,7 +36,7 @@ def test_limit_stops_a_single_pattern_match(tmp_path, monkeypatch, capsys, in_me
         capsys.readouterr()
         with_pushdown, without_pushdown = both_ways(graph, query)
         assert with_pushdown == without_pushdown
-        match = _native_calls(_trace(capsys), "match_codes")[0]
+        match = native_call_events(captured_trace(capsys), "match_codes")[0]
         assert match["limit"] == limit, query
         assert match["returned_rows"] == limit, query
 
@@ -137,8 +47,8 @@ def test_limit_is_not_pushed_where_rows_are_dropped_in_python(tmp_path, monkeypa
     match whole: the LIMIT applies to the rows as before."""
     register_sparql_pushdown()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
-    plain = Graph(store=VortexRdflibStore(_products(tmp_path)))
-    indexed_path = _products(tmp_path / "indexed", indexes=["secondary-by-copy"])
+    plain = Graph(store=VortexRdflibStore(products_file(tmp_path)))
+    indexed_path = products_file(tmp_path / "indexed", indexes=["secondary-by-copy"])
     indexed = Graph(store=VortexRdflibStore(indexed_path))
     for graph, query in [
         (plain, 'SELECT ?s WHERE { ?s ?p ?o FILTER(regex(str(?o), "1")) } LIMIT 3'),
@@ -148,7 +58,9 @@ def test_limit_is_not_pushed_where_rows_are_dropped_in_python(tmp_path, monkeypa
         capsys.readouterr()
         with_pushdown, without_pushdown = both_ways(graph, query)
         assert with_pushdown == without_pushdown
-        assert all(m["limit"] is None for m in _native_calls(_trace(capsys), "match_codes"))
+        assert all(
+            m["limit"] is None for m in native_call_events(captured_trace(capsys), "match_codes")
+        )
 
 
 @pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
@@ -156,9 +68,9 @@ def test_ask_and_count_over_a_native_filter_only_count(tmp_path, in_memory):
     """ASK and COUNT(*) over one pattern whose FILTER the native layer
     decides are counts of the keep-narrowed match — capped at one row for
     the ASK — and no row is ever matched."""
-    graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=in_memory))
+    graph = Graph(store=VortexRdflibStore(products_file(tmp_path), in_memory=in_memory))
     register_sparql_pushdown()
-    spy = _spy(graph)
+    spy = native_spy(graph)
     count = "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o FILTER(isLiteral(?o)) }"
     assert run(graph, count) == [(Literal(400),)]
     assert run(graph, "ASK { ?s ?p ?o FILTER(isIRI(?o)) }") is True
@@ -173,10 +85,10 @@ def test_values_constants_are_encoded_in_one_batch(tmp_path):
     """A VALUES table's constants are looked up in one `encode_many` —
     spelling-tolerant, so no count is spent guarding the lookup — and a
     constant the store lacks joins nothing but is still yielded."""
-    store = VortexRdflibStore(_products(tmp_path))
+    store = VortexRdflibStore(products_file(tmp_path))
     graph = Graph(store=store)
     register_sparql_pushdown()
-    spy = _spy(graph)
+    spy = native_spy(graph)
     encodes = []
     dictionary = store._dict
     assert dictionary is not None
@@ -212,10 +124,10 @@ def test_probes_that_scan_are_batched(tmp_path, monkeypatch):
     a step of a BGP matches its pattern once instead, narrowed to the codes
     its relation binds (a keep-scan). Probes on a bound subject are point
     lookups, which plain calls answer faster than a batch can be scheduled."""
-    graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=True))
+    graph = Graph(store=VortexRdflibStore(products_file(tmp_path), in_memory=True))
     register_sparql_pushdown()
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    spy = _spy(graph)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
+    spy = native_spy(graph)
     values = """SELECT ?s ?o WHERE {
         VALUES ?o { "product 1"@en "product 3"@en "product 4"@fr }
         ?s <http://ex.org/label> ?o }"""
@@ -272,6 +184,6 @@ def test_graph_variable_keeps_the_named_graphs_inside_the_match(tmp_path, monkey
         (URIRef("http://ex.org/g1"), Literal(1)),
         (URIRef("http://ex.org/g2"), Literal(1)),
     ]
-    match = _native_calls(_trace(capsys), "match_codes")[0]
+    match = native_call_events(captured_trace(capsys), "match_codes")[0]
     assert store._dict is not None
     assert match["keep"] == {"3": {"range": [1, len(store._dict)]}}

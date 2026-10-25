@@ -9,7 +9,7 @@ process does not grow with the number of queries it answers.
 
 The scope is a :class:`~contextvars.ContextVar`. The pushdown hook opens one
 at the top of every query — the query node rdflib offers it first, see
-``pushdown._eval_scoped`` — and makes it current around every step of a lazy
+``pushdown.hook._eval_scoped`` — and makes it current around every step of a lazy
 result, so it covers the iteration too; it is cleared once the last solution
 is produced or the result is closed. A call outside any query (rdflib's
 ``Store.triples()`` API, ``len()``) gets fresh state for that call alone.
@@ -26,7 +26,7 @@ class QueryTerms:
     """One query's term state over one store.
 
     ``decode`` maps codes to the rdflib terms they decode to; ``alias_*`` are
-    the literal codes classified for term aliasing (``pushdown._alias_codes``):
+    the literal codes classified for term aliasing (``pushdown.aliasing._alias_codes``):
     every code looked at, the code representing each typed term built, and
     the codes whose term another code represents; ``foreign`` and
     ``foreign_codes`` map the negative codes of query constants the
@@ -56,7 +56,7 @@ class QueryTerms:
 
 class QueryScope:
     """The term state of one query, per store it reads (one, in practice),
-    and the query's cancel token (``pushdown.cancel_scope``), ``None`` for a
+    and the query's cancel token (``cancel.cancel_scope``), ``None`` for a
     query started outside a block."""
 
     __slots__ = ("_by_store", "cancel", "__weakref__")

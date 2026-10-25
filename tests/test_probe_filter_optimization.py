@@ -1,21 +1,9 @@
-import json
-
 from rdflib import Graph, URIRef
+from tests.support import filter_spy, trace_events
 from vortex_rdf import serialize_rdf
 
-import vortex_rdflib.pushdown as pd
-from test_candidate_filters import _spy_filters
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
-
-PREFIX = "VORTEX_RDF_QUERY_TRACE "
-
-
-def _events(captured):
-    return [
-        json.loads(line.removeprefix(PREFIX))
-        for line in captured.err.splitlines()
-        if line.startswith(PREFIX)
-    ]
+from vortex_rdflib.settings import SETTINGS
 
 
 def _graph(tmp_path):
@@ -49,12 +37,12 @@ def test_probe_filter_evaluates_only_reached_codes(tmp_path, capsys, monkeypatch
 
     monkeypatch.setattr(filters, "evaluate_column", spy)
     # The Python route: langMatches would otherwise be a native keep.
-    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
+    monkeypatch.setattr(SETTINGS, "native_filters", False)
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY_ID", "probe-filter")
     register_sparql_pushdown()
     rows = list(graph.query(query))
-    payloads = _events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
 
     assert rows == [(URIRef("http://ex/s0"), rows[0][1])]
     assert len(seen) == 1
@@ -85,7 +73,7 @@ def test_probe_filter_generic_fallback_is_once_per_reached_code(tmp_path, monkey
         return original(self, bound)
 
     monkeypatch.setattr(filters.Conjunct, "generic", generic)
-    monkeypatch.setattr(filters, "_FAST_ENABLED", False)
+    monkeypatch.setattr(SETTINGS, "fast_filters", False)
     register_sparql_pushdown()
     rows = list(
         graph.query(
@@ -114,7 +102,7 @@ def test_lazy_join_probe_evaluates_only_reached_codes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(filters, "evaluate_column", spy)
     # The Python route: langMatches would otherwise be a native keep.
-    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
+    monkeypatch.setattr(SETTINGS, "native_filters", False)
     register_sparql_pushdown()
     rows = list(
         graph.query(
@@ -132,7 +120,7 @@ def test_lazy_join_probe_evaluates_only_reached_codes(tmp_path, monkeypatch):
 
 def test_non_probe_filter_keeps_eager_route(tmp_path, monkeypatch):
     graph = _graph(tmp_path)
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 10**9)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 10**9)
     seen = []
     original = filters.evaluate_column
 
@@ -142,7 +130,7 @@ def test_non_probe_filter_keeps_eager_route(tmp_path, monkeypatch):
 
     monkeypatch.setattr(filters, "evaluate_column", spy)
     # The Python route: langMatches would otherwise be a native keep.
-    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
+    monkeypatch.setattr(SETTINGS, "native_filters", False)
     register_sparql_pushdown()
     rows = list(
         graph.query(
@@ -163,7 +151,7 @@ def test_native_probe_filter_evaluates_only_the_reached_code(tmp_path, capsys, m
     vortex-rdf over the one name the probe reached: no value goes to the
     Python routes."""
     graph = _graph(tmp_path)
-    recording = _spy_filters(graph)
+    recording = filter_spy(graph)
     decoded = []
     original_decode = filters.decode_views
     monkeypatch.setattr(
@@ -183,7 +171,7 @@ def test_native_probe_filter_evaluates_only_the_reached_code(tmp_path, capsys, m
         FILTER(langMatches(lang(?name), "EN"))
     }""")
     )
-    payloads = _events(capsys.readouterr())
+    payloads = trace_events(capsys.readouterr().err)
     assert rows == [(URIRef("http://ex/s0"), rows[0][1])]
     assert [(kind, len(codes)) for kind, _, _, codes in recording.calls] == [("lang_matches", 1)]
     assert decoded == [] and generic == []

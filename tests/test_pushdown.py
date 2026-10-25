@@ -4,14 +4,32 @@ file-backed and on an in-memory store."""
 
 import contextlib
 import io
-import json
 import sys
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
 from rdflib import Dataset, Graph, Literal, URIRef, Variable
 from rdflib.plugins.sparql.sparql import QueryContext
+from tests.corpus import (
+    FIXTURE_NQ,
+    FIXTURE_NT,
+    GRAPH_QUERIES,
+    ORDER_QUERIES,
+    PROBE_MULTIPLICITY,
+    PROBE_QUADS,
+    QUERIES,
+)
+from tests.support import (
+    both_ways,
+    counting_native,
+    counting_term_dict,
+    row_key,
+    run,
+    run_ordered,
+    trace_events,
+)
 from vortex_rdf import Cancelled, CancelToken, VortexRdfStore, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
@@ -19,705 +37,10 @@ from vortex_rdflib import (
     VortexRdflibStore,
     filters,
     register_sparql_pushdown,
+    settings,
     unregister_sparql_pushdown,
 )
-
-FIXTURE_NT = """\
-<http://ex.org/alice> <http://ex.org/name> "Alice" .
-<http://ex.org/alice> <http://ex.org/knows> <http://ex.org/bob> .
-<http://ex.org/alice> <http://ex.org/knows> <http://ex.org/carol> .
-<http://ex.org/bob> <http://ex.org/name> "Bob"@en .
-<http://ex.org/bob> <http://ex.org/knows> <http://ex.org/carol> .
-<http://ex.org/bob> <http://ex.org/age> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
-<http://ex.org/carol> <http://ex.org/name> "Carol" .
-<http://ex.org/carol> <http://ex.org/likes> <http://ex.org/carol> .
-_:b0 <http://ex.org/name> "Anon" .
-_:b0 <http://ex.org/knows> <http://ex.org/alice> .
-<http://ex.org/dave> <http://ex.org/age> "042"^^<http://www.w3.org/2001/XMLSchema#integer> .
-<http://ex.org/dave> <http://ex.org/name> "Bob"@en-US .
-<http://ex.org/dave> <http://ex.org/flag> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
-<http://ex.org/dave> <http://ex.org/knows> <http://ex.org/bob> .
-<http://ex.org/erin> <http://ex.org/age> "abc"^^<http://www.w3.org/2001/XMLSchema#integer> .
-<http://ex.org/erin> <http://ex.org/score> "1.5"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex.org/erin> <http://ex.org/code> "x"^^<http://ex.org/dt> .
-<http://ex.org/erin> <http://ex.org/name> "q\\"uote" .
-<http://ex.org/frank> <http://ex.org/age> "-3"^^<http://www.w3.org/2001/XMLSchema#integer> .
-<http://ex.org/frank> <http://ex.org/score> "1e2"^^<http://www.w3.org/2001/XMLSchema#double> .
-<http://ex.org/frank> <http://ex.org/name> "" .
-<http://ex.org/frank> <http://ex.org/flag> "false"^^<http://www.w3.org/2001/XMLSchema#boolean> .
-<http://ex.org/gina> <http://ex.org/age> "7"^^<http://www.w3.org/2001/XMLSchema#byte> .
-<http://ex.org/gina> <http://ex.org/score> "NaN"^^<http://www.w3.org/2001/XMLSchema#double> .
-<http://ex.org/gina> <http://ex.org/name> "Bob"@EN .
-<http://ex.org/hank> <http://ex.org/knows> <http://ex.org/alice> .
-<http://ex.org/hank> <http://ex.org/note> "tab\\there" .
-<http://ex.org/hank> <http://ex.org/note> "line\\nbreak" .
-<http://ex.org/hank> <http://ex.org/note> "back\\\\slash" .
-<http://ex.org/hank> <http://ex.org/note> "\\u0001control" .
-<http://ex.org/hank> <http://ex.org/note> "\u00fcn\u00efc\u00f6d\u00e9" .
-<http://ex.org/hank> <http://ex.org/note> "x"@EN-us .
-<http://ex.org/hank> <http://ex.org/knows> <http://ex.org/carol> .
-<http://ex.org/carol> <http://ex.org/knows> <http://ex.org/dave> .
-<http://ex.org/dave> <http://ex.org/knows> <http://ex.org/hank> .
-<http://ex.org/ivan> <http://ex.org/rating> "10"^^<http://www.w3.org/2001/XMLSchema#integer> .
-<http://ex.org/ivan> <http://ex.org/weight> "3"^^<http://www.w3.org/2001/XMLSchema#byte> .
-<http://ex.org/jane> <http://ex.org/rating> "150"^^<http://www.w3.org/2001/XMLSchema#integer> .
-<http://ex.org/jane> <http://ex.org/weight> "-4"^^<http://www.w3.org/2001/XMLSchema#integer> .
-<http://ex.org/kim> <http://ex.org/rating> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
-<http://ex.org/kim> <http://ex.org/weight> "1.5"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-""" + (
-    "<http://ex.org/dave> <http://ex.org/born> "
-    '"2020-01-01T00:00:00"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n'
-)
-
-#: Graph names the quad fixture spreads the same statements over; the empty
-#: one is the default graph, which `GRAPH ?g` must never bind. `_:g4` is a
-#: blank-node graph name — legal in N-Quads, and the case a bare `Graph`'s own
-#: blank-node label has to be told apart from.
-FIXTURE_GRAPHS = (
-    "",
-    "<http://ex.org/g/1>",
-    "<http://ex.org/g/2>",
-    "<http://ex.org/g/3>",
-    "_:g4",
-)
-
-
-def _as_quads(ntriples: str) -> str:
-    """The triple fixture as N-Quads: every statement round-robin into one of
-    ``FIXTURE_GRAPHS``, then the first few repeated into the last graph — so
-    the union view holds some triples more than once, joins have to span
-    graphs, and each graph is a proper subset of the whole."""
-
-    def quad(line: str, graph: str) -> str:
-        statement = line.rstrip().removesuffix(".").rstrip()
-        return f"{statement} {graph} ." if graph else f"{statement} ."
-
-    lines = [line for line in ntriples.splitlines() if line]
-    quads = [quad(line, FIXTURE_GRAPHS[i % len(FIXTURE_GRAPHS)]) for i, line in enumerate(lines)]
-    quads += [quad(line, FIXTURE_GRAPHS[-1]) for line in lines[:4]]
-    return "\n".join(quads) + "\n"
-
-
-FIXTURE_NQ = _as_quads(FIXTURE_NT)
-
-QUERIES = [
-    # single patterns
-    "SELECT ?s ?o WHERE { ?s <http://ex.org/name> ?o }",
-    "SELECT ?p ?o WHERE { <http://ex.org/bob> ?p ?o }",
-    "SELECT * WHERE { ?s ?p ?o }",
-    # chain join (object of one TP is subject of the next)
-    """SELECT ?n WHERE {
-        <http://ex.org/alice> <http://ex.org/knows> ?x .
-        ?x <http://ex.org/name> ?n }""",
-    # star join
-    """SELECT ?x ?n ?a WHERE {
-        ?x <http://ex.org/name> ?n .
-        ?x <http://ex.org/age> ?a }""",
-    # three-pattern chain
-    """SELECT ?a ?c WHERE {
-        ?a <http://ex.org/knows> ?b .
-        ?b <http://ex.org/knows> ?c .
-        ?c <http://ex.org/name> ?n }""",
-    # repeated variable inside one pattern (s == o)
-    "SELECT ?x WHERE { ?x <http://ex.org/likes> ?x }",
-    # ground pattern acting as a filter alongside a variable pattern
-    """SELECT ?n WHERE {
-        <http://ex.org/bob> <http://ex.org/knows> <http://ex.org/carol> .
-        <http://ex.org/carol> <http://ex.org/name> ?n }""",
-    # ground pattern that does NOT match: must kill all solutions
-    """SELECT ?n WHERE {
-        <http://ex.org/carol> <http://ex.org/knows> <http://ex.org/bob> .
-        ?s <http://ex.org/name> ?n }""",
-    # cross product (no shared variables)
-    """SELECT ?a ?b WHERE {
-        <http://ex.org/alice> <http://ex.org/name> ?a .
-        <http://ex.org/bob> <http://ex.org/name> ?b }""",
-    # bnode in the query pattern (acts as a variable)
-    "SELECT ?n WHERE { [] <http://ex.org/name> ?n }",
-    # OPTIONAL: inner BGP evaluated under outer bindings
-    """SELECT ?x ?a WHERE {
-        ?x <http://ex.org/name> ?n .
-        OPTIONAL { ?x <http://ex.org/age> ?a } }""",
-    # UNION
-    """SELECT ?o WHERE {
-        { <http://ex.org/alice> <http://ex.org/knows> ?o }
-        UNION { ?o <http://ex.org/likes> ?o } }""",
-    # FILTER over joined bindings
-    """SELECT ?x WHERE {
-        ?x <http://ex.org/name> ?n .
-        FILTER(lang(?n) = "en") }""",
-    # VALUES feeding bindings into the BGP
-    """SELECT ?n WHERE {
-        VALUES ?x { <http://ex.org/bob> <http://ex.org/carol> }
-        ?x <http://ex.org/name> ?n }""",
-    # literal join value propagating into subject position (unsatisfiable leg)
-    """SELECT ?n WHERE {
-        ?s <http://ex.org/name> ?n .
-        ?n <http://ex.org/name> ?m }""",
-    # zero-match pattern
-    "SELECT ?s WHERE { ?s <http://ex.org/nothing> ?o }",
-    # DISTINCT + ORDER BY on top of a join
-    """SELECT DISTINCT ?b WHERE {
-        ?a <http://ex.org/knows> ?b .
-        ?b <http://ex.org/name> ?n } ORDER BY ?b""",
-    # projection narrower than the pattern, and a projected variable the
-    # pattern never binds
-    "SELECT ?o WHERE { ?s <http://ex.org/name> ?o }",
-    "SELECT ?zzz WHERE { ?s <http://ex.org/name> ?o }",
-    # LIMIT / OFFSET over single patterns: both evaluation paths see the
-    # store's own row order, so the slices must agree exactly
-    "SELECT ?o WHERE { ?s <http://ex.org/name> ?o } LIMIT 2",
-    "SELECT * WHERE { ?s ?p ?o } LIMIT 3 OFFSET 2",
-    "SELECT ?s WHERE { ?s ?p ?o } OFFSET 8",
-    "SELECT ?s WHERE { ?s ?p ?o } LIMIT 0",
-    # ASK: ground, variable, no match, repeated variable, join, empty
-    """ASK { <http://ex.org/bob> <http://ex.org/age>
-        "42"^^<http://www.w3.org/2001/XMLSchema#integer> }""",
-    "ASK { ?s <http://ex.org/knows> ?o }",
-    "ASK { ?s <http://ex.org/nothing> ?o }",
-    "ASK { ?x <http://ex.org/likes> ?x }",
-    "ASK { ?a <http://ex.org/knows> ?b . ?b <http://ex.org/age> ?n }",
-    "ASK { ?a <http://ex.org/knows> ?b . ?b <http://ex.org/nothing> ?n }",
-    "ASK {}",
-    # --- FILTER: numeric comparisons (integer, decimal, double, NaN, ill-typed, byte)
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a < 10) }",
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a >= 42) }",
-    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(42 = ?a) }",
-    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(?a != 42) }",
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a > -5 && ?a < 50) }",
-    "SELECT ?x ?v WHERE { ?x <http://ex.org/score> ?v FILTER(?v > 1) }",
-    "SELECT ?x ?v WHERE { ?x <http://ex.org/score> ?v FILTER(?v < 100) }",
-    """PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-        SELECT ?x WHERE { ?x <http://ex.org/age> ?a
-        FILTER(datatype(?a) = xsd:integer && ?a < 100) }""",
-    """PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-        SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(datatype(?a) != xsd:integer) }""",
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a IN (42, 7)) }",
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a NOT IN (42)) }",
-    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(sameTerm(?a, 42)) }",
-    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(isNumeric(?a)) }",
-    "SELECT ?x WHERE { ?x <http://ex.org/score> ?v FILTER(?v + 1 > 2) }",
-    # --- FILTER: integer + and - (compiled), and an operand that defers.
-    # `rating` and `weight` are the only well-formed integer columns: `age`
-    # holds an ill-typed "abc", which rdflib's own arithmetic raises on.
-    "SELECT ?x ?r WHERE { ?x <http://ex.org/rating> ?r FILTER(?r - 8 > 0) }",
-    "SELECT ?x ?r WHERE { ?x <http://ex.org/rating> ?r FILTER(?r + 1 - 3 < 40) }",
-    "SELECT ?x ?w WHERE { ?x <http://ex.org/weight> ?w FILTER(?w + 1 > 0) }",
-    # BSBM Explore Q5's similarity band: two block variables in one
-    # arithmetic conjunct, so it is memoized per distinct code pair.
-    """SELECT ?x ?r WHERE {
-        <http://ex.org/kim> <http://ex.org/rating> ?ref .
-        ?x <http://ex.org/rating> ?r
-        FILTER(?r < ?ref + 100 && ?r > ?ref - 100) }""",
-    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(coalesce(?zzz, ?a) = 42) }",
-    'SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(str(?a) = "42") }',
-    'SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(?a = "42") }',
-    # --- FILTER: strings, language tags, regex
-    """SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n
-        FILTER(langMatches(lang(?n), "EN")) }""",
-    """SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n
-        FILTER(langMatches(lang(?n), "en-US")) }""",
-    'SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n FILTER(lang(?n) = "") }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(?n = "Bob"@en) }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(?n = "Carol") }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(str(?n) = "Bob") }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(strstarts(?n, "A")) }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(strstarts(?n, "B"@en)) }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(contains(?n, "o")) }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(strends(str(?n), "e")) }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(regex(?n, "^a", "i")) }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(regex(str(?n), "\\"")) }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(?n != "") }',
-    "SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(?n) }",
-    # --- FILTER: term kinds, IRIs, bound
-    "SELECT ?s ?o WHERE { ?s ?p ?o FILTER(isIRI(?o)) }",
-    "SELECT ?s ?o WHERE { ?s ?p ?o FILTER(isBlank(?s)) }",
-    "SELECT ?s ?o WHERE { ?s ?p ?o FILTER(isLiteral(?o) && !isBlank(?s)) }",
-    "SELECT ?s ?o WHERE { ?s ?p ?o FILTER(isIRI(?o) || isBlank(?o)) }",
-    "SELECT ?s WHERE { ?s ?p ?o FILTER(bound(?o)) }",
-    "SELECT ?s WHERE { ?s ?p ?o FILTER(!bound(?zzz)) }",
-    "SELECT ?s WHERE { ?s ?p ?o FILTER(bound(?zzz)) }",
-    "SELECT ?s WHERE { ?s ?p ?o FILTER(?o = <http://ex.org/carol>) }",
-    "SELECT ?s WHERE { ?s ?p ?o FILTER(?o != <http://ex.org/carol>) }",
-    'SELECT ?s WHERE { ?s ?p ?o FILTER(?o IN (<http://ex.org/carol>, "Carol")) }',
-    # --- FILTER: constants, several variables, joins, other datatypes
-    "SELECT ?s WHERE { ?s ?p ?o FILTER(1 = 2) }",
-    "SELECT ?s WHERE { ?s ?p ?o FILTER(1 < 2) }",
-    "SELECT ?s WHERE { ?s ?p ?o FILTER(?s != ?o) }",
-    "SELECT ?s ?o WHERE { ?s ?p ?o FILTER(sameTerm(?s, ?o)) }",
-    """SELECT ?a ?b WHERE { ?x <http://ex.org/age> ?a . ?y <http://ex.org/age> ?b
-        FILTER(?a < ?b) }""",
-    """SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n . ?x <http://ex.org/age> ?a
-        FILTER(?a > 10) }""",
-    """SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n . ?x <http://ex.org/age> ?a
-        FILTER(?a > 10 && lang(?n) = "en") }""",
-    """SELECT ?x WHERE { ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?n
-        FILTER(regex(?n, "^C")) }""",
-    'SELECT ?x WHERE { ?x <http://ex.org/code> ?c FILTER(?c = "x"^^<http://ex.org/dt>) }',
-    "SELECT ?x WHERE { ?x <http://ex.org/code> ?c FILTER(?c < 5) }",
-    "SELECT ?x WHERE { ?x <http://ex.org/flag> ?f FILTER(?f) }",
-    "SELECT ?x WHERE { ?x <http://ex.org/flag> ?f FILTER(?f = true) }",
-    """PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-        SELECT ?x WHERE { ?x <http://ex.org/born> ?d
-        FILTER(?d < "2021-01-01T00:00:00"^^xsd:dateTime) }""",
-    """PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-        SELECT ?x WHERE { ?x <http://ex.org/born> ?d
-        FILTER(?d = "2020-01-01T00:00:00"^^xsd:dateTime) }""",
-    # --- FILTER: EXISTS (generic route), OPTIONAL-bound var, two FILTERs, RAND (fallback)
-    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
-        FILTER NOT EXISTS { ?x <http://ex.org/age> ?a } }""",
-    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
-        FILTER EXISTS { ?x <http://ex.org/knows> <http://ex.org/carol> } }""",
-    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
-        OPTIONAL { ?x <http://ex.org/age> ?a } FILTER(!bound(?a)) }""",
-    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(?a > 0) FILTER(?a < 50) }",
-    "SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(rand() < 2) }",
-    # --- FILTER under VALUES: the filter sees a context-bound variable
-    """SELECT ?x ?a WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/dave> }
-        ?x <http://ex.org/age> ?a FILTER(?a > 10) }""",
-    """SELECT ?x ?a WHERE { VALUES ?x { <http://ex.org/bob> }
-        ?x <http://ex.org/age> ?a FILTER(?x = <http://ex.org/bob>) }""",
-    "ASK { ?x <http://ex.org/age> ?a FILTER(?a > 100) }",
-    "ASK { ?x <http://ex.org/age> ?a FILTER(?a > 10) }",
-    # --- DISTINCT (code-level, then term-level: "042" and "42" are one integer)
-    "SELECT DISTINCT ?p WHERE { ?s ?p ?o }",
-    "SELECT DISTINCT ?s ?o WHERE { ?s <http://ex.org/knows> ?o }",
-    "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a }",
-    "SELECT DISTINCT ?n WHERE { ?x <http://ex.org/name> ?n }",
-    "SELECT DISTINCT ?o WHERE { ?s ?p ?o } LIMIT 3",
-    "SELECT DISTINCT ?o WHERE { ?s ?p ?o } OFFSET 5 LIMIT 4",
-    """SELECT DISTINCT ?x WHERE {
-        ?x <http://ex.org/name> ?n . ?x <http://ex.org/age> ?a }""",
-    "SELECT DISTINCT ?x ?zzz WHERE { ?x <http://ex.org/name> ?n }",
-    "SELECT DISTINCT * WHERE { ?s ?p ?o }",
-    "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a > 0) }",
-    "SELECT REDUCED ?p WHERE { ?s ?p ?o }",
-    "SELECT DISTINCT ?p WHERE { ?s ?p ?o } ORDER BY ?p LIMIT 2",
-    # --- COUNT: no grouping (count_quads fast path), bound/unbound/distinct targets
-    "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }",
-    "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://ex.org/nothing> ?o }",
-    "SELECT (COUNT(?o) AS ?n) WHERE { ?s <http://ex.org/name> ?o }",
-    "SELECT (COUNT(?zzz) AS ?n) WHERE { ?s <http://ex.org/name> ?o }",
-    "SELECT (COUNT(DISTINCT ?a) AS ?n) WHERE { ?x <http://ex.org/age> ?a }",
-    "SELECT (COUNT(DISTINCT ?n) AS ?c) WHERE { ?x <http://ex.org/name> ?n }",
-    "SELECT (COUNT(DISTINCT *) AS ?n) WHERE { ?x <http://ex.org/name> ?n }",
-    "SELECT (COUNT(*) AS ?n) (COUNT(?o) AS ?m) WHERE { ?s ?p ?o }",
-    "SELECT (COUNT(*) AS ?n) WHERE { ?x <http://ex.org/likes> ?x }",
-    "SELECT (COUNT(*) AS ?n) WHERE { ?x <http://ex.org/age> ?a FILTER(?a > 0) }",
-    """SELECT (COUNT(*) AS ?n) WHERE {
-        ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?m }""",
-    # --- GROUP BY: columns, several keys, an absent key, HAVING, joins, empty input
-    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p",
-    "SELECT ?s (COUNT(?o) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?s",
-    "SELECT ?p ?s (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p ?s",
-    "SELECT ?a (COUNT(*) AS ?n) WHERE { ?x <http://ex.org/age> ?a } GROUP BY ?a",
-    "SELECT ?n (COUNT(*) AS ?c) WHERE { ?x <http://ex.org/name> ?n } GROUP BY ?n",
-    "SELECT ?zzz (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?zzz",
-    "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p",
-    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p HAVING (COUNT(*) > 3)",
-    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o FILTER(isIRI(?o)) } GROUP BY ?p",
-    """SELECT ?x (COUNT(*) AS ?n) WHERE {
-        ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?m } GROUP BY ?x""",
-    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p <http://ex.org/nothing> } GROUP BY ?p",
-    "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p",
-    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p ORDER BY ?p LIMIT 2",
-    # --- aggregates left to rdflib: SUM, a bare variable without GROUP BY, non-block inputs
-    "SELECT (SUM(?v) AS ?n) WHERE { ?x <http://ex.org/score> ?v }",
-    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o }",
-    """SELECT ?x (COUNT(*) AS ?n) WHERE {
-        VALUES ?x { <http://ex.org/bob> <http://ex.org/dave> }
-        ?x <http://ex.org/age> ?a } GROUP BY ?x""",
-    """SELECT (COUNT(?a) AS ?n) WHERE {
-        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }""",
-    # --- OPTIONAL: hash and probe paths, hoisted inner FILTER, nesting, chains, fan-out
-    """SELECT ?x ?n ?a WHERE {
-        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }""",
-    """SELECT ?x ?a WHERE {
-        ?x <http://ex.org/knows> ?y OPTIONAL { ?y <http://ex.org/age> ?a } }""",
-    """SELECT ?x ?n ?a WHERE {
-        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a FILTER(?a > 10) } }""",
-    """SELECT ?x ?n ?a WHERE {
-        ?x <http://ex.org/name> ?n
-        OPTIONAL { ?x <http://ex.org/age> ?a FILTER(?a > 10 && lang(?n) = "en") } }""",
-    """SELECT ?x ?n ?a WHERE {
-        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a FILTER(1 = 2) } }""",
-    """SELECT ?x ?y ?z WHERE {
-        ?x <http://ex.org/knows> ?y
-        OPTIONAL { ?y <http://ex.org/knows> ?z OPTIONAL { ?z <http://ex.org/age> ?a } } }""",
-    """SELECT ?x ?a ?s WHERE {
-        ?x <http://ex.org/name> ?n
-        OPTIONAL { ?x <http://ex.org/age> ?a }
-        OPTIONAL { ?x <http://ex.org/score> ?s } }""",
-    """SELECT ?x ?y ?n WHERE {
-        ?x <http://ex.org/knows> ?y OPTIONAL { ?y <http://ex.org/name> ?n } }""",
-    """SELECT ?x ?o WHERE {
-        ?x <http://ex.org/age> ?a OPTIONAL { <http://ex.org/alice> <http://ex.org/name> ?o } }""",
-    """SELECT ?x ?n WHERE {
-        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/nothing> ?a } }""",
-    """SELECT ?x ?a WHERE {
-        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } FILTER(bound(?a)) }""",
-    """SELECT ?x ?a WHERE {
-        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } FILTER(?a > 10) }""",
-    """SELECT ?x WHERE {
-        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a }
-        FILTER(?a > 10 || !bound(?a)) }""",
-    # an OPTIONAL variable joined again later: a nullable key, left to rdflib
-    """SELECT ?x ?y ?n WHERE {
-        ?x <http://ex.org/name> ?m OPTIONAL { ?x <http://ex.org/knows> ?y }
-        ?y <http://ex.org/name> ?n }""",
-    # OPTIONAL over a joined block, and inside a lazy join (a context-bound outer variable)
-    """SELECT ?x ?n ?a WHERE {
-        ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?n
-        OPTIONAL { ?y <http://ex.org/age> ?a } }""",
-    """SELECT ?x ?a ?s WHERE {
-        VALUES ?x { <http://ex.org/bob> <http://ex.org/erin> }
-        ?x <http://ex.org/age> ?a OPTIONAL { ?x <http://ex.org/score> ?s } }""",
-    """SELECT ?x ?a WHERE {
-        VALUES ?a { 42 7 }
-        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }""",
-    """ASK { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a }
-        FILTER(!bound(?a)) }""",
-    # --- group joins: nested groups, three groups (non-lazy), cross product, a filtered group
-    """SELECT ?x ?n ?a WHERE {
-        { ?x <http://ex.org/name> ?n } { ?x <http://ex.org/age> ?a } }""",
-    """SELECT ?x ?n ?a ?s WHERE {
-        { ?x <http://ex.org/name> ?n } { ?x <http://ex.org/age> ?a }
-        { ?x <http://ex.org/score> ?s } }""",
-    """SELECT ?n ?m WHERE {
-        { <http://ex.org/alice> <http://ex.org/name> ?n }
-        { <http://ex.org/bob> <http://ex.org/name> ?m } }""",
-    """SELECT ?x ?n ?a WHERE {
-        { ?x <http://ex.org/name> ?n FILTER(lang(?n) = "en") } { ?x <http://ex.org/age> ?a } }""",
-    """SELECT ?x ?n ?a WHERE {
-        { ?x <http://ex.org/name> ?n } { ?x <http://ex.org/age> ?a FILTER(?a > 10) } }""",
-    """SELECT ?x ?y WHERE {
-        { ?x <http://ex.org/knows> ?y } { ?y <http://ex.org/knows> ?x } }""",
-    # a filter in the second group that could see the first group's binding: left to rdflib
-    """SELECT ?x ?n ?a WHERE {
-        { ?x <http://ex.org/name> ?n }
-        { ?x <http://ex.org/age> ?a FILTER(str(?n) != "") } }""",
-    # --- MINUS: shared variables, none, empty right side, nested, under a filter
-    """SELECT ?x ?n WHERE {
-        ?x <http://ex.org/name> ?n MINUS { ?x <http://ex.org/age> ?a } }""",
-    """SELECT ?x ?n WHERE {
-        ?x <http://ex.org/name> ?n MINUS { ?y <http://ex.org/age> ?a } }""",
-    """SELECT ?x ?n WHERE {
-        ?x <http://ex.org/name> ?n MINUS { ?x <http://ex.org/nothing> ?a } }""",
-    """SELECT ?x ?y WHERE {
-        ?x <http://ex.org/knows> ?y MINUS { ?x <http://ex.org/knows> <http://ex.org/carol> } }""",
-    """SELECT ?x ?y WHERE {
-        ?x <http://ex.org/knows> ?y
-        MINUS { ?y <http://ex.org/name> ?n FILTER(lang(?n) = "en") } }""",
-    """SELECT ?x WHERE {
-        ?x <http://ex.org/name> ?n MINUS { ?x <http://ex.org/age> ?a } FILTER(isIRI(?x)) }""",
-    """SELECT ?x ?n WHERE {
-        VALUES ?x { <http://ex.org/bob> <http://ex.org/alice> }
-        ?x <http://ex.org/name> ?n MINUS { ?y <http://ex.org/nothing> ?z } }""",
-    """SELECT ?x ?n WHERE {
-        VALUES ?x { <http://ex.org/bob> <http://ex.org/alice> }
-        ?x <http://ex.org/name> ?n MINUS { ?y <http://ex.org/age> ?z } }""",
-    """SELECT (COUNT(*) AS ?n) WHERE {
-        ?x <http://ex.org/name> ?m MINUS { ?x <http://ex.org/age> ?a } }""",
-    """SELECT DISTINCT ?x WHERE {
-        ?x <http://ex.org/knows> ?y OPTIONAL { ?y <http://ex.org/age> ?a } }""",
-    # --- (NOT) EXISTS: semi/anti-joins on the shared variables, and the shapes left to rdflib
-    "SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER EXISTS { ?x <http://ex.org/age> ?a } }",
-    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
-        FILTER(!EXISTS { ?x <http://ex.org/age> ?a }) }""",
-    """SELECT ?x ?y WHERE { ?x <http://ex.org/knows> ?y
-        FILTER EXISTS { ?y <http://ex.org/knows> ?x } }""",
-    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
-        FILTER EXISTS { <http://ex.org/alice> <http://ex.org/knows> ?z } }""",
-    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
-        FILTER NOT EXISTS { ?z <http://ex.org/nothing> ?w } }""",
-    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
-        FILTER(EXISTS { ?x <http://ex.org/age> ?a } || lang(?n) = "en") }""",
-    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
-        FILTER EXISTS { ?x <http://ex.org/age> ?a FILTER(?a > 10) } }""",
-    """SELECT ?x WHERE { ?x <http://ex.org/age> ?a
-        FILTER EXISTS { ?x <http://ex.org/score> ?s FILTER(?s > ?a) } }""",
-    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a }
-        FILTER NOT EXISTS { ?y <http://ex.org/age> ?a } }""",
-    """SELECT ?x ?a WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/alice> }
-        ?x <http://ex.org/age> ?a FILTER EXISTS { ?x <http://ex.org/knows> ?y } }""",
-    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
-        FILTER EXISTS { ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?m } }""",
-    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
-        FILTER NOT EXISTS { ?x <http://ex.org/knows> ?y
-        OPTIONAL { ?y <http://ex.org/age> ?a } } }""",
-    "SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER EXISTS { ?x <http://ex.org/age> ?x } }",
-    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
-        FILTER(EXISTS { ?x <http://ex.org/age> ?a } && ?n != "") }""",
-    """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
-        FILTER EXISTS { ?x <http://ex.org/knows> ?y
-        FILTER NOT EXISTS { ?y <http://ex.org/age> ?a } } }""",
-    "ASK { ?x <http://ex.org/name> ?n FILTER NOT EXISTS { ?x <http://ex.org/age> ?a } }",
-    """SELECT (COUNT(*) AS ?c) WHERE { ?x <http://ex.org/name> ?n
-        FILTER NOT EXISTS { ?x <http://ex.org/age> ?a } }""",
-    # --- ORDER BY (as multisets here; ORDER_QUERIES below compares the sequences)
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a",
-    "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY DESC(?n)",
-    "SELECT ?s ?p ?o WHERE { ?s ?p ?o FILTER(?o = ?o) } ORDER BY ?o",
-    "SELECT ?x ?s WHERE { ?x <http://ex.org/score> ?s FILTER(?s = ?s) } ORDER BY ?s",
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a LIMIT 2",
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY DESC(?a) OFFSET 1 LIMIT 2",
-    "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a",
-    "SELECT DISTINCT ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY ?n LIMIT 3",
-    """SELECT ?x ?a WHERE { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }
-        ORDER BY ?a""",
-    "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY str(?n)",
-    "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY ?zzz ?n",
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a > 0) } ORDER BY DESC(?a)",
-    "SELECT * WHERE { ?s ?p ?o } ORDER BY ?p ?s LIMIT 5",
-    """SELECT ?x ?a WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/gina> }
-        ?x <http://ex.org/age> ?a } ORDER BY ?a""",
-]
-
-#: ORDER BY queries whose order is total (every tie broken by a unique variable),
-#: compared as sequences: the pushdown must sort exactly as rdflib does. The
-#: NaN score is kept out of sorted columns (`?o = ?o`): rdflib's comparator
-#: raises decimal.InvalidOperation on a NaN double against a decimal.
-ORDER_QUERIES = [
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a ?x",
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY DESC(?a) ?x",
-    "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY ?n ?x",
-    "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY DESC(?n) DESC(?x)",
-    "SELECT ?s ?p ?o WHERE { ?s ?p ?o FILTER(?o = ?o) } ORDER BY ?o ?s ?p",
-    "SELECT ?s ?p ?o WHERE { ?s ?p ?o FILTER(?o = ?o) } ORDER BY DESC(?s) ?p ?o",
-    "SELECT ?s ?p ?o WHERE { ?s ?p ?o FILTER(?o = ?o) } ORDER BY ?p DESC(?o) ?s",
-    """SELECT ?x ?a WHERE { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }
-        ORDER BY ?a ?x""",
-    """SELECT ?x ?a WHERE { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }
-        ORDER BY DESC(?a) ?x""",
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a ?x LIMIT 2",
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a ?x OFFSET 1 LIMIT 3",
-    "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a",
-    "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY DESC(?a) LIMIT 2",
-    "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?a > 0) } ORDER BY DESC(?a) ?x",
-    "SELECT ?x ?s WHERE { ?x <http://ex.org/score> ?s FILTER(?s = ?s) } ORDER BY ?s ?x",
-    "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p ORDER BY ?p",
-    "SELECT ?x ?y WHERE { ?x <http://ex.org/knows> ?y } ORDER BY ?y ?x",
-    "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY ?zzz ?n ?x",
-]
-
-XSD = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> "
-QUERIES += [
-    # --- VALUES: present and absent constants, UNDEF, spellings, joins, standalone
-    """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/nobody> }
-        ?x <http://ex.org/name> ?n }""",
-    """SELECT ?x ?n WHERE {
-        VALUES (?x ?n) { (<http://ex.org/bob> "Bob"@EN) (<http://ex.org/alice> UNDEF) }
-        ?x <http://ex.org/name> ?n }""",
-    XSD
-    + """SELECT ?x ?a WHERE { VALUES ?a { 42 "042"^^xsd:integer 7 "7"^^xsd:byte }
-        ?x <http://ex.org/age> ?a }""",
-    XSD
-    + """SELECT ?x WHERE { VALUES ?n { "Carol" "Alice"^^xsd:string "Bob"@en }
-        ?x <http://ex.org/name> ?n }""",
-    """SELECT ?x ?n WHERE { VALUES ?n { "q\\"uote" "" } ?x <http://ex.org/name> ?n }""",
-    """SELECT ?x ?n WHERE {
-        VALUES ?n { "tab\\there" "line\\nbreak" "back\\\\slash" "\\u0001control" }
-        ?x <http://ex.org/note> ?n }""",
-    """SELECT ?x ?n WHERE { VALUES ?n { "x"@en-US "x"@EN-US "x"@en }
-        ?x <http://ex.org/note> ?n }""",
-    # an absent literal with a newline, substituted into a probe
-    'SELECT ?s WHERE { VALUES ?n { "zz\\nyy" "Alice" } ?s <http://ex.org/name> ?n }',
-    """SELECT ?n WHERE { VALUES ?n { "zz\\nyy" "Alice" }
-        FILTER EXISTS { ?s <http://ex.org/name> ?n } }""",
-    # a relative IRI (no BASE), which no probe can match
-    "SELECT ?s ?o WHERE { VALUES ?o { <zz> <http://ex.org/carol> } ?s <http://ex.org/knows> ?o }",
-    """SELECT ?o ?s WHERE { VALUES ?o { <zz> <http://ex.org/carol> }
-        OPTIONAL { ?s <http://ex.org/likes> ?o } }""",
-    """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/bob> }
-        ?x <http://ex.org/name> ?n FILTER(?x = <http://ex.org/bob>) }""",
-    "SELECT * WHERE { VALUES (?x ?y) { (1 2) (UNDEF 3) (<http://ex.org/nobody> UNDEF) } }",
-    "SELECT ?x WHERE { VALUES ?x { <http://ex.org/nobody> } }",
-    """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/bob> } { ?x <http://ex.org/name> ?n } }""",
-    """SELECT ?x ?n ?a WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/carol> }
-        ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }""",
-    """SELECT (COUNT(*) AS ?c) WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/nobody> }
-        ?x <http://ex.org/name> ?n }""",
-    """SELECT ?x ?n WHERE { { VALUES ?x { <http://ex.org/bob> } }
-        { VALUES ?x { <http://ex.org/bob> <http://ex.org/alice> } } ?x <http://ex.org/name> ?n }""",
-    """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/alice> }
-        ?x <http://ex.org/name> ?n MINUS { VALUES ?x { <http://ex.org/bob> } } }""",
-    """SELECT DISTINCT ?y WHERE { VALUES ?x { <http://ex.org/alice> <http://ex.org/bob> }
-        ?x <http://ex.org/knows> ?y }""",
-    """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/nobody> <http://ex.org/bob> }
-        ?x <http://ex.org/name> ?n } ORDER BY ?x""",
-]
-ORDER_QUERIES += [
-    """SELECT ?x ?y WHERE {
-        VALUES (?x ?y) { (<http://ex.org/nobody> 3) (<http://ex.org/bob> 1) (UNDEF 2) } }
-        ORDER BY ?x ?y""",
-]
-
-#: Two-variable FILTERs over composite blocks. Their fast conjuncts reach
-#: every BGP the single-variable ones do, as a mid-join pre-filter (always
-#: applied under the probe-forcing runs, `_PROBE_FANOUT = 0`): a group
-#: join's sides and an OPTIONAL's or a MINUS's left side, never their right
-#: side, where dropping a row would change the answer.
-QUERIES += [
-    """SELECT ?x ?a ?s WHERE {
-        { ?x <http://ex.org/score> ?s . ?x <http://ex.org/age> ?a . ?x <http://ex.org/name> ?n }
-        { ?x <http://ex.org/name> ?m }
-        FILTER(?a < ?s) }""",
-    """SELECT ?x ?a ?w WHERE {
-        ?x <http://ex.org/score> ?s . ?x <http://ex.org/age> ?a . ?x <http://ex.org/name> ?n
-        OPTIONAL { ?x <http://ex.org/weight> ?w }
-        FILTER(?a < ?s) }""",
-    """SELECT ?x ?a ?s WHERE {
-        ?x <http://ex.org/age> ?a . ?x <http://ex.org/name> ?n
-        OPTIONAL { ?x <http://ex.org/score> ?s }
-        FILTER(!bound(?s) || ?a < ?s) }""",
-    """SELECT ?x ?a WHERE {
-        ?x <http://ex.org/score> ?s . ?x <http://ex.org/age> ?a . ?x <http://ex.org/name> ?n
-        MINUS { ?x <http://ex.org/weight> ?w }
-        FILTER(?a < ?s) }""",
-]
-
-#: The string shapes vortex-rdf evaluates over candidate codes:
-#: lowered and upper-cased texts, STR() over IRIs, blank nodes and typed
-#: literals, tagged constants (an upper-case tag never matches a stored one),
-#: and REGEX over texts with newlines.
-QUERIES += [
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(regex(lcase(?n), "^bo")) }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(contains(ucase(str(?n)), "OB")) }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(strstarts(?n, "B"@en-us)) }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(contains(?n, "o"@EN)) }',
-    'SELECT ?x WHERE { ?x <http://ex.org/name> ?n FILTER(strends(lcase(?n), "b")) }',
-    'SELECT ?x ?n WHERE { ?x <http://ex.org/note> ?n FILTER(regex(?n, "k$")) }',
-    'SELECT ?x ?n WHERE { ?x <http://ex.org/note> ?n FILTER(regex(?n, "^line$", "m")) }',
-    'SELECT ?x ?n WHERE { ?x <http://ex.org/note> ?n FILTER(regex(str(?n), "\\\\w+", "i")) }',
-    'SELECT ?x ?n WHERE { ?x <http://ex.org/note> ?n FILTER(contains(lcase(?n), "ün")) }',
-    'SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a FILTER(strstarts(str(?a), "4")) }',
-    'SELECT ?s WHERE { ?s ?p ?o FILTER(regex(str(?s), "^b")) }',
-    'SELECT ?s ?o WHERE { ?s ?p ?o FILTER(strstarts(str(?o), "http://ex.org/c")) }',
-]
-
-#: IRI equality as a keep: =, sameTerm and IN over IRIs only, constants the
-#: dictionary lacks, the empty list, the predicate position.
-QUERIES += [
-    "SELECT ?s WHERE { ?s ?p ?o FILTER(?o IN (<http://ex.org/carol>, <http://ex.org/bob>)) }",
-    "SELECT ?s WHERE { ?s ?p ?o FILTER(sameTerm(?o, <http://ex.org/carol>)) }",
-    "SELECT ?s WHERE { ?s ?p ?o FILTER(<http://ex.org/carol> = ?o) }",
-    "SELECT ?s WHERE { ?s ?p ?o FILTER(?o IN (<http://ex.org/nobody>)) }",
-    "SELECT ?s WHERE { ?s ?p ?o FILTER(?o IN ()) }",
-    "SELECT ?s ?p WHERE { ?s ?p ?o FILTER(?p IN (<http://ex.org/knows>, <http://ex.org/likes>)) }",
-    "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o FILTER(?o = <http://ex.org/carol>) }",
-    "ASK { ?s ?p ?o FILTER(?o = <http://ex.org/nobody>) }",
-    """SELECT ?x ?n WHERE { ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?n
-        FILTER(?y IN (<http://ex.org/bob>, <http://ex.org/carol>)) }""",
-]
-
-#: Shapes that name a graph. rdflib evaluates the `Graph` node itself — a
-#: bound name scopes the block below, an unbound one fans out over the
-#: store's graphs — so what is under test here is that every pushed-down
-#: block sees exactly the graph rdflib made active, and no other.
-GRAPH_QUERIES = [
-    # a bound graph, an absent one, and the default graph a `GRAPH` never names
-    "SELECT ?s ?o WHERE { GRAPH <http://ex.org/g/1> { ?s <http://ex.org/name> ?o } }",
-    "SELECT * WHERE { GRAPH <http://ex.org/g/1> { ?s ?p ?o } }",
-    "SELECT * WHERE { GRAPH <http://ex.org/absent> { ?s ?p ?o } }",
-    "ASK { GRAPH <http://ex.org/g/2> { ?s <http://ex.org/name> ?o } }",
-    "ASK { GRAPH <http://ex.org/absent> { ?s ?p ?o } }",
-    'ASK { GRAPH <http://ex.org/g/1> { <http://ex.org/alice> <http://ex.org/name> "Alice" } }',
-    # a graph variable: one interception per graph, the default graph excluded
-    "SELECT ?g ?s ?o WHERE { GRAPH ?g { ?s <http://ex.org/name> ?o } }",
-    "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }",
-    "SELECT ?g (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g",
-    "SELECT (COUNT(*) AS ?n) WHERE { GRAPH <http://ex.org/g/2> { ?s ?p ?o } }",
-    "SELECT ?g ?s WHERE { GRAPH ?g { ?s <http://ex.org/name> ?o } } ORDER BY ?g ?s LIMIT 5",
-    # joins, OPTIONAL, MINUS and FILTER inside one graph
-    """SELECT ?s ?n ?k WHERE { GRAPH ?g {
-        ?s <http://ex.org/name> ?n . ?s <http://ex.org/knows> ?k } }""",
-    """SELECT ?s ?n ?a WHERE { GRAPH <http://ex.org/g/3> {
-        ?s <http://ex.org/name> ?n OPTIONAL { ?s <http://ex.org/age> ?a } } }""",
-    """SELECT ?s WHERE { GRAPH <http://ex.org/g/3> {
-        ?s <http://ex.org/name> ?n MINUS { ?s <http://ex.org/knows> ?k } } }""",
-    """SELECT ?s ?n WHERE { GRAPH ?g {
-        ?s <http://ex.org/name> ?n FILTER(isIRI(?s)) } }""",
-    """SELECT ?s ?a WHERE { GRAPH <http://ex.org/g/1> {
-        ?s <http://ex.org/age> ?a
-        FILTER(datatype(?a) = <http://www.w3.org/2001/XMLSchema#integer>) } }""",
-    """SELECT ?s ?n WHERE { GRAPH <http://ex.org/g/3> {
-        VALUES ?s { <http://ex.org/alice> <http://ex.org/bob> } ?s <http://ex.org/name> ?n } }""",
-    # a block spanning the union default graph and a named one
-    """SELECT ?s ?n ?k WHERE {
-        ?s <http://ex.org/name> ?n .
-        GRAPH <http://ex.org/g/1> { ?s <http://ex.org/knows> ?k } }""",
-    """SELECT ?s ?n WHERE {
-        ?s <http://ex.org/name> ?n
-        FILTER NOT EXISTS { GRAPH <http://ex.org/g/1> { ?s <http://ex.org/knows> ?k } } }""",
-    # two graphs joined through the same variable
-    """SELECT ?s ?n ?k WHERE {
-        GRAPH <http://ex.org/g/1> { ?s <http://ex.org/name> ?n }
-        GRAPH <http://ex.org/g/2> { ?s <http://ex.org/knows> ?k } }""",
-    # --- the graph as a column: shapes where ?g is an ordinary variable ---
-    # a join inside one graph variable: both patterns must land in the *same*
-    # graph, which is the join on ?g
-    """SELECT ?g ?s ?n ?k WHERE { GRAPH ?g {
-        ?s <http://ex.org/name> ?n . ?s <http://ex.org/knows> ?k } }""",
-    # two graph variables, joined on the subject
-    """SELECT ?g ?h ?s WHERE {
-        GRAPH ?g { ?s <http://ex.org/name> ?n }
-        GRAPH ?h { ?s <http://ex.org/knows> ?k } }""",
-    # the union default graph joined to a graph variable
-    """SELECT ?g ?s ?k WHERE {
-        ?s <http://ex.org/name> ?n .
-        GRAPH ?g { ?s <http://ex.org/knows> ?k } }""",
-    # OPTIONAL and MINUS under a graph variable
-    """SELECT ?g ?s ?n ?a WHERE { GRAPH ?g {
-        ?s <http://ex.org/name> ?n OPTIONAL { ?s <http://ex.org/age> ?a } } }""",
-    """SELECT ?g ?s ?n WHERE { GRAPH ?g {
-        ?s <http://ex.org/name> ?n MINUS { ?s <http://ex.org/knows> ?k } } }""",
-    # an OPTIONAL whose *whole* right side is a graph: ?g may be unbound
-    """SELECT ?s ?g ?k WHERE {
-        ?s <http://ex.org/name> ?n
-        OPTIONAL { GRAPH ?g { ?s <http://ex.org/knows> ?k } } }""",
-    # FILTER on the graph variable itself
-    "SELECT ?g ?s WHERE { GRAPH ?g { ?s ?p ?o } FILTER(isIRI(?g)) }",
-    "SELECT ?g ?s WHERE { GRAPH ?g { ?s ?p ?o } FILTER(?g = <http://ex.org/g/2>) }",
-    "SELECT ?g ?s WHERE { GRAPH ?g { ?s ?p ?o } FILTER(isBLANK(?g)) }",
-    # the graph name repeated in another position of the same pattern
-    "SELECT ?g ?p ?o WHERE { GRAPH ?g { ?g ?p ?o } }",
-    # VALUES over graph names, including one the file does not hold
-    """SELECT ?g ?s WHERE {
-        VALUES ?g { <http://ex.org/g/1> <http://ex.org/absent> }
-        GRAPH ?g { ?s <http://ex.org/name> ?o } }""",
-    # heads over the graph column
-    "SELECT ?g ?s WHERE { GRAPH ?g { ?s ?p ?o } } ORDER BY ?g ?s LIMIT 7",
-    "SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }",
-    "SELECT ?g (COUNT(DISTINCT ?s) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g",
-    "ASK { GRAPH ?g { ?s <http://ex.org/knows> ?o } }",
-    # nested GRAPH: the inner one wins
-    """SELECT ?g ?h ?s WHERE {
-        GRAPH ?g { GRAPH <http://ex.org/g/2> { ?s <http://ex.org/name> ?n } }
-        GRAPH ?h { ?s <http://ex.org/knows> ?k } }""",
-    # (NOT) EXISTS under a graph variable — the body would be answered in the
-    # union, so the block goes back to rdflib rather than being pushed down
-    """SELECT ?g ?s WHERE { GRAPH ?g {
-        ?s <http://ex.org/name> ?n
-        FILTER EXISTS { ?s <http://ex.org/knows> ?k } } }""",
-    """SELECT ?g ?s WHERE { GRAPH ?g {
-        ?s <http://ex.org/name> ?n
-        FILTER NOT EXISTS { ?s <http://ex.org/knows> ?k } } }""",
-    # an EXISTS body that names a graph of its own
-    """SELECT ?s WHERE {
-        ?s <http://ex.org/name> ?n
-        FILTER EXISTS { GRAPH ?g { ?s <http://ex.org/knows> ?k } } }""",
-    # a FILTER EXISTS hoisted into an OPTIONAL's condition
-    """SELECT ?s ?n ?k WHERE {
-        ?s <http://ex.org/name> ?n
-        OPTIONAL { ?s <http://ex.org/knows> ?k
-                   FILTER EXISTS { ?s <http://ex.org/age> ?a } } }""",
-    # a two-variable FILTER over a graph block: its fast conjunct reaches the
-    # BGP inside, as the single-variable ones do
-    """SELECT ?x ?y WHERE {
-        GRAPH ?g { ?x <http://ex.org/knows> ?y . ?x <http://ex.org/name> ?n .
-                   ?y <http://ex.org/name> ?m }
-        FILTER(?n != ?m) }""",
-]
+from vortex_rdflib.settings import SETTINGS
 
 
 @pytest.fixture(scope="module")
@@ -811,51 +134,169 @@ def variant_graph(variant_vortex, request):
     return Graph(store=store)
 
 
-def _row_key(row):
-    # rdflib's term ordering is not total (NaN literals), so sort on the
-    # N-Triples spellings, which is.
-    return tuple("" if term is None else term.n3() for term in row)
+@dataclass(frozen=True)
+class Forcing:
+    """A path of the planner forced on: the settings that force it, the
+    answer it gives every point-lookup question (``None``: the store's own,
+    ``False``: every probe would scan, ``True``: every probe is a point
+    lookup), and the runs of its equivalence matrix — each a corpus
+    (:data:`_CORPORA`) over the views it names (``graph-file`` and
+    ``graph-mem`` over the triples, ``dataset-*`` over the quads, as a
+    union-default ``Dataset``)."""
+
+    settings: dict
+    runs: tuple
+    point: bool | None = None
 
 
-def run(graph, sparql):
-    """A query's answer in a comparable form: the ASK boolean, or the
-    solution rows as a sorted multiset."""
-    result = graph.query(sparql)
-    if result.type == "ASK":
-        return result.askAnswer
-    return sorted((tuple(row) for row in result), key=_row_key)
+_GRAPH = ("graph-file", "graph-mem")
+_DATASET = ("dataset-file", "dataset-mem")
+#: Every corpus, file-backed and in memory.
+_EVERY = (("queries", _GRAPH), ("order", _GRAPH), ("graph", _DATASET))
+#: The paths with no file-or-memory difference of their own, file-backed.
+_FILE = (("queries", ("graph-file",)),)
+_FILE_AND_GRAPHS = (("queries", ("graph-file",)), ("graph", ("dataset-file",)))
+
+#: The default plan, and every path forced on, by name.
+FORCINGS = {
+    "default": Forcing(
+        {}, (("queries", (*_GRAPH, "dataset-file")), ("order", _GRAPH), ("graph", _DATASET))
+    ),
+    # Every shared-variable join planned per row: probes where they are point
+    # lookups, and a keep-scan in a BGP where they would scan.
+    "probe0": Forcing({"probe_fanout": 0}, _FILE_AND_GRAPHS),
+    # Only basic graph patterns solved here (VORTEX_RDF_PUSHDOWN_OPS=bgp):
+    # every head is rdflib's own operator, and rdflib evaluates a `Graph`
+    # node itself, pushing each block down under a constant scope.
+    "bgp_only": Forcing({"enabled_ops": frozenset({"BGP"})}, _FILE_AND_GRAPHS),
+    # The native term predicates off: every conjunct they would decide runs
+    # on the Python fast route.
+    "python_filters": Forcing({"native_filters": False}, _FILE),
+    # VORTEX_RDF_FILTER_FAST=0: every FILTER value through rdflib's own
+    # evaluator, once per distinct value.
+    "generic_filters": Forcing({"fast_filters": False}, _FILE_AND_GRAPHS),
+    # Every probe a scan, through the batch calls in batches of three, a lone
+    # probe included; a BGP step keep-scans instead.
+    "batched_scans": Forcing(
+        {"probe_fanout": 0, "probe_batch": 3, "scan_batch_min": 1, "memory_scan_batch_min": 1},
+        _FILE,
+        point=False,
+    ),
+    # Every probe a point lookup, through the batch calls in batches of
+    # three, a lone probe included: BGP steps probe and batch too.
+    "batched_points": Forcing(
+        {"probe_fanout": 0, "probe_batch": 3, "cheap_batch_min": 1}, _FILE, point=True
+    ),
+    # COUNT(DISTINCT) groups from the distinct (key, value) pairs rather than
+    # one native gather per group.
+    "group_pairs": Forcing({"native_groups_max": 0}, (("counts", _DATASET),)),
+    # A pair budget of 0: every BGP join step that makes a row is over it.
+    "budget0": Forcing({"pair_budget": 0}, _EVERY),
+    # Every last hash step that shares one variable and makes a row streams,
+    # its fed side cut into pieces of one row, or of three.
+    "stream_pieces1": Forcing({"pair_budget": 0, "piece_rows": 1}, _EVERY),
+    "stream_pieces3": Forcing({"pair_budget": 0, "piece_rows": 3}, _EVERY),
+    # The probe threshold at zero and every probe a scan: every BGP join step
+    # that shares a variable keep-scans its pattern.
+    "keep_scan": Forcing({"probe_fanout": 0}, _EVERY, point=False),
+}
+
+_CORPORA = {
+    "queries": (QUERIES, run),
+    "order": (ORDER_QUERIES, run_ordered),
+    "graph": (GRAPH_QUERIES, run),
+    "counts": ([sparql for sparql in QUERIES + GRAPH_QUERIES if "COUNT" in sparql], run),
+}
 
 
-def run_ordered(graph, sparql):
-    """The solution rows in the order the query produced them."""
-    return [tuple(row) for row in graph.query(sparql)]
+def _view(name: str, triples, quads):
+    """A fresh view of the fixture store: ``graph-file`` and the like."""
+    kind, residency = name.split("-")
+    store = VortexRdflibStore(
+        str(triples if kind == "graph" else quads), in_memory=residency == "mem"
+    )
+    return Graph(store=store) if kind == "graph" else Dataset(store=store, default_union=True)
 
 
-def both_ways(graph, sparql, runner=run):
-    """The answer with the pushdown and under rdflib's default evaluator."""
+def _force(forcing: Forcing, monkeypatch) -> None:
+    for name, value in forcing.settings.items():
+        monkeypatch.setattr(SETTINGS, name, value)
+    if forcing.point is not None:
+        monkeypatch.setattr(
+            VortexRdflibStore, "_point_lookup", lambda store, n3, answer=forcing.point: answer
+        )
+
+
+_MATRIX = [
+    pytest.param(name, corpus, view, sparql, id=f"{name}-{corpus}{index}-{view}")
+    for name, forcing in FORCINGS.items()
+    for corpus, views in forcing.runs
+    for view in views
+    for index, sparql in enumerate(_CORPORA[corpus][0])
+]
+
+
+@pytest.mark.parametrize(("forcing", "corpus", "view", "sparql"), _MATRIX)
+def test_answers_equal_the_default_evaluator(
+    dict_vortex, dict_vortex_quads, monkeypatch, forcing, corpus, view, sparql
+):
+    """Every query shape answers alike with the pushdown and with rdflib's
+    default evaluator: on the default plan and on each path forced on
+    (:data:`FORCINGS`), file-backed and in memory, an ORDER BY in its order.
+    The store is built before the path is forced, as an application builds
+    it before a query runs."""
+    target = _view(view, dict_vortex, dict_vortex_quads)
+    _force(FORCINGS[forcing], monkeypatch)
+    _, runner = _CORPORA[corpus]
+    with_pushdown, without_pushdown = both_ways(target, sparql, runner)
+    assert with_pushdown == without_pushdown
+
+
+#: The forced paths a trace shows taken, by id: the forcing, and the test
+#: of a trace event that shows the path.
+FORCED_PATHS = {
+    "budget0": ("budget0", lambda event: event["event"] == "bgp_over_budget"),
+    "stream": (
+        "stream_pieces1",
+        lambda event: event["event"] == "bgp_join_step_complete" and event["strategy"] == "stream",
+    ),
+    "tier3": (
+        "budget0",
+        lambda event: event["event"] == "bgp_plan_complete" and bool(event["rest_pattern_indices"]),
+    ),
+    "keep_scan": (
+        "keep_scan",
+        lambda event: (
+            event["event"] == "bgp_join_step_complete" and event["strategy"] == "keep_scan"
+        ),
+    ),
+}
+
+
+@pytest.mark.parametrize("path", list(FORCED_PATHS))
+def test_forcing_reaches_the_path(dict_vortex, dict_vortex_quads, monkeypatch, capsys, path):
+    """A forced matrix passes for nothing unless the planner reads what its
+    forcing sets: under each forcing, a query of its matrix traces the path,
+    file-backed and in memory. The stores are built before the forcing is
+    applied, as the matrix builds its own."""
+    forcing, taken = FORCED_PATHS[path]
+    matrices = {}
+    for residency in ("file", "mem"):
+        graph = _view(f"graph-{residency}", dict_vortex, dict_vortex_quads)
+        dataset = _view(f"dataset-{residency}", dict_vortex, dict_vortex_quads)
+        matrix = [(graph, sparql) for sparql in QUERIES + ORDER_QUERIES]
+        matrices[residency] = matrix + [(dataset, sparql) for sparql in GRAPH_QUERIES]
+    _force(FORCINGS[forcing], monkeypatch)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
-    with_pushdown = runner(graph, sparql)
-    try:
-        unregister_sparql_pushdown()
-        without_pushdown = runner(graph, sparql)
-    finally:
-        register_sparql_pushdown()
-    return with_pushdown, without_pushdown
+    capsys.readouterr()
 
+    def reaches(view, sparql) -> bool:
+        run(view, sparql)
+        return any(taken(event) for event in trace_events(capsys.readouterr().err))
 
-@pytest.mark.parametrize("sparql", QUERIES)
-def test_pushdown_equals_default_evaluator(graph, sparql):
-    with_pushdown, without_pushdown = both_ways(graph, sparql)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", QUERIES)
-def test_pushdown_equals_default_evaluator_over_quads(file_dataset, sparql):
-    """The same shapes over the union default graph of a quad store: the
-    pushdown must scope every native match to the graph rdflib would have
-    asked, duplicates across graphs included."""
-    with_pushdown, without_pushdown = both_ways(file_dataset, sparql)
-    assert with_pushdown == without_pushdown
+    for residency, matrix in matrices.items():
+        assert any(reaches(view, sparql) for view, sparql in matrix), (path, residency)
 
 
 @pytest.mark.parametrize("sparql", QUERIES)
@@ -875,50 +316,19 @@ def test_graph_pattern_over_a_file_backed_dictionary(dict_vortex_quads, sparql):
     assert with_pushdown == without_pushdown
 
 
-@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
-def test_graph_pattern_equals_default_evaluator(dataset, sparql):
-    """`GRAPH` shapes: a named graph, a graph variable rdflib fans out over
-    the store's graphs, and blocks that span the two."""
-    with_pushdown, without_pushdown = both_ways(dataset, sparql)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
-def test_graph_pattern_probe_path_equals_default_evaluator(file_dataset, monkeypatch, sparql):
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    with_probe, without_pushdown = both_ways(file_dataset, sparql)
-    assert with_probe == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
-def test_graph_pattern_bgp_only_equals_default_evaluator(file_dataset, monkeypatch, sparql):
-    """With only BGPs intercepted, rdflib evaluates the `Graph` node itself
-    and walks the store's graphs — so each block is pushed down under a
-    *constant* scope instead of binding the graph from the column. Both
-    routes must answer identically."""
-    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
-    bgp_only, without_pushdown = both_ways(file_dataset, sparql)
-    assert bgp_only == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
-def test_graph_pattern_generic_filter_equals_default_evaluator(file_dataset, monkeypatch, sparql):
-    monkeypatch.setattr(filters, "_FAST_ENABLED", False)
-    generic, without_pushdown = both_ways(file_dataset, sparql)
-    assert generic == without_pushdown
-
-
 def test_solutions_do_not_share_a_context_under_a_pushed_graph(dataset, monkeypatch):
     """rdflib's ``evalGraph`` writes ``solution.ctx.graph`` back to the graph
     it replaced as it yields. Here it evaluates the ``GRAPH`` and the
     ``OPTIONAL`` itself over rows this module produced, so one context shared
     across those rows would carry that write forward and send the OPTIONAL's
     right side to the union instead of the row's graph."""
-    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
+    monkeypatch.setattr(SETTINGS, "enabled_ops", frozenset({"BGP"}))
     active = []
-    original = pd._active_scope
+    original = pd.algebra._active_scope
     monkeypatch.setattr(
-        pd, "_active_scope", lambda ctx, store: active.append(ctx.graph) or original(ctx, store)
+        pd.algebra,
+        "_active_scope",
+        lambda ctx, store: active.append(ctx.graph) or original(ctx, store),
     )
     register_sparql_pushdown()
     rows = run(
@@ -963,14 +373,14 @@ def test_graph_scope_reaches_the_native_match(dataset, monkeypatch):
     """The graph is the pattern's fourth position, not a filter over the
     union: an absent graph matches nothing and never materializes a row."""
     patterns = []
-    original = pd._pattern_terms
+    original = pd.matching._pattern_terms
 
     def spy(*args, **kwargs):
         pattern = original(*args, **kwargs)
-        patterns.append(pattern["n3"][3])
+        patterns.append(pattern.n3[3])
         return pattern
 
-    monkeypatch.setattr(pd, "_pattern_terms", spy)
+    monkeypatch.setattr(pd.matching, "_pattern_terms", spy)
     register_sparql_pushdown()
     assert run(dataset, "SELECT * WHERE { GRAPH <http://ex.org/g/1> { ?s ?p ?o } }")
     assert run(dataset, "SELECT * WHERE { GRAPH <http://ex.org/absent> { ?s ?p ?o } }") == []
@@ -1010,7 +420,7 @@ def _answer_in_mode(monkeypatch, mode, path, view, sparql):
     """``sparql`` over ``view`` of the file-backed store at ``path``, with the
     pushdown on, limited to BGPs (``VORTEX_RDF_PUSHDOWN_OPS=bgp``) or
     unregistered."""
-    monkeypatch.setattr(pd, "_ENABLED_OPS", pd._ENABLED_OPS)
+    monkeypatch.setattr(SETTINGS, "enabled_ops", SETTINGS.enabled_ops)
     if mode == "bgp":
         monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "bgp")
     # Building the store registers the pushdown, so it is built first.
@@ -1080,222 +490,6 @@ def test_a_term_the_parser_rejects_has_no_triples_and_no_graphs(dict_vortex_quad
         assert list(store.contexts(pattern)) == []
 
 
-@pytest.mark.parametrize("sparql", ORDER_QUERIES)
-def test_order_by_sequence_equals_default_evaluator(graph, sparql):
-    with_pushdown, without_pushdown = both_ways(graph, sparql, run_ordered)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", QUERIES)
-def test_probe_join_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
-    """Same A/B matrix with the probe threshold forced to zero, so every
-    shared-variable join is planned per row instead of as a hash join —
-    probes where they are point lookups, and a keep-scan in a BGP where they
-    would scan — and every strategy must be observationally identical."""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    with_probe, without_pushdown = both_ways(file_graph, sparql)
-    assert with_probe == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", QUERIES)
-def test_bgp_only_mode_equals_default_evaluator(file_graph, monkeypatch, sparql):
-    """``VORTEX_RDF_PUSHDOWN_OPS=bgp``: only basic graph patterns are solved
-    here, every head is rdflib's own operator over the rows we hand back."""
-    monkeypatch.setattr(pd, "_ENABLED_OPS", frozenset({"BGP"}))
-    bgp_only, without_pushdown = both_ways(file_graph, sparql)
-    assert bgp_only == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", QUERIES)
-def test_python_filter_routes_equal_default_evaluator(file_graph, monkeypatch, sparql):
-    """With the native term predicates off, every conjunct the native layer
-    would decide runs on the Python fast route instead."""
-    monkeypatch.setattr(filters, "_NATIVE_ENABLED", False)
-    with_pushdown, without_pushdown = both_ways(file_graph, sparql)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", QUERIES)
-def test_batched_probe_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
-    """Every probe a scan, through the native batch calls in batches of
-    three — a lone probe included: those of the joins above a BGP, OPTIONAL
-    and EXISTS. A BGP step keep-scans instead."""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
-    monkeypatch.setattr(pd, "_SCAN_BATCH_MIN", 1)
-    monkeypatch.setattr(pd, "_MEMORY_SCAN_BATCH_MIN", 1)
-    with_pushdown, without_pushdown = both_ways(file_graph, sparql)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", QUERIES)
-def test_batched_cheap_probe_path_equals_default_evaluator(file_graph, monkeypatch, sparql):
-    """Every probe a point lookup, through the native batch calls in batches
-    of three, a lone probe included: BGP steps probe and batch too."""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: True)
-    monkeypatch.setattr(pd, "_CHEAP_BATCH_MIN", 1)
-    with_pushdown, without_pushdown = both_ways(file_graph, sparql)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", [q for q in QUERIES + GRAPH_QUERIES if "COUNT" in q])
-def test_grouped_counts_over_pairs_equal_default_evaluator(dataset, monkeypatch, sparql):
-    """COUNT(DISTINCT) groups from the distinct (key, value) pairs rather
-    than one native gather per group."""
-    monkeypatch.setattr(pd, "_NATIVE_GROUPS_MAX", 0)
-    with_pushdown, without_pushdown = both_ways(dataset, sparql)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", QUERIES)
-def test_generic_filter_route_equals_default_evaluator(file_graph, monkeypatch, sparql):
-    """``VORTEX_RDF_FILTER_FAST=0``: every FILTER value goes through rdflib's
-    own expression evaluator, once per distinct value."""
-    monkeypatch.setattr(filters, "_FAST_ENABLED", False)
-    generic, without_pushdown = both_ways(file_graph, sparql)
-    assert generic == without_pushdown
-
-
-@pytest.fixture
-def over_budget(monkeypatch):
-    """A pair budget of 0: every BGP join step that makes a row is over it."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
-
-
-@pytest.mark.parametrize("sparql", QUERIES)
-def test_over_budget_equals_default_evaluator(graph, over_budget, sparql):
-    with_pushdown, without_pushdown = both_ways(graph, sparql)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", ORDER_QUERIES)
-def test_over_budget_order_by_sequence_equals_default_evaluator(graph, over_budget, sparql):
-    with_pushdown, without_pushdown = both_ways(graph, sparql, run_ordered)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
-def test_over_budget_graph_pattern_equals_default_evaluator(dataset, over_budget, sparql):
-    with_pushdown, without_pushdown = both_ways(dataset, sparql)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.fixture
-def stream_pieces(request, monkeypatch):
-    """A pair budget of 0 and pieces of ``request.param`` rows (1 unless the
-    test sets it): every last hash join step that shares one variable and
-    makes a row streams, its fed side cut into pieces that small."""
-    monkeypatch.setattr(pd, "_PAIR_BUDGET", 0)
-    monkeypatch.setattr(pd, "_PIECE_ROWS", getattr(request, "param", 1))
-
-
-_PIECE_SIZES = pytest.mark.parametrize(
-    "stream_pieces", [1, 3], indirect=True, ids=["pieces1", "pieces3"]
-)
-
-
-@_PIECE_SIZES
-@pytest.mark.parametrize("sparql", QUERIES)
-def test_stream_pieces_equals_default_evaluator(graph, stream_pieces, sparql):
-    with_pushdown, without_pushdown = both_ways(graph, sparql)
-    assert with_pushdown == without_pushdown
-
-
-@_PIECE_SIZES
-@pytest.mark.parametrize("sparql", ORDER_QUERIES)
-def test_stream_pieces_order_by_sequence_equals_default_evaluator(graph, stream_pieces, sparql):
-    with_pushdown, without_pushdown = both_ways(graph, sparql, run_ordered)
-    assert with_pushdown == without_pushdown
-
-
-@_PIECE_SIZES
-@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
-def test_stream_pieces_graph_pattern_equals_default_evaluator(dataset, stream_pieces, sparql):
-    with_pushdown, without_pushdown = both_ways(dataset, sparql)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.fixture
-def keep_scan(monkeypatch):
-    """The probe threshold at zero and every probe a scan: every BGP join step
-    that shares a variable keep-scans its pattern."""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: False)
-
-
-@pytest.mark.parametrize("sparql", QUERIES)
-def test_keep_scan_equals_default_evaluator(graph, keep_scan, sparql):
-    with_pushdown, without_pushdown = both_ways(graph, sparql)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", ORDER_QUERIES)
-def test_keep_scan_order_by_sequence_equals_default_evaluator(graph, keep_scan, sparql):
-    with_pushdown, without_pushdown = both_ways(graph, sparql, run_ordered)
-    assert with_pushdown == without_pushdown
-
-
-@pytest.mark.parametrize("sparql", GRAPH_QUERIES)
-def test_keep_scan_graph_pattern_equals_default_evaluator(dataset, keep_scan, sparql):
-    with_pushdown, without_pushdown = both_ways(dataset, sparql)
-    assert with_pushdown == without_pushdown
-
-
-#: The forced paths of the matrices above, by id: the fixture that forces the
-#: path, and the test of a trace event that shows the path taken.
-FORCED_PATHS = {
-    "budget0": ("over_budget", lambda event: event["event"] == "bgp_over_budget"),
-    "stream": (
-        "stream_pieces",
-        lambda event: event["event"] == "bgp_join_step_complete" and event["strategy"] == "stream",
-    ),
-    "tier3": (
-        "over_budget",
-        lambda event: event["event"] == "bgp_plan_complete" and bool(event["rest_pattern_indices"]),
-    ),
-    "keep_scan": (
-        "keep_scan",
-        lambda event: (
-            event["event"] == "bgp_join_step_complete" and event["strategy"] == "keep_scan"
-        ),
-    ),
-}
-
-
-@pytest.mark.parametrize("forcing", list(FORCED_PATHS))
-def test_forcing_reaches_the_path(
-    request, dict_vortex, dict_vortex_quads, monkeypatch, capsys, forcing
-):
-    """A forced matrix passes for nothing unless the planner reads what its
-    fixture sets: under each forcing, a query of the matrix traces the path,
-    file-backed and in memory. The stores are built before the forcing is
-    applied, as the matrices build theirs."""
-    fixture, taken = FORCED_PATHS[forcing]
-    matrices = {}
-    for in_memory in (False, True):
-        graph = Graph(store=VortexRdflibStore(str(dict_vortex), in_memory=in_memory))
-        dataset = Dataset(
-            store=VortexRdflibStore(str(dict_vortex_quads), in_memory=in_memory),
-            default_union=True,
-        )
-        matrix = [(graph, sparql) for sparql in QUERIES + ORDER_QUERIES]
-        matrices[in_memory] = matrix + [(dataset, sparql) for sparql in GRAPH_QUERIES]
-    request.getfixturevalue(fixture)
-    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
-    register_sparql_pushdown()
-    capsys.readouterr()
-
-    def reaches(view, sparql) -> bool:
-        run(view, sparql)
-        return any(taken(event) for event in _trace_events(capsys.readouterr().err))
-
-    for in_memory, matrix in matrices.items():
-        assert any(reaches(view, sparql) for view, sparql in matrix), (forcing, in_memory)
-
-
 def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
     """A 1-row anchor joined against a 300-row predicate must take the probe
     path under the real threshold, and still produce the right rows."""
@@ -1311,8 +505,10 @@ def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
     serialize_rdf(str(nt), str(out), layout="dictionary")
 
     probes = []
-    original = pd._probe_join
-    monkeypatch.setattr(pd, "_probe_join", lambda *a, **k: probes.append(1) or original(*a, **k))
+    original = pd.probes._probe_join
+    monkeypatch.setattr(
+        pd.probes, "_probe_join", lambda *a, **k: probes.append(1) or original(*a, **k)
+    )
     graph = Graph(store=VortexRdflibStore(str(out)))
     register_sparql_pushdown()
     rows = run(
@@ -1330,98 +526,14 @@ def test_probe_join_pads_rows_when_the_pattern_shares_no_variable(graph):
     padded with None — also when the pattern shares no variable with the
     relation, so nothing is substituted per row. No caller probes such a
     pattern today, but `_probe_join` must not rely on that."""
-    pattern = {
-        "n3": [None, "<http://ex.org/nothing>", None, None],
-        "varpos": {Variable("x"): [0], Variable("a"): [2]},
-    }
-    schema, rows = pd._probe_join(
+    pattern = pd.matching.Pattern(
+        [None, "<http://ex.org/nothing>", None, None], {Variable("x"): [0], Variable("a"): [2]}
+    )
+    schema, rows = pd.probes._probe_join(
         graph.store, (Variable("z"),), [(0,), (1,)], pattern, keep_unmatched=True
     )
     assert schema == (Variable("z"), Variable("x"), Variable("a"))
     assert rows == [(0, None, None), (1, None, None)]
-
-
-#: Quads under `http://ex/` for the probe joins' multiplicity. `s1` holds `q`
-#: in g1 and g2 and `p` in g1, g2 and g3, so the union default graph has two
-#: quads of its `q` triple and three of its `p` triple; `s2` holds only `p`,
-#: `s3` only `q`; `s4` holds both in the default graph and `p` in g1 too.
-PROBE_QUADS = """\
-<http://ex/s1> <http://ex/q> <http://ex/x> <http://ex/g1> .
-<http://ex/s1> <http://ex/p> <http://ex/o1> <http://ex/g1> .
-<http://ex/s1> <http://ex/p> <http://ex/o1> <http://ex/g2> .
-<http://ex/s1> <http://ex/p> <http://ex/o1> <http://ex/g3> .
-<http://ex/s2> <http://ex/p> <http://ex/o1> <http://ex/g1> .
-<http://ex/s1> <http://ex/q> <http://ex/x> <http://ex/g2> .
-<http://ex/s3> <http://ex/q> <http://ex/x> <http://ex/g1> .
-<http://ex/s4> <http://ex/q> <http://ex/x> .
-<http://ex/s4> <http://ex/p> <http://ex/o1> .
-<http://ex/s4> <http://ex/p> <http://ex/o1> <http://ex/g1> .
-"""
-
-_EX = "PREFIX : <http://ex/> "
-
-#: Per shape: whether the default graph is the union of the graphs, the query,
-#: the rows rdflib answers, the probe the pushdown takes when it probes, and
-#: the `limit` of the fully bound counts that probe makes.
-PROBE_MULTIPLICITY = {
-    # The union default graph: a triple several graphs hold is one solution per
-    # graph. `s1` joins 2 `q` quads with 3 `p` quads, `s4` 1 with 2.
-    "bgp-join": (True, _EX + "SELECT ?s WHERE { ?s :q :x . ?s :p :o1 }", 8, "_probe_join", None),
-    "group-join": (
-        True,
-        _EX + "SELECT ?s WHERE { { ?s :q :x } { ?s :p :o1 } }",
-        8,
-        "_probe_join",
-        None,
-    ),
-    # `s3` has no `p`: its row is padded, once.
-    "optional": (
-        True,
-        _EX + "SELECT ?s WHERE { ?s :q :x OPTIONAL { ?s :p :o1 } }",
-        9,
-        "_probe_join",
-        None,
-    ),
-    # The condition rejects `s1`: its 2 rows are padded, not repeated.
-    "optional-condition": (
-        True,
-        _EX + "SELECT ?s WHERE { ?s :q :x OPTIONAL { ?s :p :o1 FILTER(?s != :s1) } }",
-        5,
-        "_probe_join",
-        None,
-    ),
-    # A fixed graph holds at most one quad of a triple: `s1` and `s4` have the
-    # `p` triple in other graphs too, which the probe does not read.
-    "graph-variable": (
-        True,
-        _EX + "SELECT ?g ?s WHERE { GRAPH ?g { ?s :q :x . ?s :p :o1 } }",
-        2,
-        "_probe_join",
-        1,
-    ),
-    "named-graph": (
-        True,
-        _EX + "SELECT ?s WHERE { GRAPH :g2 { ?s :q :x . ?s :p :o1 } }",
-        1,
-        "_probe_join",
-        1,
-    ),
-    "default-graph": (
-        False,
-        _EX + "SELECT ?s WHERE { ?s :q :x . ?s :p :o1 }",
-        1,
-        "_probe_join",
-        1,
-    ),
-    # EXISTS is boolean: the rows of the block, `s1` twice.
-    "exists": (
-        True,
-        _EX + "SELECT ?s WHERE { ?s :q :x FILTER EXISTS { ?s :p :o1 } }",
-        3,
-        "_probe_exists",
-        1,
-    ),
-}
 
 
 @pytest.fixture(scope="module")
@@ -1435,8 +547,8 @@ def probe_quads(tmp_path_factory):
 
 
 def _recording(calls, name):
-    """`pd.<name>`, appending its name to `calls` as it is called."""
-    original = getattr(pd, name)
+    """`pd.probes.<name>`, appending its name to `calls` as it is called."""
+    original = getattr(pd.probes, name)
 
     def record(*args, **kwargs):
         calls.append(name)
@@ -1462,10 +574,10 @@ def test_a_probe_join_keeps_the_multiplicity_rdflib_reads(probe_quads, monkeypat
     holding the triple; where it is fixed, at most one; an EXISTS test adds
     none."""
     union, sparql, rows, probed, _ = PROBE_MULTIPLICITY[case]
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
     probes = []
     for name in ("_probe_join", "_probe_exists"):
-        monkeypatch.setattr(pd, name, _recording(probes, name))
+        monkeypatch.setattr(pd.probes, name, _recording(probes, name))
     with_pushdown, without_pushdown = both_ways(_probe_dataset(probe_quads, union), sparql)
     assert with_pushdown == without_pushdown
     assert len(without_pushdown) == rows
@@ -1480,9 +592,9 @@ def test_an_existence_probe_asks_for_one_row_unless_the_graph_is_open(
     A fixed graph holds at most one and an EXISTS test is boolean in any
     graph, so both ask for one row."""
     union, sparql, _, _, expected = PROBE_MULTIPLICITY[case]
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     dataset = _probe_dataset(probe_quads, union)
-    native = _counting_native(dataset)
+    native = counting_native(dataset)
     register_sparql_pushdown()
     run(dataset, sparql)
     asked = [limit for args, limit in native.count_calls if None not in args[:3]]
@@ -1493,8 +605,10 @@ def test_hash_joined_bgp_keeps_a_columnar_body(graph, monkeypatch):
     """A hash-joined BGP's relation is columns, not row tuples — tuples
     appear only as rows are consumed."""
     rels = []
-    original = pd._join_patterns
-    monkeypatch.setattr(pd, "_join_patterns", lambda *a: rels.append(original(*a)) or rels[-1])
+    original = pd.bgp._join_incremental_bgp
+    monkeypatch.setattr(
+        pd.bgp, "_join_incremental_bgp", lambda *a: rels.append(original(*a)) or rels[-1]
+    )
     register_sparql_pushdown()
     rows = run(
         graph,
@@ -1552,8 +666,10 @@ def test_tuple_filtered_bgp_keeps_a_columnar_body(
     values, so 25 rows over two patterns and 50 over three."""
     graph = _three_predicate_graph(tmp_path, "s", lambda i: i + 1000 if i % 2 == 0 else i - 1000)
     rels = []
-    original = pd._join_patterns
-    monkeypatch.setattr(pd, "_join_patterns", lambda *a: rels.append(original(*a)) or rels[-1])
+    original = pd.bgp._join_incremental_bgp
+    monkeypatch.setattr(
+        pd.bgp, "_join_incremental_bgp", lambda *a: rels.append(original(*a)) or rels[-1]
+    )
     register_sparql_pushdown()
     rows = run(
         graph,
@@ -1566,46 +682,6 @@ def test_tuple_filtered_bgp_keeps_a_columnar_body(
     assert len(rows) == expected_rows
     assert {str(row[0]) for row in rows} == {f"http://ex.org/s{i}" for i in range(0, 50, 2)}
     assert rels and rels[-1].cols is not None, "the tuple FILTER materialized the BGP as rows"
-
-
-class _CountingTermDict:
-    """A TermDict stand-in that counts the codes the pushdown decodes."""
-
-    def __init__(self, inner):
-        self._inner = inner
-        self.decoded = 0
-
-    def decode(self, code):
-        self.decoded += 1
-        return self._inner.decode(code)
-
-    def decode_many(self, codes):
-        codes = list(codes)
-        self.decoded += len(codes)
-        return self._inner.decode_many(codes)
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-
-def _counting_term_dict(graph) -> _CountingTermDict:
-    """Install the counter over the store's term dictionary."""
-    counting = _CountingTermDict(graph.store._dict)
-    graph.store._dict = counting
-    return counting
-
-
-def is_graph_name_check(args) -> bool:
-    """Whether a native count is the store's own question whether a bare
-    Graph's blank-node label names a graph of the file
-    (`VortexRdflibStore._blank_graph_n3`, once per query): bookkeeping, not
-    what a query plan costs."""
-    return (
-        len(args) == 4
-        and args[:3] == (None, None, None)
-        and isinstance(args[3], str)
-        and args[3].startswith("_:")
-    )
 
 
 @pytest.mark.parametrize(
@@ -1621,7 +697,7 @@ def test_limit_streams_a_tuple_filter_over_a_hash_join(tmp_path, extra_pattern):
     pruning stops as soon as 20 pass and leaves the rest to stream."""
     graph = _three_predicate_graph(tmp_path, "s", lambda i: i + 1000, n=1000)
     register_sparql_pushdown()
-    counting = _counting_term_dict(graph)
+    counting = counting_term_dict(graph)
     rows = run(
         graph,
         f"""SELECT ?s WHERE {{
@@ -1641,7 +717,7 @@ def test_filter_decodes_a_generic_only_conjunct_once(tmp_path):
     of this 400-row cross product is decoded once."""
     graph = _three_predicate_graph(tmp_path, "t", lambda i: i + 1000, n=20)
     register_sparql_pushdown()
-    counting = _counting_term_dict(graph)
+    counting = counting_term_dict(graph)
     rows = run(
         graph,
         """SELECT ?a WHERE {
@@ -1661,7 +737,7 @@ def test_filter_reuses_the_terms_its_early_pass_decoded(tmp_path):
     subjects the answer names."""
     graph = _three_predicate_graph(tmp_path, "s", lambda i: i + 1000, n=1000)
     register_sparql_pushdown()
-    counting = _counting_term_dict(graph)
+    counting = counting_term_dict(graph)
     rows = run(
         graph,
         """SELECT ?s WHERE {
@@ -1674,29 +750,21 @@ def test_filter_reuses_the_terms_its_early_pass_decoded(tmp_path):
     assert counting.decoded == 3000
 
 
-def _trace_events(text: str) -> list[dict]:
-    """The query-trace events printed to ``text`` (captured stderr)."""
-    prefix = pd._TRACE_PREFIX
-    return [
-        json.loads(line[len(prefix) :]) for line in text.splitlines() if line.startswith(prefix)
-    ]
-
-
 @contextlib.contextmanager
 def _tracing():
     """A query trace around the native wrapper under test; the events it
     emits wait in the trace's pending lines (:func:`_pending_events`)."""
-    trace = pd._QueryTrace(query_id=None)
-    token = pd._TRACE.set(trace)
+    trace = pd.tracing._QueryTrace(query_id=None)
+    token = pd.tracing._TRACE.set(trace)
     try:
         yield trace
     finally:
-        pd._TRACE.reset(token)
+        pd.tracing._TRACE.reset(token)
 
 
 def _pending_events(trace) -> list[dict]:
     """The events a trace holds, not yet flushed to stderr."""
-    return _trace_events("\n".join(trace.pending))
+    return trace_events("\n".join(trace.pending))
 
 
 _PRUNED_SQL = """SELECT ?c WHERE {
@@ -1722,11 +790,11 @@ def test_trace_records_every_native_call(tmp_path, monkeypatch, capsys):
     and 1 probe of `r`."""
     graph = _pruned_graph(tmp_path)
     register_sparql_pushdown()
-    native = _counting_native(graph)
+    native = counting_native(graph)
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
     run(graph, _PRUNED_SQL)
-    trace = _trace_events(capsys.readouterr().err)
+    trace = trace_events(capsys.readouterr().err)
     calls = [e for e in trace if e["event"] == "native_call_complete"]
     batches = [e for e in trace if e["event"] == "native_batch_complete"]
     assert (native.counts, native.matches, native.batches) == (3, 3, 1)
@@ -1747,10 +815,10 @@ def test_traced_batch_does_not_pull_ahead(file_graph, monkeypatch, capsys):
     """A traced ``match_codes_many`` hands its caller the native iterator, not
     the rows it drained from it: the probe join pulls exactly the answers it
     consumes, and the batch events add up to the probes served."""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
-    monkeypatch.setattr(pd, "_PROBE_BATCH", 3)
-    monkeypatch.setattr(pd, "_cheap_probe", lambda store, n3: True)
-    monkeypatch.setattr(pd, "_CHEAP_BATCH_MIN", 1)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
+    monkeypatch.setattr(SETTINGS, "probe_batch", 3)
+    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: True)
+    monkeypatch.setattr(SETTINGS, "cheap_batch_min", 1)
     native = _PullCountingNative(file_graph.store._store())
     file_graph.store._native = native
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
@@ -1759,7 +827,7 @@ def test_traced_batch_does_not_pull_ahead(file_graph, monkeypatch, capsys):
     assert with_pushdown == without_pushdown
     batches = [
         e
-        for e in _trace_events(capsys.readouterr().err)
+        for e in trace_events(capsys.readouterr().err)
         if e["event"] == "native_batch_complete" and e["operation"] == "match_codes_many"
     ]
     assert len(native.answers) == len(batches) > 1
@@ -1773,7 +841,7 @@ def test_closing_a_traced_batch_reports_the_pulls_it_made(file_graph):
     that once: its probe count is the batch's, its rows the pulled answers'."""
     native = _PullCountingNative(file_graph.store._store())
     with _tracing() as trace:
-        answers = pd._TracedNative(native).match_codes_many(_FOUR_PROBES)
+        answers = pd.tracing._TracedNative(native).match_codes_many(_FOUR_PROBES)
         assert len(answers) == len(_FOUR_PROBES)
         pulled = [next(answers), next(answers)]
         assert native.answers[0].pulls == 2 and _pending_events(trace) == []
@@ -1796,7 +864,7 @@ def test_traced_chunks_report_the_chunks_pulled(file_graph):
     keep = {"o": (0, 1_000_000)}
     rows = store.count_quads(*pattern)
     with _tracing() as trace:
-        chunks = pd._TracedNative(store).match_code_chunks(
+        chunks = pd.tracing._TracedNative(store).match_code_chunks(
             *pattern, keep=keep, columns=("s", "o"), batch_rows=4
         )
         pulled = [next(chunks)]
@@ -1819,11 +887,11 @@ def test_a_traced_chunk_call_without_codes_returns_none(tmp_path):
     out = tmp_path / "plain.vortex"
     serialize_rdf(str(source), str(out), layout="default")
     with _tracing():
-        assert pd._TracedNative(VortexRdfStore(str(out))).match_code_chunks() is None
+        assert pd.tracing._TracedNative(VortexRdfStore(str(out))).match_code_chunks() is None
 
 
 def test_the_traced_native_forwards_the_native_keywords(file_graph):
-    traced = pd._TracedNative(file_graph.store._store())
+    traced = pd.tracing._TracedNative(file_graph.store._store())
     token = CancelToken()
     with _tracing():
         counts = traced.count_quads_many(_FOUR_PROBES, lookahead=1, cancel=token)
@@ -1850,7 +918,7 @@ def test_trace_reports_a_mid_join_prune_between_the_steps_it_links(tmp_path, mon
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
     run(graph, _PRUNED_SQL)
-    trace = _trace_events(capsys.readouterr().err)
+    trace = trace_events(capsys.readouterr().err)
     steps = [e for e in trace if e["event"] == "bgp_join_step_complete"]
     prunes = [e for e in trace if e["event"] == "bgp_prune_complete"]
     assert len(prunes) == 1 and prunes[0]["pruned"] is True
@@ -1875,7 +943,7 @@ def test_trace_output_is_not_timed_as_native_work(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "stderr", slow)
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     run(graph, "SELECT ?s WHERE { ?s <http://ex.org/p> ?a . ?s <http://ex.org/q> ?b }")
-    done = next(e for e in _trace_events(slow.getvalue()) if e["event"] == "bgp_complete")
+    done = next(e for e in trace_events(slow.getvalue()) if e["event"] == "bgp_complete")
     assert done["native_match_ns"] < 20_000_000
 
 
@@ -1898,8 +966,10 @@ def test_tuple_filter_prunes_a_bgp_so_a_remaining_pattern_is_probed(
         graph_name="http://ex.org/g" if in_graph else None,
     )
     probes = []
-    original = pd._probe_join
-    monkeypatch.setattr(pd, "_probe_join", lambda *a, **k: probes.append(1) or original(*a, **k))
+    original = pd.probes._probe_join
+    monkeypatch.setattr(
+        pd.probes, "_probe_join", lambda *a, **k: probes.append(1) or original(*a, **k)
+    )
     register_sparql_pushdown()
     patterns = "?s <http://ex.org/p> ?a . ?s <http://ex.org/q> ?b . ?s <http://ex.org/r> ?c"
     body = f"GRAPH <http://ex.org/g> {{ {patterns} }}" if in_graph else patterns
@@ -1948,19 +1018,19 @@ def test_columnar_join_matches_row_join():
     kb = [rnd.randrange(40) for _ in range(200)]
     vb = [rnd.randrange(1000) for _ in range(200)]
     schema_a, schema_b = ("k", "x"), ("k", "y")
-    expected = pd._join(
+    expected = pd.relation._join(
         schema_a, list(zip(ka, va, strict=True)), schema_b, list(zip(kb, vb, strict=True))
     )[1]
     cols_a = (array("Q", ka), array("Q", va))
     cols_b = (array("Q", kb), array("Q", vb))
-    joined = pd._join_columns(schema_a, cols_a, schema_b, cols_b)
+    joined = pd.relation._join_columns(schema_a, cols_a, schema_b, cols_b)
     assert joined is not None
     schema, cols, pairs = joined
     assert schema == ("k", "x", "y")
-    assert pd._cols_to_rows(cols) == expected
+    assert pd.relation._cols_to_rows(cols) == expected
     assert pairs is None  # within the product bound: built uncounted
     # Several shared variables decline: the row join handles them.
-    assert pd._join_columns(("k", "x"), cols_a, ("k", "x"), cols_a) is None
+    assert pd.relation._join_columns(("k", "x"), cols_a, ("k", "x"), cols_a) is None
 
 
 @pytest.mark.parametrize("tail_width", [0, 1, 2], ids=["no-tail", "one-tail", "two-tails"])
@@ -1982,12 +1052,15 @@ def test_hash_join_kernels_join_like_a_nested_loop(tail_width):
     schema_a, schema_b = ("k", "x"), ("k", "y", "z")[: 1 + tail_width]
     expected = [ra + rb[1:] for ra in rows_a for rb in rows_b if ra[0] == rb[0]]
 
-    assert pd._join(schema_a, rows_a, schema_b, rows_b) == (schema_a + schema_b[1:], expected)
+    assert pd.relation._join(schema_a, rows_a, schema_b, rows_b) == (
+        schema_a + schema_b[1:],
+        expected,
+    )
     cols_a = tuple(array("Q", column) for column in zip(*rows_a, strict=True))
     cols_b = tuple(array("Q", column) for column in zip(*rows_b, strict=True))
-    joined = pd._join_columns(schema_a, cols_a, schema_b, cols_b)
+    joined = pd.relation._join_columns(schema_a, cols_a, schema_b, cols_b)
     assert joined is not None
-    assert pd._cols_to_rows(joined[1]) == expected
+    assert pd.relation._cols_to_rows(joined[1]) == expected
 
 
 def test_repeated_pattern_is_matched_once(graph):
@@ -2050,8 +1123,8 @@ def test_distinct_patterns_are_matched_separately(graph):
 
 def test_pushdown_is_actually_used(graph, monkeypatch):
     calls = []
-    original = pd._solve_bgp
-    monkeypatch.setattr(pd, "_solve_bgp", lambda *a: calls.append(1) or original(*a))
+    original = pd.bgp._solve_bgp
+    monkeypatch.setattr(pd.bgp, "_solve_bgp", lambda *a: calls.append(1) or original(*a))
     register_sparql_pushdown()
     rows = run(graph, "SELECT ?s ?o WHERE { ?s <http://ex.org/name> ?o }")
     assert len(rows) == 8
@@ -2062,8 +1135,8 @@ def test_head_intercepts_the_whole_slice_project_chain(graph, monkeypatch):
     """A ``Slice(Project(BGP))`` is one interception at the Slice: rdflib
     never evaluates the Project or the BGP below it itself."""
     heads = []
-    original = pd._eval_head
-    monkeypatch.setattr(pd, "_eval_head", lambda *a: heads.append(a[2].name) or original(*a))
+    original = pd.head._eval_head
+    monkeypatch.setattr(pd.head, "_eval_head", lambda *a: heads.append(a[2].name) or original(*a))
     register_sparql_pushdown()
     rows = run(graph, "SELECT ?o WHERE { ?s <http://ex.org/name> ?o } LIMIT 2")
     assert len(rows) == 2
@@ -2102,54 +1175,10 @@ def test_limit_decodes_only_the_first_chunk(tmp_path):
     store = VortexRdflibStore(str(out), in_memory=True)
     graph = Graph(store=store)
     register_sparql_pushdown()
-    counting = _counting_term_dict(graph)
+    counting = counting_term_dict(graph)
     rows = run(graph, "SELECT * WHERE { ?s ?p ?o } LIMIT 10")
     assert len(rows) == 10
-    assert counting.decoded <= 3 * pd._CHUNK_START
-
-
-class _CountingNative:
-    """A VortexRdfStore stand-in that counts the counts and matches the
-    pushdown asks for — each probe of a batch call is one. ``count_calls``
-    lists the pattern and limit of each plain ``count_quads`` call."""
-
-    def __init__(self, inner):
-        self._inner = inner
-        self.counts = 0
-        self.matches = 0
-        self.batches = 0
-        self.count_calls: list[tuple[tuple, int | None]] = []
-
-    def count_quads(self, *args, **kwargs):
-        if not is_graph_name_check(args):
-            self.counts += 1
-            self.count_calls.append((args, kwargs.get("limit")))
-        return self._inner.count_quads(*args, **kwargs)
-
-    def match_codes(self, *args, **kwargs):
-        self.matches += 1
-        return self._inner.match_codes(*args, **kwargs)
-
-    def count_quads_many(self, probes, **options):
-        self.counts += len(probes)
-        self.batches += 1
-        return self._inner.count_quads_many(probes, **options)
-
-    def match_codes_many(self, probes, **options):
-        self.matches += len(probes)
-        self.batches += 1
-        return self._inner.match_codes_many(probes, **options)
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-
-def _counting_native(graph) -> _CountingNative:
-    """Install the counter. The store's own graph-name check is not counted
-    (`is_graph_name_check`): it is not what a query plan costs."""
-    native = _CountingNative(graph.store._store())
-    graph.store._native = native
-    return native
+    assert counting.decoded <= 3 * SETTINGS.chunk_start
 
 
 class _PullCounter:
@@ -2194,7 +1223,7 @@ class _PullCountingNative:
 def test_batch_stand_ins_accept_keywords(graph):
     """The counting stand-in passes the native batch keywords on, as the real
     store takes them."""
-    native = _counting_native(graph)
+    native = counting_native(graph)
     token = CancelToken()
     probes = [
         (None, "<http://ex.org/name>", None, None),
@@ -2208,7 +1237,7 @@ def test_batch_stand_ins_accept_keywords(graph):
 
 def test_ask_over_one_pattern_counts_instead_of_matching(graph):
     register_sparql_pushdown()
-    native = _counting_native(graph)
+    native = counting_native(graph)
     assert run(graph, "ASK { ?s <http://ex.org/knows> ?o }") is True
     assert run(graph, "ASK { ?s <http://ex.org/nothing> ?o }") is False
     assert (native.counts, native.matches) == (2, 0)
@@ -2234,13 +1263,13 @@ def test_native_none_falls_back_at_call_time(graph):
 
 
 def test_pushdown_ops_env_switch(dict_vortex, monkeypatch):
-    monkeypatch.setattr(pd, "_ENABLED_OPS", pd._ALL_OPS)
+    monkeypatch.setattr(SETTINGS, "enabled_ops", settings.ALL_OPS)
     monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "bgp")
     VortexRdflibStore(str(dict_vortex))
-    assert pd._ENABLED_OPS == {"BGP"}
+    assert SETTINGS.enabled_ops == {"BGP"}
     monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "BGP, Project")
     VortexRdflibStore(str(dict_vortex))
-    assert pd._ENABLED_OPS == {"BGP", "Project"}
+    assert SETTINGS.enabled_ops == {"BGP", "Project"}
     monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "Bogus")
     with pytest.raises(ValueError, match="Bogus"):
         VortexRdflibStore(str(dict_vortex))
@@ -2249,10 +1278,10 @@ def test_pushdown_ops_env_switch(dict_vortex, monkeypatch):
 def test_native_filters_env_switch(dict_vortex, monkeypatch):
     """`VORTEX_RDF_NATIVE_FILTERS=0` keeps every conjunct on the Python
     routes: no conjunct carries a native predicate, and the answer stands."""
-    monkeypatch.setattr(filters, "_NATIVE_ENABLED", True)
+    monkeypatch.setattr(SETTINGS, "native_filters", True)
     monkeypatch.setenv("VORTEX_RDF_NATIVE_FILTERS", "0")
     graph = Graph(store=VortexRdflibStore(str(dict_vortex)))
-    assert filters._NATIVE_ENABLED is False
+    assert SETTINGS.native_filters is False
     with_pushdown, without_pushdown = both_ways(
         graph, "SELECT ?s WHERE { ?s ?p ?o FILTER(isIRI(?o)) }"
     )
@@ -2283,8 +1312,10 @@ def test_filter_is_pushed_into_the_pattern_scan(graph, monkeypatch):
     """A single-variable conjunct restricts the pattern before any row is
     built, on the fast route: rdflib's evaluator is never consulted."""
     restrictions = []
-    original = pd._restrict_pattern
-    monkeypatch.setattr(pd, "_restrict_pattern", lambda *a: restrictions.append(1) or original(*a))
+    original = pd.matching._restrict_pattern
+    monkeypatch.setattr(
+        pd.matching, "_restrict_pattern", lambda *a: restrictions.append(1) or original(*a)
+    )
     generic_calls = []
     original_generic = filters.Conjunct.generic
     monkeypatch.setattr(
@@ -2318,11 +1349,11 @@ def test_init_bindings_are_visible_to_filters(graph):
     sparql = "SELECT ?a WHERE { ?x <http://ex.org/age> ?a FILTER(?x = ?who && ?a > 0) }"
     init = {"who": URIRef("http://ex.org/bob")}
     register_sparql_pushdown()
-    with_pushdown = sorted((tuple(r) for r in graph.query(sparql, initBindings=init)), key=_row_key)
+    with_pushdown = sorted((tuple(r) for r in graph.query(sparql, initBindings=init)), key=row_key)
     try:
         unregister_sparql_pushdown()
         without_pushdown = sorted(
-            (tuple(r) for r in graph.query(sparql, initBindings=init)), key=_row_key
+            (tuple(r) for r in graph.query(sparql, initBindings=init)), key=row_key
         )
     finally:
         register_sparql_pushdown()
@@ -2372,7 +1403,7 @@ IRI_KEEP_PATHS = {
 )
 def test_iri_keep_paths_agree_with_rdflib(file_graph, monkeypatch, fanout, sparql, init, expected):
     """The paths an IRI keep takes, each with a query whose answer changes if
-    the path breaks, hash-joined (``_PROBE_FANOUT`` 100) and probed (0):
+    the path breaks, hash-joined (``SETTINGS.probe_fanout`` 100) and probed (0):
 
     - a probed pattern's free variable tests the keep's codes on the rows each
       probe returns (``keep_member``);
@@ -2382,12 +1413,12 @@ def test_iri_keep_paths_agree_with_rdflib(file_graph, monkeypatch, fanout, sparq
     - an IRI that is no N-Triples IRIREF makes no keep (``_SPELLABLE_IRI``):
       a bound variable's here, which ``encode_many`` would read as another
       IRI."""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", fanout)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
     bindings = None if init is None else {name: URIRef(iri) for name, iri in init.items()}
 
     def answer(graph, sparql):
         rows = graph.query(sparql, initBindings=bindings)
-        return sorted((tuple(row) for row in rows), key=_row_key)
+        return sorted((tuple(row) for row in rows), key=row_key)
 
     with_pushdown, without_pushdown = both_ways(file_graph, sparql, answer)
     assert with_pushdown == without_pushdown
@@ -2396,13 +1427,13 @@ def test_iri_keep_paths_agree_with_rdflib(file_graph, monkeypatch, fanout, sparq
 
 def test_distinct_and_count_are_answered_in_code_space(graph, monkeypatch):
     distincts, aggregates = [], []
-    original_distinct = pd._eval_distinct
-    original_aggregate = pd._eval_aggregate
+    original_distinct = pd.head._eval_distinct
+    original_aggregate = pd.aggregate._eval_aggregate
     monkeypatch.setattr(
-        pd, "_eval_distinct", lambda *a: distincts.append(1) or original_distinct(*a)
+        pd.head, "_eval_distinct", lambda *a: distincts.append(1) or original_distinct(*a)
     )
     monkeypatch.setattr(
-        pd, "_eval_aggregate", lambda *a: aggregates.append(1) or original_aggregate(*a)
+        pd.aggregate, "_eval_aggregate", lambda *a: aggregates.append(1) or original_aggregate(*a)
     )
     register_sparql_pushdown()
     rows = run(graph, "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a }")
@@ -2433,7 +1464,7 @@ def test_term_aliases_are_classified_within_each_query(graph, order):
     for sparql in _ALIAS_QUERIES[::order]:
         with_pushdown, without_pushdown = both_ways(graph, sparql)
         assert with_pushdown == without_pushdown, sparql
-    counting = _counting_term_dict(graph)
+    counting = counting_term_dict(graph)
     decoded = []
     for _ in range(2):
         before = counting.decoded
@@ -2444,7 +1475,7 @@ def test_term_aliases_are_classified_within_each_query(graph, order):
 
 def test_count_over_one_pattern_counts_instead_of_matching(graph):
     register_sparql_pushdown()
-    native = _counting_native(graph)
+    native = counting_native(graph)
     rows = run(graph, "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://ex.org/name> ?o }")
     assert rows == [(Literal(8),)]
     rows = run(graph, "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://ex.org/nothing> ?o }")
@@ -2467,7 +1498,7 @@ def test_distinct_decodes_only_the_survivors(tmp_path):
     store = VortexRdflibStore(str(out), in_memory=True)
     graph = Graph(store=store)
     register_sparql_pushdown()
-    counting = _counting_term_dict(graph)
+    counting = counting_term_dict(graph)
     rows = run(graph, "SELECT DISTINCT ?p WHERE { ?s ?p ?o }")
     assert len(rows) == 7
     assert counting.decoded == 7
@@ -2478,33 +1509,33 @@ def test_left_join_probe_and_hash_paths_are_ours(graph, monkeypatch):
     outer row under a low threshold, hash-joined under a high one — never by
     rdflib re-entering the BGP hook once per outer solution."""
     left_joins, probes, bgps = [], [], []
-    original_left = pd._solve_left_join
-    original_probe = pd._probe_join
-    original_bgp = pd._solve_bgp
+    original_left = pd.blocks._solve_left_join
+    original_probe = pd.probes._probe_join
+    original_bgp = pd.bgp._solve_bgp
     monkeypatch.setattr(
-        pd, "_solve_left_join", lambda *a: left_joins.append(1) or original_left(*a)
+        pd.blocks, "_solve_left_join", lambda *a: left_joins.append(1) or original_left(*a)
     )
     monkeypatch.setattr(
-        pd, "_probe_join", lambda *a, **k: probes.append(1) or original_probe(*a, **k)
+        pd.probes, "_probe_join", lambda *a, **k: probes.append(1) or original_probe(*a, **k)
     )
-    monkeypatch.setattr(pd, "_solve_bgp", lambda *a: bgps.append(1) or original_bgp(*a))
+    monkeypatch.setattr(pd.bgp, "_solve_bgp", lambda *a: bgps.append(1) or original_bgp(*a))
     register_sparql_pushdown()
     sparql = (
         "SELECT ?x ?a WHERE { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }"
     )
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     assert len(run(graph, sparql)) == 8
     assert left_joins and probes and len(bgps) == 1
     left_joins.clear(), probes.clear(), bgps.clear()
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 10**9)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 10**9)
     assert len(run(graph, sparql)) == 8
     assert left_joins and not probes and len(bgps) == 1
 
 
 def test_minus_is_an_anti_join_in_code_space(graph, monkeypatch):
     calls = []
-    original = pd._solve_minus
-    monkeypatch.setattr(pd, "_solve_minus", lambda *a: calls.append(1) or original(*a))
+    original = pd.blocks._solve_minus
+    monkeypatch.setattr(pd.blocks, "_solve_minus", lambda *a: calls.append(1) or original(*a))
     register_sparql_pushdown()
     rows = run(
         graph, "SELECT ?x WHERE { ?x <http://ex.org/name> ?n MINUS { ?x <http://ex.org/age> ?a } }"
@@ -2520,7 +1551,7 @@ def test_cheated_scope_falls_back_to_rdflib(graph, monkeypatch):
     left side is re-checked by rdflib with that binding dropped; that shape
     is handed back, and still answered correctly."""
     left_joins = []
-    original = pd._solve_left_join
+    original = pd.blocks._solve_left_join
 
     def spy(*args):
         try:
@@ -2529,7 +1560,7 @@ def test_cheated_scope_falls_back_to_rdflib(graph, monkeypatch):
             left_joins.append("fallback")
             raise
 
-    monkeypatch.setattr(pd, "_solve_left_join", spy)
+    monkeypatch.setattr(pd.blocks, "_solve_left_join", spy)
     sparql = """SELECT ?x ?a ?y WHERE {
         { VALUES ?a { 42 } }
         { ?x <http://ex.org/name> ?n OPTIONAL { ?y <http://ex.org/age> ?a } } }"""
@@ -2543,11 +1574,15 @@ def test_exists_is_a_semi_join_in_code_space(graph, monkeypatch):
     variables — probed per row for a small block, hash-joined otherwise —
     without rdflib's evaluator running per row."""
     applied, probes, generic_calls = [], [], []
-    original_apply = pd._apply_exists
-    original_probe = pd._probe_exists
+    original_apply = pd.blocks._apply_exists
+    original_probe = pd.probes._probe_exists
     original_generic = filters.Conjunct.generic
-    monkeypatch.setattr(pd, "_apply_exists", lambda *a: applied.append(1) or original_apply(*a))
-    monkeypatch.setattr(pd, "_probe_exists", lambda *a: probes.append(1) or original_probe(*a))
+    monkeypatch.setattr(
+        pd.blocks, "_apply_exists", lambda *a: applied.append(1) or original_apply(*a)
+    )
+    monkeypatch.setattr(
+        pd.probes, "_probe_exists", lambda *a: probes.append(1) or original_probe(*a)
+    )
     monkeypatch.setattr(
         filters.Conjunct,
         "generic",
@@ -2556,10 +1591,10 @@ def test_exists_is_a_semi_join_in_code_space(graph, monkeypatch):
     register_sparql_pushdown()
     sparql = """SELECT ?x WHERE { ?x <http://ex.org/name> ?n
         FILTER NOT EXISTS { ?x <http://ex.org/age> ?a } }"""
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     assert len(run(graph, sparql)) == 3 and applied and probes and not generic_calls
     applied.clear(), probes.clear()
-    monkeypatch.setattr(pd, "_PROBE_FANOUT", 10**9)
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 10**9)
     assert len(run(graph, sparql)) == 3 and applied and not probes and not generic_calls
     # a body FILTER that sees the block's bindings: rdflib's evaluator, per distinct tuple
     rows = run(
@@ -2572,8 +1607,8 @@ def test_exists_is_a_semi_join_in_code_space(graph, monkeypatch):
 
 def test_order_by_is_a_rank_sort_in_code_space(graph, monkeypatch):
     ordered = []
-    original = pd._order_rows
-    monkeypatch.setattr(pd, "_order_rows", lambda *a: ordered.append(a[4]) or original(*a))
+    original = pd.head._order_rows
+    monkeypatch.setattr(pd.head, "_order_rows", lambda *a: ordered.append(a[4]) or original(*a))
     register_sparql_pushdown()
     rows = run_ordered(
         graph, "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a ?x LIMIT 2"
@@ -2590,8 +1625,8 @@ def test_order_by_is_a_rank_sort_in_code_space(graph, monkeypatch):
 
 def test_values_is_a_code_space_relation(graph, monkeypatch):
     calls = []
-    original = pd._solve_values
-    monkeypatch.setattr(pd, "_solve_values", lambda *a: calls.append(1) or original(*a))
+    original = pd.blocks._solve_values
+    monkeypatch.setattr(pd.blocks, "_solve_values", lambda *a: calls.append(1) or original(*a))
     register_sparql_pushdown()
     rows = run(
         graph,

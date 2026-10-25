@@ -21,12 +21,12 @@ A conjunct on a variable a VALUES table binds holds on the table's rows."""
 
 import pytest
 from rdflib import Dataset, Variable
+from tests.support import both_ways, captured_trace, run
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from test_native_primitives import _trace
-from test_pushdown import both_ways, run
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
+from vortex_rdflib.settings import SETTINGS
 
 # Two named graphs and the default graph: a first hop (p), a second and third
 # hop for the nested groups, OPTIONAL and MINUS (q, r), a subject with a first
@@ -1121,9 +1121,9 @@ def route(request, monkeypatch):
     """The default planning; every one-pattern side probed per row; every
     FILTER value through rdflib's evaluator."""
     if request.param == "probe":
-        monkeypatch.setattr(pd, "_PROBE_FANOUT", 0)
+        monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     elif request.param == "generic":
-        monkeypatch.setattr(filters, "_FAST_ENABLED", False)
+        monkeypatch.setattr(SETTINGS, "fast_filters", False)
     return request.param
 
 
@@ -1149,7 +1149,7 @@ def test_a_filter_on_a_variable_the_graph_group_binds_stays_native(
         monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
         capsys.readouterr()
         rows = run(dataset, query)
-        native = [e for e in _trace(capsys) if e["event"] == "native_filter_complete"]
+        native = [e for e in captured_trace(capsys) if e["event"] == "native_filter_complete"]
         monkeypatch.delenv("VORTEX_RDF_TRACE_QUERY")
         assert [(e["kind"], e["candidate_codes"], e["passed_codes"]) for e in native] == [
             ("str_prefix", 2, 2)
@@ -1300,7 +1300,7 @@ def test_the_pushdown_answers_these_shapes_whole(
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
     run(dataset, PREFIX + sparql)
-    events = _trace(capsys)
+    events = captured_trace(capsys)
     assert any(e["event"] == "eval_part_complete" for e in events)
     assert {e["algebra_node"] for e in events if e["event"] == "eval_part_fallback"}.isdisjoint(
         _BLOCK_NODES
@@ -1318,15 +1318,15 @@ def test_a_values_variable_a_pattern_binds_keeps_its_route(quad_files, monkeypat
     )
     register_sparql_pushdown()
     restricted, filtered, generic = [], [], []
-    restrict, filter_relation = pd._restrict_pattern, pd._filter_relation
+    restrict, filter_relation = pd.matching._restrict_pattern, pd.relation._filter_relation
     original_generic = filters.Conjunct.generic
     monkeypatch.setattr(
-        pd,
+        pd.matching,
         "_restrict_pattern",
         lambda store, pat, preds: restricted.extend(preds) or restrict(store, pat, preds),
     )
     monkeypatch.setattr(
-        pd, "_filter_relation", lambda *a: filtered.append(a) or filter_relation(*a)
+        pd.relation, "_filter_relation", lambda *a: filtered.append(a) or filter_relation(*a)
     )
     monkeypatch.setattr(
         filters.Conjunct,

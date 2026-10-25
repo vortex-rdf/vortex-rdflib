@@ -6,79 +6,17 @@ a pattern scan) and every ordered pair of spellings for two (the row
 predicate applied to joined rows)."""
 
 import pytest
-from rdflib import Graph
-from rdflib.plugins.sparql.algebra import translateQuery
 from rdflib.plugins.sparql.evalutils import _ebv
-from rdflib.plugins.sparql.parser import parseQuery
-from rdflib.plugins.sparql.sparql import FrozenBindings, QueryContext
+from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import Variable
+from tests.corpus import SPELLINGS
+from tests.support import CTX, RAISES, V, W, filter_expr, rdflib_answer, typed
 
 from vortex_rdflib import VortexRdflibStore, filters
 from vortex_rdflib.terms import BLANK, IRI, LITERAL, TermView, kind_bounds, kind_of, parse_spelling
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
-PREFIXES = (
-    f"PREFIX xsd: <{XSD}> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> "
-    "PREFIX ex: <http://ex.org/> "
-)
-V = Variable("v")
-W = Variable("w")
 
-
-def typed(lexical: str, datatype: str) -> str:
-    return f'"{lexical}"^^<{XSD}{datatype}>'
-
-
-#: Data-side spellings, as the store's dictionary holds them (lowercase
-#: language tags, minimal escapes); None is an unbound variable.
-SPELLINGS = [
-    typed("5", "integer"),
-    typed("01", "integer"),
-    typed("+7", "integer"),
-    typed(" 7", "integer"),
-    typed("1_0", "integer"),
-    typed("1.5", "integer"),
-    typed("abc", "integer"),
-    typed("0x10", "integer"),
-    typed("99999999999999999999", "integer"),
-    typed("-3", "integer"),
-    typed("1.5", "decimal"),
-    typed("5", "decimal"),
-    typed("NaN", "double"),
-    typed("INF", "double"),
-    typed("-INF", "double"),
-    typed("1e2", "double"),
-    typed("5", "float"),
-    typed("7", "byte"),
-    typed("300", "byte"),
-    typed("5", "int"),
-    typed("5", "short"),
-    typed("5", "unsignedByte"),
-    typed("-1", "nonNegativeInteger"),
-    typed("5", "positiveInteger"),
-    typed("true", "boolean"),
-    typed("True", "boolean"),
-    typed("1", "boolean"),
-    typed("maybe", "boolean"),
-    typed("2020-01-01T00:00:00", "dateTime"),
-    typed("2020-01-01", "date"),
-    '"5"',
-    '"05"',
-    '""',
-    '"abc"',
-    '"Abc"',
-    '"abc"@en',
-    '"abc"@en-us',
-    '"5"@en',
-    '"a\\"b"',
-    '"a\\nb"',
-    '"x"^^<http://ex.org/dt>',
-    "<http://ex.org/x>",
-    "<http://ex.org/y>",
-    "_:b0",
-    "<http://www.w3.org/1999/02/22-rdf-syntax-ns#nil>",
-    None,
-]
 
 EXPRESSIONS = [
     "?v < 5",
@@ -179,31 +117,6 @@ TWO_VAR_EXPRESSIONS = [
 ]
 
 
-def filter_expr(sparql_expr: str):
-    query = translateQuery(
-        parseQuery(f"{PREFIXES}SELECT * WHERE {{ ?s ?p ?v FILTER({sparql_expr}) }}")
-    )
-    node = query.algebra.p.p
-    assert node.name == "Filter"
-    return node.expr
-
-
-# rdflib's own contexts always carry an initBindings mapping; an unbound
-# variable is looked up there last (Graph.query defaults it to {}).
-CTX = QueryContext(graph=Graph(), initBindings={})
-
-
-RAISES = "rdflib raises"
-
-
-def rdflib_answer(expr, spelling):
-    bindings = {} if spelling is None else {V: VortexRdflibStore._from_n3_safe(spelling)}
-    try:
-        return _ebv(expr, FrozenBindings(CTX, bindings))
-    except Exception:  # noqa: BLE001 - rdflib's own bugs (e.g. NaN vs Decimal) are the oracle
-        return RAISES
-
-
 def fast_answer(predicate, spelling):
     view = None if spelling is None else parse_spelling(spelling)
     return predicate((view,))
@@ -217,12 +130,12 @@ def fast_answer(predicate, spelling):
 @pytest.mark.parametrize("sparql_expr", EXPRESSIONS)
 def test_fast_route_agrees_with_rdflib(sparql_expr):
     expr = filter_expr(sparql_expr)
-    predicate = filters.compile_fast(expr, (V,), {})
+    predicate = filters.compiler.compile_fast(expr, (V,), {})
     assert predicate is not None, "expression is in the whitelist"
     answered = 0
     for spelling in SPELLINGS:
         fast = fast_answer(predicate, spelling)
-        if fast is filters.UNKNOWN:
+        if fast is filters.values.UNKNOWN:
             continue
         answered += 1
         # Where rdflib itself raises, the fast route must have deferred, so
@@ -239,7 +152,7 @@ def test_two_variable_fast_route_agrees_with_rdflib(sparql_expr):
     the only route on which one operand can be unbound while another carries
     a value rdflib would raise on."""
     expr = filter_expr(sparql_expr)
-    predicate = filters.compile_fast(expr, (V, W), {})
+    predicate = filters.compiler.compile_fast(expr, (V, W), {})
     assert predicate is not None, "expression is in the whitelist"
     # 45x45 lookups of each spelling: parse every one once.
     terms = {s: None if s is None else VortexRdflibStore._from_n3_safe(s) for s in SPELLINGS}
@@ -248,7 +161,7 @@ def test_two_variable_fast_route_agrees_with_rdflib(sparql_expr):
     for left in SPELLINGS:
         for right in SPELLINGS:
             fast = predicate((views[left], views[right]))
-            if fast is filters.UNKNOWN:
+            if fast is filters.values.UNKNOWN:
                 continue
             answered += 1
             bound = {var: terms[s] for var, s in ((V, left), (W, right)) if s is not None}
@@ -290,7 +203,7 @@ def test_two_variable_fast_route_agrees_with_rdflib(sparql_expr):
 )
 def test_fast_route_answers_the_common_shapes(sparql_expr, spelling, expected):
     """The shapes the benchmark queries use must not fall back to rdflib."""
-    predicate = filters.compile_fast(filter_expr(sparql_expr), (V,), {})
+    predicate = filters.compiler.compile_fast(filter_expr(sparql_expr), (V,), {})
     assert predicate is not None
     assert fast_answer(predicate, spelling) is expected
 
@@ -307,10 +220,12 @@ def test_fast_route_answers_the_common_shapes(sparql_expr, spelling, expected):
     ],
 )
 def test_fast_route_defers_outside_its_domain(sparql_expr, spelling):
-    predicate = filters.compile_fast(filter_expr(sparql_expr), (V,), {})
+    predicate = filters.compiler.compile_fast(filter_expr(sparql_expr), (V,), {})
     assert predicate is not None
     answer = fast_answer(predicate, spelling)
-    assert answer is filters.UNKNOWN or answer == rdflib_answer(filter_expr(sparql_expr), spelling)
+    assert answer is filters.values.UNKNOWN or answer == rdflib_answer(
+        filter_expr(sparql_expr), spelling
+    )
 
 
 @pytest.mark.parametrize(
@@ -322,7 +237,7 @@ def test_fast_route_defers_outside_its_domain(sparql_expr, spelling):
     ],
 )
 def test_outside_the_whitelist_is_not_compiled(sparql_expr):
-    assert filters.compile_fast(filter_expr(sparql_expr), (V,), {}) is None
+    assert filters.compiler.compile_fast(filter_expr(sparql_expr), (V,), {}) is None
 
 
 @pytest.mark.parametrize(
@@ -341,9 +256,9 @@ def test_additive_outside_the_integer_domain_defers(spelling):
     """Every operand rdflib would treat by a rule the fast route does not
     reproduce has to come back UNKNOWN, not a guess: the value then goes to
     rdflib alone, and a query that raises there raises with the pushdown too."""
-    predicate = filters.compile_fast(filter_expr("?v + 1 > 3"), (V,), {})
+    predicate = filters.compiler.compile_fast(filter_expr("?v + 1 > 3"), (V,), {})
     assert predicate is not None
-    assert fast_answer(predicate, spelling) is filters.UNKNOWN
+    assert fast_answer(predicate, spelling) is filters.values.UNKNOWN
 
 
 @pytest.mark.parametrize(
@@ -361,10 +276,10 @@ def test_out_of_range_typed_constant_defers_every_value(sparql_expr):
     as it orders an out-of-range data literal. The fast route reproduces
     neither from the spelling alone: every value goes to rdflib."""
     expr = filter_expr(sparql_expr)
-    predicate = filters.compile_fast(expr, (V,), {})
+    predicate = filters.compiler.compile_fast(expr, (V,), {})
     assert predicate is not None
     for spelling in SPELLINGS:
-        assert fast_answer(predicate, spelling) is filters.UNKNOWN, spelling
+        assert fast_answer(predicate, spelling) is filters.values.UNKNOWN, spelling
     # and rdflib indeed compares by value: 5 < 300
     if sparql_expr == '?v < "300"^^xsd:byte':
         assert rdflib_answer(expr, typed("5", "integer")) is True
@@ -373,11 +288,11 @@ def test_out_of_range_typed_constant_defers_every_value(sparql_expr):
 def test_ctx_bound_constants_are_substituted():
     expr = filter_expr("?v = ?w")
     view = parse_spelling(typed("5", "integer"))
-    predicate = filters.compile_fast(expr, (V,), {Variable("w"): view})
+    predicate = filters.compiler.compile_fast(expr, (V,), {Variable("w"): view})
     assert predicate is not None
     assert fast_answer(predicate, typed("05", "integer")) is True
     assert fast_answer(predicate, typed("6", "integer")) is False
-    unbound = filters.compile_fast(expr, (V,), {})
+    unbound = filters.compiler.compile_fast(expr, (V,), {})
     assert unbound is not None
     assert fast_answer(unbound, typed("5", "integer")) is False  # unbound ?w is an error
 
@@ -399,7 +314,9 @@ def test_fast_reject_predicate_keeps_a_row_the_filter_keeps_over_an_unbound_vari
     dictionary = store._dict
     assert dictionary is not None  # the code path is active
     expr = filter_expr("!bound(?w) || ?v < ?w")
-    conjunct = filters.Conjunct(expr, (V, W), filters.compile_fast(expr, (V, W), {}), False)
+    conjunct = filters.Conjunct(
+        expr, (V, W), filters.compiler.compile_fast(expr, (V, W), {}), False
+    )
     keep = filters.tuple_fast_reject_predicate(store, conjunct, [0, 1])
     assert keep((dictionary.encode(five), None)) is True
 
