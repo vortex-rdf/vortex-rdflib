@@ -327,7 +327,7 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
     def generic():
         conjunct = exists.conjunct
         _reject_graph_exists(ctx, store, [conjunct], scope)
-        if filters.has_minus(body) and (
+        if filters.exprs.has_minus(body) and (
             not conjunct.vars or any(v in rel.nullable for v in conjunct.vars)
         ):
             # rdflib binds the whole row in the body, so a MINUS there always
@@ -401,7 +401,7 @@ def _reject_env_references(node, plan, env, ctx) -> None:
     conjuncts = plan.constant + plan.tuples + [c for cs in plan.per_var.values() for c in cs]
     conjuncts += [exists.conjunct for exists in plan.exists]
     for conjunct in conjuncts:
-        for var in filters.expr_vars(conjunct.expr):
+        for var in filters.exprs.expr_vars(conjunct.expr):
             if var in env and var not in conjunct.consts:
                 if (var in conjunct.vars) != (everything or var in allowed):
                     raise NotImplementedError
@@ -412,7 +412,7 @@ def _reject_graph_exists(ctx, store, conjuncts, scope) -> None:
     made active: a conjunct it decides that holds one cannot be evaluated
     under a ``GRAPH`` that scopes the block to another graph."""
     if scope != algebra._active_scope(ctx, store) and any(
-        filters.has_exists(c.expr) for c in conjuncts
+        filters.exprs.has_exists(c.expr) for c in conjuncts
     ):
         raise NotImplementedError
 
@@ -425,8 +425,9 @@ def _reject_forgotten_exists(ctx, conjuncts, kept) -> None:
     context, and rdflib's evaluator, handed no binding, thaws the whole
     context. A conjunct holding an EXISTS that names one is left to rdflib."""
     for conjunct in conjuncts:
-        if filters.has_exists(conjunct.expr) and any(
-            ctx[var] is not None and var not in kept for var in filters.expr_vars(conjunct.expr)
+        if filters.exprs.has_exists(conjunct.expr) and any(
+            ctx[var] is not None and var not in kept
+            for var in filters.exprs.expr_vars(conjunct.expr)
         ):
             raise NotImplementedError
 
@@ -518,7 +519,10 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
         if dropped & frozenset(vars2):
             raise NotImplementedError
         cheated = (env | frozenset(outer)) - init
-        if condition is not None and frozenset(filters.expr_vars(condition)) & p1_vars & cheated:
+        if (
+            condition is not None
+            and frozenset(filters.exprs.expr_vars(condition)) & p1_vars & cheated
+        ):
             raise NotImplementedError
 
     left = _solve_block(ctx, store, p1, env, var_preds, scope)

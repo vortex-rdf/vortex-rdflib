@@ -116,7 +116,7 @@ def _traced_eval(active: _QueryTrace | None, run, ctx, store, part):
 
 
 def _eval_scoped(ctx, part):
-    """Evaluate ``part`` in a query scope of its own (:mod:`.query_scope`).
+    """Evaluate ``part`` in a query scope of its own (:mod:`vortex_rdflib.query_scope`).
 
     That is the top of a query — rdflib offers the query node first — or a
     node reached outside any query (a SPARQL Update's WHERE clause). Inside

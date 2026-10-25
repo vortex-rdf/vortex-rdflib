@@ -298,7 +298,7 @@ def _probe_join(
             if isinstance(spec, tuple):
                 probe_keep[position] = spec
             else:
-                tests.append((position, filters.keep_member(spec)))
+                tests.append((position, filters.native.keep_member(spec)))
     narrowing = matching._narrowing(probe_keep, limit=None if free else 1)
     whole = matching._narrowing(probe_keep)
     patterns = _substituted_patterns(store, rows, pat, bound)

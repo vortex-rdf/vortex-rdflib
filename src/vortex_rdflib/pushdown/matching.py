@@ -272,14 +272,14 @@ def _set_native_keep(pat: Pattern, position: int, keep) -> None:
     The pattern gets a new keep mapping, so one taken before stays whole."""
     nkeep = dict(pat.nkeep or {})
     if position in nkeep:
-        keep = filters.intersect_keeps([nkeep[position], keep])
+        keep = filters.native.intersect_keeps([nkeep[position], keep])
     nkeep[position] = keep
     pat.nkeep = nkeep
 
 
 def _push_native_restrictions(store, pat: Pattern, var_preds) -> dict:
     """Move the conjuncts vortex-rdf answers with a keep — kind tests and IRI
-    equality (:func:`filters.native_restriction`) — into the pattern's native
+    equality (:func:`filters.native.native_restriction`) — into the pattern's native
     keep, at every position their variable takes; returns the residual
     conjuncts per variable, evaluated over the codes the pattern brings
     (:func:`_restrict_pattern`, :func:`_probe_join`).
@@ -295,7 +295,7 @@ def _push_native_restrictions(store, pat: Pattern, var_preds) -> dict:
         conjuncts = var_preds.get(var)
         if not conjuncts:
             continue
-        keep, rest = filters.native_restriction(store, conjuncts)
+        keep, rest = filters.native.native_restriction(store, conjuncts)
         if keep is not None:
             for position in positions:
                 _set_native_keep(pat, position, keep)

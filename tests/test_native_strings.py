@@ -19,10 +19,11 @@ from vortex_rdf import serialize_rdf
 from test_filters import filter_expr, rdflib_answer
 from test_native_filters import _outcome
 from test_pushdown import both_ways
-from vortex_rdflib import VortexRdflibStore, candidates, filters, register_sparql_pushdown
-from vortex_rdflib.candidates import NativeShape
+from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
+from vortex_rdflib.filters import native
+from vortex_rdflib.filters.native import NativeShape
 from vortex_rdflib.settings import SETTINGS
-from vortex_rdflib.terms import canonical_spelling, parse_spelling
+from vortex_rdflib.terms import LITERAL, canonical_spelling, parse_spelling
 
 V = Variable("v")
 XSD = "http://www.w3.org/2001/XMLSchema#"
@@ -76,7 +77,7 @@ def _rdflib_text(spelling: str, case: str | None, as_str: bool) -> str | None:
     view = parse_spelling(spelling)
     if as_str:
         text = str(term)
-    elif view.kind == filters.LITERAL and view.dt in (None, XSD + "string"):
+    elif view.kind == LITERAL and view.dt in (None, XSD + "string"):
         text = str(term)
     else:
         return None
@@ -165,7 +166,7 @@ def _check_regex(store, codes, spellings, pattern, flags, case, as_str) -> int:
     except re.error:
         return 0  # native_shape never maps a pattern Python cannot compile
     shape = NativeShape("regex", pattern, flags, case, as_str)
-    passed, undecided = candidates.evaluate(store, shape, codes)
+    passed, undecided = native.evaluate(store, shape, codes)
     checked = 0
     for code in codes - set(undecided):
         text = _rdflib_text(spellings[code], case, as_str)
@@ -226,12 +227,12 @@ STRING_EXPRESSIONS = [
 def test_string_functions_agree_with_rdflib(corpus, sparql_expr):
     store, codes = corpus
     expr = filter_expr(sparql_expr)
-    shape = filters.native_shape(expr, V, {})
+    shape = filters.native.native_shape(expr, V, {})
     if shape is None:
         # A tagged constant against STR(): an error for every value in rdflib.
         assert "str(?v)" in sparql_expr and '"@' in sparql_expr
         return
-    passed, undecided = candidates.evaluate(store, shape, codes)
+    passed, undecided = native.evaluate(store, shape, codes)
     decided = 0
     for code in codes - set(undecided):
         stored = store._dict.decode(code)
@@ -251,7 +252,7 @@ def test_bsbm_literals_agree_with_python_re():
     CONTAINS/STRSTARTS/STRENDS constants."""
     store = VortexRdflibStore(os.environ["VORTEX_RDFLIB_BSBM_STORE"])
     assert store._dict is not None
-    lo, hi = store._kind_ranges()[filters.LITERAL]
+    lo, hi = store._kind_ranges()[LITERAL]
     ordered = list(range(lo, hi, max(1, (hi - lo) // 20000)))
     codes = set(ordered)
     spellings = {
@@ -290,7 +291,7 @@ def test_bsbm_literals_agree_with_python_re():
     for word in list(dict.fromkeys(words))[:50]:
         for function, test in tests.items():
             shape = NativeShape(function, canonical_spelling(Literal(word)))
-            passed, undecided = candidates.evaluate(store, shape, codes)
+            passed, undecided = native.evaluate(store, shape, codes)
             decided = 0
             for code in codes - set(undecided):
                 view = parse_spelling(spellings[code])

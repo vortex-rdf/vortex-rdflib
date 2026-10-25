@@ -41,7 +41,7 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None, limit=None, stream=Fa
     """Evaluate a BGP by matching one seed and probing connected patterns.
 
     The filter conjuncts that are native keeps (see
-    :func:`filters.native_restriction`) become keeps on each pattern's native
+    :func:`filters.native.native_restriction`) become keeps on each pattern's native
     match before anything is counted (see :func:`_push_native_restrictions`);
     the others are evaluated over the codes the pattern brings
     (:func:`filters.evaluate_column`): vortex-rdf decides those with a native

@@ -16,7 +16,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
-from .. import candidates
+from ..filters import native
 
 _TRACE_PREFIX = "VORTEX_RDF_QUERY_TRACE "
 
@@ -85,7 +85,7 @@ def _stopwatch() -> Callable[[], int]:
 def _trace_native_filter(
     kind: str, sent: int, passed: int, undecided: int, elapsed_ns: int
 ) -> None:
-    """One ``TermDict.filter_codes`` call (:func:`candidates.evaluate`) as a
+    """One ``TermDict.filter_codes`` call (:func:`native.evaluate`) as a
     trace event."""
     _trace_event(
         "native_filter_complete",
@@ -97,7 +97,7 @@ def _trace_native_filter(
     )
 
 
-candidates.TRACE = _trace_native_filter
+native.TRACE = _trace_native_filter
 
 
 def _keep_summary(keep) -> dict | None:

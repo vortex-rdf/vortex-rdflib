@@ -39,7 +39,7 @@ What runs in code space:
   row of the relation so far (tier 3) where the relation goes straight to the
   emitter, and elsewhere the node goes back to rdflib, which offers the BGP
   below it alone, where tier 3 applies;
-- a ``Filter`` over a block is split into conjuncts (:mod:`.filters`):
+- a ``Filter`` over a block is split into conjuncts (:mod:`vortex_rdflib.filters`):
   those over one variable that are a kind test or an IRI equality (``=``,
   ``sameTerm``, ``IN``) become a ``keep`` on the match of every pattern
   binding the variable, so the rows that fail never leave it (a probed
@@ -48,7 +48,7 @@ What runs in code space:
   pattern that binds it — over the pattern's whole column when it is
   matched, over the codes the probes reach when it is probed — by
   vortex-rdf when they have a native shape
-  (``TermDict.filter_codes`` over exactly those codes, :mod:`.candidates`),
+  (``TermDict.filter_codes`` over exactly those codes, :mod:`vortex_rdflib.filters.native`),
   and the match is compacted natively to the rows that pass; the rest per
   distinct code tuple, after the join (mid-join when that lets a later
   pattern be probed, and as a test of one variable when the relation binds
@@ -84,7 +84,7 @@ What runs in code space:
   and a ``COUNT(*)`` over one pattern (under a FILTER the native match
   decides, too) is answered by ``count_quads`` without matching a row;
 - solutions are decoded lazily in growing chunks, each distinct code once
-  per query through the query's term cache (:mod:`.query_scope`), and built
+  per query through the query's term cache (:mod:`vortex_rdflib.query_scope`), and built
   directly as ``FrozenBindings``, the row shape every rdflib operator above
   expects.
 
@@ -105,7 +105,7 @@ named graphs only.
 
 Cancellation: ``cancel_scope(token)`` gives the queries started inside it a
 ``vortex_rdf.CancelToken``. A query keeps it in its scope
-(:mod:`.query_scope`), so every step of its lazy result runs under it, the
+(:mod:`vortex_rdflib.query_scope`), so every step of its lazy result runs under it, the
 steps after the block included. A native call the token can stop — a batch,
 a chunked match, a one-shot call that scans a file-backed store — is given
 it (``cancel=``) and races it; the other one-shot calls — a point lookup, a
