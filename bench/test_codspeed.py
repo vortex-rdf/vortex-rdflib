@@ -265,7 +265,7 @@ def _traced_run(graph: Graph, query: Query, monkeypatch, capsys) -> list[dict]:
         assert _consume_query(graph, query) > 0
     finally:
         monkeypatch.delenv("VORTEX_RDF_TRACE_QUERY")
-    prefix = pushdown._TRACE_PREFIX
+    prefix = pushdown.tracing._TRACE_PREFIX
     return [
         json.loads(line[len(prefix) :])
         for line in capsys.readouterr().err.splitlines()

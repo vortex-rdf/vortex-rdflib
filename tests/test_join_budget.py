@@ -319,9 +319,9 @@ def test_the_pair_count_skips_a_product_within_the_budget(monkeypatch):
     counted only once the product passes the budget."""
     left, right = U64Column([1, 1, 2]), U64Column([1, 2, 2, 3])
     monkeypatch.setattr(SETTINGS, "pair_budget", 12)
-    assert pd._pair_count(left, right) is None
+    assert pd.relation._pair_count(left, right) is None
     monkeypatch.setattr(SETTINGS, "pair_budget", 11)
-    assert pd._pair_count(left, right) == 4
+    assert pd.relation._pair_count(left, right) == 4
 
 
 def test_a_row_step_counts_its_first_shared_variable(monkeypatch):
@@ -332,11 +332,11 @@ def test_a_row_step_counts_its_first_shared_variable(monkeypatch):
     rows_a = [(1, 5), (1, 6), (2, 7)]
     rows_b = [(1, 5, 0), (2, 9, 0), (3, 7, 0)]
     monkeypatch.setattr(SETTINGS, "pair_budget", 0)
-    assert pd._row_step_pairs((k, x), rows_a, (k, x, y), rows_b) == 3
-    assert len(pd._join((k, x), rows_a, (k, x, y), rows_b)[1]) == 1
-    assert pd._row_step_pairs((z,), [(1,), (2,)], (k, x, y), rows_b) == 6
+    assert pd.relation._row_step_pairs((k, x), rows_a, (k, x, y), rows_b) == 3
+    assert len(pd.relation._join((k, x), rows_a, (k, x, y), rows_b)[1]) == 1
+    assert pd.relation._row_step_pairs((z,), [(1,), (2,)], (k, x, y), rows_b) == 6
     monkeypatch.setattr(SETTINGS, "pair_budget", 6)
-    assert pd._row_step_pairs((z,), [(1,), (2,)], (k, x, y), rows_b) is None
+    assert pd.relation._row_step_pairs((z,), [(1,), (2,)], (k, x, y), rows_b) is None
 
 
 def test_small_joins_make_no_count(graph, monkeypatch, capsys):
@@ -548,7 +548,7 @@ def test_a_batch_short_of_answers_raises(graph, monkeypatch, tokened):
     graph.store._native = _ShortBatches(graph.store._store())
     probes = [((None, f"<{EX}p>", None, None), {}), ((None, f"<{EX}q>", None, None), {})]
     with _scope(tokened):
-        answers = iter(pd._run_probes(graph.store, probes, count=False))
+        answers = iter(pd.probes._run_probes(graph.store, probes, count=False))
         assert len(next(answers)[0]) == 10
         with pytest.raises(ValueError, match="fewer than its 2 probes"):
             next(answers)
@@ -580,7 +580,7 @@ def test_a_batch_past_its_probes_raises(graph, monkeypatch, tokened):
     graph.store._native = _LongBatches(graph.store._store())
     probes = [((None, f"<{EX}p>", None, None), {}), ((None, f"<{EX}q>", None, None), {})]
     with _scope(tokened):
-        answers = iter(pd._run_probes(graph.store, probes, count=False))
+        answers = iter(pd.probes._run_probes(graph.store, probes, count=False))
         assert len(next(answers)[0]) == 10
         with pytest.raises(ValueError, match="more than its 2 probes"):
             next(answers)
@@ -623,13 +623,13 @@ def test_groups_go_on_the_smaller_side(
     fan-out made of the relation."""
     monkeypatch.setattr(SETTINGS, "pair_budget", budget)
     grouped = []
-    gather_pieces = pd._gather_pieces
+    gather_pieces = pd.streaming._gather_pieces
 
     def watched(groups, fed, key, columns, order):
         grouped.append((len(groups), {len(column) for column in columns}))
         return gather_pieces(groups, fed, key, columns, order)
 
-    monkeypatch.setattr(pd, "_gather_pieces", watched)
+    monkeypatch.setattr(pd.streaming, "_gather_pieces", watched)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, sparql
     )
@@ -847,10 +847,10 @@ def test_rows_of_drains_once():
         return tuple(memoryview(U64Column(column)).cast("Q") for column in columns)
 
     pieces = iter([piece([1, 2], [3, 4]), piece([5], [6])])
-    rel = pd.Relation((x, y), None, None, 0, pieces=pieces)
-    rows = pd._rows_of(rel)
+    rel = pd.relation.Relation((x, y), None, None, 0, pieces=pieces)
+    rows = pd.relation._rows_of(rel)
     assert rows == [(1, 3), (2, 4), (5, 6)]
-    assert pd._rows_of(rel) is rows
+    assert pd.relation._rows_of(rel) is rows
     assert (rel.rows, rel.cols, rel.pieces, rel.nrows) == (rows, None, None, 3)
 
 
@@ -863,19 +863,19 @@ def test_a_memoized_match_is_sliced(graph):
     seed = native.match_codes(None, f"<{EX}p>", None, None)
     n3 = [None, f"<{EX}q>", None, None]
     match = native.match_codes(*n3)
-    pat = pd.Pattern(n3, {s: [0], y: [2]}, estimate=20)
+    pat = pd.matching.Pattern(n3, {s: [0], y: [2]}, estimate=20)
     spy = _spy(graph)
     columns = (seed[0], seed[2])
-    relation = pd.Relation.from_cols((s, x), columns)
-    schema, pieces = pd._streamed_step(graph.store, relation, pat, {tuple(n3): match})
-    rows = pd._rows_of(pd.Relation(schema, None, None, 0, pieces=pieces))
+    relation = pd.relation.Relation.from_cols((s, x), columns)
+    schema, pieces = pd.streaming._streamed_step(graph.store, relation, pat, {tuple(n3): match})
+    rows = pd.relation._rows_of(pd.relation.Relation(schema, None, None, 0, pieces=pieces))
     assert spy.names() == []
     views = tuple(memoryview(column).cast("Q") for column in columns)
-    joined_schema, joined, _ = pd._join_columns(
+    joined_schema, joined, _ = pd.relation._join_columns(
         (s, x), views, (s, y), (memoryview(match[0]).cast("Q"), memoryview(match[2]).cast("Q"))
     )
     assert schema == joined_schema == (s, x, y)
-    assert sorted(rows) == sorted(pd._cols_to_rows(joined))
+    assert sorted(rows) == sorted(pd.relation._cols_to_rows(joined))
 
 
 def test_tier2_joins_a_fitting_pattern_first(graph, monkeypatch, capsys):
@@ -917,16 +917,16 @@ def test_tier2_does_not_trust_a_capped_estimate(graph, monkeypatch):
     relation 101 rows make a product of 202, within a budget of 202, yet the
     pattern fits only once its count is known whole."""
     x, d = Variable("x"), Variable("d")
-    seed = pd.Pattern([f"<{EX}ts0>", f"<{EX}ta>", None, None], {x: [2]}, index=0)
-    linked = pd.Pattern([None, f"<{EX}tl>", None, None], {x: [0], d: [2]}, index=1)
-    pd._join_incremental_bgp(graph.store, [seed, linked], pd._BgpStats())
+    seed = pd.matching.Pattern([f"<{EX}ts0>", f"<{EX}ta>", None, None], {x: [2]}, index=0)
+    linked = pd.matching.Pattern([None, f"<{EX}tl>", None, None], {x: [0], d: [2]}, index=1)
+    pd.bgp._join_incremental_bgp(graph.store, [seed, linked], pd.bgp._BgpStats())
     assert (seed.estimate, seed.estimate_capped) == (1, False)
     assert (linked.estimate, linked.estimate_capped) == (101, True)
     monkeypatch.setattr(SETTINGS, "pair_budget", 202)
-    relation = pd.Relation.from_rows((x,), [(1,), (2,)])
-    assert not pd._fits(relation, linked, {}, graph.store)
+    relation = pd.relation.Relation.from_rows((x,), [(1,), (2,)])
+    assert not pd.bgp._fits(relation, linked, {}, graph.store)
     linked.estimate_capped = False
-    assert pd._fits(relation, linked, {}, graph.store)
+    assert pd.bgp._fits(relation, linked, {}, graph.store)
 
 
 def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
@@ -939,20 +939,20 @@ def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
     native = graph.store._store()
     seed = native.match_codes(None, f"<{EX}ta>", None, None)
     n3 = [None, f"<{EX}tl>", None, None]
-    pat = pd.Pattern(n3, {x: [0], d: [2]}, estimate=245)
+    pat = pd.matching.Pattern(n3, {x: [0], d: [2]}, estimate=245)
     memo = {tuple(n3): native.match_codes(*n3)}
     cols = (memoryview(seed[0]).cast("Q"), memoryview(seed[2]).cast("Q"))
-    columnar = pd.Relation.from_cols((s, x), cols)
+    columnar = pd.relation.Relation.from_cols((s, x), cols)
     assert columnar.nrows == 120
-    bodies = [columnar, pd.Relation.from_rows((s, x), pd._cols_to_rows(cols))]
+    bodies = [columnar, pd.relation.Relation.from_rows((s, x), pd.relation._cols_to_rows(cols))]
     monkeypatch.setattr(SETTINGS, "pair_budget", 5)
-    assert [pd._fits(body, pat, memo, graph.store) for body in bodies] == [True] * 2
-    assert not pd._fits(columnar, pat, {}, graph.store)
+    assert [pd.bgp._fits(body, pat, memo, graph.store) for body in bodies] == [True] * 2
+    assert not pd.bgp._fits(columnar, pat, {}, graph.store)
     monkeypatch.setattr(SETTINGS, "probe_fanout", 2)
-    assert not pd._fits(columnar, pat, memo, graph.store)
+    assert not pd.bgp._fits(columnar, pat, memo, graph.store)
     monkeypatch.setattr(SETTINGS, "probe_fanout", 100)
     monkeypatch.setattr(SETTINGS, "pair_budget", 4)
-    assert [pd._fits(body, pat, memo, graph.store) for body in bodies] == [False] * 2
+    assert [pd.bgp._fits(body, pat, memo, graph.store) for body in bodies] == [False] * 2
 
 
 @pytest.mark.parametrize("budget", [119, 60])
@@ -1146,11 +1146,11 @@ def test_a_relation_rdflib_finishes_reaches_only_the_emitter():
     consumer that would hold or pull them fails loudly."""
     x = Variable("x")
     rest = ((x, URIRef(f"{EX}p"), Variable("y")),)
-    rel = pd.Relation((x,), None, [(1,)], 1, rest=rest)
+    rel = pd.relation.Relation((x,), None, [(1,)], 1, rest=rest)
     with pytest.raises(AssertionError):
-        pd._rows_of(rel)
+        pd.relation._rows_of(rel)
     with pytest.raises(AssertionError):
-        pd._code_rows(rel)
+        pd.relation._code_rows(rel)
 
 
 def _keep_scans(events) -> list[dict]:
@@ -1367,17 +1367,17 @@ def test_a_put_back_keep_scan_drops_its_keep(graph, planned):
     and the match leaves the memo with the copy's narrower keep."""
     k, f, p = (Variable(name) for name in "kfp")
     keys = graph.store._store().match_codes(f"<{EX}c0>", f"<{EX}has>", None, None)[2]
-    pat = pd.Pattern([None, None, None, None], {f: [0], p: [1], k: [2]}, estimate=1348)
+    pat = pd.matching.Pattern([None, None, None, None], {f: [0], p: [1], k: [2]}, estimate=1348)
     pat.nkeep = planned
     whole = None if planned is None else dict(planned)
     memo: dict = {}
-    relation = pd.Relation.from_cols((k,), (memoryview(keys).cast("Q"),))
+    relation = pd.relation.Relation.from_cols((k,), (memoryview(keys).cast("Q"),))
     work = pat.copy()
-    pd._keep_scan(graph.store, work, relation, memo)
+    pd.bgp._keep_scan(graph.store, work, relation, memo)
     assert work.nrows == 18
     assert work.nkeep is not None and set(work.nkeep) == {2} | set(planned or ())
-    assert list(memo) == [pd._pattern_key(work)]
-    pd._discard_step(pat, work, memo)
+    assert list(memo) == [pd.matching._pattern_key(work)]
+    pd.bgp._discard_step(pat, work, memo)
     assert pat.nkeep is planned
     assert planned == whole
     assert not pat.matched and memo == {}
@@ -1390,9 +1390,11 @@ def test_a_memo_key_holds_its_keep_column():
     the entry."""
     n3 = [None, f"<{EX}q>", None, None]
     keep = U64Column([1, 2])
-    key = pd._pattern_key(pd.Pattern(n3, {}, nkeep={2: keep}))
-    assert key == pd._pattern_key(pd.Pattern(n3, {}, nkeep={2: keep}))
-    assert key != pd._pattern_key(pd.Pattern(n3, {}, nkeep={2: U64Column([1, 2])}))
+    key = pd.matching._pattern_key(pd.matching.Pattern(n3, {}, nkeep={2: keep}))
+    assert key == pd.matching._pattern_key(pd.matching.Pattern(n3, {}, nkeep={2: keep}))
+    assert key != pd.matching._pattern_key(
+        pd.matching.Pattern(n3, {}, nkeep={2: U64Column([1, 2])})
+    )
     [(position, (kind, held))] = key[-1]
     assert (position, kind) == (2, "codes")
     assert held is keep
@@ -1408,7 +1410,9 @@ def test_a_keep_column_at_a_reused_address_is_no_memo_hit(graph, monkeypatch):
     def one_address(obj):
         return 0 if isinstance(obj, U64Column) else builtins.id(obj)
 
-    monkeypatch.setattr(pd, "id", one_address, raising=False)
+    # The modules that key the memo: matching builds the keys, bgp keeps it.
+    monkeypatch.setattr(pd.matching, "id", one_address, raising=False)
+    monkeypatch.setattr(pd.bgp, "id", one_address, raising=False)
     sparql = (
         _PREFIX + "SELECT ?a ?b ?c ?d WHERE { ?a :q ?b . ?c :q ?d "
         "FILTER(?b IN (:y0-0, :y1-0) && ?d IN (:y2-1)) }"

@@ -157,8 +157,10 @@ def test_a_restricted_match_stays_columnar(tmp_path, monkeypatch):
     row predicate left to stream."""
     graph = Graph(store=VortexRdflibStore(_products(tmp_path), in_memory=True))
     rels = []
-    original = pd._rel_from_pattern
-    monkeypatch.setattr(pd, "_rel_from_pattern", lambda pat: rels.append(original(pat)) or rels[-1])
+    original = pd.matching._rel_from_pattern
+    monkeypatch.setattr(
+        pd.matching, "_rel_from_pattern", lambda pat: rels.append(original(pat)) or rels[-1]
+    )
     register_sparql_pushdown()
     assert len(run(graph, f"SELECT ?s WHERE {{ ?s {PRICE} ?v FILTER(?v < 300) }}")) == _under(300)
     [rel] = rels
@@ -349,7 +351,7 @@ def test_compacting_a_match_keeps_the_allowed_rows_in_match_order(varpos, keep, 
     kept variable's first position is allowed, in match order; the columns of
     constant positions are dropped, and the match's own columns are untouched."""
     columns = tuple(U64Column(column) for column in MATCH)
-    pat = pd.Pattern([None] * 4, varpos)
+    pat = pd.matching.Pattern([None] * 4, varpos)
     pat.set_match(columns, len(MATCH[0]))
     kept = [
         i
@@ -357,7 +359,7 @@ def test_compacting_a_match_keeps_the_allowed_rows_in_match_order(varpos, keep, 
         if all(MATCH[varpos[var][0]][i] in allowed for var, allowed in keep.items())
     ]
     assert kept == remaining
-    pd._compact_pattern(pat, keep)
+    pd.matching._compact_pattern(pat, keep)
     assert pat.nrows == len(kept)
     read = {idx for positions in varpos.values() for idx in positions}
     for idx in range(4):
@@ -379,10 +381,10 @@ def test_restricting_a_match_compacts_it_to_the_rows_that_pass(tmp_path, limit, 
     columns = _price_match(store)
     subjects, prices = (memoryview(columns[i]).cast("Q").tolist() for i in (0, 2))
     passing = {_price_code(store, i) for i in range(200) if (i * 37) % 1000 < limit}
-    pat = pd.Pattern([None] * 4, {S: [0], V: [2]}, index=0)
+    pat = pd.matching.Pattern([None] * 4, {S: [0], V: [2]}, index=0)
     pat.set_match(columns, len(subjects))
     [conjunct] = filters.analyze_expr(filter_expr(f"?v < {limit}"), [V], CTX, {}).per_var[V]
-    pd._restrict_pattern(store, pat, {V: [conjunct]})
+    pd.matching._restrict_pattern(store, pat, {V: [conjunct]})
     rows = [i for i, price in enumerate(prices) if price in passing]
     assert 0 < len(rows) and (len(rows) < len(subjects)) == compacted
     assert pat.nrows == len(rows)

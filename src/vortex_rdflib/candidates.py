@@ -59,7 +59,7 @@ IRI_IN = "iri_in"
 #: (string literals only) or, with ``as_str``, ``STR(?v)``.
 STRING_KINDS = frozenset({"regex", "contains", "strstarts", "strends"})
 
-#: The pushdown's query trace (``pushdown._trace_native_filter``), installed
+#: The pushdown's query trace (``pushdown.tracing._trace_native_filter``), installed
 #: when that module is imported; called after every ``filter_codes`` call
 #: that answers, with the kind, how many codes were sent, passed and left
 #: undecided, and the call's nanoseconds.

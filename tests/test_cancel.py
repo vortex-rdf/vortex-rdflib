@@ -275,13 +275,13 @@ def _watch_gathers(monkeypatch, during=None) -> list:
     """The gathers of every streamed join step, recorded as they are made
     (see :class:`_Groups`)."""
     gathers: list = []
-    gather_pieces = pd._gather_pieces
+    gather_pieces = pd.streaming._gather_pieces
 
     def watched(groups, fed, key, grouped, order):
         groups = _Groups(groups, gathers, during)
         return gather_pieces(groups, fed, key, grouped, order)  # ty: ignore[invalid-argument-type]
 
-    monkeypatch.setattr(pd, "_gather_pieces", watched)
+    monkeypatch.setattr(pd.streaming, "_gather_pieces", watched)
     return gathers
 
 
@@ -399,13 +399,13 @@ def test_tier3_rows_stop_on_cancel(mem_graph, monkeypatch):
     which rdflib never extends."""
     monkeypatch.setattr(SETTINGS, "pair_budget", 0)
     extended = []
-    eval_bgp = pd.evalBGP
+    eval_bgp = pd.solutions.evalBGP
 
     def watched(ctx, bgp):
         extended.append(len(bgp))
         return eval_bgp(ctx, bgp)
 
-    monkeypatch.setattr(pd, "evalBGP", watched)
+    monkeypatch.setattr(pd.solutions, "evalBGP", watched)
     register_sparql_pushdown()
     token = CancelToken()
     with cancel_scope(token):

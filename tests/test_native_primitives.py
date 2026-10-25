@@ -41,9 +41,9 @@ def _products(tmp_path, n=200, indexes=()) -> str:
 
 def _trace(capsys) -> list[dict]:
     return [
-        json.loads(line[len(pd._TRACE_PREFIX) :])
+        json.loads(line[len(pd.tracing._TRACE_PREFIX) :])
         for line in capsys.readouterr().err.splitlines()
-        if line.startswith(pd._TRACE_PREFIX)
+        if line.startswith(pd.tracing._TRACE_PREFIX)
     ]
 
 

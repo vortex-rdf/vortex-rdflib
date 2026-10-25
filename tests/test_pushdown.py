@@ -918,9 +918,11 @@ def test_solutions_do_not_share_a_context_under_a_pushed_graph(dataset, monkeypa
     right side to the union instead of the row's graph."""
     monkeypatch.setattr(SETTINGS, "enabled_ops", frozenset({"BGP"}))
     active = []
-    original = pd._active_scope
+    original = pd.algebra._active_scope
     monkeypatch.setattr(
-        pd, "_active_scope", lambda ctx, store: active.append(ctx.graph) or original(ctx, store)
+        pd.algebra,
+        "_active_scope",
+        lambda ctx, store: active.append(ctx.graph) or original(ctx, store),
     )
     register_sparql_pushdown()
     rows = run(
@@ -965,14 +967,14 @@ def test_graph_scope_reaches_the_native_match(dataset, monkeypatch):
     """The graph is the pattern's fourth position, not a filter over the
     union: an absent graph matches nothing and never materializes a row."""
     patterns = []
-    original = pd._pattern_terms
+    original = pd.matching._pattern_terms
 
     def spy(*args, **kwargs):
         pattern = original(*args, **kwargs)
         patterns.append(pattern.n3[3])
         return pattern
 
-    monkeypatch.setattr(pd, "_pattern_terms", spy)
+    monkeypatch.setattr(pd.matching, "_pattern_terms", spy)
     register_sparql_pushdown()
     assert run(dataset, "SELECT * WHERE { GRAPH <http://ex.org/g/1> { ?s ?p ?o } }")
     assert run(dataset, "SELECT * WHERE { GRAPH <http://ex.org/absent> { ?s ?p ?o } }") == []
@@ -1313,8 +1315,10 @@ def test_probe_join_triggers_on_skewed_join(tmp_path, monkeypatch):
     serialize_rdf(str(nt), str(out), layout="dictionary")
 
     probes = []
-    original = pd._probe_join
-    monkeypatch.setattr(pd, "_probe_join", lambda *a, **k: probes.append(1) or original(*a, **k))
+    original = pd.probes._probe_join
+    monkeypatch.setattr(
+        pd.probes, "_probe_join", lambda *a, **k: probes.append(1) or original(*a, **k)
+    )
     graph = Graph(store=VortexRdflibStore(str(out)))
     register_sparql_pushdown()
     rows = run(
@@ -1332,10 +1336,10 @@ def test_probe_join_pads_rows_when_the_pattern_shares_no_variable(graph):
     padded with None — also when the pattern shares no variable with the
     relation, so nothing is substituted per row. No caller probes such a
     pattern today, but `_probe_join` must not rely on that."""
-    pattern = pd.Pattern(
+    pattern = pd.matching.Pattern(
         [None, "<http://ex.org/nothing>", None, None], {Variable("x"): [0], Variable("a"): [2]}
     )
-    schema, rows = pd._probe_join(
+    schema, rows = pd.probes._probe_join(
         graph.store, (Variable("z"),), [(0,), (1,)], pattern, keep_unmatched=True
     )
     assert schema == (Variable("z"), Variable("x"), Variable("a"))
@@ -1436,8 +1440,8 @@ def probe_quads(tmp_path_factory):
 
 
 def _recording(calls, name):
-    """`pd.<name>`, appending its name to `calls` as it is called."""
-    original = getattr(pd, name)
+    """`pd.probes.<name>`, appending its name to `calls` as it is called."""
+    original = getattr(pd.probes, name)
 
     def record(*args, **kwargs):
         calls.append(name)
@@ -1466,7 +1470,7 @@ def test_a_probe_join_keeps_the_multiplicity_rdflib_reads(probe_quads, monkeypat
     monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
     probes = []
     for name in ("_probe_join", "_probe_exists"):
-        monkeypatch.setattr(pd, name, _recording(probes, name))
+        monkeypatch.setattr(pd.probes, name, _recording(probes, name))
     with_pushdown, without_pushdown = both_ways(_probe_dataset(probe_quads, union), sparql)
     assert with_pushdown == without_pushdown
     assert len(without_pushdown) == rows
@@ -1494,9 +1498,9 @@ def test_hash_joined_bgp_keeps_a_columnar_body(graph, monkeypatch):
     """A hash-joined BGP's relation is columns, not row tuples — tuples
     appear only as rows are consumed."""
     rels = []
-    original = pd._join_incremental_bgp
+    original = pd.bgp._join_incremental_bgp
     monkeypatch.setattr(
-        pd, "_join_incremental_bgp", lambda *a: rels.append(original(*a)) or rels[-1]
+        pd.bgp, "_join_incremental_bgp", lambda *a: rels.append(original(*a)) or rels[-1]
     )
     register_sparql_pushdown()
     rows = run(
@@ -1555,9 +1559,9 @@ def test_tuple_filtered_bgp_keeps_a_columnar_body(
     values, so 25 rows over two patterns and 50 over three."""
     graph = _three_predicate_graph(tmp_path, "s", lambda i: i + 1000 if i % 2 == 0 else i - 1000)
     rels = []
-    original = pd._join_incremental_bgp
+    original = pd.bgp._join_incremental_bgp
     monkeypatch.setattr(
-        pd, "_join_incremental_bgp", lambda *a: rels.append(original(*a)) or rels[-1]
+        pd.bgp, "_join_incremental_bgp", lambda *a: rels.append(original(*a)) or rels[-1]
     )
     register_sparql_pushdown()
     rows = run(
@@ -1681,7 +1685,7 @@ def test_filter_reuses_the_terms_its_early_pass_decoded(tmp_path):
 
 def _trace_events(text: str) -> list[dict]:
     """The query-trace events printed to ``text`` (captured stderr)."""
-    prefix = pd._TRACE_PREFIX
+    prefix = pd.tracing._TRACE_PREFIX
     return [
         json.loads(line[len(prefix) :]) for line in text.splitlines() if line.startswith(prefix)
     ]
@@ -1691,12 +1695,12 @@ def _trace_events(text: str) -> list[dict]:
 def _tracing():
     """A query trace around the native wrapper under test; the events it
     emits wait in the trace's pending lines (:func:`_pending_events`)."""
-    trace = pd._QueryTrace(query_id=None)
-    token = pd._TRACE.set(trace)
+    trace = pd.tracing._QueryTrace(query_id=None)
+    token = pd.tracing._TRACE.set(trace)
     try:
         yield trace
     finally:
-        pd._TRACE.reset(token)
+        pd.tracing._TRACE.reset(token)
 
 
 def _pending_events(trace) -> list[dict]:
@@ -1778,7 +1782,7 @@ def test_closing_a_traced_batch_reports_the_pulls_it_made(file_graph):
     that once: its probe count is the batch's, its rows the pulled answers'."""
     native = _PullCountingNative(file_graph.store._store())
     with _tracing() as trace:
-        answers = pd._TracedNative(native).match_codes_many(_FOUR_PROBES)
+        answers = pd.tracing._TracedNative(native).match_codes_many(_FOUR_PROBES)
         assert len(answers) == len(_FOUR_PROBES)
         pulled = [next(answers), next(answers)]
         assert native.answers[0].pulls == 2 and _pending_events(trace) == []
@@ -1801,7 +1805,7 @@ def test_traced_chunks_report_the_chunks_pulled(file_graph):
     keep = {"o": (0, 1_000_000)}
     rows = store.count_quads(*pattern)
     with _tracing() as trace:
-        chunks = pd._TracedNative(store).match_code_chunks(
+        chunks = pd.tracing._TracedNative(store).match_code_chunks(
             *pattern, keep=keep, columns=("s", "o"), batch_rows=4
         )
         pulled = [next(chunks)]
@@ -1824,11 +1828,11 @@ def test_a_traced_chunk_call_without_codes_returns_none(tmp_path):
     out = tmp_path / "plain.vortex"
     serialize_rdf(str(source), str(out), layout="default")
     with _tracing():
-        assert pd._TracedNative(VortexRdfStore(str(out))).match_code_chunks() is None
+        assert pd.tracing._TracedNative(VortexRdfStore(str(out))).match_code_chunks() is None
 
 
 def test_the_traced_native_forwards_the_native_keywords(file_graph):
-    traced = pd._TracedNative(file_graph.store._store())
+    traced = pd.tracing._TracedNative(file_graph.store._store())
     token = CancelToken()
     with _tracing():
         counts = traced.count_quads_many(_FOUR_PROBES, lookahead=1, cancel=token)
@@ -1903,8 +1907,10 @@ def test_tuple_filter_prunes_a_bgp_so_a_remaining_pattern_is_probed(
         graph_name="http://ex.org/g" if in_graph else None,
     )
     probes = []
-    original = pd._probe_join
-    monkeypatch.setattr(pd, "_probe_join", lambda *a, **k: probes.append(1) or original(*a, **k))
+    original = pd.probes._probe_join
+    monkeypatch.setattr(
+        pd.probes, "_probe_join", lambda *a, **k: probes.append(1) or original(*a, **k)
+    )
     register_sparql_pushdown()
     patterns = "?s <http://ex.org/p> ?a . ?s <http://ex.org/q> ?b . ?s <http://ex.org/r> ?c"
     body = f"GRAPH <http://ex.org/g> {{ {patterns} }}" if in_graph else patterns
@@ -1953,19 +1959,19 @@ def test_columnar_join_matches_row_join():
     kb = [rnd.randrange(40) for _ in range(200)]
     vb = [rnd.randrange(1000) for _ in range(200)]
     schema_a, schema_b = ("k", "x"), ("k", "y")
-    expected = pd._join(
+    expected = pd.relation._join(
         schema_a, list(zip(ka, va, strict=True)), schema_b, list(zip(kb, vb, strict=True))
     )[1]
     cols_a = (array("Q", ka), array("Q", va))
     cols_b = (array("Q", kb), array("Q", vb))
-    joined = pd._join_columns(schema_a, cols_a, schema_b, cols_b)
+    joined = pd.relation._join_columns(schema_a, cols_a, schema_b, cols_b)
     assert joined is not None
     schema, cols, pairs = joined
     assert schema == ("k", "x", "y")
-    assert pd._cols_to_rows(cols) == expected
+    assert pd.relation._cols_to_rows(cols) == expected
     assert pairs is None  # within the product bound: built uncounted
     # Several shared variables decline: the row join handles them.
-    assert pd._join_columns(("k", "x"), cols_a, ("k", "x"), cols_a) is None
+    assert pd.relation._join_columns(("k", "x"), cols_a, ("k", "x"), cols_a) is None
 
 
 @pytest.mark.parametrize("tail_width", [0, 1, 2], ids=["no-tail", "one-tail", "two-tails"])
@@ -1987,12 +1993,15 @@ def test_hash_join_kernels_join_like_a_nested_loop(tail_width):
     schema_a, schema_b = ("k", "x"), ("k", "y", "z")[: 1 + tail_width]
     expected = [ra + rb[1:] for ra in rows_a for rb in rows_b if ra[0] == rb[0]]
 
-    assert pd._join(schema_a, rows_a, schema_b, rows_b) == (schema_a + schema_b[1:], expected)
+    assert pd.relation._join(schema_a, rows_a, schema_b, rows_b) == (
+        schema_a + schema_b[1:],
+        expected,
+    )
     cols_a = tuple(array("Q", column) for column in zip(*rows_a, strict=True))
     cols_b = tuple(array("Q", column) for column in zip(*rows_b, strict=True))
-    joined = pd._join_columns(schema_a, cols_a, schema_b, cols_b)
+    joined = pd.relation._join_columns(schema_a, cols_a, schema_b, cols_b)
     assert joined is not None
-    assert pd._cols_to_rows(joined[1]) == expected
+    assert pd.relation._cols_to_rows(joined[1]) == expected
 
 
 def test_repeated_pattern_is_matched_once(graph):
@@ -2055,8 +2064,8 @@ def test_distinct_patterns_are_matched_separately(graph):
 
 def test_pushdown_is_actually_used(graph, monkeypatch):
     calls = []
-    original = pd._solve_bgp
-    monkeypatch.setattr(pd, "_solve_bgp", lambda *a: calls.append(1) or original(*a))
+    original = pd.bgp._solve_bgp
+    monkeypatch.setattr(pd.bgp, "_solve_bgp", lambda *a: calls.append(1) or original(*a))
     register_sparql_pushdown()
     rows = run(graph, "SELECT ?s ?o WHERE { ?s <http://ex.org/name> ?o }")
     assert len(rows) == 8
@@ -2067,8 +2076,8 @@ def test_head_intercepts_the_whole_slice_project_chain(graph, monkeypatch):
     """A ``Slice(Project(BGP))`` is one interception at the Slice: rdflib
     never evaluates the Project or the BGP below it itself."""
     heads = []
-    original = pd._eval_head
-    monkeypatch.setattr(pd, "_eval_head", lambda *a: heads.append(a[2].name) or original(*a))
+    original = pd.head._eval_head
+    monkeypatch.setattr(pd.head, "_eval_head", lambda *a: heads.append(a[2].name) or original(*a))
     register_sparql_pushdown()
     rows = run(graph, "SELECT ?o WHERE { ?s <http://ex.org/name> ?o } LIMIT 2")
     assert len(rows) == 2
@@ -2288,8 +2297,10 @@ def test_filter_is_pushed_into_the_pattern_scan(graph, monkeypatch):
     """A single-variable conjunct restricts the pattern before any row is
     built, on the fast route: rdflib's evaluator is never consulted."""
     restrictions = []
-    original = pd._restrict_pattern
-    monkeypatch.setattr(pd, "_restrict_pattern", lambda *a: restrictions.append(1) or original(*a))
+    original = pd.matching._restrict_pattern
+    monkeypatch.setattr(
+        pd.matching, "_restrict_pattern", lambda *a: restrictions.append(1) or original(*a)
+    )
     generic_calls = []
     original_generic = filters.Conjunct.generic
     monkeypatch.setattr(
@@ -2401,13 +2412,13 @@ def test_iri_keep_paths_agree_with_rdflib(file_graph, monkeypatch, fanout, sparq
 
 def test_distinct_and_count_are_answered_in_code_space(graph, monkeypatch):
     distincts, aggregates = [], []
-    original_distinct = pd._eval_distinct
-    original_aggregate = pd._eval_aggregate
+    original_distinct = pd.head._eval_distinct
+    original_aggregate = pd.aggregate._eval_aggregate
     monkeypatch.setattr(
-        pd, "_eval_distinct", lambda *a: distincts.append(1) or original_distinct(*a)
+        pd.head, "_eval_distinct", lambda *a: distincts.append(1) or original_distinct(*a)
     )
     monkeypatch.setattr(
-        pd, "_eval_aggregate", lambda *a: aggregates.append(1) or original_aggregate(*a)
+        pd.aggregate, "_eval_aggregate", lambda *a: aggregates.append(1) or original_aggregate(*a)
     )
     register_sparql_pushdown()
     rows = run(graph, "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a }")
@@ -2483,16 +2494,16 @@ def test_left_join_probe_and_hash_paths_are_ours(graph, monkeypatch):
     outer row under a low threshold, hash-joined under a high one — never by
     rdflib re-entering the BGP hook once per outer solution."""
     left_joins, probes, bgps = [], [], []
-    original_left = pd._solve_left_join
-    original_probe = pd._probe_join
-    original_bgp = pd._solve_bgp
+    original_left = pd.blocks._solve_left_join
+    original_probe = pd.probes._probe_join
+    original_bgp = pd.bgp._solve_bgp
     monkeypatch.setattr(
-        pd, "_solve_left_join", lambda *a: left_joins.append(1) or original_left(*a)
+        pd.blocks, "_solve_left_join", lambda *a: left_joins.append(1) or original_left(*a)
     )
     monkeypatch.setattr(
-        pd, "_probe_join", lambda *a, **k: probes.append(1) or original_probe(*a, **k)
+        pd.probes, "_probe_join", lambda *a, **k: probes.append(1) or original_probe(*a, **k)
     )
-    monkeypatch.setattr(pd, "_solve_bgp", lambda *a: bgps.append(1) or original_bgp(*a))
+    monkeypatch.setattr(pd.bgp, "_solve_bgp", lambda *a: bgps.append(1) or original_bgp(*a))
     register_sparql_pushdown()
     sparql = (
         "SELECT ?x ?a WHERE { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }"
@@ -2508,8 +2519,8 @@ def test_left_join_probe_and_hash_paths_are_ours(graph, monkeypatch):
 
 def test_minus_is_an_anti_join_in_code_space(graph, monkeypatch):
     calls = []
-    original = pd._solve_minus
-    monkeypatch.setattr(pd, "_solve_minus", lambda *a: calls.append(1) or original(*a))
+    original = pd.blocks._solve_minus
+    monkeypatch.setattr(pd.blocks, "_solve_minus", lambda *a: calls.append(1) or original(*a))
     register_sparql_pushdown()
     rows = run(
         graph, "SELECT ?x WHERE { ?x <http://ex.org/name> ?n MINUS { ?x <http://ex.org/age> ?a } }"
@@ -2525,7 +2536,7 @@ def test_cheated_scope_falls_back_to_rdflib(graph, monkeypatch):
     left side is re-checked by rdflib with that binding dropped; that shape
     is handed back, and still answered correctly."""
     left_joins = []
-    original = pd._solve_left_join
+    original = pd.blocks._solve_left_join
 
     def spy(*args):
         try:
@@ -2534,7 +2545,7 @@ def test_cheated_scope_falls_back_to_rdflib(graph, monkeypatch):
             left_joins.append("fallback")
             raise
 
-    monkeypatch.setattr(pd, "_solve_left_join", spy)
+    monkeypatch.setattr(pd.blocks, "_solve_left_join", spy)
     sparql = """SELECT ?x ?a ?y WHERE {
         { VALUES ?a { 42 } }
         { ?x <http://ex.org/name> ?n OPTIONAL { ?y <http://ex.org/age> ?a } } }"""
@@ -2548,11 +2559,15 @@ def test_exists_is_a_semi_join_in_code_space(graph, monkeypatch):
     variables — probed per row for a small block, hash-joined otherwise —
     without rdflib's evaluator running per row."""
     applied, probes, generic_calls = [], [], []
-    original_apply = pd._apply_exists
-    original_probe = pd._probe_exists
+    original_apply = pd.blocks._apply_exists
+    original_probe = pd.probes._probe_exists
     original_generic = filters.Conjunct.generic
-    monkeypatch.setattr(pd, "_apply_exists", lambda *a: applied.append(1) or original_apply(*a))
-    monkeypatch.setattr(pd, "_probe_exists", lambda *a: probes.append(1) or original_probe(*a))
+    monkeypatch.setattr(
+        pd.blocks, "_apply_exists", lambda *a: applied.append(1) or original_apply(*a)
+    )
+    monkeypatch.setattr(
+        pd.probes, "_probe_exists", lambda *a: probes.append(1) or original_probe(*a)
+    )
     monkeypatch.setattr(
         filters.Conjunct,
         "generic",
@@ -2577,8 +2592,8 @@ def test_exists_is_a_semi_join_in_code_space(graph, monkeypatch):
 
 def test_order_by_is_a_rank_sort_in_code_space(graph, monkeypatch):
     ordered = []
-    original = pd._order_rows
-    monkeypatch.setattr(pd, "_order_rows", lambda *a: ordered.append(a[4]) or original(*a))
+    original = pd.head._order_rows
+    monkeypatch.setattr(pd.head, "_order_rows", lambda *a: ordered.append(a[4]) or original(*a))
     register_sparql_pushdown()
     rows = run_ordered(
         graph, "SELECT ?x ?a WHERE { ?x <http://ex.org/age> ?a } ORDER BY ?a ?x LIMIT 2"
@@ -2595,8 +2610,8 @@ def test_order_by_is_a_rank_sort_in_code_space(graph, monkeypatch):
 
 def test_values_is_a_code_space_relation(graph, monkeypatch):
     calls = []
-    original = pd._solve_values
-    monkeypatch.setattr(pd, "_solve_values", lambda *a: calls.append(1) or original(*a))
+    original = pd.blocks._solve_values
+    monkeypatch.setattr(pd.blocks, "_solve_values", lambda *a: calls.append(1) or original(*a))
     register_sparql_pushdown()
     rows = run(
         graph,

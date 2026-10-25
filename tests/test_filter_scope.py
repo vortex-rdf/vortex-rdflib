@@ -1319,15 +1319,15 @@ def test_a_values_variable_a_pattern_binds_keeps_its_route(quad_files, monkeypat
     )
     register_sparql_pushdown()
     restricted, filtered, generic = [], [], []
-    restrict, filter_relation = pd._restrict_pattern, pd._filter_relation
+    restrict, filter_relation = pd.matching._restrict_pattern, pd.relation._filter_relation
     original_generic = filters.Conjunct.generic
     monkeypatch.setattr(
-        pd,
+        pd.matching,
         "_restrict_pattern",
         lambda store, pat, preds: restricted.extend(preds) or restrict(store, pat, preds),
     )
     monkeypatch.setattr(
-        pd, "_filter_relation", lambda *a: filtered.append(a) or filter_relation(*a)
+        pd.relation, "_filter_relation", lambda *a: filtered.append(a) or filter_relation(*a)
     )
     monkeypatch.setattr(
         filters.Conjunct,

@@ -116,7 +116,7 @@ def test_the_by_spelling_check_agrees_with_rdflib(caplog):
         for _ in range(1000)
     ]
     spellings = [_typed(lexical, datatype) for lexical, datatype in cases]
-    built = {i for i, _ in pd._rewritable(range(len(spellings)), spellings)}
+    built = {i for i, _ in pd.aliasing._rewritable(range(len(spellings)), spellings)}
     counts = {"skipped": 0, "rewritten": 0, "ill-typed": 0}
     for i, ((lexical, datatype), spelling) in enumerate(zip(cases, spellings, strict=True)):
         term = Literal(lexical, datatype=URIRef(datatype))
@@ -153,9 +153,9 @@ def test_without_rdflibs_converter_table_every_typed_spelling_is_built(monkeypat
         '"plain"',
         '"x"@en',
     ]
-    assert [i for i, _ in pd._rewritable(range(6), spellings)] == [1, 3]
-    monkeypatch.setattr(pd, "_toPythonMapping", None)
-    assert [i for i, _ in pd._rewritable(range(6), spellings)] == [0, 1, 2, 3]
+    assert [i for i, _ in pd.aliasing._rewritable(range(6), spellings)] == [1, 3]
+    monkeypatch.setattr(pd.aliasing, "_toPythonMapping", None)
+    assert [i for i, _ in pd.aliasing._rewritable(range(6), spellings)] == [0, 1, 2, 3]
 
 
 @pytest.fixture(scope="module")
@@ -242,7 +242,7 @@ def test_alias_classes_are_rdflibs_term_equality(generated_store, caplog, calls)
             batches = [codes]
         aliases: dict = {}
         for batch in batches:
-            pd._alias_codes(store, batch, store._terms().foreign, aliases)
+            pd.aliasing._alias_codes(store, batch, store._terms().foreign, aliases)
     finally:
         query_scope.leave(token)
     expected = _partition(codes, lambda c: reference[c] if c >= 0 else foreign[c])
@@ -283,7 +283,7 @@ def test_query_constants_look_up_no_twin(generated_store, monkeypatch):
         codes = [store._foreign_code(term) for term in constants]
         monkeypatch.setattr(store, "_dict", _Lookups(store._dict))
         aliases: dict = {}
-        pd._alias_codes(store, codes, store._terms().foreign, aliases)
+        pd.aliasing._alias_codes(store, codes, store._terms().foreign, aliases)
     finally:
         query_scope.leave(token)
     assert len(set(codes)) == 3 and all(code < 0 for code in codes)
@@ -328,13 +328,13 @@ def test_canonical_twins_look_up_alone_after_a_rejected_batch_and_check_the_term
         return encode(spelling)
 
     monkeypatch.setattr(store, "_dict", _Stub(reject_batch, reject_one))
-    assert pd._canonical_twins(store, read) == {forty_two: encode(f'"42"^^<{INTEGER}>')}
+    assert pd.aliasing._canonical_twins(store, read) == {forty_two: encode(f'"42"^^<{INTEGER}>')}
 
     def another_term(spellings):
         return [encode('"x"@en') for _ in spellings]
 
     monkeypatch.setattr(store, "_dict", _Stub(another_term, encode))
-    assert pd._canonical_twins(store, read[:1]) == {}
+    assert pd.aliasing._canonical_twins(store, read[:1]) == {}
 
 
 def test_the_alias_pass_builds_only_spellings_rdflib_may_rewrite(tmp_path, monkeypatch):
@@ -370,7 +370,7 @@ def test_the_alias_pass_builds_only_spellings_rdflib_may_rewrite(tmp_path, monke
     token = query_scope.enter(scope)
     try:
         aliases: dict = {}
-        pd._alias_codes(store, codes, {}, aliases)
+        pd.aliasing._alias_codes(store, codes, {}, aliases)
     finally:
         query_scope.leave(token)
     assert sorted(built) == sorted(

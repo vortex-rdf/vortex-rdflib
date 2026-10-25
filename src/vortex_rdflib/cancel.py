@@ -17,7 +17,7 @@ from vortex_rdf import Cancelled, CancelToken
 #: The cancel token of the query being evaluated: set by :func:`cancel_scope`
 #: for the queries started inside it, kept in the query's scope
 #: (``QueryScope.cancel``) and set again around each step of its lazy result
-#: (``pushdown._scoped_iterator``).
+#: (``pushdown.hook._scoped_iterator``).
 CANCEL_TOKEN: ContextVar[CancelToken | None] = ContextVar("vortex_rdflib_cancel", default=None)
 
 

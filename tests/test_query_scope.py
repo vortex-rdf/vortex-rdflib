@@ -244,7 +244,7 @@ def test_later_custom_evaluators_are_offered_the_query_node(tmp_path):
     CUSTOM_EVALS["test_query_scope_recorder"] = record
     try:
         order = list(CUSTOM_EVALS)
-        assert order.index(pd._EVAL_KEY) < order.index("test_query_scope_recorder")
+        assert order.index(pd.hook._EVAL_KEY) < order.index("test_query_scope_recorder")
         assert len(run(graph, "SELECT ?s WHERE { ?s <http://ex.org/knows> ?o }")) == 50
         built = graph.query(
             "CONSTRUCT { ?o <http://ex.org/known> ?s } WHERE { ?s <http://ex.org/knows> ?o }"

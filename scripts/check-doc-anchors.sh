@@ -75,21 +75,31 @@ def head_line(path, n):
 
 
 def search_order(path):
-    """``path`` if it exists, then every other file of the nearest existing
-    directory's tree, sorted, with the same extension."""
+    """``path`` if it exists — or, for a module that became a package of the
+    same name (``x.py`` -> ``x/``), that package's files — then every other
+    file of the nearest existing directory's tree, sorted, with the same
+    extension."""
     root = os.path.dirname(path)
     while root and not os.path.isdir(root):
         root = os.path.dirname(root)
-    ext = os.path.splitext(path)[1]
-    others = sorted(
-        os.path.normpath(os.path.join(top, name))
-        for top, dirs, names in os.walk(root or ".")
-        if "__pycache__" not in top
-        for name in names
-        if name.endswith(ext)
-    )
-    first = [path] if os.path.isfile(path) else []
-    return first + [p for p in others if p != path]
+    stem, ext = os.path.splitext(path)
+
+    def files(top_dir):
+        return sorted(
+            os.path.normpath(os.path.join(top, name))
+            for top, dirs, names in os.walk(top_dir)
+            if "__pycache__" not in top
+            for name in names
+            if name.endswith(ext)
+        )
+
+    if os.path.isfile(path):
+        first = [path]
+    elif os.path.isdir(stem):
+        first = files(stem)
+    else:
+        first = []
+    return first + [p for p in files(root or ".") if p not in first]
 
 
 def place(path, n, name):

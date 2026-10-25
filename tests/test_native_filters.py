@@ -502,9 +502,9 @@ def test_a_mid_size_code_set_goes_to_the_native_layer_whole(tmp_path, monkeypatc
     assert with_pushdown == without_pushdown
     assert len(with_pushdown) == 100
     trace = [
-        json.loads(line[len(pd._TRACE_PREFIX) :])
+        json.loads(line[len(pd.tracing._TRACE_PREFIX) :])
         for line in capsys.readouterr().err.splitlines()
-        if line.startswith(pd._TRACE_PREFIX)
+        if line.startswith(pd.tracing._TRACE_PREFIX)
     ]
     match = next(
         e for e in trace if e["event"] == "native_call_complete" and e["operation"] == "match_codes"

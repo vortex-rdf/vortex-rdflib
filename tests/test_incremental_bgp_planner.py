@@ -394,9 +394,9 @@ def test_a_capped_count_is_not_remembered_as_exact(tmp_path):
     """A capped answer is a lower bound: it is never shared with a pattern
     that needs the count itself."""
     graph = indexed_graph_of(tmp_path)
-    pat = pd.Pattern([None, "<http://ex/name>", None, None], {})
+    pat = pd.matching.Pattern([None, "<http://ex/name>", None, None], {})
     counts: dict = {}
-    assert pd._count_pattern(graph.store, pat, counts, limit=11) == 11
+    assert pd.matching._count_pattern(graph.store, pat, counts, limit=11) == 11
     assert counts == {}
-    assert pd._count_pattern(graph.store, pat, counts) == 300
-    assert pd._count_pattern(graph.store, pat, counts, limit=11) == 300
+    assert pd.matching._count_pattern(graph.store, pat, counts) == 300
+    assert pd.matching._count_pattern(graph.store, pat, counts, limit=11) == 300

@@ -554,7 +554,7 @@ def test_an_rdflib_without_the_private_names_still_imports():
         "del rdflib.term._is_valid_langtag, rdflib.term._toPythonMapping\n"
         "from vortex_rdflib import pushdown, store, terms\n"
         "assert store.VortexRdflibStore._from_n3_safe is terms._term_by_constructors\n"
-        "assert pushdown._toPythonMapping is None\n"
+        "assert pushdown.aliasing._toPythonMapping is None\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
 
