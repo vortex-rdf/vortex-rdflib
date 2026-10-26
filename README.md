@@ -306,7 +306,12 @@ it shows how many times faster each vortex-rdflib configuration answers than
 rdflib's in-memory store. The figure is a geometric mean over the queries
 (synthetic) or the Explore templates (BSBM), exec only or full. CI records one
 point per dataset and run on the `bench-history` branch (`records/`,
-`records-bsbm/`). To plot a change on your branch against the synthetic line
+`records-bsbm/`). A point's configurations and rdflib run in one job, so each
+ratio divides two timings from one machine, and the point names that machine's
+CPU in its tooltip: CI's runners differ in CPU model, so a step between two
+points on different CPUs is no evidence by itself. The Benchmark History
+Backfill workflow re-measures any commits of `main` in one job, so the points it
+writes share one CPU. To plot a change on your branch against the synthetic line
 before merging it, run `scripts/refresh.sh --history` (about 6 minutes at the
 default scale). It measures the working tree on the synthetic set and renders
 `public/index.html` with your point after `main`'s. The BSBM chart takes no

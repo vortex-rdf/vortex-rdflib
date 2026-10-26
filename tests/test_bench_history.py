@@ -88,6 +88,26 @@ def test_instances_rdflib_never_reached_are_not_compared():
     assert record["dropped"] == {}
 
 
+@pytest.mark.parametrize(
+    ("cpu", "label"),
+    [
+        ("AMD EPYC 7763 64-Core Processor", "AMD EPYC 7763"),
+        ("Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz", "Intel Xeon Platinum 8370C"),
+        ("Intel(R) Core(TM) Ultra 7 155H", "Intel Core Ultra 7 155H"),
+        (None, None),
+    ],
+)
+def test_a_point_names_the_cpu_that_measured_it(cpu, label):
+    # CI's runners differ in CPU model, and a ratio over rdflib moves with it: the
+    # chart says which machine measured each point.
+    record = history.make_record(
+        bsbm_results({"rdflib_memory": AGREED, "vortex_dict_mem": AGREED}), COMMIT, "ci"
+    )
+    record["run"]["cpu"] = cpu
+    series = history.build_series([record], [])
+    assert series is not None and series["points"][0]["cpu"] == label
+
+
 def test_bsbm_records_make_a_series_of_templates():
     record = history.make_record(
         bsbm_results({"rdflib_memory": AGREED, "vortex_dict_mem": AGREED}), COMMIT, "ci"

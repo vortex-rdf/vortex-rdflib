@@ -27,6 +27,7 @@ import argparse
 import json
 import math
 import platform
+import re
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -254,8 +255,20 @@ def _point(record: dict, present: list[str], queries: list[str]) -> dict:
         "local": record["run"]["source"] == "local",
         "measured": record["run"]["measured"],
         "rdflib": record["run"].get("versions", {}).get("rdflib"),
+        "cpu": cpu_label(record["run"].get("cpu")),
         "values": values,
     }
+
+
+def cpu_label(cpu: str | None) -> str | None:
+    """A CPU model name without its trademarks, core count or clock: the chart's
+    label for the machine that measured a point."""
+    if not cpu:
+        return None
+    label = re.sub(
+        r"\((?:R|TM)\)|\b\d+-Core Processor\b|\bProcessor\b|\bCPU\b.*$", "", cpu, flags=re.I
+    )
+    return " ".join(label.split()) or cpu
 
 
 def _usable(record: dict, warnings: list[str]) -> bool:

@@ -1130,12 +1130,13 @@ function renderHistory(pane, HISTORY, unit){
   }
 
   // One readout for every visible configuration: the value leads, keyed by a
-  // short line in the series color; the commit and its rdflib version head it.
+  // short line in the series color; the commit, its rdflib version and the CPU
+  // that measured it head it.
   function fillTip(p){
     tipEl.replaceChildren();
     const head = html("div", "head", null, tipEl);
     html("span", "mono", commitLabel(p), head);
-    head.append(` · ${dayOf(p)} · ${p.source} · rdflib ${p.rdflib ?? "?"}`);
+    head.append(` · ${dayOf(p)} · ${p.source} · rdflib ${p.rdflib ?? "?"} · ${p.cpu ?? "CPU ?"}`);
     html("div", "subject", p.commit.subject, head);
     for (const s of SERIES.filter(s => visible.has(s.slug))){
       const c = cell(p, s);
@@ -1154,13 +1155,13 @@ function renderHistory(pane, HISTORY, unit){
     const shown = SERIES.filter(s => visible.has(s.slug));
     const table = html("table", "matrix-table", null, tableEl);
     const head = html("tr", null, null, html("thead", null, null, table));
-    for (const h of ["Commit", "Date", "Source", "rdflib"]) html("th", "rowh", h, head);
+    for (const h of ["Commit", "Date", "Source", "rdflib", "CPU"]) html("th", "rowh", h, head);
     for (const s of shown) html("th", null, short(s), head);
     const body = html("tbody", null, null, table);
     for (const p of POINTS){
       const tr = html("tr", null, null, body);
       html("td", "rowh mono", commitLabel(p), tr);
-      for (const text of [dayOf(p), p.source, p.rdflib ?? "?"]) html("td", "rowh sub", text, tr);
+      for (const text of [dayOf(p), p.source, p.rdflib ?? "?", p.cpu ?? "?"]) html("td", "rowh sub", text, tr);
       for (const s of shown){
         const c = cell(p, s);
         const text = c?.speedup == null ? "—" : fmt(c.speedup) + (c.dropped.length ? " *" : "");
