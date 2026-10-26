@@ -3,7 +3,9 @@
 The synthetic bench's adapters and worker processes, on a directory
 ``bench.bsbm.prepare`` wrote: every store builds from ``dataset.nt``, given as
 both its N-Quads and N-Triples source (N-Triples is valid N-Quads), runs the
-warm-up, then each measured instance once (``bench.worker ... --bsbm DIR``).
+warm-up, then each measured instance once (``bench.worker ... --bsbm DIR``). A
+store built into a file runs the streams in a fresh process that opens it, as
+on the synthetic set (``run_bench.measure_adapter``).
 The results file is rewritten after every store, so a cut-short run keeps every
 store that finished. The work dir (isolated venvs, built stores: about 1 GB at
 10K products) is removed at the end. Env: ``BSBM_QUERY_TIMEOUT_S`` (5),

@@ -267,17 +267,21 @@ Every section of the dashboard has a tab per dataset:
   QMpH, as the official driver counts it. A store still running after 300 s of
   measured mixes finishes its mix, stops, and is marked *partial*.
 
-Each store's whole lifecycle runs in its own process. SPARQL evaluation is
-rdflib's engine for every store but `pyoxigraph`. Results are cross-checked
-across stores after every run:
+Each store answers its queries in a process of its own. A store built into a
+file (vortex-rdflib, COTTAS, HDT) is built in one process, timed as its load,
+and queried in a fresh one that opens the file, as an application opens a
+built store; the others load in the process that queries them. SPARQL
+evaluation is rdflib's engine for every store but `pyoxigraph`. Results are
+cross-checked across stores after every run:
 - on the synthetic set, every store must return the same number of rows;
 - on BSBM, the rdflib-engine stores must return the same answer to every
   instance (compared by digest), and pyoxigraph the same number of rows.
 
 A store that does not is reported as a failure on the dashboard. The memory
-panel shows each store's peak RSS and its peak anonymous memory (RssAnon). A
-memory-mapped store's RSS includes file pages the kernel may drop again; its
-RssAnon does not.
+panel shows the peak RSS and the peak anonymous memory (RssAnon) of the process
+that answers a store's queries. A memory-mapped store's RSS includes file pages
+the kernel may drop again; its RssAnon does not. Every query row in the results
+file also carries `minflt`, the median minor page faults per sample.
 
 Run it locally with `scripts/refresh.sh` — it syncs the contenders, ensures
 the HDT builder, measures, and re-renders the dashboard:
@@ -358,6 +362,57 @@ python -m bench.bsbm.compare bench/bsbm-data/baseline.json bench/bsbm-data/run.j
   to the abort.
 - `bench.bsbm.record_native` and `bench.bsbm.replay_native` record a stream's
   native calls and replay them against another vortex-rdf build.
+
+### Performance gate
+
+`scripts/perf-gate.sh BASE [HEAD]` compares two vortex-rdflib versions on one
+machine: `BASE` against `HEAD`, or against the working tree when `HEAD` is
+left out. Each side is a snapshot of its `src/vortex_rdflib` on `PYTHONPATH`,
+over one environment and this checkout's `bench/`. Every measurement runs as a
+quartet, `BASE`, `HEAD`, `HEAD`, `BASE`, back to back, so its two rounds pair
+runs taken close together and steady drift lands on both sides. It runs:
+
+- the synthetic set on the flagship configuration, a store with the
+  `secondary-by-copy` index, file-backed and in memory (`GATE_ADAPTERS` names
+  others), compared by `python -m bench.compare`. A heavy query takes 15
+  samples, or stops after three once they pass 5 s (`BENCH_HEAVY_ITERS`,
+  `BENCH_HEAVY_BUDGET_S`);
+- the flagged cells again, in fresh processes and in quartets of the other
+  order, `HEAD`, `BASE`, `BASE`, `HEAD`, measuring their queries alone
+  (`BENCH_QUERIES`): a flag stands only when this confirmation repeats it;
+- when `bench/bsbm-data/p10000` holds prepared BSBM data (`scripts/refresh.sh
+  --bsbm` writes it), the BSBM cell (`python -m bench.bsbm.cell`): the official
+  Explore streams, every template, on the flagship configuration, a store with
+  the `secondary-by-copy` index built from that data, file-backed and in
+  memory. Each residency runs two quartets of opposite order, and a template is
+  flagged only when both flag it; every instance must answer the same rows in
+  every run.
+
+A cell regresses when `HEAD` is slower than `BASE` in every round, by more
+than the larger of 5 % and `BASE`'s own spread between its rounds. Minor page
+faults per query follow the same rule against 25 %, and only above 256 faults:
+an allocator returning freed buffers to the kernel shows there and in no
+timer. Over a hundred cells judged at once flag a few by chance now and then,
+and a run's position in its quartet can favour one side; the confirmation, in
+the other order, repeats neither. rdflib, when `GATE_ADAPTERS` names it, runs no
+vortex-rdflib code, so its ratio is reported as the machine's drift and never
+flagged. Each run first waits for
+the 1-minute load average to drop under `GATE_MAX_LOAD` (1.5). The script exits
+1 on a standing regression or fault shift, an answer that differs, or a
+failure, and writes its reports to `bench/gate/<base>-<head>/`. A run takes
+about 4 minutes; compare only runs from one machine.
+
+```bash
+scripts/perf-gate.sh main            # main against the working tree
+scripts/perf-gate.sh v0.4.0 main     # two revisions
+# the working tree on another vortex-rdf, installed with
+# uv pip install --target ../vortex-rdf-next --no-deps vortex-rdf==VERSION
+HEAD_PATH=../vortex-rdf-next scripts/perf-gate.sh main
+```
+
+The CodSpeed cells (`bench/test_codspeed.py`) count instructions on
+32,768-row stores. The gate covers what they cannot: costs that grow with a
+store's size, the probe count of a join, or the allocator's state.
 
 ## Development
 

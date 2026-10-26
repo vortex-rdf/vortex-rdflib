@@ -438,19 +438,22 @@
     </div>
     <div class="ds-pane" data-ds="synthetic">
       <p class="group-desc">
-        Each store's whole lifecycle runs in its own process: build, every query, result
-        materialization. <b>Peak RSS</b> is the kernel high-water mark
-        (<span class="mono">VmHWM</span>), which counts file pages a store maps and the kernel may
-        drop again; <b>Peak anon</b> is the highest anonymous memory
-        (<span class="mono">RssAnon</span>) sampled after the build and after every query: the
-        memory the process itself holds. Lower is better.
+        Each store answers its queries in a process of its own. A store built into a file
+        (vortex-rdflib, COTTAS, HDT) is built in one process and queried in a fresh one that opens
+        the file, as an application opens a built store; the others load in the process that
+        queries them. The figures are the querying process's. <b>Peak RSS</b> is the kernel
+        high-water mark (<span class="mono">VmHWM</span>), which counts file pages a store maps and
+        the kernel may drop again; <b>Peak anon</b> is the highest anonymous memory
+        (<span class="mono">RssAnon</span>) sampled after the open or load and after every query:
+        the memory the process itself holds. Lower is better.
       </p>
       <div class="panel-grid"></div>
     </div>
     <div class="ds-pane" data-ds="bsbm" hidden>
       <p class="group-desc">
-        The same two figures over the BSBM run: build, warm-up and measured mixes, with
-        <span class="mono">RssAnon</span> sampled after the build and after every measured mix.
+        The same two figures over the BSBM run: open or load, warm-up and measured mixes, with
+        <span class="mono">RssAnon</span> sampled after the open or load and after every measured
+        mix.
       </p>
       <div class="panel-grid"></div>
     </div>
@@ -794,10 +797,10 @@ function renderBsbmQueries(ctx, host){
 
 // ---- memory ----
 function renderMemory(ctx, host){
-  const when = ctx.key === "bsbm" ? "after the load and after every measured mix" : "after the load and after every query";
+  const when = ctx.key === "bsbm" ? "after the open or load and after every measured mix" : "after the open or load and after every query";
   renderMatrixPanel(host, {
-    title: "Peak memory — whole lifecycle",
-    note: `Peak RSS: kernel high-water mark (VmHWM) of each store's own process; it includes file pages a store maps. Peak anon: the highest RssAnon sampled ${when} — the memory the process itself holds. Smallest first.`,
+    title: "Peak memory — the querying process",
+    note: `Peak RSS: kernel high-water mark (VmHWM) of the process that answers a store's queries, which opens a built file (vortex-rdflib, COTTAS, HDT) or loads the data (the others); it includes file pages a store maps. Peak anon: the highest RssAnon sampled ${when} — the memory the process itself holds. Smallest first.`,
     rowHeaders: ["Store"], columns: ["Peak RSS", "Peak anon"], sortByColumn: 1,
     rows: storeRows(ctx, a => [a.slug, a.slug + ":anon"]),
   }, ctx.memPeak);

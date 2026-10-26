@@ -116,13 +116,15 @@ def test_the_string_path_translates_what_preparequery_translates(monkeypatch):
 
 
 def test_one_run_yields_a_sample_of_each_mode():
-    rows, prepare_ns, evaluate_ns = run_once(dataset(), QUERY, {}, {})
+    rows, prepare_ns, evaluate_ns, _prepare_faults, _evaluate_faults = run_once(
+        dataset(), QUERY, {}, {}
+    )
     assert rows == 1
     assert prepare_ns > 0 and evaluate_ns > 0
 
 
 def test_every_full_sample_is_its_own_exec_sample_plus_a_preparation():
-    rows, warmed, samples = measure_query(dataset(), QUERY, {})
+    rows, warmed, samples, _faults = measure_query(dataset(), QUERY, {})
     assert rows == warmed == 1
     assert set(samples) == set(MODES)
     assert len(samples["full"]) == len(samples["exec"]) >= 3
@@ -132,7 +134,7 @@ def test_every_full_sample_is_its_own_exec_sample_plus_a_preparation():
 
 def test_a_heavy_query_is_sampled_without_the_string_warmup():
     heavy = BenchQuery(name="probe", group="tests", sparql=SPARQL, heavy=True)
-    rows, warmed, samples = measure_query(dataset(), heavy, {})
+    rows, warmed, samples, _faults = measure_query(dataset(), heavy, {})
     assert rows == 1
     assert warmed is None  # no warmup run, so no count to compare against
     assert len(samples["full"]) == len(samples["exec"]) == 3
@@ -146,6 +148,42 @@ def test_only_the_exec_rows_carry_a_mode_in_their_id():
         make_row("p-scan", "vortex_dict_mem", [1.0], "exec")["id"]
         == "p-scan::vortex_dict_mem::exec"
     )
+
+
+def test_a_heavy_query_stops_at_its_time_budget_but_never_under_three_samples(monkeypatch):
+    heavy = BenchQuery(name="probe", group="tests", sparql=SPARQL, heavy=True)
+    monkeypatch.setattr(worker_module, "run_once", lambda *a, **k: (1, 1.0e9, 1.0e9, 0, 0))
+    monkeypatch.setattr(worker_module, "HEAVY_ITERS", 15)
+    monkeypatch.setattr(worker_module, "HEAVY_BUDGET_NS", 5e9)
+    # Two seconds a sample: past the five-second budget after the third.
+    _rows, _warmed, samples, _faults = worker_module.measure_query(_Namespaces(), heavy, {})
+    assert len(samples["full"]) == 3
+    # A millisecond a sample: every one of the 15 fits.
+    monkeypatch.setattr(worker_module, "run_once", lambda *a, **k: (1, 5e5, 5e5, 0, 0))
+    _rows, _warmed, samples, _faults = worker_module.measure_query(_Namespaces(), heavy, {})
+    assert len(samples["full"]) == 15
+    # No budget: the fixed count.
+    monkeypatch.setattr(worker_module, "run_once", lambda *a, **k: (1, 1.0e9, 1.0e9, 0, 0))
+    monkeypatch.setattr(worker_module, "HEAVY_BUDGET_NS", float("inf"))
+    _rows, _warmed, samples, _faults = worker_module.measure_query(_Namespaces(), heavy, {})
+    assert len(samples["full"]) == 15
+
+
+def test_a_row_carries_the_median_fault_count_of_its_samples():
+    assert make_row("p-scan", "vortex_dict_mem", [1.0, 2.0, 3.0], faults=[3, 5, 100])["minflt"] == 5
+    # No counts (the load row, a platform without getrusage): no column.
+    assert "minflt" not in make_row("p-scan", "vortex_dict_mem", [1.0])
+    assert "minflt" not in make_row("p-scan", "vortex_dict_mem", [1.0], faults=[])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="getrusage is Unix-only")
+def test_every_sample_counts_its_faults_per_mode():
+    _rows, _warmed, samples, faults = measure_query(dataset(), QUERY, {})
+    assert {mode: len(f) for mode, f in faults.items()} == {
+        mode: len(s) for mode, s in samples.items()
+    }
+    # `full` spans the preparation and the evaluation, `exec` the evaluation alone.
+    assert all(full >= ex >= 0 for full, ex in zip(faults["full"], faults["exec"], strict=True))
 
 
 class Solution:
@@ -177,7 +215,7 @@ def test_every_value_of_a_native_solution_is_read():
 
 def test_a_native_store_is_timed_end_to_end_only():
     # No algebra for rdflib to prepare, so there is no `exec` half to split off.
-    rows, warmed, samples = measure_query(NativeStore(), QUERY, {}, native=True)
+    rows, warmed, samples, _faults = measure_query(NativeStore(), QUERY, {}, native=True)
     assert rows == warmed == 1
     assert set(samples) == {"full"}
     assert len(samples["full"]) >= 3
@@ -295,17 +333,17 @@ def test_fresh_mode_samples_a_new_constant_every_time(monkeypatch):
 
     def fake_run_once(graph, q, kwargs, init_ns):
         seen.append(q.sparql)
-        return 1, 10.0, 20.0
+        return 1, 10.0, 20.0, 0, 0
 
     def fake_string(graph, q, kwargs, native=False):
         seen.append("warm:" + q.sparql)
-        return 1, 30.0
+        return 1, 30.0, 0
 
     monkeypatch.setattr(worker_module, "FRESH_CONSTANTS", True)
     monkeypatch.setattr(worker_module, "run_once", fake_run_once)
     monkeypatch.setattr(worker_module, "run_string_once", fake_string)
     monkeypatch.setattr(worker_module, "QUERY_ITERS", 3)
-    _rows, warmed, _samples = worker_module.measure_query(_Namespaces(), query, {})
+    _rows, warmed, _samples, _faults = worker_module.measure_query(_Namespaces(), query, {})
     assert warmed is None  # every variant has its own answer: no warm-up check
     assert seen == [
         "warm:SELECT * WHERE { ?s ?p ?o } LIMIT 1",
@@ -321,10 +359,10 @@ def test_fresh_mode_reports_the_rows_of_the_warmup_variant(monkeypatch):
     # store, and the orchestrator compares what the stores report.
     query = replace(BenchQuery("q", "g", "SELECT * WHERE { ?s ?p ?o }"), fresh=lambda k: f"V{k}")
     monkeypatch.setattr(worker_module, "FRESH_CONSTANTS", True)
-    monkeypatch.setattr(worker_module, "run_once", lambda *a, **k: (7, 10.0, 20.0))
-    monkeypatch.setattr(worker_module, "run_string_once", lambda *a, **k: (5, 30.0))
+    monkeypatch.setattr(worker_module, "run_once", lambda *a, **k: (7, 10.0, 20.0, 0, 0))
+    monkeypatch.setattr(worker_module, "run_string_once", lambda *a, **k: (5, 30.0, 0))
     monkeypatch.setattr(worker_module, "QUERY_ITERS", 3)
-    matched, warmed, samples = worker_module.measure_query(_Namespaces(), query, {})
+    matched, warmed, samples, _faults = worker_module.measure_query(_Namespaces(), query, {})
     assert (matched, warmed) == (5, None)  # the warm-up's rows, not the last sample's 7
     assert len(samples["full"]) == 3
 
@@ -335,14 +373,14 @@ def test_a_heavy_query_in_fresh_mode_samples_its_variants_without_a_warmup(monke
 
     def fake_run_once(graph, q, kwargs, init_ns):
         seen.append(q.sparql)
-        return 1, 10.0, 20.0
+        return 1, 10.0, 20.0, 0, 0
 
     monkeypatch.setattr(worker_module, "FRESH_CONSTANTS", True)
     monkeypatch.setattr(worker_module, "run_once", fake_run_once)
     monkeypatch.setattr(worker_module, "HEAVY_ITERS", 3)
     # `run_string_once` is left real: the graph below has no `query`, so a
     # warm-up would raise.
-    _rows, warmed, _samples = worker_module.measure_query(_Namespaces(), query, {})
+    _rows, warmed, _samples, _faults = worker_module.measure_query(_Namespaces(), query, {})
     assert warmed is None
     assert seen == ["SELECT 1", "SELECT 2", "SELECT 3"]
 
@@ -353,11 +391,11 @@ def test_without_fresh_mode_the_text_never_changes(monkeypatch):
 
     def fake_run_once(graph, q, kwargs, init_ns):
         seen.append(q.sparql)
-        return 1, 10.0, 20.0
+        return 1, 10.0, 20.0, 0, 0
 
     monkeypatch.setattr(worker_module, "FRESH_CONSTANTS", False)
     monkeypatch.setattr(worker_module, "run_once", fake_run_once)
-    monkeypatch.setattr(worker_module, "run_string_once", lambda *a, **k: (1, 30.0))
+    monkeypatch.setattr(worker_module, "run_string_once", lambda *a, **k: (1, 30.0, 0))
     monkeypatch.setattr(worker_module, "QUERY_ITERS", 3)
     worker_module.measure_query(_Namespaces(), query, {})
     assert seen == [query.sparql] * 3
@@ -367,11 +405,93 @@ def test_a_query_without_variants_is_still_checked_in_fresh_mode(monkeypatch):
     # Its text never changes, so the prepared run keeps being held to the
     # rows the warm-up's string query saw: here they differ, and both are reported.
     monkeypatch.setattr(worker_module, "FRESH_CONSTANTS", True)
-    monkeypatch.setattr(worker_module, "run_once", lambda *a, **k: (4, 10.0, 20.0))
-    monkeypatch.setattr(worker_module, "run_string_once", lambda *a, **k: (3, 30.0))
+    monkeypatch.setattr(worker_module, "run_once", lambda *a, **k: (4, 10.0, 20.0, 0, 0))
+    monkeypatch.setattr(worker_module, "run_string_once", lambda *a, **k: (3, 30.0, 0))
     monkeypatch.setattr(worker_module, "QUERY_ITERS", 3)
-    rows, warmed, _samples = worker_module.measure_query(_Namespaces(), QUERY, {})
+    rows, warmed, _samples, _faults = worker_module.measure_query(_Namespaces(), QUERY, {})
     assert (rows, warmed) == (4, 3)
+
+
+def worker(tmp_path: Path, slug: str, out: Path, *args: str) -> subprocess.CompletedProcess:
+    """``python -m bench.worker`` over the 4,000-quad set in ``tmp_path``, one sample a query."""
+    return worker_with(tmp_path, slug, out, {}, *args)
+
+
+def worker_with(
+    tmp_path: Path, slug: str, out: Path, extra_env: dict[str, str], *args: str
+) -> subprocess.CompletedProcess:
+    """``worker`` with ``extra_env`` on top of its environment."""
+    nq, nt = tmp_path / "d.nq", tmp_path / "d.nt"
+    if not nq.exists():
+        write_nquads(str(nq), _CFG)
+        write_ntriples(str(nt), _CFG)
+    env = {
+        **os.environ,
+        "BENCH_TRIPLES": "4000",
+        "BENCH_QUERY_ITERS": "1",
+        "BENCH_HEAVY_ITERS": "1",
+        "BENCH_LOAD_ITERS": "1",
+        **extra_env,
+    }
+    return subprocess.run(
+        [sys.executable, "-m", "bench.worker", slug, str(nq), str(nt), str(tmp_path), str(out)]
+        + list(args),
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def test_a_built_store_is_queried_by_a_process_that_only_opens_it(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    # A query process builds nothing: with no built file there is nothing to open.
+    alone = worker(empty, "vortex_dict_file", empty / "q.json", "--phase", "query")
+    assert alone.returncode != 0 and not (empty / "q.json").exists()
+
+    load_out, query_out = tmp_path / "load.json", tmp_path / "query.json"
+    loaded = worker(tmp_path, "vortex_dict_file", load_out, "--phase", "load")
+    assert loaded.returncode == 0, loaded.stderr
+    load = json.loads(load_out.read_text())
+    assert [r["id"] for r in load["rows"]] == ["load::vortex_dict_file"]
+    assert load["buildPeakRssMb"] is None or load["buildPeakRssMb"] > 0
+
+    queried = worker(tmp_path, "vortex_dict_file", query_out, "--phase", "query")
+    assert queried.returncode == 0, queried.stderr
+    query = json.loads(query_out.read_text())
+    ids = {r["id"] for r in query["rows"]}
+    assert "load::vortex_dict_file" not in ids
+    assert {"p-scan::vortex_dict_file", "p-scan::vortex_dict_file::exec"} <= ids
+    assert query["failures"] == [] and query["matched"]["p-scan"] > 0
+    if sys.platform != "win32":
+        assert all("minflt" in r for r in query["rows"])
+
+
+def test_a_run_restricted_to_some_queries_measures_those_alone(tmp_path):
+    out = tmp_path / "only.json"
+    proc = worker_with(tmp_path, "rdflib_memory", out, {"BENCH_QUERIES": "p-scan,count-all"})
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(out.read_text())
+    assert {r["group"] for r in report["rows"]} == {"load", "p-scan", "count-all"}
+    assert set(report["matched"]) == {"p-scan", "count-all"}
+
+
+def test_every_store_built_into_a_file_can_be_reopened():
+    # The orchestrator queries these in a fresh process; the others load where they answer.
+    files = {"pycottas", "rdflib_hdt"} | {s for s in BY_SLUG if s.startswith("vortex_")}
+    assert {s for s, a in BY_SLUG.items() if a.reopen is not None} == files
+
+
+def test_a_vortex_store_reopens_what_its_load_built(tmp_path):
+    nq = tmp_path / "d.nq"
+    write_nquads(str(nq), _CFG)
+    for slug in ("vortex_dict_mem_copy", "vortex_dict_file_ref"):
+        adapter = BY_SLUG[slug]
+        assert adapter.reopen is not None
+        loaded = adapter.make(str(nq), "", str(tmp_path))
+        reopened = adapter.reopen(str(tmp_path))
+        assert len(reopened) == len(loaded) > 0
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="RssAnon is Linux-only")

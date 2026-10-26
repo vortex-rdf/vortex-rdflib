@@ -19,8 +19,9 @@ graph is asked of every store over identical data (``bench.dataset``).
 Scale knobs (env): ``BENCH_TRIPLES`` (default 250,000), ``BENCH_PREDICATES``,
 ``BENCH_SUBJ_RATIO``, ``BENCH_OBJ_RATIO``, ``BENCH_LITERAL_FRAC``,
 ``BENCH_GRAPHS`` (default 8, one of them the default graph),
-``BENCH_QUERY_ITERS``, ``BENCH_HEAVY_ITERS``, ``BENCH_LOAD_ITERS``,
-``BENCH_QUERY_BUDGET_S``. ``BENCH_FRESH_CONSTANTS=1`` asks a query with a
+``BENCH_QUERY_ITERS``, ``BENCH_HEAVY_ITERS``, ``BENCH_HEAVY_BUDGET_S``,
+``BENCH_LOAD_ITERS``, ``BENCH_QUERY_BUDGET_S``. ``BENCH_QUERIES`` measures the
+named queries alone (``config.onlyQueries``). ``BENCH_FRESH_CONSTANTS=1`` asks a query with a
 FILTER constant a new constant in every sample (see ``worker.py``); the
 results say so (``config.freshConstants`` and their provenance), and their
 history record is another dataset, never plotted on the repeated-text line.
@@ -61,8 +62,12 @@ def run_worker(
     python: str,
     extra_args: tuple[str, ...] = (),
     extra_env: dict[str, str] | None = None,
+    phase: str = "all",
 ) -> dict | None:
-    out_file = work_dir / f"worker-{adapter.slug}.json"
+    """One worker process of ``phase`` (``bench.worker``); its output, or None
+    when it failed or timed out."""
+    name = adapter.slug if phase == "all" else f"{adapter.slug}-{phase}"
+    out_file = work_dir / f"worker-{name}.json"
     cmd = [
         python,
         "-m",
@@ -72,6 +77,8 @@ def run_worker(
         str(nt_path),
         str(work_dir),
         str(out_file),
+        "--phase",
+        phase,
         *extra_args,
     ]
     try:
@@ -103,6 +110,11 @@ def measure_adapter(
 ) -> dict | None:
     """Build the adapter's isolated env if it needs one, then run its worker.
 
+    A store built into a file (``Adapter.reopen``) runs as two workers: one
+    builds the file and times the load, a fresh one opens it and answers the
+    queries. Their output is merged: the load row first, the query process's
+    memory readings, and the build's peak RSS as ``buildPeakRssMb``.
+
     Returns the worker's output, its own failures appended to ``failures`` with
     the adapter's slug and label. Returns None after appending the ``venv`` or
     ``worker`` failure instead: one store falling over never stops the others."""
@@ -120,9 +132,23 @@ def measure_adapter(
             }
         )
         return None
-    out = run_worker(
-        adapter, nq_path, nt_path, work_dir, python, extra_args=extra_args, extra_env=extra_env
-    )
+
+    def worker(phase: str, args: tuple[str, ...] = ()) -> dict | None:
+        return run_worker(adapter, nq_path, nt_path, work_dir, python, args, extra_env, phase=phase)
+
+    out: dict | None
+    if adapter.reopen is None:
+        out = worker("all", extra_args)
+    else:
+        built = worker("load")
+        out = None if built is None else worker("query", extra_args)
+        if built is not None and out is not None:
+            out = {
+                **out,
+                "rows": [*built["rows"], *out["rows"]],
+                "failures": [*built.get("failures", []), *out.get("failures", [])],
+                "buildPeakRssMb": built.get("buildPeakRssMb"),
+            }
     if out is None:
         failures.append(
             {
@@ -251,7 +277,10 @@ def reconcile(
 
 
 def memory_entry(adapter: Adapter, out: dict) -> dict:
-    """A worker's memory readings, as the dashboard's memory panel reads them."""
+    """A worker's memory readings, as the dashboard's memory panel reads them:
+    those of the process that answered the queries. ``buildPeakRssMb`` is the
+    peak RSS of the process that built the store's file, for a store built in a
+    process of its own, else None."""
     loaded, baseline = out.get("loadedMb"), out.get("baselineMb")
     store_mb = loaded - baseline if isinstance(loaded, int) and isinstance(baseline, int) else None
     return {
@@ -263,6 +292,7 @@ def memory_entry(adapter: Adapter, out: dict) -> dict:
         "baselineMb": baseline,
         "loadedMb": loaded,
         "storeMb": store_mb,
+        "buildPeakRssMb": out.get("buildPeakRssMb"),
     }
 
 
@@ -327,6 +357,10 @@ def main(argv: list[str] | None = None) -> int:
     cfg = config_from_env()
     m = moduli(cfg)
     queries = build_queries(cfg, m)
+    only = sorted({q for q in os.environ.get("BENCH_QUERIES", "").split(",") if q})
+    unknown = set(only) - {q.name for q in queries}
+    if unknown:
+        parser.error(f"BENCH_QUERIES names no query of the set: {', '.join(sorted(unknown))}")
 
     work_dir = Path(tempfile.mkdtemp(prefix="vortex-rdflib-bench-"))
     nq_path, nt_path = work_dir / "data.nq", work_dir / "data.nt"
@@ -399,6 +433,10 @@ def main(argv: list[str] | None = None) -> int:
         "queryIters": int(os.environ.get("BENCH_QUERY_ITERS", 10)),
         "heavyIters": int(os.environ.get("BENCH_HEAVY_ITERS", 3)),
     }
+    if os.environ.get("BENCH_HEAVY_BUDGET_S"):
+        config["heavyBudgetS"] = float(os.environ["BENCH_HEAVY_BUDGET_S"])
+    if only:
+        config["onlyQueries"] = only
     # The workers inherit this environment, so it says how they sampled.
     fresh = os.environ.get(FRESH_CONSTANTS_ENV) == "1"
     if fresh:

@@ -4,8 +4,9 @@ Shared by ``run_stream`` (one vortex store, paired comparisons) and the
 dashboard worker (``bench.worker --bsbm``, any store). The warm-up runs first,
 untimed. Every measured instance runs once, timed as two adjacent spans like
 ``bench.worker.run_once``: ``prepareQuery``, then evaluate-and-consume; a store
-taking query text (``native``: pyoxigraph) has one span. Answers are digested
-outside the timing. RssAnon is sampled after every measured mix.
+taking query text (``native``: pyoxigraph) has one span. Its minor page faults
+over both spans are its ``minflt``. Answers are digested outside the timing.
+RssAnon is sampled after every measured mix.
 
 Limits, off unless given: a per-query timeout (SIGALRM via ``setitimer``,
 raising ``QueryTimeout`` once Python regains control; POSIX only), and a store
@@ -26,7 +27,7 @@ from contextlib import contextmanager
 from itertools import groupby
 from time import perf_counter_ns
 
-from ..procmem import rss_anon_mb
+from ..procmem import minor_faults, rss_anon_mb
 
 QUERY_TIMEOUT_ENV = "BSBM_QUERY_TIMEOUT_S"
 STORE_BUDGET_ENV = "BSBM_STORE_BUDGET_S"
@@ -146,6 +147,7 @@ def _attempt(
     and answered (rdflib's bare ``except:`` blocks can). A timed-out or failed
     instance's time is its elapsed time, up to where it stopped. The digest is
     taken outside the timing, inside the guard."""
+    f0 = minor_faults()
     t0 = perf_counter_ns()
     timer = Deadline()  # stays unexpired when the deadline cannot be armed
     error = None
@@ -154,12 +156,14 @@ def _attempt(
             rows, prep_ns, exec_ns = run_instance(
                 graph, text, native=native, query_kwargs=kwargs, init_ns=init_ns
             )
+        f1 = minor_faults()
         if not timer.expired:
             record = {
                 "prep_ns": prep_ns,
                 "exec_ns": exec_ns,
                 "rows": len(rows),
                 "digest": None if native else answer_digest(rows),
+                "minflt": None if f0 is None or f1 is None else f1 - f0,
             }
             return record, (prep_ns or 0) + exec_ns
     except QueryTimeout:
