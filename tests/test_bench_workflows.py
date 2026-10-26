@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 from bench.adapters import ADAPTERS
 from bench.bsbm import tools
+from bench.history import CONFIGURATIONS, REFERENCE
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -66,6 +67,38 @@ def matrix_problems(text: str) -> list[str]:
         f"{slug} is not a store in bench/adapters.py" for slug in sorted(set(listed) - set(known))
     ]
     problems += [f"{slug} is in no group" for slug in known if slug not in listed]
+    return problems
+
+
+def history_problems(text: str) -> list[str]:
+    """The history's stores must share one matrix job, and that job must write the BSBM record.
+
+    The chart divides rdflib's time by each configuration's. Two jobs land on runners that may
+    differ in CPU model, so a store of the history in another job than rdflib's would plot that
+    difference as a speedup; a record written by another job would name another machine's CPU.
+    """
+    wanted = {*CONFIGURATIONS, REFERENCE}
+    holding = [group for group, slugs in matrix_groups(text) if wanted & set(slugs)]
+    if len(holding) != 1:
+        return [f"the history's stores are spread over {len(holding)} matrix groups: {holding}"]
+    group = holding[0]
+    slugs = dict(matrix_groups(text))[group]
+    problems = [f"{slug} is not in the {group} group" for slug in sorted(wanted - set(slugs))]
+    bsbm = job_text(text, "bsbm")
+    step = re.search(
+        r"- name: Record this commit's BSBM point\n\s+if: (.+)\n"
+        r"(?:.*\n){0,2}?.*bench\.history record bsbm-partial/(\S+)\.json",
+        bsbm,
+    )
+    if not step:
+        problems.append("the bsbm job does not record the BSBM point from its group's results")
+    else:
+        if f"matrix.group == '{group}'" not in step.group(1):
+            problems.append(f"the BSBM record step does not run in the {group} group alone")
+        if step.group(2) != group:
+            problems.append(f"the BSBM record reads {step.group(2)}.json, not {group}.json")
+    if "bench.history record" in job_text(text, "bsbm-merge"):
+        problems.append("the merge job writes a BSBM record, on a runner that measured nothing")
     return problems
 
 
@@ -264,6 +297,39 @@ def test_every_store_is_in_exactly_one_matrix_group():
 )
 def test_the_matrix_check_notices_a_wrong_group(fault, expected):
     problems = matrix_problems(fault(read(DASHBOARD)))
+    assert any(expected in problem for problem in problems), problems
+
+
+def test_the_history_is_measured_and_recorded_in_one_job():
+    assert history_problems(read(DASHBOARD)) == []
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected"),
+    [
+        # rdflib moved to a job of its own
+        (
+            lambda t: t.replace(",rdflib_memory\n", "\n", 1).replace(
+                "adapters: rdflib_hdt", "adapters: rdflib_hdt,rdflib_memory", 1
+            ),
+            "spread over 2 matrix groups",
+        ),
+        # the record written by every group's job
+        (lambda t: t.replace("if: matrix.group == 'history' && github", "if: github", 1), "alone"),
+        # the record written by the merge job again
+        (
+            lambda t: t.replace(
+                "bench.bsbm.merge --out",
+                "bench.history record bench/results-bsbm.json && bench.bsbm.merge --out",
+                1,
+            ),
+            "measured nothing",
+        ),
+    ],
+    ids=["reference-elsewhere", "every-group", "merge-job"],
+)
+def test_the_history_check_notices_a_split_or_a_record_elsewhere(fault, expected):
+    problems = history_problems(fault(read(DASHBOARD)))
     assert any(expected in problem for problem in problems), problems
 
 
