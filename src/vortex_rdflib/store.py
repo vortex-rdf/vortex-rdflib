@@ -7,7 +7,7 @@ from rdflib.store import NO_STORE, VALID_STORE, Store
 from rdflib.term import BNode, IdentifiedNode, Node, URIRef
 from vortex_rdf import VortexRdfStore
 
-from . import query_scope
+from . import counters, query_scope
 from .pushdown import (
     _CHUNK_MAX,
     _CHUNK_START,
@@ -173,6 +173,7 @@ class VortexRdflibStore(Store):
         # each distinct code is decoded to an rdflib term once per query. None
         # on other layouts -> string fallback path.
         self._dict = self._native.term_dict() if self._use_codes else None
+        self._native, self._dict = counters.wrap(self._native, self._dict)  # VORTEX_RDF_COUNTERS
         self._kind_bounds = None
         self._ranges = None
         self._default_code = _UNRESOLVED

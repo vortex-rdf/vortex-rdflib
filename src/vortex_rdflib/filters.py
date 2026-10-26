@@ -51,7 +51,7 @@ from rdflib.plugins.sparql.sparql import FrozenBindings, SPARQLError
 from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
 
-from . import candidates
+from . import ablation, candidates
 from .candidates import IRI_IN, NativeShape
 from .terms import BLANK, IRI, LITERAL, TermView, canonical_spelling, kind_of, parse_spelling
 
@@ -933,6 +933,17 @@ def _constant_term(node, consts: dict):
 
 
 def native_shape(expr, var, consts: dict) -> NativeShape | None:
+    """:func:`_native_shape`, except that with ``VORTEX_RDF_CODE_PREDICATES=0`` a kind test or an IRI equality is
+    not one: it is decided over decoded values, not as a code range or code set."""
+    shape = _native_shape(expr, var, consts)
+    if shape is not None and not ablation.CODE_PREDICATES and (
+        shape.kind in candidates.KIND_TESTS or shape.kind == IRI_IN
+    ):
+        return None
+    return shape
+
+
+def _native_shape(expr, var, consts: dict) -> NativeShape | None:
     """The native predicate (:class:`~vortex_rdflib.candidates.NativeShape`)
     that ``expr`` is as a test of ``var`` alone — any other variable seen only
     through ``consts`` — or ``None``.
@@ -1247,7 +1258,8 @@ def _compile_conjunct(
         if const_views is not None:
             fast = compile_fast(expr, variables, const_views)
     return Conjunct(
-        expr, variables, fast, fast is not None and is_kind_only(expr), consts, ctx, native
+        expr, variables, fast, fast is not None and is_kind_only(expr) and ablation.CODE_PREDICATES, consts, ctx,
+        native,
     )
 
 

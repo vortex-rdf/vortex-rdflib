@@ -166,7 +166,7 @@ from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import Cancelled, CancelToken, CodeGroups, JoinTooLarge, U64Column
 
-from . import candidates, filters, query_scope
+from . import ablation, candidates, filters, query_scope
 from .terms import CANONICAL_INTEGER, INTEGER_SUFFIX, canonical_spelling, unparseable_iri
 
 _EVAL_KEY = "vortex_rdflib_bgp"
@@ -199,6 +199,8 @@ _ENABLED_OPS = _ALL_OPS
 # dozen rows, the cap keeps a full scan to a handful of decode_many calls.
 _CHUNK_START = 64
 _CHUNK_MAX = 4096
+if ablation.DECODE_CHUNK is not None:  # VORTEX_RDF_DECODE_CHUNK: one fixed chunk size
+    _CHUNK_START = _CHUNK_MAX = ablation.DECODE_CHUNK
 
 _TRACE_PREFIX = "VORTEX_RDF_QUERY_TRACE "
 _TRACE_SCHEMA = "vortex-rdf-query-trace-v1"
@@ -2014,7 +2016,7 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
             repeated_free = any(
                 len(pos) > 1 for v, pos in pat["varpos"].items() if v not in rel.schema
             )
-            if not repeated_free and len(rows) * _PROBE_FANOUT < _count_pattern(
+            if not repeated_free and len(rows) * _PROBE_FANOUT < _planning_count(
                 store, pat, {}, limit=len(rows) * _PROBE_FANOUT + 1
             ):
                 flags = _probe_exists(store, rel.schema, rows, pat)
@@ -2701,6 +2703,20 @@ def _count_pattern(store, pat, counts: dict, exact: bool = False, limit: int | N
     return n
 
 
+def _static_estimate(pat) -> int:
+    """``VORTEX_RDF_COUNT_ORDER=0``: a planning estimate from the pattern's bound positions alone, in place of a
+    native count — fewer rows for more bound positions, and never few enough that a connected step matches rather
+    than probes (rdflib's nested loop)."""
+    return 1 << (62 - 8 * sum(value is not None for value in pat["n3"]))
+
+
+def _planning_count(store, pat, counts: dict, limit: int | None = None) -> int:
+    """:func:`_count_pattern` for a planning decision, or the static estimate when counts do not plan."""
+    if not ablation.COUNT_ORDER:
+        return 0 if pat["unsatisfiable"] else _static_estimate(pat)
+    return _count_pattern(store, pat, counts, limit=limit)
+
+
 def _count_patterns(store, patterns, counts: dict) -> int:
     """Set the patterns' ``"estimate"`` — their planning counts (see
     :func:`_count_pattern`) — counting the quad patterns ``counts`` does not
@@ -2719,6 +2735,10 @@ def _count_patterns(store, patterns, counts: dict) -> int:
     release for all — after the point counts (:func:`_cheap_probe`: those
     the native layer answers without a scan), any of which may still end the
     block first. Returns the counts made."""
+    if not ablation.COUNT_ORDER:
+        for pat in patterns:
+            pat["estimate"] = _planning_count(store, pat, counts)
+        return 0
     before = len(counts)
     ordered = sorted(patterns, key=_pattern_static_rank)
     minimum = _MEMORY_SCAN_BATCH_MIN if store.in_memory else _SCAN_BATCH_MIN
@@ -2791,6 +2811,8 @@ _CHEAP_BATCH_MIN = 256
 #: them gains less than the batch costs; they batch from three on.
 _SCAN_BATCH_MIN = 2
 _MEMORY_SCAN_BATCH_MIN = 3
+if ablation.PROBE_BATCH is not None:  # VORTEX_RDF_PROBE_BATCH: every probe step batched (see _PROBE_BATCH)
+    _CHEAP_BATCH_MIN = _SCAN_BATCH_MIN = _MEMORY_SCAN_BATCH_MIN = 1
 
 #: The ``lookahead`` of a batch call whose probes scan the store
 #: (:func:`_probe_lookahead`): a scan per core, eight at most. The native
@@ -3160,6 +3182,8 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
         native_call_count=calls,
         native_match_ns=native_ns,
     )
+    if ablation.DECODE_EACH_STEP:
+        cols, rows = _decode_each_step(store, cols, rows)
     cols, rows, tuples = _prune_early(store, schema, cols, rows, tuples, remaining, views)
 
     execution_index = 1
@@ -3348,6 +3372,8 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
         order.append(pat.get("index"))
         if pieces is not None:
             break
+        if ablation.DECODE_EACH_STEP:
+            cols, rows = _decode_each_step(store, cols, rows)
         cols, rows, tuples = _prune_early(store, schema, cols, rows, tuples, remaining, views)
         execution_index += 1
 
@@ -3381,6 +3407,29 @@ def _join_incremental_bgp(store, patterns, pushed=None, stream=False) -> tuple[R
     if cols is not None:
         return Relation(schema, cols, None, len(cols[0])), stats
     return Relation.from_rows(schema, rows), stats
+
+
+def _decode_each_step(store, cols, rows):
+    """``VORTEX_RDF_DECODE_EACH_STEP=1``: the relation's codes decoded to their spellings and encoded again — the
+    same codes (tests/test_ablation_switches.py checks it), after the term round trip a term-space evaluator pays at every step. Codes outside the dictionary
+    (negative: query constants) pass through."""
+    term_dict = store._dict
+
+    def again(codes: list) -> list:
+        mine = [c for c in codes if c >= 0]
+        back = iter(term_dict.encode_many(term_dict.decode_many(U64Column(mine))) if mine else ())
+        return [next(back) if c >= 0 else c for c in codes]
+
+    if cols is not None:
+        out = []
+        for col in cols:
+            view = col if isinstance(col, memoryview) else memoryview(col)
+            codes = (view if view.format == "Q" else view.cast("Q")).tolist()
+            out.append(memoryview(U64Column(again(codes))).cast("Q"))
+        return tuple(out), None
+    width = len(rows[0]) if rows else 0
+    columns = [again([row[i] for row in rows]) for i in range(width)]
+    return None, list(zip(*columns, strict=True)) if width else rows
 
 
 def _specialize_tuple_conjuncts(store, pat, schema, cols, rows, tuples, pushed) -> list:
@@ -3537,7 +3586,7 @@ def _plan_pattern_side(ctx, store, triple, scope, left: Relation, left_rows, var
     )
     if free_preds:
         free_preds = _push_native_restrictions(store, pat, free_preds)
-    estimate = _count_pattern(store, pat, {}, limit=len(left_rows) * _PROBE_FANOUT + 1)
+    estimate = _planning_count(store, pat, {}, limit=len(left_rows) * _PROBE_FANOUT + 1)
     if shared and len(left_rows) * _PROBE_FANOUT < estimate:
         _shared_key_ok(left, Relation((), None, [], 0), shared)
         if free_preds:
@@ -4236,6 +4285,8 @@ def _join_patterns(store, patterns, stats=None, pushed=None, stream=False) -> Re
 
 #: Probes per native batch call: bounds the columns one batch holds at once.
 _PROBE_BATCH = 4096
+if ablation.PROBE_BATCH is not None:  # VORTEX_RDF_PROBE_BATCH: this many probes per batch call
+    _PROBE_BATCH = ablation.PROBE_BATCH
 
 
 def _probe_join(
