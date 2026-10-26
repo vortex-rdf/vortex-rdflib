@@ -18,6 +18,7 @@ dist/
 /bench/results-bsbm.json
 /bench/results-bsbm.json.tmp
 /bench/bsbm-data/
+/bench/gate/
 /public/
 
 .claude
