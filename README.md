@@ -267,17 +267,21 @@ Every section of the dashboard has a tab per dataset:
   QMpH, as the official driver counts it. A store still running after 300 s of
   measured mixes finishes its mix, stops, and is marked *partial*.
 
-Each store's whole lifecycle runs in its own process. SPARQL evaluation is
-rdflib's engine for every store but `pyoxigraph`. Results are cross-checked
-across stores after every run:
+Each store answers its queries in a process of its own. A store built into a
+file (vortex-rdflib, COTTAS, HDT) is built in one process, timed as its load,
+and queried in a fresh one that opens the file, as an application opens a
+built store; the others load in the process that queries them. SPARQL
+evaluation is rdflib's engine for every store but `pyoxigraph`. Results are
+cross-checked across stores after every run:
 - on the synthetic set, every store must return the same number of rows;
 - on BSBM, the rdflib-engine stores must return the same answer to every
   instance (compared by digest), and pyoxigraph the same number of rows.
 
 A store that does not is reported as a failure on the dashboard. The memory
-panel shows each store's peak RSS and its peak anonymous memory (RssAnon). A
-memory-mapped store's RSS includes file pages the kernel may drop again; its
-RssAnon does not.
+panel shows the peak RSS and the peak anonymous memory (RssAnon) of the process
+that answers a store's queries. A memory-mapped store's RSS includes file pages
+the kernel may drop again; its RssAnon does not. Every query row in the results
+file also carries `minflt`, the median minor page faults per sample.
 
 Run it locally with `scripts/refresh.sh` — it syncs the contenders, ensures
 the HDT builder, measures, and re-renders the dashboard:

@@ -107,6 +107,7 @@ def test_a_memory_entry_carries_peak_anon():
         "baselineMb": 40,
         "loadedMb": 160,
         "storeMb": 120,
+        "buildPeakRssMb": None,
     }
 
 
@@ -157,6 +158,81 @@ def test_a_worker_that_fails_is_a_worker_failure_and_its_own_failures_are_labell
     assert failures == [{"slug": "vortex", "label": "label vortex", "phase": "Q1", "error": "boom"}]
 
 
+def built(slug: str) -> Adapter:
+    """A store built into a file: it has a ``reopen``, which is never called here."""
+
+    def unused(work_dir: str) -> Graph:
+        raise AssertionError("the orchestrator never opens a store itself")
+
+    return replace(adapters(slug)[0], reopen=unused)
+
+
+def test_a_built_store_is_loaded_by_one_worker_and_queried_by_a_fresh_one(monkeypatch, tmp_path):
+    calls: list[tuple] = []
+    outputs = {
+        "load": {
+            "rows": [{"id": "load::vortex"}],
+            "failures": [{"phase": "load", "error": "slow"}],
+            "baselineMb": 30,
+            "loadedMb": 400,
+            "buildPeakRssMb": 900,
+        },
+        "query": {
+            "rows": [{"id": "q::vortex"}],
+            "failures": [{"phase": "q", "error": "boom"}],
+            "baselineMb": 30,
+            "loadedMb": 60,
+            "peakRssMb": 120,
+            "peakAnonMb": 80,
+            "matched": {"q": 3},
+        },
+    }
+
+    def fake_worker(adapter, nq, nt, work_dir, python, extra_args=(), extra_env=None, phase="all"):
+        calls.append((phase, tuple(extra_args), extra_env))
+        return outputs[phase]
+
+    monkeypatch.setattr("bench.run_bench.run_worker", fake_worker)
+    failures: list[dict] = []
+    out = run_bench.measure_adapter(
+        built("vortex"),
+        tmp_path / "a.nq",
+        tmp_path / "a.nt",
+        tmp_path,
+        failures,
+        extra_args=("--bsbm", "DIR"),
+        extra_env={"BENCH_LOAD_ITERS": "1"},
+    )
+    # The streams go to the query process only; both get the environment.
+    assert calls == [
+        ("load", (), {"BENCH_LOAD_ITERS": "1"}),
+        ("query", ("--bsbm", "DIR"), {"BENCH_LOAD_ITERS": "1"}),
+    ]
+    assert out is not None
+    assert [r["id"] for r in out["rows"]] == ["load::vortex", "q::vortex"]
+    assert [f["phase"] for f in failures] == ["load", "q"]
+    entry = memory_entry(built("vortex"), out)
+    # The panel shows the process that answered the queries; the build's peak rides along.
+    assert (entry["loadedMb"], entry["peakRssMb"], entry["buildPeakRssMb"]) == (60, 120, 900)
+    assert out["matched"] == {"q": 3}
+
+
+def test_a_built_store_whose_load_fails_is_never_queried(monkeypatch, tmp_path):
+    phases: list[str] = []
+
+    def fake_worker(*args, phase="all", **kwargs):
+        phases.append(phase)
+        return None
+
+    monkeypatch.setattr("bench.run_bench.run_worker", fake_worker)
+    failures: list[dict] = []
+    out = run_bench.measure_adapter(
+        built("vortex"), tmp_path / "a.nq", tmp_path / "a.nt", tmp_path, failures
+    )
+    assert out is None and phases == ["load"]
+    assert [f["phase"] for f in failures] == ["worker"]
+
+
 def test_a_bsbm_dir_without_the_bsbm_dataset_is_refused(tmp_path, monkeypatch, capsys):
     def synthetic(*_args):
         raise AssertionError("ran the synthetic benchmark")
@@ -193,3 +269,12 @@ def test_a_bsbm_dir_without_meta_json_is_refused(tmp_path, capsys):
     assert stop.value.code == 2
     err = capsys.readouterr().err
     assert f"{tmp_path} holds no meta.json" in err and "python -m bench.bsbm.prepare" in err
+
+
+def test_a_query_filter_must_name_queries_of_the_set(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("BENCH_TRIPLES", "5000")
+    monkeypatch.setenv("BENCH_QUERIES", "p-scan,no-such-query")
+    with pytest.raises(SystemExit) as stop:
+        run_bench.main(["--adapters", "rdflib_memory", "--out", str(tmp_path / "r.json")])
+    assert stop.value.code == 2
+    assert "no-such-query" in capsys.readouterr().err

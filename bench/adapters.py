@@ -1,11 +1,16 @@
 """Store adapters under comparison.
 
-Each adapter runs its full lifecycle (build/parse, queries, memory readings)
-in its own worker process (see ``worker.py``), so heavy imports live inside
-the factory functions: the rdflib-Memory worker never imports vortex_rdflib
-(whose pushdown hook registers into rdflib's ``CUSTOM_EVALS``), only the
-oxrdflib and pyoxigraph workers import pyoxigraph, and the pyoxigraph worker
-never imports rdflib.
+Each adapter runs in worker processes of its own (see ``worker.py``), so heavy
+imports live inside the factory functions: the rdflib-Memory worker never
+imports vortex_rdflib (whose pushdown hook registers into rdflib's
+``CUSTOM_EVALS``), only the oxrdflib and pyoxigraph workers import pyoxigraph,
+and the pyoxigraph worker never imports rdflib.
+
+A store built into a file (the Vortex rows, COTTAS, HDT) has a ``reopen``: one
+process builds the file, timed as the load, and a fresh one opens it with
+``reopen`` and answers the queries, as an application opens a built store. The
+build's allocations then leave no allocator state behind for the queries to
+inherit. The other stores load in the process that queries them.
 
 Quads: the dataset is N-Quads, and every store whose format has named graphs
 loads it into an rdflib ``Dataset`` whose default graph is the **union** of
@@ -113,29 +118,41 @@ class Adapter:
     venv_packages: tuple[str, ...] = ()
     # External command the adapter shells out to during its build step.
     requires_cli: str | None = None
+    # work_dir -> what queries are asked of, opened from the file `make` built
+    # in work_dir. Set for a store built into a file: its queries then run in a
+    # fresh process over this, apart from the load (see the module docstring).
+    reopen: Callable[[str], "Graph"] | None = None
 
 
-def _make_vortex(
-    tag: str, in_memory: bool, indexes: tuple[str, ...] = ()
-) -> Callable[[str, str, str], "Graph"]:
-    """A Dictionary-layout store built with `indexes`, opened per `in_memory`.
+def _vortex(tag: str, in_memory: bool, indexes: tuple[str, ...] = ()) -> dict:
+    """``make`` and ``reopen`` of a Dictionary-layout store built with `indexes`,
+    opened per `in_memory`.
 
     `tag` names the built file, so adapters sharing an index configuration
     share one build: the workers run sequentially and `serialize_rdf` is
     deterministic, so the residency variants rewrite identical bytes.
     """
 
-    def make(nq_path: str, nt_path: str, work_dir: str) -> "Graph":
+    def path(work_dir: str) -> str:
+        return str(Path(work_dir) / f"data-dict-{tag}.vortex")
+
+    def reopen(work_dir: str) -> "Graph":
         from rdflib import Dataset
-        from vortex_rdf import serialize_rdf
 
         from vortex_rdflib import VortexRdflibStore
 
-        out = str(Path(work_dir) / f"data-dict-{tag}.vortex")
-        serialize_rdf(nq_path, out, format="nquads", layout="dictionary", indexes=list(indexes))
-        return Dataset(store=VortexRdflibStore(out, in_memory=in_memory), default_union=True)
+        store = VortexRdflibStore(path(work_dir), in_memory=in_memory)
+        return Dataset(store=store, default_union=True)
 
-    return make
+    def make(nq_path: str, nt_path: str, work_dir: str) -> "Graph":
+        from vortex_rdf import serialize_rdf
+
+        serialize_rdf(
+            nq_path, path(work_dir), format="nquads", layout="dictionary", indexes=list(indexes)
+        )
+        return reopen(work_dir)
+
+    return {"make": make, "reopen": reopen}
 
 
 def _make_rdflib_memory(nq_path: str, nt_path: str, work_dir: str) -> "Graph":
@@ -169,6 +186,13 @@ def _make_pyoxigraph(nq_path: str, nt_path: str, work_dir: str) -> "Store":
     return store
 
 
+def _reopen_rdflib_hdt(work_dir: str) -> "Graph":
+    from rdflib import Graph
+    from rdflib_hdt import HDTStore  # ty: ignore[unresolved-import]
+
+    return Graph(store=HDTStore(str(Path(work_dir) / "data.hdt")))
+
+
 def _make_rdflib_hdt(nq_path: str, nt_path: str, work_dir: str) -> "Graph":
     """An HDT file built from the shared N-Triples, served through its store.
 
@@ -190,12 +214,16 @@ def _make_rdflib_hdt(nq_path: str, nt_path: str, work_dir: str) -> "Graph":
     so queries never go back to the file. The file-backed rows
     (`vortex-rdflib (dict . file)`, `pycottas-rdflib`) read the file per query.
     """
-    from rdflib import Graph
-    from rdflib_hdt import HDTStore  # ty: ignore[unresolved-import]
-
     out = Path(work_dir) / "data.hdt"
     subprocess.run(["hdt", "convert", nt_path, str(out)], check=True, capture_output=True)
-    return Graph(store=HDTStore(str(out)))
+    return _reopen_rdflib_hdt(work_dir)
+
+
+def _reopen_pycottas(work_dir: str) -> "Graph":
+    from pycottas import COTTASStore  # ty: ignore[unresolved-import]
+    from rdflib import Graph
+
+    return Graph(store=COTTASStore(str(Path(work_dir) / "data.cottas")))
 
 
 def _make_pycottas(nq_path: str, nt_path: str, work_dir: str) -> "Graph":
@@ -205,12 +233,10 @@ def _make_pycottas(nq_path: str, nt_path: str, work_dir: str) -> "Graph":
     `serialize_rdf` for the Vortex rows: both turn the same `.nt` into their
     own columnar file before any query runs.
     """
-    from pycottas import COTTASStore, rdf2cottas  # ty: ignore[unresolved-import]
-    from rdflib import Graph
+    from pycottas import rdf2cottas  # ty: ignore[unresolved-import]
 
-    out = str(Path(work_dir) / "data.cottas")
-    rdf2cottas(nt_path, out)
-    return Graph(store=COTTASStore(out))
+    rdf2cottas(nt_path, str(Path(work_dir) / "data.cottas"))
+    return _reopen_pycottas(work_dir)
 
 
 BY_COPY = ("secondary-by-copy",)
@@ -221,50 +247,50 @@ ADAPTERS: list[Adapter] = [
         "vortex_dict_mem",
         "vortex-rdflib (dict · in-mem)",
         "rdflib",
-        _make_vortex("noidx", in_memory=True),
+        **_vortex("noidx", in_memory=True),
     ),
     Adapter(
         "vortex_dict_mem_copy",
         "vortex-rdflib (dict · in-mem · by-copy)",
         "rdflib",
-        _make_vortex("copy", in_memory=True, indexes=BY_COPY),
+        **_vortex("copy", in_memory=True, indexes=BY_COPY),
     ),
     Adapter(
         "vortex_dict_mem_ref",
         "vortex-rdflib (dict · in-mem · by-reference)",
         "rdflib",
-        _make_vortex("ref", in_memory=True, indexes=BY_REFERENCE),
+        **_vortex("ref", in_memory=True, indexes=BY_REFERENCE),
     ),
     Adapter(
         "vortex_dict_mem_nopushdown",
         "vortex-rdflib (dict · in-mem · pushdown off)",
         "rdflib",
-        _make_vortex("noidx", in_memory=True),
+        **_vortex("noidx", in_memory=True),
         env={"VORTEX_RDF_DISABLE_PUSHDOWN": "1"},
     ),
     Adapter(
         "vortex_dict_file",
         "vortex-rdflib (dict · file)",
         "rdflib",
-        _make_vortex("noidx", in_memory=False),
+        **_vortex("noidx", in_memory=False),
     ),
     Adapter(
         "vortex_dict_file_copy",
         "vortex-rdflib (dict · file · by-copy)",
         "rdflib",
-        _make_vortex("copy", in_memory=False, indexes=BY_COPY),
+        **_vortex("copy", in_memory=False, indexes=BY_COPY),
     ),
     Adapter(
         "vortex_dict_file_ref",
         "vortex-rdflib (dict · file · by-reference)",
         "rdflib",
-        _make_vortex("ref", in_memory=False, indexes=BY_REFERENCE),
+        **_vortex("ref", in_memory=False, indexes=BY_REFERENCE),
     ),
     Adapter(
         "vortex_dict_file_nopushdown",
         "vortex-rdflib (dict · file · pushdown off)",
         "rdflib",
-        _make_vortex("noidx", in_memory=False),
+        **_vortex("noidx", in_memory=False),
         env={"VORTEX_RDF_DISABLE_PUSHDOWN": "1"},
     ),
     Adapter("rdflib_memory", "rdflib (in-mem)", "rdflib", _make_rdflib_memory),
@@ -283,6 +309,7 @@ ADAPTERS: list[Adapter] = [
         _make_pycottas,
         venv_packages=("rdflib>=7,<8", "pycottas>=1.1"),
         quads=False,
+        reopen=_reopen_pycottas,
     ),
     Adapter(
         "rdflib_hdt",
@@ -292,6 +319,7 @@ ADAPTERS: list[Adapter] = [
         venv_packages=("rdflib-hdt>=3.2",),
         requires_cli="hdt",
         quads=False,
+        reopen=_reopen_rdflib_hdt,
     ),
     # Last, and ruled off in the dashboard: no rdflib at all, so a different
     # engine rather than a different store. See the module docstring on how
