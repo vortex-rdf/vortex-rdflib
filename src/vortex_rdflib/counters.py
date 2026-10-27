@@ -34,6 +34,12 @@ def snapshot() -> dict:
         out["io_rchar"] = int(io["rchar"])
     except (OSError, KeyError, ValueError):
         pass
+    try:  # vortex-rdf's encoded-search counters, from builds that have them (same switch, VORTEX_RDF_COUNTERS)
+        from vortex_rdf._native import engine_counters
+    except ImportError:
+        pass
+    else:
+        out.update({f"native_{k}": v for k, v in engine_counters().items()})
     usage = resource.getrusage(resource.RUSAGE_SELF)
     out["major_faults"], out["minor_faults"] = usage.ru_majflt, usage.ru_minflt
     return out
