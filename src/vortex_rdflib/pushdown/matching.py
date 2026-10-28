@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
 
-from .. import filters
+from .. import ablation, filters
 from ..cancel import CANCEL_TOKEN, cancel_kw_for
 from ..terms import unparseable_iri
 from . import relation, tracing
@@ -132,6 +132,21 @@ def _count_pattern(
         if limit is None or n < limit:
             counts[key] = n
     return n
+
+
+def _static_estimate(pat: Pattern) -> int:
+    """``VORTEX_RDF_COUNT_ORDER=0``: a planning estimate from the pattern's bound positions alone,
+    in place of a native count — fewer rows for more bound positions, and never few enough that a
+    connected step matches rather than probes (rdflib's nested loop)."""
+    return 1 << (62 - 8 * sum(value is not None for value in pat.n3))
+
+
+def _planning_count(store, pat: Pattern, counts: dict, limit: int | None = None) -> int:
+    """:func:`_count_pattern` for a planning decision, or the static estimate when counts do not
+    plan."""
+    if not ablation.COUNT_ORDER:
+        return 0 if pat.unsatisfiable else _static_estimate(pat)
+    return _count_pattern(store, pat, counts, limit=limit)
 
 
 def _narrowing(keep=None, limit=None) -> dict:

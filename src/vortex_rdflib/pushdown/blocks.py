@@ -363,7 +363,7 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
             repeated_free = any(
                 len(pos) > 1 for v, pos in pat.varpos.items() if v not in rel.schema
             )
-            if not repeated_free and len(rows) * SETTINGS.probe_fanout < matching._count_pattern(
+            if not repeated_free and len(rows) * SETTINGS.probe_fanout < matching._planning_count(
                 store, pat, {}, limit=len(rows) * SETTINGS.probe_fanout + 1
             ):
                 flags = probes._probe_exists(store, rel.schema, rows, pat)
@@ -680,7 +680,7 @@ def _plan_pattern_side(ctx, store, triple, scope, left: Relation, left_rows, var
     )
     if free_preds:
         free_preds = matching._push_native_restrictions(store, pat, free_preds)
-    estimate = matching._count_pattern(
+    estimate = matching._planning_count(
         store, pat, {}, limit=len(left_rows) * SETTINGS.probe_fanout + 1
     )
     if shared and len(left_rows) * SETTINGS.probe_fanout < estimate:
