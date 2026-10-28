@@ -6,7 +6,8 @@ Usage:
         [--bsbm bench/results-bsbm.json] [--history DIR] [--local DIR] [--bsbm-history DIR]
 
 Both datasets' results go into one page, where every section has a tab per
-dataset. A results file missing (or not given) disables its tabs with a note;
+dataset; BSBM's names its scale (BSBM_10K: 10,000 products). A results file
+missing (or not given) disables its tabs with a note;
 with neither, nothing renders. ``--history`` (``records/`` of the
 ``bench-history`` branch) and ``--local`` (``bench/history-local``) feed the
 synthetic history chart, ``--bsbm-history`` (``records-bsbm/``) the BSBM one.
@@ -49,6 +50,14 @@ def load_results(path: Path | None, what: str) -> tuple[dict | None, str | None]
     return data, None
 
 
+def tab_labels(bsbm: dict | None) -> dict[str, str]:
+    """Each dataset's tab name: BSBM's gives its run's scale in thousands of products
+    (BSBM_10K: 10,000), and is plain BSBM when no results name one."""
+    products = (bsbm or {}).get("config", {}).get("products")
+    scale = f"_{products / 1000:g}K" if isinstance(products, int) and products > 0 else ""
+    return {"synthetic": "Synthetic", "bsbm": f"BSBM{scale}"}
+
+
 def page_set(data: dict, history: dict | None) -> dict:
     config = {k: v for k, v in data.get("config", {}).items() if k not in PAGE_DROPS}
     return {
@@ -83,6 +92,7 @@ def main() -> int:
         "synthetic": page_set(synthetic, synthetic_history) if synthetic else None,
         "bsbm": page_set(bsbm, bsbm_history) if bsbm else None,
         "notes": {"synthetic": synthetic_note, "bsbm": bsbm_note},
+        "labels": tab_labels(bsbm),
     }
     # Commit subjects and query texts are free text: "</script>" or "<!--" in one
     # must not end the page's script, so every "<" goes in as <.
