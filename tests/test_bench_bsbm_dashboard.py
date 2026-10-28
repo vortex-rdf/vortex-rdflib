@@ -109,6 +109,34 @@ def test_a_store_report_has_template_rows_answers_and_qmph():
     ]
 
 
+def test_a_template_row_carries_its_instances_median_faults():
+    # An instance's faults span its prepare and its evaluation, so the full row alone has them.
+    run = {
+        "results": [
+            {
+                "q": 1,
+                "i": k,
+                "mix": 0,
+                "prep_ns": 10,
+                "exec_ns": 90,
+                "rows": 1,
+                "digest": "a",
+                "minflt": faults,
+            }
+            for k, faults in enumerate((300, 100, 200))
+        ],
+        "mix_ns": [1000],
+        "mixes_done": 1,
+        "mixes_planned": 1,
+        "partial": False,
+        "warmup_ns": 5,
+        "warmup_timeouts": 0,
+        "warmup_errors": 0,
+    }
+    exec_row, full_row = report.store_report("vortex_dict_mem", run, native=False)["rows"]
+    assert full_row["minflt"] == 200 and "minflt" not in exec_row
+
+
 def test_a_native_store_reports_the_full_mode_only():
     run = {
         "results": [

@@ -3,7 +3,8 @@
 A *record* is one benchmark run of one commit, reduced to what the
 dashboard's history chart needs: every query's median time, exec and full,
 for each vortex configuration and for the reference store, ``rdflib
-(in-mem)``, plus the queries a configuration answered with a different row
+(in-mem)``, with its median minor page faults where the run counted them
+(``faults``), plus the queries a configuration answered with a different row
 count than rdflib. CI writes one per commit on ``main`` to the
 ``bench-history`` branch (``records/<sha>.json``), the backfill workflow
 writes older commits' there, and ``scripts/refresh.sh --history`` writes
@@ -52,12 +53,16 @@ def make_record(results: dict, commit: dict, source: str) -> dict:
     bsbm = config.get("dataset") == "bsbm"
     wanted = {*CONFIGURATIONS, REFERENCE}
     medians: dict[str, dict[str, dict[str, float]]] = {}
+    faults: dict[str, dict[str, dict[str, int]]] = {}
     for row in results["results"]:
         slug = row["variant"].split("::")[0]
         if slug in wanted and row["group"] != "load":
-            modes = medians.setdefault(slug, {mode: {} for mode in MODES})
-            modes[row.get("mode", "full")][row["group"]] = row["median_ns"]
-    return {
+            mode = row.get("mode", "full")
+            modes = medians.setdefault(slug, {m: {} for m in MODES})
+            modes[mode][row["group"]] = row["median_ns"]
+            if row.get("minflt") is not None:
+                faults.setdefault(slug, {}).setdefault(mode, {})[row["group"]] = row["minflt"]
+    record = {
         "schema": SCHEMA,
         "commit": commit,
         "run": {
@@ -78,6 +83,9 @@ def make_record(results: dict, commit: dict, source: str) -> dict:
         if bsbm
         else dropped_queries(config.get("rowCounts", {}), results.get("failures", [])),
     }
+    if faults:
+        record["faults"] = faults
+    return record
 
 
 def dropped_queries(

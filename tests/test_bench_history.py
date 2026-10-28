@@ -108,6 +108,19 @@ def test_a_point_names_the_cpu_that_measured_it(cpu, label):
     assert series is not None and series["points"][0]["cpu"] == label
 
 
+def test_a_record_keeps_the_median_faults_of_every_row_that_counted_them():
+    results = bsbm_results({"rdflib_memory": AGREED, "vortex_dict_mem": AGREED})
+    for r in results["results"]:
+        if r["group"] != "load" and r.get("mode", "full") == "full":
+            r["minflt"] = 1_234
+    record = history.make_record(results, COMMIT, "ci")
+    assert record["faults"]["vortex_dict_mem"]["full"] == {"Q1": 1_234, "Q2": 1_234}
+    assert "exec" not in record["faults"]["vortex_dict_mem"]
+    # A run that counted none (an older harness, a platform without getrusage): no map.
+    plain = bsbm_results({"rdflib_memory": AGREED, "vortex_dict_mem": AGREED})
+    assert "faults" not in history.make_record(plain, COMMIT, "ci")
+
+
 def test_bsbm_records_make_a_series_of_templates():
     record = history.make_record(
         bsbm_results({"rdflib_memory": AGREED, "vortex_dict_mem": AGREED}), COMMIT, "ci"
