@@ -16,7 +16,8 @@ on:
 # official BSBM tools' Java), so the workflow's token only reads the repository,
 # and their checkouts leave no credentials behind. Two jobs ask for more, and each
 # runs nothing but its one task: record is the one place that writes the repository
-# (nothing but git), and deploy is the one that publishes the page.
+# (nothing but git and bench.place_records, on the runner's own Python), and deploy
+# is the one that publishes the page.
 permissions:
   contents: read
 
@@ -263,21 +264,28 @@ jobs:
           fi
       # This run's own points, straight from the jobs that measured them. The record
       # job pushes the same files, but nothing orders it before this job, so the
-      # branch alone may not hold them yet. After the fetch, because git will not
-      # add a worktree over a directory that already has files in it. A failure
-      # costs the point, never the deploy.
+      # branch alone may not hold them yet. Each goes in where it is its commit's
+      # newest measurement, so a re-run of this job keeps a later backfill. After
+      # the fetch, because git will not add a worktree over a directory that
+      # already has files in it. A failure costs the point, never the deploy.
       - uses: actions/download-artifact@v4
         if: github.ref == 'refs/heads/main'
         continue-on-error: true
         with:
           name: history-record
-          path: history/records
+          path: own/records
       - uses: actions/download-artifact@v4
         if: github.ref == 'refs/heads/main'
         continue-on-error: true
         with:
           name: history-record-bsbm
-          path: history/records-bsbm
+          path: own/records-bsbm
+      - name: Add this run's points to the history
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          uv run python -m bench.place_records own/records history/records
+          uv run python -m bench.place_records own/records-bsbm history/records-bsbm
       - name: Render dashboard
         run: >-
           uv run python scripts/render_bench_dashboard.py bench/results.json public/index.html
@@ -289,9 +297,11 @@ jobs:
           path: public
 
   # Pushes both records to bench-history: the only job with write access, and it
-  # runs nothing but git. The group serializes it with the backfill's push job; a
-  # push that loses a race anyway rebases once. The render job does not wait for
-  # this one: it reads the same records from the build and merge jobs' artifacts.
+  # runs nothing but git and bench.place_records (stdlib, on the runner's own
+  # Python), which keeps each commit's newest measurement. The group serializes it
+  # with the backfill's push job; a push that loses a race anyway rebases once. The
+  # render job does not wait for this one: it reads the same records from the
+  # build and merge jobs' artifacts.
   record:
     needs: [build, bsbm-merge]
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
@@ -328,10 +338,7 @@ jobs:
             git worktree add --orphan -b bench-history history
           fi
           for folder in records records-bsbm; do
-            if compgen -G "incoming/$folder/*.json" >/dev/null; then
-              mkdir -p "history/$folder"
-              cp "incoming/$folder/"*.json "history/$folder/"
-            fi
+            python3 -m bench.place_records "incoming/$folder" "history/$folder"
           done
           cd history
           for folder in records records-bsbm; do

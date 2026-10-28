@@ -34,6 +34,9 @@ def template_number(name: str) -> int:
 def store_report(slug: str, run: dict, native: bool) -> dict:
     exec_ns: dict[str, list[float]] = defaultdict(list)
     full_ns: dict[str, list[float]] = defaultdict(list)
+    # An instance's minor faults span its prepare and its evaluation: they go
+    # to the full row alone.
+    faults: dict[str, list[int]] = defaultdict(list)
     timeouts: Counter[str] = Counter()
     errors: dict[str, dict] = {}
     answers: dict[str, list | None] = {}
@@ -48,6 +51,8 @@ def store_report(slug: str, run: dict, native: bool) -> dict:
             answers[i] = None
         else:
             answers[i] = [record["rows"], record["digest"]]
+            if record.get("minflt") is not None:
+                faults[name].append(record["minflt"])
             if native:
                 full_ns[name].append(record["exec_ns"])
             else:
@@ -57,7 +62,7 @@ def store_report(slug: str, run: dict, native: bool) -> dict:
     for name in sorted(full_ns, key=template_number):
         if not native:
             rows.append(make_row(name, slug, exec_ns[name], "exec"))
-        rows.append(make_row(name, slug, full_ns[name], "full"))
+        rows.append(make_row(name, slug, full_ns[name], "full", faults[name]))
     mean_mix = statistics.fmean(run["mix_ns"]) if run["mix_ns"] else None
     return {
         "rows": rows,

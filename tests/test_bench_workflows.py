@@ -2,9 +2,10 @@
 
 The dashboard's matrix must cover every store exactly once (the merge job names any store that no
 group reported as a failure), the backfill must measure the same BSBM data as the dashboard (its
-records go on the same line, and it restores the cache the dashboard saved), the page must
-include the point its own run just measured and be published whenever it was built, and a re-run
-job must be able to upload its artifacts again.
+records go on the same line, and it restores the cache the dashboard saved), the backfill must
+measure the anchor it corrects drift with, the page must include the point its own run just
+measured and be published whenever it was built, records must keep a commit's newest measurement
+wherever they are placed, and a re-run job must be able to upload its artifacts again.
 
 Stdlib only: PyYAML is not a dependency, so these read the workflow text with regular expressions
 and a line scan, which is enough for the few scalar lines they need. Each reader asserts what it
@@ -102,6 +103,50 @@ def history_problems(text: str) -> list[str]:
     return problems
 
 
+def backfill_problems(text: str) -> list[str]:
+    """The backfill must be able to run as an experiment: measure a commit more than once, hand
+    over its raw results, and leave the history alone when its `push` input is off. It must also
+    keep what corrects its records for drift: the loop measures in bench.backfill's order (the
+    anchor among the others), every record names its place in the job and keeps a folder of its
+    own, and the collect step runs after a measure step that ran out of time too, before the
+    records are handed over."""
+    problems = []
+    measure = job_text(text, "measure")
+    if "bench.backfill schedule" not in measure or "for commit in $order; do" not in measure:
+        problems.append("the loop does not follow bench.backfill's order, so it measures no anchor")
+    calls = re.findall(r"bench\.history record\b(.*?); then", measure, re.S)
+    if len(calls) != 2:
+        problems.append(f"expected a synthetic and a BSBM record call, found {len(calls)}")
+    for call in calls:
+        if '--position "$position"' not in call:
+            problems.append("a record does not name its place in the job (--position)")
+        if '--out "out/measured/$run/' not in call:
+            problems.append("a record is not kept apart per measurement (out/measured/$run)")
+    collect = re.search(
+        r"- name: Collect each commit's record\n\s+if: (.+)\n(?:.*\n)*?"
+        r'.*bench\.backfill collect --anchor "\$ANCHOR"',
+        measure,
+    )
+    if not collect:
+        problems.append("no step collects the records with the anchor")
+    else:
+        if "!cancelled()" not in collect.group(1):
+            problems.append("the collect step skips a measure step that ran out of time")
+        if measure.find("name: backfill-records") < collect.start():
+            problems.append("the records are handed over before they are collected")
+    if re.search(r"(lib|deps|results(?:-bsbm)?)-\$commit", measure):
+        problems.append("a commit's files are named by the commit alone, so it cannot repeat")
+    upload = re.search(r"name: backfill-results\s+path: (.+)", measure)
+    if not upload:
+        problems.append("the measure job does not hand over its raw results")
+    elif "results" not in upload.group(1):
+        problems.append(f"the raw results artifact uploads {upload.group(1)}")
+    push = re.search(r"^    if: (.+)$", job_text(text, "push"), re.MULTILINE)
+    if not push or "inputs.push" not in push.group(1):
+        problems.append("the push job runs whatever the push input says")
+    return problems
+
+
 def top_level_env(text: str) -> dict[str, str]:
     """The workflow-level `env:` mapping: its scalar lines, quotes dropped."""
     lines = text.splitlines()
@@ -182,11 +227,14 @@ def job_text(text: str, name: str) -> str:
 
 
 def render_problems(text: str) -> list[str]:
-    """The render job must read this run's own records, after it has fetched the history.
+    """The render job must add this run's own records to the history it fetched, keeping a
+    commit's newest measurement.
 
     The record job pushes them to bench-history, but nothing orders it before the render job, so
-    the fetched branch alone can lack the point this run just measured. The download comes after
-    the fetch because git will not add a worktree over a directory that already has files in it.
+    the fetched branch alone can lack the point this run just measured. A re-run render job finds
+    a branch a backfill may have re-measured the commit on since, so the run's records go in with
+    bench.place_records, which keeps the later measurement. That comes after the fetch because git
+    will not add a worktree over a directory that already has files in it.
     """
     render = job_text(text, "render")
     fetch = render.find("name: Fetch the history")
@@ -195,13 +243,29 @@ def render_problems(text: str) -> list[str]:
         ("history-record", "history/records", "--history"),
         ("history-record-bsbm", "history/records-bsbm", "--bsbm-history"),
     ):
-        step = re.search(rf"name: {artifact}\s+path: {folder}\s", render)
-        if not step:
-            problems.append(f"the render job does not download {artifact} into {folder}")
-        elif step.start() < fetch:
-            problems.append(f"the render job downloads {artifact} before it fetches the history")
+        download = re.search(rf"name: {artifact}\s+path: (\S+)\s", render)
+        place = re.search(rf"bench\.place_records (\S+) {folder}\s", render)
+        if not download:
+            problems.append(f"the render job does not download {artifact}")
+        elif not place or place.group(1) != download.group(1):
+            problems.append(f"the render job does not place {artifact} with bench.place_records")
+        elif place.start() < fetch:
+            problems.append(f"the render job places {artifact} before it fetches the history")
         if f"{flag} {folder}" not in render:
             problems.append(f"the render job does not pass {flag} {folder}")
+    return problems
+
+
+def placement_problems(text: str, job: str) -> list[str]:
+    """A job that pushes records to bench-history must keep a commit's newest measurement there:
+    a re-run record job, or a backfill that measured before a later run, would otherwise lay an
+    earlier measurement over a later one. It places them with bench.place_records, never `cp`."""
+    body = job_text(text, job)
+    problems = []
+    if not re.search(r"bench\.place_records \S*incoming\S* \S*history\S*", body):
+        problems.append(f"the {job} job does not place its records with bench.place_records")
+    if re.search(r"\bcp\b[^\n]*history/", body):
+        problems.append(f"the {job} job copies records into history/, over any later measurement")
     return problems
 
 
@@ -333,6 +397,71 @@ def test_the_history_check_notices_a_split_or_a_record_elsewhere(fault, expected
     assert any(expected in problem for problem in problems), problems
 
 
+def test_the_backfill_can_repeat_commits_and_correct_their_drift():
+    assert backfill_problems(read(BACKFILL)) == []
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected"),
+    [
+        (
+            lambda t: t.replace('lib="$RUNNER_TEMP/lib-$run"', 'lib="$RUNNER_TEMP/lib-$commit"', 1),
+            "repeat",
+        ),
+        (lambda t: t.replace("name: backfill-results", "name: backfill-other", 1), "raw results"),
+        (lambda t: t.replace("&& inputs.push }}", "}}", 1), "push input"),
+        (
+            lambda t: t.replace("for commit in $order; do", "for commit in $COMMITS; do", 1),
+            "anchor",
+        ),
+        (lambda t: t.replace(' --position "$position"', "", 1), "place in the job"),
+        (lambda t: t.replace('"out/measured/$run/records"', "out/records", 1), "kept apart"),
+        (
+            lambda t: re.sub(
+                r"(- name: Collect each commit's record\n\s+if: ).+", r"\1success()", t, count=1
+            ),
+            "ran out of time",
+        ),
+    ],
+    ids=[
+        "per-commit-paths",
+        "no-raw-results",
+        "push-ignored",
+        "listed-order",
+        "no-position",
+        "shared-folder",
+        "collect-skipped",
+    ],
+)
+def test_the_backfill_check_notices_a_fault(fault, expected):
+    text = read(BACKFILL)
+    faulty = fault(text)
+    assert faulty != text, "the fault did not apply"
+    problems = backfill_problems(faulty)
+    assert any(expected in problem for problem in problems), problems
+
+
+#: The jobs that push records to bench-history, how they place a folder of records, and the `cp`
+#: that would lay an earlier measurement over a later one.
+PUSHING_JOBS = [(DASHBOARD, "record"), (BACKFILL, "push")]
+PLACE_PUSHED = 'python3 -m bench.place_records "incoming/$folder" "history/$folder"'
+COPY_PUSHED = 'cp "incoming/$folder/"*.json "history/$folder/"'
+
+
+@pytest.mark.parametrize(("name", "job"), PUSHING_JOBS)
+def test_the_jobs_that_push_records_keep_a_commits_newest_measurement(name, job):
+    assert placement_problems(read(name), job) == []
+
+
+@pytest.mark.parametrize(("name", "job"), PUSHING_JOBS)
+def test_the_placement_check_notices_a_copy(name, job):
+    text = read(name)
+    faulty = text.replace(PLACE_PUSHED, COPY_PUSHED, 1)
+    assert faulty != text, f"the {job} job does not place records the way this test replaces"
+    problems = placement_problems(faulty, job)
+    assert any("copies records" in problem for problem in problems), problems
+
+
 def test_both_workflows_measure_the_same_bsbm_data():
     assert env_problems(read(DASHBOARD), read(BACKFILL)) == []
 
@@ -375,6 +504,7 @@ RENDER = """\
 jobs:
   render:
     steps:
+{downloads}
 {first}
       - name: Fetch the history
         run: git worktree add --detach history FETCH_HEAD
@@ -387,24 +517,32 @@ DOWNLOADS = """\
       - uses: actions/download-artifact@v4
         with:
           name: history-record
-          path: history/records
+          path: {folder}/records
       - uses: actions/download-artifact@v4
         with:
           name: history-record-bsbm
-          path: history/records-bsbm"""
+          path: {folder}/records-bsbm"""
+PLACE = """\
+      - name: Add this run's points to the history
+        run: |
+          uv run python -m bench.place_records own/records history/records
+          uv run python -m bench.place_records own/records-bsbm history/records-bsbm"""
 
 
 @pytest.mark.parametrize(
-    ("first", "second", "expected"),
+    ("folder", "first", "second", "expected"),
     [
-        ("", DOWNLOADS, None),
-        (DOWNLOADS, "", "before it fetches the history"),
-        ("", "", "does not download history-record into history/records"),
+        ("own", "", PLACE, None),
+        ("own", PLACE, "", "before it fetches the history"),
+        # the run's records laid straight over the fetched ones, newer or not
+        ("history", "", "", "does not place history-record with bench.place_records"),
+        (None, "", "", "does not download history-record"),
     ],
-    ids=["after the fetch", "before the fetch", "absent"],
+    ids=["placed after the fetch", "placed before the fetch", "laid over", "absent"],
 )
-def test_the_render_check_notices_a_download_in_the_wrong_place(first, second, expected):
-    problems = render_problems(RENDER.format(first=first, second=second))
+def test_the_render_check_notices_records_placed_wrongly(folder, first, second, expected):
+    downloads = DOWNLOADS.format(folder=folder) if folder else ""
+    problems = render_problems(RENDER.format(downloads=downloads, first=first, second=second))
     if expected is None:
         assert problems == []
     else:

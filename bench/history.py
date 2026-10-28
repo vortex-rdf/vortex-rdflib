@@ -3,7 +3,8 @@
 A *record* is one benchmark run of one commit, reduced to what the
 dashboard's history chart needs: every query's median time, exec and full,
 for each vortex configuration and for the reference store, ``rdflib
-(in-mem)``, plus the queries a configuration answered with a different row
+(in-mem)``, with its median minor page faults where the run counted them
+(``faults``), plus the queries a configuration answered with a different row
 count than rdflib. CI writes one per commit on ``main`` to the
 ``bench-history`` branch (``records/<sha>.json``), the backfill workflow
 writes older commits' there, and ``scripts/refresh.sh --history`` writes
@@ -16,11 +17,13 @@ or failed (``bsbm_dropped``).
 
 The chart plots, per record and configuration, rdflib's time divided by the
 configuration's: how many times faster than rdflib, in the same run, so runs
-on different machines stay roughly comparable.
+on different machines stay roughly comparable. A backfilled record names its
+place in its job (``run.position``) and may carry ``drift``, factors the chart
+multiplies those speedups by (``bench.backfill``).
 
     python -m bench.history adapters
     python -m bench.history record RESULTS --source ci|backfill|local
-        --commit REV [--ref NAME] [--dataset synthetic|bsbm] --out DIR
+        --commit REV [--ref NAME] [--dataset synthetic|bsbm] [--position N] --out DIR
 """
 
 import argparse
@@ -32,6 +35,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from .adapters import ADAPTERS
 from .run_bench import cpu_model, version_of
@@ -46,27 +50,35 @@ MODES = ("exec", "full")
 SOURCES = ("ci", "backfill", "local")
 
 
-def make_record(results: dict, commit: dict, source: str) -> dict:
-    """Reduce one ``run_bench`` results file, synthetic or BSBM, to a history record."""
+def make_record(results: dict, commit: dict, source: str, position: int | None = None) -> dict:
+    """Reduce one ``run_bench`` results file, synthetic or BSBM, to a history record;
+    ``position`` is the measurement's place in a backfill job."""
     config = results["config"]
     bsbm = config.get("dataset") == "bsbm"
     wanted = {*CONFIGURATIONS, REFERENCE}
     medians: dict[str, dict[str, dict[str, float]]] = {}
+    faults: dict[str, dict[str, dict[str, int]]] = {}
     for row in results["results"]:
         slug = row["variant"].split("::")[0]
         if slug in wanted and row["group"] != "load":
-            modes = medians.setdefault(slug, {mode: {} for mode in MODES})
-            modes[row.get("mode", "full")][row["group"]] = row["median_ns"]
-    return {
+            mode = row.get("mode", "full")
+            modes = medians.setdefault(slug, {m: {} for m in MODES})
+            modes[mode][row["group"]] = row["median_ns"]
+            if row.get("minflt") is not None:
+                faults.setdefault(slug, {}).setdefault(mode, {})[row["group"]] = row["minflt"]
+    run: dict[str, Any] = {
+        "source": source,
+        "measured": datetime.now(UTC).isoformat(timespec="seconds"),
+        "cpu": cpu_model(),
+        "python": platform.python_version(),
+        "versions": {package: version_of(package) for package in ("vortex-rdf", "rdflib")},
+    }
+    if position is not None:
+        run["position"] = position
+    record = {
         "schema": SCHEMA,
         "commit": commit,
-        "run": {
-            "source": source,
-            "measured": datetime.now(UTC).isoformat(timespec="seconds"),
-            "cpu": cpu_model(),
-            "python": platform.python_version(),
-            "versions": {package: version_of(package) for package in ("vortex-rdf", "rdflib")},
-        },
+        "run": run,
         # A run with any other knob set is another dataset, skipped beside main's line.
         "dataset": bsbm_dataset(config) if bsbm else synthetic_dataset(config),
         "reference": REFERENCE,
@@ -78,6 +90,9 @@ def make_record(results: dict, commit: dict, source: str) -> dict:
         if bsbm
         else dropped_queries(config.get("rowCounts", {}), results.get("failures", [])),
     }
+    if faults:
+        record["faults"] = faults
+    return record
 
 
 def dropped_queries(
@@ -229,6 +244,7 @@ def build_series(main: list[dict], local: list[dict]) -> dict | None:
 
 def _point(record: dict, present: list[str], queries: list[str]) -> dict:
     reference = record["medians"][record["reference"]]
+    drift = record.get("drift")
     values: dict[str, dict | None] = {}
     for slug in present:
         mine = record["medians"].get(slug)
@@ -247,6 +263,11 @@ def _point(record: dict, present: list[str], queries: list[str]) -> dict:
                 else None
             )
             per_mode[mode] = {"speedup": speedup, "dropped": dropped}
+            factor = (drift or {}).get("factors", {}).get(slug, {}).get(mode)
+            if factor is not None:
+                per_mode[mode]["drift"] = factor
+                if speedup is not None:
+                    per_mode[mode]["speedup"] = speedup * factor
         values[slug] = per_mode
     commit = record["commit"]
     return {
@@ -256,6 +277,7 @@ def _point(record: dict, present: list[str], queries: list[str]) -> dict:
         "measured": record["run"]["measured"],
         "rdflib": record["run"].get("versions", {}).get("rdflib"),
         "cpu": cpu_label(record["run"].get("cpu")),
+        "anchor": drift["anchor"]["short"] if drift else None,
         "values": values,
     }
 
@@ -334,6 +356,9 @@ def main(argv: list[str] | None = None) -> int:
         default="synthetic",
         help="which results the file holds",
     )
+    rec.add_argument(
+        "--position", type=int, help="the measurement's place in its backfill job (bench.backfill)"
+    )
     rec.add_argument("--out", type=Path, required=True, help="folder to write the record to")
     args = parser.parse_args(argv)
 
@@ -346,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
     if found != args.dataset:
         parser.error(f"{args.results} holds {found} results: pass --dataset {found}")
     commit = commit_info(args.commit, args.ref, local=args.source == "local")
-    record = make_record(results, commit, args.source)
+    record = make_record(results, commit, args.source, args.position)
     if not record["medians"].get(REFERENCE):
         parser.error(
             f"{args.results} has no {REFERENCE} rows; measure with "
