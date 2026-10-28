@@ -4,13 +4,14 @@ name: Benchmark History Backfill
 # bench-history, so the history charts have points from before CI recorded them.
 # Each commit's own library code runs: its worktree's src/ goes first on
 # PYTHONPATH, ahead of the editable install, and so does the vortex-rdf release
-# its uv.lock pins, installed into a directory of its own. Started by hand;
-# re-running a commit replaces its record. A commit listed twice is measured
-# twice, and its last measurement is its record. Every run hands over its raw
-# results files (`backfill-results`); with `push` off it changes nothing else,
-# which makes it an experiment. The measure job holds a read-only token and
-# keeps no credentials (it runs the BSBM tools' Java); the push job holds the
-# write token and runs nothing but git.
+# its uv.lock pins, installed into a directory of its own. Started by hand; a
+# commit's newest measurement is its record on bench-history. A commit listed
+# twice is measured twice, and its last measurement is its record. Every run
+# hands over its raw results files (`backfill-results`); with `push` off it
+# changes nothing else, which makes it an experiment. The measure job holds a
+# read-only token and keeps no credentials (it runs the BSBM tools' Java); the
+# push job holds the write token and runs nothing but git and
+# bench.place_records.
 on:
   workflow_dispatch:
     inputs:
@@ -211,10 +212,7 @@ jobs:
             git worktree add --orphan -b bench-history history
           fi
           for folder in records records-bsbm; do
-            if compgen -G "incoming/$folder/*.json" >/dev/null; then
-              mkdir -p "history/$folder"
-              cp "incoming/$folder/"*.json "history/$folder/"
-            fi
+            python3 -m bench.place_records "incoming/$folder" "history/$folder"
           done
           recorded="$(cat incoming/recorded.txt 2>/dev/null || true)"
           cd history

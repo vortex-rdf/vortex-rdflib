@@ -316,13 +316,14 @@ CPU in its tooltip: CI's runners differ in CPU model, so a step between two
 points on different CPUs is no evidence by itself. Every record also keeps
 each query's median minor page faults. The Benchmark History Backfill workflow
 re-measures any commits of `main` in one job, so the points it writes share one
-CPU. A commit listed twice is measured twice, every run hands over its raw
-results files as the `backfill-results` artifact, and with `push` off it writes
-no record: an experiment. To plot a change on your branch against the synthetic line
-before merging it, run `scripts/refresh.sh --history` (about 6 minutes at the
-default scale). It measures the working tree on the synthetic set and renders
-`public/index.html` with your point after `main`'s. The BSBM chart takes no
-local points.
+CPU. A commit's newest measurement is its record, so a re-run dashboard job
+never lays an older point over a backfill. A commit listed twice is measured
+twice, every run hands over its raw results files as the `backfill-results`
+artifact, and with `push` off it writes no record: an experiment. To plot a
+change on your branch against the synthetic line before merging it, run
+`scripts/refresh.sh --history` (about 6 minutes at the default scale). It
+measures the working tree on the synthetic set and renders `public/index.html`
+with your point after `main`'s. The BSBM chart takes no local points.
 
 ### BSBM harness
 
