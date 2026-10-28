@@ -8,7 +8,6 @@ from storage, and bytes asked of the kernel) and page faults (major ones are pag
 memory map). The counts are cumulative; a caller takes the difference around a query.
 """
 
-import resource
 import threading
 from typing import TypeVar, cast
 
@@ -51,6 +50,10 @@ def snapshot() -> dict:
         pass
     else:
         out.update({f"native_{k}": v for k, v in engine_counters().items()})
+    try:
+        import resource  # POSIX only: no page-fault counts on Windows
+    except ImportError:
+        return out
     usage = resource.getrusage(resource.RUSAGE_SELF)
     out["major_faults"], out["minor_faults"] = usage.ru_majflt, usage.ru_minflt
     return out
