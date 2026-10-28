@@ -5,9 +5,12 @@ name: Benchmark History Backfill
 # Each commit's own library code runs: its worktree's src/ goes first on
 # PYTHONPATH, ahead of the editable install, and so does the vortex-rdf release
 # its uv.lock pins, installed into a directory of its own. Started by hand;
-# re-running a commit replaces its record. The measure job holds a read-only
-# token and keeps no credentials (it runs the BSBM tools' Java); the push job
-# holds the write token and runs nothing but git.
+# re-running a commit replaces its record. A commit listed twice is measured
+# twice, and its last measurement is its record. Every run hands over its raw
+# results files (`backfill-results`); with `push` off it changes nothing else,
+# which makes it an experiment. The measure job holds a read-only token and
+# keeps no credentials (it runs the BSBM tools' Java); the push job holds the
+# write token and runs nothing but git.
 on:
   workflow_dispatch:
     inputs:
@@ -22,6 +25,10 @@ on:
           - synthetic
           - bsbm
         default: both
+      push:
+        description: Write the records to bench-history (off, the run only measures)
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -79,7 +86,7 @@ jobs:
           COMMITS: ${{ inputs.commits }}
           DATASET: ${{ inputs.dataset }}
         run: |
-          mkdir -p out/records out/records-bsbm
+          mkdir -p out/records out/records-bsbm "$RUNNER_TEMP/results"
           adapters="$(uv run python -m bench.history adapters)"
           recorded=""
           # A commit is listed as soon as one of its records exists, and the list is
@@ -90,9 +97,13 @@ jobs:
               *) recorded="$recorded $commit"; echo "$recorded" > out/recorded.txt ;;
             esac
           }
+          position=0
           for commit in $COMMITS; do
-            lib="$RUNNER_TEMP/lib-$commit"
-            deps="$RUNNER_TEMP/deps-$commit"
+            # The commit's place in the list names its files: a commit listed twice is measured twice.
+            position=$((position + 1))
+            run="$position-$commit"
+            lib="$RUNNER_TEMP/lib-$run"
+            deps="$RUNNER_TEMP/deps-$run"
             if ! git worktree add --detach "$lib" "$commit"; then
               echo "::error::$commit: not a commit of this repository; skipped"; continue
             fi
@@ -117,9 +128,9 @@ jobs:
             # record names the commit's vortex-rdf version.
             if [ "$DATASET" != bsbm ]; then
               if PYTHONPATH="$path" uv run python -m bench.run_bench --adapters "$adapters" \
-                    --out "$RUNNER_TEMP/results-$commit.json" \
+                    --out "$RUNNER_TEMP/results/$run.json" \
                   && PYTHONPATH="$deps" uv run python -m bench.history record \
-                    "$RUNNER_TEMP/results-$commit.json" --source backfill --commit "$commit" \
+                    "$RUNNER_TEMP/results/$run.json" --source backfill --commit "$commit" \
                     --ref main --out out/records; then
                 note
               else
@@ -128,9 +139,9 @@ jobs:
             fi
             if [ "$DATASET" != synthetic ]; then
               if PYTHONPATH="$path" uv run python -m bench.run_bench --dataset bsbm --bsbm-dir "$BSBM_DIR" \
-                    --adapters "$adapters" --out "$RUNNER_TEMP/results-bsbm-$commit.json" \
+                    --adapters "$adapters" --out "$RUNNER_TEMP/results/bsbm-$run.json" \
                   && PYTHONPATH="$deps" uv run python -m bench.history record \
-                    "$RUNNER_TEMP/results-bsbm-$commit.json" --dataset bsbm --source backfill \
+                    "$RUNNER_TEMP/results/bsbm-$run.json" --dataset bsbm --source backfill \
                     --commit "$commit" --ref main --out out/records-bsbm; then
                 note
               else
@@ -151,6 +162,18 @@ jobs:
           if-no-files-found: ignore
           overwrite: true
           retention-days: 7
+      # Every query's samples, page faults and the run's provenance, named by
+      # their place in the list: what a record leaves out, for an experiment
+      # to read.
+      - name: Hand over the raw results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: backfill-results
+          path: ${{ runner.temp }}/results
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 7
 
   # Runs after a failed or timed-out measure job too, for whatever that handed over.
   # The group serializes it with the dashboard's record job; a push that loses a race
@@ -158,7 +181,7 @@ jobs:
   # delays a dashboard run.
   push:
     needs: measure
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && inputs.push }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:

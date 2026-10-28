@@ -102,6 +102,24 @@ def history_problems(text: str) -> list[str]:
     return problems
 
 
+def backfill_problems(text: str) -> list[str]:
+    """The backfill must be able to run as an experiment: measure a commit more than once, hand
+    over its raw results, and leave the history alone when its `push` input is off."""
+    problems = []
+    measure = job_text(text, "measure")
+    if re.search(r"(lib|deps|results(?:-bsbm)?)-\$commit", measure):
+        problems.append("a commit's files are named by the commit alone, so it cannot repeat")
+    upload = re.search(r"name: backfill-results\s+path: (.+)", measure)
+    if not upload:
+        problems.append("the measure job does not hand over its raw results")
+    elif "results" not in upload.group(1):
+        problems.append(f"the raw results artifact uploads {upload.group(1)}")
+    push = re.search(r"^    if: (.+)$", job_text(text, "push"), re.MULTILINE)
+    if not push or "inputs.push" not in push.group(1):
+        problems.append("the push job runs whatever the push input says")
+    return problems
+
+
 def top_level_env(text: str) -> dict[str, str]:
     """The workflow-level `env:` mapping: its scalar lines, quotes dropped."""
     lines = text.splitlines()
@@ -330,6 +348,27 @@ def test_the_history_is_measured_and_recorded_in_one_job():
 )
 def test_the_history_check_notices_a_split_or_a_record_elsewhere(fault, expected):
     problems = history_problems(fault(read(DASHBOARD)))
+    assert any(expected in problem for problem in problems), problems
+
+
+def test_the_backfill_can_run_as_an_experiment():
+    assert backfill_problems(read(BACKFILL)) == []
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected"),
+    [
+        (
+            lambda t: t.replace('lib="$RUNNER_TEMP/lib-$run"', 'lib="$RUNNER_TEMP/lib-$commit"', 1),
+            "repeat",
+        ),
+        (lambda t: t.replace("name: backfill-results", "name: backfill-other", 1), "raw results"),
+        (lambda t: t.replace("&& inputs.push }}", "}}", 1), "push input"),
+    ],
+    ids=["per-commit-paths", "no-raw-results", "push-ignored"],
+)
+def test_the_backfill_check_notices_what_would_spoil_an_experiment(fault, expected):
+    problems = backfill_problems(fault(read(BACKFILL)))
     assert any(expected in problem for problem in problems), problems
 
 
