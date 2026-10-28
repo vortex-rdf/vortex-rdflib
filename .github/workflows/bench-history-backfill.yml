@@ -5,12 +5,16 @@ name: Benchmark History Backfill
 # Each commit's own library code runs: its worktree's src/ goes first on
 # PYTHONPATH, ahead of the editable install, and so does the vortex-rdf release
 # its uv.lock pins, installed into a directory of its own. Started by hand; a
-# commit's newest measurement is its record on bench-history. A commit listed
-# twice is measured twice, and its last measurement is its record. Every run
-# hands over its raw results files (`backfill-results`); with `push` off it
-# changes nothing else, which makes it an experiment. The measure job holds a
-# read-only token and keeps no credentials (it runs the BSBM tools' Java); the
-# push job holds the write token and runs nothing but git and
+# commit's newest measurement is its record on bench-history. A long job runs
+# slower as it goes, so the last listed commit, the anchor, is measured first,
+# again after every `anchor-every` others, and last: each other record carries the
+# drift the anchor's measurements show, which the chart takes out (bench.backfill).
+# A commit listed twice is measured twice, and its last measurement is its record
+# (the anchor's first). Every run hands over its raw results files
+# (`backfill-results`); with `push` off it changes nothing else, which makes it an
+# experiment, and `anchor-every` 0 measures the list as given. The measure job
+# holds a read-only token and keeps no credentials (it runs the BSBM tools' Java);
+# the push job holds the write token and runs nothing but git and
 # bench.place_records.
 on:
   workflow_dispatch:
@@ -30,6 +34,10 @@ on:
         description: Write the records to bench-history (off, the run only measures)
         type: boolean
         default: true
+      anchor-every:
+        description: Measure the last listed commit again after every this many others, to correct the records for the runner's drift (0 measures the list as given)
+        type: number
+        default: 4
 
 permissions:
   contents: read
@@ -76,19 +84,34 @@ jobs:
           uv run python -m bench.bsbm.prepare --products "$BSBM_PRODUCTS"
           --warmup-mixes "$BSBM_WARMUP_MIXES" --mixes "$BSBM_MIXES" --seed "$BSBM_SEED"
           --out "$BSBM_DIR"
+      # The last listed commit, unless anchor-every is 0 (bench.backfill).
+      - name: Choose the anchor
+        env:
+          COMMITS: ${{ inputs.commits }}
+          ANCHOR_EVERY: ${{ inputs.anchor-every }}
+        run: |
+          anchor=""
+          if [ "$ANCHOR_EVERY" -gt 0 ]; then
+            for commit in $COMMITS; do anchor="$commit"; done
+          fi
+          echo "ANCHOR=$anchor" >> "$GITHUB_ENV"
       # One commit's failure is reported and skipped; everything recorded is
       # handed to the push job together, even when a later commit fails or this
       # step runs out of time. The step's limit sits under the job's: a step that
-      # times out fails, so the upload below still runs, where a job that times
-      # out is cancelled and skips it.
+      # times out fails, so the steps below still run, where a job that times out
+      # is cancelled and skips them.
       - name: Measure and record each commit
         timeout-minutes: 280
         env:
           COMMITS: ${{ inputs.commits }}
           DATASET: ${{ inputs.dataset }}
+          ANCHOR_EVERY: ${{ inputs.anchor-every }}
         run: |
-          mkdir -p out/records out/records-bsbm "$RUNNER_TEMP/results"
+          mkdir -p out/measured "$RUNNER_TEMP/results"
           adapters="$(uv run python -m bench.history adapters)"
+          read -ra listed <<< "$COMMITS"
+          order="$(uv run python -m bench.backfill schedule --anchor "$ANCHOR" --every "$ANCHOR_EVERY" "${listed[@]}")"
+          echo "measuring, in order: ${order//$'\n'/ }"
           recorded=""
           # A commit is listed as soon as one of its records exists, and the list is
           # rewritten each time, so a run cut short still hands over a true one.
@@ -99,8 +122,9 @@ jobs:
             esac
           }
           position=0
-          for commit in $COMMITS; do
-            # The commit's place in the list names its files: a commit listed twice is measured twice.
+          for commit in $order; do
+            # The measurement's place in the job names its files and its records' folder,
+            # so a commit measured twice keeps both.
             position=$((position + 1))
             run="$position-$commit"
             lib="$RUNNER_TEMP/lib-$run"
@@ -132,7 +156,7 @@ jobs:
                     --out "$RUNNER_TEMP/results/$run.json" \
                   && PYTHONPATH="$deps" uv run python -m bench.history record \
                     "$RUNNER_TEMP/results/$run.json" --source backfill --commit "$commit" \
-                    --ref main --out out/records; then
+                    --ref main --position "$position" --out "out/measured/$run/records"; then
                 note
               else
                 echo "::error::$commit: the synthetic benchmark or its record did not complete"
@@ -143,17 +167,30 @@ jobs:
                     --adapters "$adapters" --out "$RUNNER_TEMP/results/bsbm-$run.json" \
                   && PYTHONPATH="$deps" uv run python -m bench.history record \
                     "$RUNNER_TEMP/results/bsbm-$run.json" --dataset bsbm --source backfill \
-                    --commit "$commit" --ref main --out out/records-bsbm; then
+                    --commit "$commit" --ref main --position "$position" \
+                    --out "out/measured/$run/records-bsbm"; then
                 note
               else
                 echo "::error::$commit: the BSBM benchmark or its record did not complete"
               fi
             fi
           done
-          if ! compgen -G 'out/records*/*.json' >/dev/null; then
+          if ! compgen -G 'out/measured/*/records*/*.json' >/dev/null; then
             echo "::error::no record was produced"
             exit 1
           fi
+      # Each commit's record from its measurements, corrected for the drift the
+      # anchor's show; after a measure step that ran out of time too.
+      - name: Collect each commit's record
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: |
+          for folder in records records-bsbm; do
+            if compgen -G "out/measured/*/$folder/*.json" >/dev/null; then
+              uv run python -m bench.backfill collect --anchor "$ANCHOR" --out "out/$folder" \
+                out/measured/*/"$folder"/*.json
+            fi
+          done
       - name: Hand the records to the push job
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4

@@ -278,3 +278,35 @@ def test_record_without_dataset_on_synthetic_results(tmp_path, monkeypatch):
     assert "triples" in record["dataset"]
     assert "graphs" in record["dataset"]
     assert "cardinality" in record["dataset"]
+
+
+def test_a_point_applies_the_drift_factor_its_record_carries():
+    record = history.make_record(
+        bsbm_results({"rdflib_memory": AGREED, "vortex_dict_mem": AGREED}), COMMIT, "backfill"
+    )
+    record["drift"] = {
+        "anchor": {"sha": "b" * 40, "short": "bbbbbbb"},
+        "positions": [1, 5],
+        "factors": {"vortex_dict_mem": {"exec": 1.25}},
+    }
+    series = history.build_series([record], [])
+    assert series is not None
+    point = series["points"][0]
+    exec_, full = (
+        point["values"]["vortex_dict_mem"]["exec"],
+        point["values"]["vortex_dict_mem"]["full"],
+    )
+    assert exec_["speedup"] == pytest.approx(12.5) and exec_["drift"] == 1.25
+    assert full["speedup"] == pytest.approx(10.0) and "drift" not in full
+    assert point["anchor"] == "bbbbbbb"
+
+
+def test_a_backfill_record_keeps_its_place_in_the_job(tmp_path, monkeypatch):
+    path = tmp_path / "results.json"
+    path.write_text(json.dumps(bsbm_results({"rdflib_memory": AGREED})))
+    monkeypatch.setattr("bench.history.commit_info", lambda *a, **kw: COMMIT)
+    out = tmp_path / "out"
+    args = ["record", str(path), "--dataset", "bsbm", "--source", "backfill", "--commit", "HEAD"]
+    assert history.main([*args, "--position", "3", "--out", str(out)]) == 0
+    record = json.loads((out / f"{COMMIT['sha']}.json").read_text())
+    assert record["run"]["position"] == 3

@@ -965,6 +965,10 @@ function renderHistory(pane, HISTORY, unit){
   const cell = (p, s) => p.values[s.slug]?.[mode] ?? null;
   const commitLabel = p => p.local && p.commit.dirty ? "working tree" : p.commit.short;
   const dayOf = p => (p.local ? p.measured : p.commit.date).slice(0, 10);
+  // A backfilled point taken back to its job's first anchor measurement: the anchor
+  // it names, and per value the correction applied.
+  const sourceOf = p => p.anchor ? `${p.source}, drift-corrected against ${p.anchor}` : p.source;
+  const driftOf = c => `drift ${c.drift >= 1 ? "+" : "−"}${(Math.abs(c.drift - 1) * 100).toFixed(1)} %`;
 
   // ---- controls: timing switch, one chip per configuration (the legend), table ----
   const controls = pane.querySelector(".history-controls");
@@ -1139,14 +1143,15 @@ function renderHistory(pane, HISTORY, unit){
     tipEl.replaceChildren();
     const head = html("div", "head", null, tipEl);
     html("span", "mono", commitLabel(p), head);
-    head.append(` · ${dayOf(p)} · ${p.source} · rdflib ${p.rdflib ?? "?"} · ${p.cpu ?? "CPU ?"}`);
+    head.append(` · ${dayOf(p)} · ${sourceOf(p)} · rdflib ${p.rdflib ?? "?"} · ${p.cpu ?? "CPU ?"}`);
     html("div", "subject", p.commit.subject, head);
     for (const s of SERIES.filter(s => visible.has(s.slug))){
       const c = cell(p, s);
       const row = html("div", "row", null, tipEl);
       html("span", "hkey", null, row).style.background = colorOf(s);
       html("strong", null, c?.speedup == null ? "—" : fmt(c.speedup), row);
-      html("span", "lbl", c?.speedup == null ? `${short(s)} · not measured` : short(s), row);
+      html("span", "lbl", c?.speedup == null ? `${short(s)} · not measured`
+        : c.drift == null ? short(s) : `${short(s)} · ${driftOf(c)}`, row);
       if (c?.dropped.length) html("div", "drop", `leaves out ${c.dropped.join(", ")}`, tipEl);
     }
   }
@@ -1164,12 +1169,15 @@ function renderHistory(pane, HISTORY, unit){
     for (const p of POINTS){
       const tr = html("tr", null, null, body);
       html("td", "rowh mono", commitLabel(p), tr);
-      for (const text of [dayOf(p), p.source, p.rdflib ?? "?", p.cpu ?? "?"]) html("td", "rowh sub", text, tr);
+      for (const text of [dayOf(p), sourceOf(p), p.rdflib ?? "?", p.cpu ?? "?"]) html("td", "rowh sub", text, tr);
       for (const s of shown){
         const c = cell(p, s);
         const text = c?.speedup == null ? "—" : fmt(c.speedup) + (c.dropped.length ? " *" : "");
         const td = html("td", "num", text, tr);
-        if (c?.dropped.length) td.title = `leaves out ${c.dropped.join(", ")}`;
+        const notes = [];
+        if (c?.dropped.length) notes.push(`leaves out ${c.dropped.join(", ")}`);
+        if (c?.drift != null) notes.push(driftOf(c));
+        if (notes.length) td.title = notes.join(" · ");
       }
     }
   }

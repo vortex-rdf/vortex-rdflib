@@ -2,10 +2,10 @@
 
 The dashboard's matrix must cover every store exactly once (the merge job names any store that no
 group reported as a failure), the backfill must measure the same BSBM data as the dashboard (its
-records go on the same line, and it restores the cache the dashboard saved), the page must
-include the point its own run just measured and be published whenever it was built, records must
-keep a commit's newest measurement wherever they are placed, and a re-run job must be able to
-upload its artifacts again.
+records go on the same line, and it restores the cache the dashboard saved), the backfill must
+measure the anchor it corrects drift with, the page must include the point its own run just
+measured and be published whenever it was built, records must keep a commit's newest measurement
+wherever they are placed, and a re-run job must be able to upload its artifacts again.
 
 Stdlib only: PyYAML is not a dependency, so these read the workflow text with regular expressions
 and a line scan, which is enough for the few scalar lines they need. Each reader asserts what it
@@ -105,9 +105,35 @@ def history_problems(text: str) -> list[str]:
 
 def backfill_problems(text: str) -> list[str]:
     """The backfill must be able to run as an experiment: measure a commit more than once, hand
-    over its raw results, and leave the history alone when its `push` input is off."""
+    over its raw results, and leave the history alone when its `push` input is off. It must also
+    keep what corrects its records for drift: the loop measures in bench.backfill's order (the
+    anchor among the others), every record names its place in the job and keeps a folder of its
+    own, and the collect step runs after a measure step that ran out of time too, before the
+    records are handed over."""
     problems = []
     measure = job_text(text, "measure")
+    if "bench.backfill schedule" not in measure or "for commit in $order; do" not in measure:
+        problems.append("the loop does not follow bench.backfill's order, so it measures no anchor")
+    calls = re.findall(r"bench\.history record\b(.*?); then", measure, re.S)
+    if len(calls) != 2:
+        problems.append(f"expected a synthetic and a BSBM record call, found {len(calls)}")
+    for call in calls:
+        if '--position "$position"' not in call:
+            problems.append("a record does not name its place in the job (--position)")
+        if '--out "out/measured/$run/' not in call:
+            problems.append("a record is not kept apart per measurement (out/measured/$run)")
+    collect = re.search(
+        r"- name: Collect each commit's record\n\s+if: (.+)\n(?:.*\n)*?"
+        r'.*bench\.backfill collect --anchor "\$ANCHOR"',
+        measure,
+    )
+    if not collect:
+        problems.append("no step collects the records with the anchor")
+    else:
+        if "!cancelled()" not in collect.group(1):
+            problems.append("the collect step skips a measure step that ran out of time")
+        if measure.find("name: backfill-records") < collect.start():
+            problems.append("the records are handed over before they are collected")
     if re.search(r"(lib|deps|results(?:-bsbm)?)-\$commit", measure):
         problems.append("a commit's files are named by the commit alone, so it cannot repeat")
     upload = re.search(r"name: backfill-results\s+path: (.+)", measure)
@@ -371,7 +397,7 @@ def test_the_history_check_notices_a_split_or_a_record_elsewhere(fault, expected
     assert any(expected in problem for problem in problems), problems
 
 
-def test_the_backfill_can_run_as_an_experiment():
+def test_the_backfill_can_repeat_commits_and_correct_their_drift():
     assert backfill_problems(read(BACKFILL)) == []
 
 
@@ -384,11 +410,34 @@ def test_the_backfill_can_run_as_an_experiment():
         ),
         (lambda t: t.replace("name: backfill-results", "name: backfill-other", 1), "raw results"),
         (lambda t: t.replace("&& inputs.push }}", "}}", 1), "push input"),
+        (
+            lambda t: t.replace("for commit in $order; do", "for commit in $COMMITS; do", 1),
+            "anchor",
+        ),
+        (lambda t: t.replace(' --position "$position"', "", 1), "place in the job"),
+        (lambda t: t.replace('"out/measured/$run/records"', "out/records", 1), "kept apart"),
+        (
+            lambda t: re.sub(
+                r"(- name: Collect each commit's record\n\s+if: ).+", r"\1success()", t, count=1
+            ),
+            "ran out of time",
+        ),
     ],
-    ids=["per-commit-paths", "no-raw-results", "push-ignored"],
+    ids=[
+        "per-commit-paths",
+        "no-raw-results",
+        "push-ignored",
+        "listed-order",
+        "no-position",
+        "shared-folder",
+        "collect-skipped",
+    ],
 )
-def test_the_backfill_check_notices_what_would_spoil_an_experiment(fault, expected):
-    problems = backfill_problems(fault(read(BACKFILL)))
+def test_the_backfill_check_notices_a_fault(fault, expected):
+    text = read(BACKFILL)
+    faulty = fault(text)
+    assert faulty != text, "the fault did not apply"
+    problems = backfill_problems(faulty)
     assert any(expected in problem for problem in problems), problems
 
 
