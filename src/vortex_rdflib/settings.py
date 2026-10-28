@@ -170,8 +170,9 @@ def pushdown_disabled() -> bool:
 
 def apply_switches() -> None:
     """Narrow :data:`SETTINGS` by the switches set in the environment:
-    ``VORTEX_RDF_PUSHDOWN_OPS`` (:func:`parse_ops`), ``VORTEX_RDF_FILTER_FAST=0``
-    and ``VORTEX_RDF_NATIVE_FILTERS=0``. A switch left unset changes nothing,
+    ``VORTEX_RDF_PUSHDOWN_OPS`` (:func:`parse_ops`), ``VORTEX_RDF_FILTER_FAST=0``,
+    ``VORTEX_RDF_NATIVE_FILTERS=0``, and the ablation's ``VORTEX_RDF_DECODE_CHUNK`` and
+    ``VORTEX_RDF_PROBE_BATCH`` (:mod:`vortex_rdflib.ablation`). A switch left unset changes nothing,
     and a list the parser refuses raises before any setting changes."""
     spec = os.environ.get(PUSHDOWN_OPS_ENV)
     ops = None if spec is None else parse_ops(spec)
@@ -181,6 +182,15 @@ def apply_switches() -> None:
         SETTINGS.fast_filters = False
     if os.environ.get("VORTEX_RDF_NATIVE_FILTERS") == "0":
         SETTINGS.native_filters = False
+    from . import ablation  # the ablation's size switches (read on import there)
+
+    if ablation.DECODE_CHUNK is not None:  # VORTEX_RDF_DECODE_CHUNK: one fixed chunk size
+        SETTINGS.chunk_start = SETTINGS.chunk_max = ablation.DECODE_CHUNK
+    if (
+        ablation.PROBE_BATCH is not None
+    ):  # VORTEX_RDF_PROBE_BATCH: this many probes a call, every step batched
+        SETTINGS.probe_batch = ablation.PROBE_BATCH
+        SETTINGS.cheap_batch_min = SETTINGS.scan_batch_min = SETTINGS.memory_scan_batch_min = 1
 
 
 def in_memory_by_default() -> bool:

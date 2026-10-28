@@ -48,6 +48,7 @@ from typing import Any
 from rdflib.plugins.sparql.evalutils import _ebv as rdflib_ebv
 from rdflib.plugins.sparql.sparql import FrozenBindings
 
+from .. import ablation
 from ..settings import SETTINGS
 from ..terms import TermView, kind_of, parse_spelling
 from . import compiler, exprs, native
@@ -128,7 +129,13 @@ def _compile_conjunct(
         if const_views is not None:
             fast = compiler.compile_fast(expr, variables, const_views)
     return Conjunct(
-        expr, variables, fast, fast is not None and compiler.is_kind_only(expr), consts, ctx, native
+        expr,
+        variables,
+        fast,
+        fast is not None and compiler.is_kind_only(expr) and ablation.CODE_PREDICATES,
+        consts,
+        ctx,
+        native,
     )
 
 

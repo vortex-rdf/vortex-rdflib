@@ -5,12 +5,13 @@ keep-scan or a hash join within the pair budget, a last step over it
 streamed (:mod:`.streaming`) — and their trace events.
 """
 
+import dataclasses
 import math
 from dataclasses import dataclass, field
 
 from vortex_rdf import U64Column
 
-from .. import filters
+from .. import ablation, filters
 from ..cancel import cancel_kw
 from ..settings import SETTINGS
 from . import algebra, matching, probes, relation, streaming, tracing
@@ -206,6 +207,10 @@ def _count_patterns(store, patterns, counts: dict) -> int:
     release for all — after the point counts (``store._point_lookup``: those
     the native layer answers without a scan), any of which may still end the
     block first. Returns the counts made."""
+    if not ablation.COUNT_ORDER:  # VORTEX_RDF_COUNT_ORDER=0: static estimates, no native counts
+        for pat in patterns:
+            pat.estimate = matching._planning_count(store, pat, counts)
+        return 0
     before = len(counts)
     ordered = sorted(patterns, key=matching._pattern_static_rank)
     minimum = SETTINGS.memory_scan_batch_min if store.in_memory else SETTINGS.scan_batch_min
@@ -364,6 +369,8 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
         native_call_count=calls,
         native_match_ns=native_ns,
     )
+    if ablation.DECODE_EACH_STEP:
+        rel = _decode_each_step(store, rel)
     rel, tuples = _prune_early(store, rel, tuples, remaining, views)
 
     execution_index = 1
@@ -529,6 +536,8 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
         order.append(pat.index)
         if rel.pieces is not None:
             break
+        if ablation.DECODE_EACH_STEP:
+            rel = _decode_each_step(store, rel)
         rel, tuples = _prune_early(store, rel, tuples, remaining, views)
         execution_index += 1
 
@@ -613,6 +622,34 @@ def _single_code(rel: Relation, index: int) -> int | None:
     row, or ``None`` when it holds several."""
     distinct = rel.native_column(index).distinct()
     return memoryview(distinct).cast("Q")[0] if len(distinct) == 1 else None
+
+
+def _decode_each_step(store, rel: Relation) -> Relation:
+    """``VORTEX_RDF_DECODE_EACH_STEP=1``: the relation's codes decoded to their spellings and
+    encoded again — the same codes (tests/test_ablation_switches.py checks it), after the term round
+    trip a term-space evaluator pays at every step. Codes outside the dictionary (negative: query
+    constants) pass through; a streamed relation (pieces) is left as it is."""
+    term_dict = store._dict
+
+    def again(codes: list) -> list:
+        mine = [c for c in codes if c >= 0]
+        back = iter(term_dict.encode_many(term_dict.decode_many(U64Column(mine))) if mine else ())
+        return [next(back) if c >= 0 else c for c in codes]
+
+    if rel.cols is not None:
+        out = []
+        for col in rel.cols:
+            view = col if isinstance(col, memoryview) else memoryview(col)
+            codes = (view if view.format == "Q" else view.cast("Q")).tolist()
+            out.append(memoryview(U64Column(again(codes))).cast("Q"))
+        return dataclasses.replace(rel, cols=tuple(out))
+    if rel.rows:
+        width = len(rel.rows[0])
+        columns = [again([row[i] for row in rel.rows]) for i in range(width)]
+        return dataclasses.replace(
+            rel, rows=list(zip(*columns, strict=True)) if width else rel.rows
+        )
+    return rel
 
 
 def _prune_early(store, rel: Relation, pending, remaining, views) -> tuple[Relation, tuple]:

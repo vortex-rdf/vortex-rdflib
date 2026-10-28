@@ -39,6 +39,7 @@ from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import Literal, URIRef
 from vortex_rdf import U64Column
 
+from .. import ablation
 from ..settings import SETTINGS
 from ..terms import BLANK, IRI, LITERAL, canonical_spelling
 from . import compiler, exprs, values
@@ -344,6 +345,19 @@ def _constant_term(node, consts: dict):
 
 
 def native_shape(expr, var, consts: dict) -> NativeShape | None:
+    """:func:`_native_shape`, except that with ``VORTEX_RDF_CODE_PREDICATES=0`` a kind test or an
+    IRI equality is not one: it is decided over decoded values, not as a code range or code set."""
+    shape = _native_shape(expr, var, consts)
+    if (
+        shape is not None
+        and not ablation.CODE_PREDICATES
+        and (shape.kind in KIND_TESTS or shape.kind == IRI_IN)
+    ):
+        return None
+    return shape
+
+
+def _native_shape(expr, var, consts: dict) -> NativeShape | None:
     """The native predicate (:class:`NativeShape`)
     that ``expr`` is as a test of ``var`` alone — any other variable seen only
     through ``consts`` — or ``None``.
