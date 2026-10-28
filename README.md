@@ -258,9 +258,10 @@ Every section of the dashboard has a tab per dataset:
 - **Synthetic**: a generated dataset of 250,000 quads in 8 graphs and a
   representative SPARQL set (lookups and scans, star and chain joins, FILTER /
   DISTINCT / ORDER BY / GROUP BY, named graphs).
-- **BSBM**: the [Berlin SPARQL Benchmark](https://github.com/Tpt/bsbm-tools)
-  Explore use case at 10,000 products (3.5M triples). The data comes from the
-  official generator. The queries come from the unmodified official test driver
+- **BSBM_10K**: the [Berlin SPARQL Benchmark](https://github.com/Tpt/bsbm-tools)
+  Explore use case at 10,000 products (3.5M triples); the number in the tab's
+  name is the scale in thousands of products. The data comes from the official
+  generator. The queries come from the unmodified official test driver
   (seed 808080, 5 warm-up and 20 measured mixes), so every query instance
   carries its own parameters. A query running past 5 s is aborted and counted as
   a timeout. Its time up to the abort still counts in its mix's time, and so in
@@ -289,8 +290,8 @@ the HDT builder, measures, and re-renders the dashboard:
 ```bash
 scripts/refresh.sh                             # every default stage, at the 250k CI scale
 BENCH_TRIPLES=20000 scripts/refresh.sh         # scale down
-scripts/refresh.sh --bsbm                      # the BSBM tab at CI's scale (needs Java)
-BSBM_PRODUCTS=1000 scripts/refresh.sh --bsbm   # a smaller BSBM run
+scripts/refresh.sh --bsbm                      # the BSBM_10K tab, at CI's scale (needs Java)
+BSBM_PRODUCTS=1000 scripts/refresh.sh --bsbm   # a smaller BSBM run: the BSBM_1K tab
 scripts/refresh.sh --only render               # template-only edits: no re-measurement
 scripts/refresh.sh --history                   # plot the working tree on the synthetic history chart
 ```

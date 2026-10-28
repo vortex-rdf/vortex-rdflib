@@ -96,6 +96,42 @@ def test_a_missing_results_file_disables_its_tab_with_a_note(tmp_path):
     assert sets["bsbm"] is None and "absent.json" in sets["notes"]["bsbm"]
 
 
+@pytest.mark.parametrize(
+    ("products", "label"), [(10000, "BSBM_10K"), (1000, "BSBM_1K"), (2500, "BSBM_2.5K")]
+)
+def test_the_bsbm_tab_names_its_scale_in_thousands_of_products(tmp_path, products, label):
+    bsbm = results("bsbm")
+    bsbm["config"]["products"] = products
+    proc, out = render(
+        tmp_path,
+        write(tmp_path / "r.json", results("synthetic")),
+        "--bsbm",
+        write(tmp_path / "rb.json", bsbm),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert embedded(out.read_text(encoding="utf-8"))["labels"] == {
+        "synthetic": "Synthetic",
+        "bsbm": label,
+    }
+
+
+def test_a_bsbm_tab_with_no_results_has_no_scale_to_name(tmp_path):
+    proc, out = render(tmp_path, write(tmp_path / "r.json", results("synthetic")))
+    assert proc.returncode == 0, proc.stderr
+    assert embedded(out.read_text(encoding="utf-8"))["labels"]["bsbm"] == "BSBM"
+
+
+def test_the_page_names_its_tabs_as_the_render_does():
+    # the tabs and the text naming a tab both read SETS.labels: no name is fixed in the page
+    template = TEMPLATE.read_text(encoding="utf-8")
+    assert "SETS.labels" in template
+    assert not re.search(r'label: "(Synthetic|BSBM)', template)
+    named = re.findall(r'data-label="([^"]*)"', template)
+    assert named, "no text names a tab"
+    assert set(named) <= {"synthetic", "bsbm"}
+    assert not re.search(r"<strong>BSBM</strong> tab", template)
+
+
 def test_no_results_at_all_is_an_error(tmp_path):
     proc, _ = render(tmp_path, str(tmp_path / "none.json"))
     assert proc.returncode == 1

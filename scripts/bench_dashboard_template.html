@@ -313,10 +313,11 @@
       These stores use flattened N-Triples and do not report measurements in the <em>Named graphs</em> panel.
     </p>
     <p class="lede">
-      The <strong>BSBM</strong> tab of every section runs the same stores on the
+      The <strong data-label="bsbm">BSBM</strong> tab of every section runs the same stores on the
       <a href="https://github.com/Tpt/bsbm-tools">Berlin SPARQL Benchmark</a>'s Explore use case:
       data from the official generator, and the query streams the unmodified official test driver
-      sends, captured once. Each store answers the warm-up mixes, then every measured query instance
+      sends, captured once. The number in its name is the generator's scale, in thousands of
+      products. Each store answers the warm-up mixes, then every measured query instance
       once, with the parameters the driver drew for it. A query over the per-query timeout is aborted
       and counted; a store over its time budget finishes its mix and stops, marked <em>partial</em>.
     </p>
@@ -543,11 +544,13 @@
 
 <script>
 // Both datasets' results, from scripts/render_bench_dashboard.py:
-// {synthetic: set|null, bsbm: set|null, notes: {synthetic, bsbm}}, a set being
-// {results, memory, config, failures, provenance, history}. A dataset with no
+// {synthetic: set|null, bsbm: set|null, notes: {synthetic, bsbm}, labels: {synthetic, bsbm}},
+// a set being {results, memory, config, failures, provenance, history}, a label the
+// dataset's tab name (BSBM's names its scale: BSBM_10K). A dataset with no
 // results has its tab disabled in every section, with the note saying why.
 const SETS = __DATASETS__;
-const DATASETS = [{ key: "synthetic", label: "Synthetic" }, { key: "bsbm", label: "BSBM" }];
+const DATASETS = ["synthetic", "bsbm"].map(key => ({ key, label: SETS.labels[key] }));
+for (const el of document.querySelectorAll("[data-label]")) el.textContent = SETS.labels[el.dataset.label];
 
 function cellMb(mb){ return mb == null ? null : { median: mb.toLocaleString() + " MB", median_ns: mb }; }
 
