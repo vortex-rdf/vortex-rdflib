@@ -138,11 +138,13 @@ def test_decode_each_step_returns_the_same_codes(store):
 
     st = VortexRdflibStore(str(store))
     st._store()
+    assert st._dict is not None
     n = len(st._dict)
     codes = list(range(n)) + [-5]
     rel = _decode_each_step(
         st, Relation(("a",), (memoryview(U64Column(list(range(n)))).cast("Q"),), None, n)
     )
-    assert rel.rows is None and rel.cols[0].tolist() == list(range(n))
+    assert rel.rows is None and rel.cols is not None
+    assert rel.cols[0].tolist() == list(range(n))
     rel = _decode_each_step(st, Relation(("a", "b"), None, [(c, c) for c in codes], len(codes)))
     assert rel.cols is None and rel.rows == [(c, c) for c in codes]

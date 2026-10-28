@@ -10,6 +10,7 @@ memory map). The counts are cumulative; a caller takes the difference around a q
 
 import resource
 import threading
+from typing import TypeVar, cast
 
 from .ablation import flag
 
@@ -152,8 +153,14 @@ class CountingDict:
         return getattr(self._inner, name)
 
 
-def wrap(native, term_dict):
-    """``(native, term_dict)``, counted when the counters are on."""
+N = TypeVar("N")
+D = TypeVar("D")
+
+
+def wrap(native: N, term_dict: D) -> tuple[N, D]:
+    """``(native, term_dict)``, counted when the counters are on. Typed as what it was given: the
+    proxies forward every call, so callers keep the native types."""
     if not ON:
         return native, term_dict
-    return CountingNative(native), None if term_dict is None else CountingDict(term_dict)
+    counted_dict = None if term_dict is None else CountingDict(term_dict)
+    return cast(N, CountingNative(native)), cast(D, counted_dict)
