@@ -39,6 +39,7 @@ def test_probe_optional_counts_before_match_and_skips_complete_match(tmp_path, m
         def __getattr__(self, name):
             return getattr(native, name)
 
+    graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     graph.store._native = Counting()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
@@ -86,6 +87,7 @@ def test_lazy_join_counts_before_match_and_probes(tmp_path, monkeypatch, capsys)
         def __getattr__(self, name):
             return getattr(native, name)
 
+    graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     graph.store._native = Counting()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()

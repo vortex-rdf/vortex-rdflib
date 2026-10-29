@@ -9,6 +9,7 @@ from collections.abc import Iterator, Sequence
 
 from vortex_rdf import CodeGroups, U64Column
 
+from .. import union
 from ..cancel import cancel_kw, check_cancelled
 from ..settings import SETTINGS
 from . import matching, relation, tracing
@@ -134,6 +135,10 @@ def _streamed_step(
             )
             if fed is None:
                 raise NotImplementedError
+            if pat.distinct:
+                # Every column a chunk holds is a variable's, and the rows of
+                # one triple differ only in the graph, which none is.
+                fed = union.distinct_chunks(fed, key=range(len(pattern_schema)))
     groups = grouped[grouped_schema.index(key_var)].groups()
     gathered_schema = [v for v in fed_schema if v != key_var] + list(grouped_schema)
     order = [gathered_schema.index(v) for v in step_schema]

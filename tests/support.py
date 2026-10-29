@@ -93,6 +93,7 @@ class CountingTermDict:
 
 def counting_term_dict(graph) -> CountingTermDict:
     """Install the counter over the store's term dictionary."""
+    graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     counting = CountingTermDict(graph.store._dict)
     graph.store._dict = counting
     return counting
@@ -137,6 +138,7 @@ class CountingNative:
 def counting_native(graph) -> CountingNative:
     """Install the counter. The store's own graph-name check is not counted
     (`is_graph_name_check`): it is not what a query plan costs."""
+    graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     native = CountingNative(graph.store._store())
     graph.store._native = native
     return native
@@ -209,6 +211,9 @@ class NativeSpy:
         self.pulls: list[int] = []
         self.feeds: list[weakref.ref] = []
 
+    def __len__(self):
+        return len(self._inner)
+
     def __getattr__(self, name):
         attribute = getattr(self._inner, name)
         if not callable(attribute):
@@ -231,6 +236,7 @@ class NativeSpy:
 
 
 def native_spy(graph) -> NativeSpy:
+    graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     spy = NativeSpy(graph.store._store())
     graph.store._native = spy
     return spy

@@ -357,6 +357,7 @@ def test_graph_variable_is_bound_from_the_column(dataset):
         def __getattr__(self, name):
             return getattr(inner, name)
 
+    dataset.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     dataset.store._native = _Counting()
     register_sparql_pushdown()
     try:
@@ -568,11 +569,10 @@ def _probe_dataset(path, union: bool) -> Dataset:
 @pytest.mark.parametrize("fanout", [0, 100])
 @pytest.mark.parametrize("case", PROBE_MULTIPLICITY)
 def test_a_probe_join_keeps_the_multiplicity_rdflib_reads(probe_quads, monkeypatch, case, fanout):
-    """A pattern with subject, predicate and object bound is one solution per
-    quad it matches, probed per row (fanout 0) or hash-joined (fanout 100).
-    Where the graph is open, in the union default graph, that is one per graph
-    holding the triple; where it is fixed, at most one; an EXISTS test adds
-    none."""
+    """A pattern with subject, predicate and object bound is one solution
+    when its graph holds the triple, probed per row (fanout 0) or hash-joined
+    (fanout 100): a fixed graph holds a triple once, and so does the union
+    default graph, however many graphs hold it; an EXISTS test adds none."""
     union, sparql, rows, probed, _ = PROBE_MULTIPLICITY[case]
     monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
     probes = []
@@ -585,12 +585,10 @@ def test_a_probe_join_keeps_the_multiplicity_rdflib_reads(probe_quads, monkeypat
 
 
 @pytest.mark.parametrize("case", PROBE_MULTIPLICITY)
-def test_an_existence_probe_asks_for_one_row_unless_the_graph_is_open(
-    probe_quads, monkeypatch, case
-):
-    """A fully bound probe counts every quad only in the union default graph.
-    A fixed graph holds at most one and an EXISTS test is boolean in any
-    graph, so both ask for one row."""
+def test_an_existence_probe_asks_for_one_row(probe_quads, monkeypatch, case):
+    """A fully bound probe asks for one row in any graph: a fixed graph holds
+    a triple at most once, the union default graph is a set too, and an
+    EXISTS test is boolean."""
     union, sparql, _, _, expected = PROBE_MULTIPLICITY[case]
     monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     dataset = _probe_dataset(probe_quads, union)
@@ -820,6 +818,7 @@ def test_traced_batch_does_not_pull_ahead(file_graph, monkeypatch, capsys):
     monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: True)
     monkeypatch.setattr(SETTINGS, "cheap_batch_min", 1)
     native = _PullCountingNative(file_graph.store._store())
+    file_graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     file_graph.store._native = native
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
@@ -1078,6 +1077,7 @@ def test_repeated_pattern_is_matched_once(graph):
         def __getattr__(self, name):
             return getattr(inner, name)
 
+    graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     graph.store._native = _Counting()
     register_sparql_pushdown()
     try:
@@ -1107,6 +1107,7 @@ def test_distinct_patterns_are_matched_separately(graph):
         def __getattr__(self, name):
             return getattr(inner, name)
 
+    graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     graph.store._native = _Counting()
     register_sparql_pushdown()
     try:
@@ -1256,6 +1257,7 @@ def test_native_none_falls_back_at_call_time(graph):
         def __getattr__(self, name):
             return getattr(inner, name)
 
+    graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     graph.store._native = _NoCodes()
     register_sparql_pushdown()
     rows = run(graph, "SELECT ?o WHERE { ?s <http://ex.org/name> ?o } LIMIT 2")

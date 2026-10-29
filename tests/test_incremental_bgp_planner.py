@@ -43,6 +43,7 @@ def test_connected_patterns_are_probed_without_complete_matches(tmp_path, monkey
         def __getattr__(self, name):
             return getattr(native, name)
 
+    graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     graph.store._native = Counting()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
@@ -108,6 +109,7 @@ def test_seed_is_the_smallest_count_not_the_most_selective_shape(tmp_path, monke
         def __getattr__(self, name):
             return getattr(native, name)
 
+    graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     graph.store._native = Counting()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
@@ -145,6 +147,7 @@ def test_pattern_selecting_nothing_ends_the_block_before_any_match(
         def __getattr__(self, name):
             return getattr(native, name)
 
+    graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     graph.store._native = Counting()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()

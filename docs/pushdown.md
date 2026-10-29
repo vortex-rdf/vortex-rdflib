@@ -311,9 +311,12 @@ the join from the pattern sizes:
      go through `match_codes_many` in one batch whose answers are pulled as the
      join reaches them
      ([`_run_probes`](../src/vortex_rdflib/pushdown/probes.py#L90)). A probe with
-     no free variable is a count, and its row stands once per quad counted:
-     at most once in a single graph, once per graph that holds the triple
-     under a union default graph.
+     no free variable is a count capped at one row, and its row stands once
+     when the triple is there: in a single graph, and under a union default
+     graph, which is a set of triples however many graphs hold one. A probe
+     with free variables under the union keeps one row of each run of equal
+     triples, as every match over the union does (a pattern's `distinct`,
+     [`vortex_rdflib.union`](../src/vortex_rdflib/union.py)).
    - **Keep-scan** ([`_keep_scan`](../src/vortex_rdflib/pushdown/bgp.py#L760)),
      when the relation is that much smaller but each probe would scan the
      store: the pattern is matched once, narrowed to the codes the relation

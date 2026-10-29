@@ -726,37 +726,37 @@ EX_PREFIX = "PREFIX : <http://ex/> "
 #: the rows rdflib answers, the probe the pushdown takes when it probes, and
 #: the `limit` of the fully bound counts that probe makes.
 PROBE_MULTIPLICITY = {
-    # The union default graph: a triple several graphs hold is one solution per
-    # graph. `s1` joins 2 `q` quads with 3 `p` quads, `s4` 1 with 2.
+    # The union default graph is a set of triples: a triple several graphs
+    # hold is one solution. `s1` and `s4` have both triples, in several graphs.
     "bgp-join": (
         True,
         EX_PREFIX + "SELECT ?s WHERE { ?s :q :x . ?s :p :o1 }",
-        8,
+        2,
         "_probe_join",
-        None,
+        1,
     ),
     "group-join": (
         True,
         EX_PREFIX + "SELECT ?s WHERE { { ?s :q :x } { ?s :p :o1 } }",
-        8,
+        2,
         "_probe_join",
-        None,
+        1,
     ),
     # `s3` has no `p`: its row is padded, once.
     "optional": (
         True,
         EX_PREFIX + "SELECT ?s WHERE { ?s :q :x OPTIONAL { ?s :p :o1 } }",
-        9,
+        3,
         "_probe_join",
-        None,
+        1,
     ),
-    # The condition rejects `s1`: its 2 rows are padded, not repeated.
+    # The condition rejects `s1`: its row is padded, not repeated.
     "optional-condition": (
         True,
         EX_PREFIX + "SELECT ?s WHERE { ?s :q :x OPTIONAL { ?s :p :o1 FILTER(?s != :s1) } }",
-        5,
+        3,
         "_probe_join",
-        None,
+        1,
     ),
     # A fixed graph holds at most one quad of a triple: `s1` and `s4` have the
     # `p` triple in other graphs too, which the probe does not read.
@@ -781,11 +781,11 @@ PROBE_MULTIPLICITY = {
         "_probe_join",
         1,
     ),
-    # EXISTS is boolean: the rows of the block, `s1` twice.
+    # EXISTS is boolean: the rows of the block, `s1` once.
     "exists": (
         True,
         EX_PREFIX + "SELECT ?s WHERE { ?s :q :x FILTER EXISTS { ?s :p :o1 } }",
-        3,
+        2,
         "_probe_exists",
         1,
     ),

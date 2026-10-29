@@ -455,6 +455,7 @@ def test_probes_stop_on_cancel(mem_graph):
         token,
         lambda name, args: name == "match_codes" and args[0] is not None and args[1] == f"<{EX}r>",
     )
+    mem_graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     mem_graph.store._native = native
     with cancel_scope(token), pytest.raises(Cancelled):
         mem_graph.query(PROBED_TWICE)
