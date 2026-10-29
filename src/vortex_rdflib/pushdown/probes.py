@@ -272,10 +272,11 @@ def _probe_join(
     ``count_quads_many`` for an existence probe, a pattern with no free
     position): one call each, a batch's probes running as far ahead as
     :func:`_probe_lookahead` lets them. An existence probe keeps its row
-    once per quad it matches: a fixed graph (a named graph, the default graph
-    alone, a bound ``GRAPH ?g``) holds at most one, so the count stops at one
-    row; the union default graph holds a triple once per graph that has it,
-    so the count is whole. The pattern's native keep narrows each probe on the
+    once when its triple is there: the quads are unique, and the union over
+    every graph is a set, so its count stops at one row. A probe of a
+    ``distinct`` pattern (the union over the graphs of a store holding
+    several) keeps one row of each run of equal triples, adjacent in its
+    match (:mod:`vortex_rdflib.union`). The pattern's native keep narrows each probe on the
     positions it leaves free (a code range inside the native match, a code
     column over the rows it returns), as do ``row_preds`` over the extended
     row; with ``keep_unmatched`` a row without a continuation is kept, padded
@@ -300,21 +301,13 @@ def _probe_join(
             else:
                 tests.append((position, filters.native.keep_member(spec)))
     narrowing = matching._narrowing(probe_keep, limit=None if free else 1)
-    whole = matching._narrowing(probe_keep)
     patterns = _substituted_patterns(store, rows, pat, bound)
 
     pad = (None,) * len(free)
     out = []
     for start in range(0, len(rows), SETTINGS.probe_batch):
         batch = range(start, min(start + SETTINGS.probe_batch, len(rows)))
-        # An existence probe counts whole where its graph position is open
-        # (the union default graph), capped where it is fixed — a `GRAPH ?g`
-        # the row binds is substituted, so it is fixed.
-        probes = [
-            (patterns[i], whole if patterns[i][3] is None else narrowing)
-            for i in batch
-            if patterns[i] is not None
-        ]
+        probes = [(patterns[i], narrowing) for i in batch if patterns[i] is not None]
         answers = iter(_run_probes(store, probes, count=not free))
         try:
             for i in batch:
@@ -334,7 +327,15 @@ def _probe_join(
                     if cols is None:
                         raise NotImplementedError
                     views = {idx: memoryview(cols[idx]).cast("Q").tolist() for idx in needed}
+                    previous = None
                     for j in range(len(views[needed[0]])):
+                        if pat.distinct:
+                            # The rows of one triple differ only in their
+                            # graph, which no variable reads: keep the first.
+                            triple = tuple(views[idx][j] for idx in needed)
+                            if triple == previous:
+                                continue
+                            previous = triple
                         if all(views[a][j] == views[b][j] for a, b in eq_checks) and all(
                             test(views[p][j]) for p, test in tests
                         ):

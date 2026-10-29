@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
 
-from .. import ablation, filters
+from .. import ablation, filters, union
 from ..cancel import CANCEL_TOKEN, cancel_kw_for
 from ..terms import unparseable_iri
 from . import relation, tracing
@@ -30,7 +30,9 @@ class Pattern:
     predicate position, an IRI the parser rejects, a keep left empty).
     ``index`` is its place in the BGP, ``None`` outside one. ``nkeep``
     narrows its native match per position (a code range, or an ascending
-    code column). ``deferred`` maps variables to the conjuncts still to be
+    code column). ``distinct`` says it is matched in the union over every
+    graph of a store holding several, so its match is made a set of triples
+    (:func:`union.distinct_rows`). ``deferred`` maps variables to the conjuncts still to be
     evaluated over the codes the pattern brings. Both mappings are replaced
     when they change, never mutated (:func:`_set_native_keep`), so a keep
     taken before stays whole and a copy (:meth:`copy`) shares them safely.
@@ -52,6 +54,7 @@ class Pattern:
     unsatisfiable: bool = False
     index: int | None = None
     nkeep: dict | None = None
+    distinct: bool = False
     deferred: dict | None = None
     estimate: int | None = None
     estimate_capped: bool = False
@@ -89,19 +92,20 @@ def _pattern_static_rank(pat: Pattern) -> tuple:
 def _pattern_key(pat: Pattern) -> tuple:
     """What a pattern's native count and match are memoized by: the resolved
     quad pattern and its native keep (two triples resolving to the same quad
-    share both only when they are narrowed alike). A code column stands in
-    the key itself, compared by identity: the key holds it, so no later
-    column can take its place while the memo keeps the entry."""
+    share both only when they are narrowed alike, and a distinct match only
+    with another). A code column stands in the key itself, compared by
+    identity: the key holds it, so no later column can take its place while
+    the memo keeps the entry."""
     nkeep = pat.nkeep
     if not nkeep:
-        return tuple(pat.n3)
+        return (*pat.n3, "distinct") if pat.distinct else tuple(pat.n3)
     narrowing = tuple(
         sorted(
             (position, ("range", *keep) if isinstance(keep, tuple) else ("codes", keep))
             for position, keep in nkeep.items()
         )
     )
-    return (*pat.n3, narrowing)
+    return (*pat.n3, narrowing, *(("distinct",) if pat.distinct else ()))
 
 
 def _count_pattern(
@@ -119,9 +123,19 @@ def _count_pattern(
     size a join decision hinges on — narrows by the keep. With ``limit`` the
     count stops there: an answer that reaches it is a lower bound, which is
     never memoized as the count. A count already memoized is returned whole.
+    A planning count of a ``distinct`` pattern counts its quads, a bound on
+    its triples; its exact count is its match's, made distinct.
     """
     if pat.unsatisfiable:
         return 0
+    if exact and pat.distinct:
+        token = CANCEL_TOKEN.get()
+        cancel = {} if token is None else cancel_kw_for({"cancel": token}, store, pat.n3)
+        cols = tracing._native(store).match_codes(*pat.n3, **_narrowing(pat.nkeep), **cancel)
+        if cols is None:
+            raise NotImplementedError
+        n = len(union.distinct_rows(cols)[0])
+        return n if limit is None else min(n, limit)
     nkeep = pat.nkeep if exact else None
     key = _pattern_key(pat) if nkeep else tuple(pat.n3)
     n = counts.get(key)
@@ -168,7 +182,9 @@ def _match_resolved_pattern(store, pat: Pattern, memo=None, limit=None) -> tuple
     they took when tracing. ``limit`` takes only the first rows of the
     match, in base order — the order an unlimited match returns them where
     no index serves it (see :func:`_limit_reaches_match`); a limited match
-    neither reads nor fills the memo.
+    neither reads nor fills the memo. A ``distinct`` pattern's match is made a
+    set of triples, unless the limit cut it: a match that reaches its limit
+    keeps its rows, so a caller testing it against the limit still can.
 
     Only the columns are shared through the memo, as read-only views;
     ``varpos`` stays per pattern, since two triples matching the same rows
@@ -178,8 +194,8 @@ def _match_resolved_pattern(store, pat: Pattern, memo=None, limit=None) -> tuple
     if pat.unsatisfiable:
         pat.set_match((), 0)
         return 0, 0
+    key = _pattern_key(pat)
     nkeep = pat.nkeep
-    key = _pattern_key(pat) if nkeep else tuple(pat.n3)
     cols = memo.get(key) if memo is not None and limit is None else None
     calls = 0
     if cols is None:
@@ -192,6 +208,8 @@ def _match_resolved_pattern(store, pat: Pattern, memo=None, limit=None) -> tuple
             cols = native.match_codes(*pat.n3, **cancel)
         if cols is None:
             raise NotImplementedError
+        if pat.distinct and (limit is None or len(cols[0]) < limit):
+            cols = union.distinct_rows(cols)
         if memo is not None and limit is None:
             memo[key] = cols
         calls = 1
@@ -207,10 +225,13 @@ def _limit_reaches_match(store, pat: Pattern, residual) -> bool:
     variable's equality), and the store must hold no secondary index: the
     native layer windows a match in base order, which is the order an
     unlimited match returns only when no index serves it — and rdflib, which
-    reads the pattern through ``triples()``, sees that order.
+    reads the pattern through ``triples()``, sees that order. A ``distinct``
+    pattern's rows are its match's made a set, so a limit on the match would
+    cut short the rows it keeps.
     """
     return (
         not residual
+        and not pat.distinct
         and not store._indexes
         and all(len(positions) == 1 for positions in pat.varpos.values())
     )
@@ -257,6 +278,7 @@ def _pattern_terms(ctx, store, s, p, o, scope) -> Pattern:
     n3 = [store._node_to_n3(v) for v in (rs, rp, ro)]
     n3.append(scope.n3)
     pat = Pattern(n3, varpos, unsatisfiable)
+    pat.distinct = scope.n3 is None and scope.var is None and store._union_has_repeats()
     if scope.var is not None:
         _exclude_default_graph(store, pat)
     return pat

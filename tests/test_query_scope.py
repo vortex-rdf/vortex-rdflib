@@ -211,6 +211,7 @@ def test_a_bare_graphs_label_is_resolved_once_per_query(tmp_path):
         def __getattr__(self, name):
             return getattr(inner, name)
 
+    store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     store._native = _Counting()  # ty: ignore[invalid-assignment]
     for _ in range(3):
         run(graph, "SELECT ?s WHERE { ?s <http://ex.org/knows> ?o . ?o <http://ex.org/knows> ?x }")

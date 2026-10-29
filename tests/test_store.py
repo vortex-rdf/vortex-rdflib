@@ -136,7 +136,7 @@ def test_len_per_graph(quad_store):
     assert len(dataset.graph(G1)) == 2
     assert len(dataset.graph(G2)) == 2
     assert len(dataset.default_graph) == 2
-    assert len(quad_store) == 6  # the union counts quads, not distinct triples
+    assert len(quad_store) == 5  # the union counts distinct triples, as rdflib's Memory store
 
 
 def test_len_of_an_absent_graph(quad_store):
@@ -169,18 +169,19 @@ def test_bare_graph_is_the_union_view(quad_store):
     """rdflib names an identifier-less graph with a blank node, which names
     nothing the file holds; that is the whole-store view the README shows."""
     whole = Graph(store=quad_store)
-    assert len(whole) == 6
-    # Alice's name is in two graphs, so the union yields it twice.
-    assert len(list(whole.triples((ALICE, FOAF_NAME, None)))) == 2
+    # Six quads, five triples: Alice's name is in two graphs, and the union,
+    # a set of triples, holds it once.
+    assert len(whole) == 5
+    assert len(list(whole.triples((ALICE, FOAF_NAME, None)))) == 1
 
 
 def test_ground_pattern_union_carries_each_graphs_context(quad_store):
-    """A fully-ground pattern under the union yields once per graph holding
-    the triple, each row with that graph's own context — served from the
-    graph column alone, no term materialized."""
+    """A fully-ground pattern under the union yields the triple once, with
+    the context of every graph holding it — served from the graph column
+    alone, no term materialized."""
     rows = list(quad_store.triples((ALICE, FOAF_NAME, Literal("Alice"))))
-    assert [triple for triple, _ in rows] == [(ALICE, FOAF_NAME, Literal("Alice"))] * 2
-    assert {ctx[0].identifier for _, ctx in rows} == {G1, G2}
+    assert [triple for triple, _ in rows] == [(ALICE, FOAF_NAME, Literal("Alice"))]
+    assert {ctx.identifier for ctx in rows[0][1]} == {G1, G2}
     assert list(quad_store.triples((ALICE, FOAF_NAME, Literal("nobody")))) == []
 
 
@@ -195,10 +196,13 @@ def test_union_match_in_one_graph_shares_one_context(quad_store):
 
 
 def test_union_match_across_graphs_keeps_per_row_contexts(quad_store):
+    """Each triple once, with the contexts of all the graphs holding it."""
     rows = list(quad_store.triples((None, FOAF_NAME, None)))
+    assert len(rows) == len({triple for triple, _ in rows}) == 3
     by_graph: dict = {}
-    for (s_, _, _), ctx in rows:
-        by_graph.setdefault(ctx[0].identifier, set()).add(s_)
+    for (s_, _, _), contexts in rows:
+        for ctx in contexts:
+            by_graph.setdefault(ctx.identifier, set()).add(s_)
     assert set(by_graph) >= {G1, G2}
     assert ALICE in by_graph[G1] and ALICE in by_graph[G2]
 
@@ -209,8 +213,8 @@ def test_default_graph_is_not_a_named_graph(quad_store):
         str(row.g) for row in dataset.query("SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }")
     }
     assert named == {GRAPH_1, GRAPH_2}
-    # ...but the union default graph does include it.
-    assert len(list(dataset.query("SELECT * WHERE { ?s ?p ?o }"))) == 6
+    # ...but the union default graph does include it, each triple once.
+    assert len(list(dataset.query("SELECT * WHERE { ?s ?p ?o }"))) == 5
 
 
 def test_dataset_without_union_sees_only_the_default_graph(quad_store):
@@ -237,7 +241,7 @@ def test_union_view_is_keyed_on_default_union_not_the_class(quad_store):
     with pytest.warns(DeprecationWarning):
         legacy = ConjunctiveGraph(store=quad_store, identifier=URIRef("http://ex.org/g/1"))
     assert quad_store._graph_n3(legacy) is None
-    assert len(list(legacy.triples((None, None, None)))) == 6
+    assert len(list(legacy.triples((None, None, None)))) == 5
 
 
 def test_add_graph_is_a_no_op(quad_store):
@@ -625,7 +629,8 @@ def _chunk_bounds(rows: int) -> list[tuple[int, int]]:
 @pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
 def test_triples_yield_the_rows_and_contexts_of_the_match(chunked_quads, monkeypatch, in_memory):
     """Decoded a chunk at a time, triples() yields what the string path
-    yields, in its order, each row with its graph's one context tuple: over
+    yields, in its order, each row with its graph's one context tuple (a triple
+    several graphs hold, one row with a tuple of their contexts): over
     the union (chunks in one graph and chunks across graphs), in a named
     graph, in the default graph, and for ground patterns."""
     store = VortexRdflibStore(str(chunked_quads), in_memory=in_memory)
@@ -654,10 +659,11 @@ def test_triples_yield_the_rows_and_contexts_of_the_match(chunked_quads, monkeyp
             rows = [(triple, ctx[0].identifier) for triple, ctx in got]
             assert rows == [(triple, ctx[0].identifier) for triple, ctx in want], (name, pattern)
             shared: dict = {}
-            assert all(shared.setdefault(ctx[0].identifier, ctx) is ctx for _, ctx in got)
+            # a triple in several graphs carries all their contexts: a tuple of its own
+            assert all(len(ctx) > 1 or shared.setdefault(ctx[0].identifier, ctx) is ctx for _, ctx in got)
     union = [ctx[0].identifier for _, ctx in store.triples((None, None, None))]
     graphs_per_chunk = [len(set(union[i:j])) for i, j in _chunk_bounds(len(union))]
-    assert len(union) == 6004 and len(graphs_per_chunk) == 5
+    assert len(union) == 6001 and len(graphs_per_chunk) == 5  # 6,004 quads, one triple in 4 graphs
     assert 1 in graphs_per_chunk and max(graphs_per_chunk) == 4
 
 
@@ -767,6 +773,7 @@ def test_triples_rejects_match_columns_of_unequal_lengths(
 
     if chunk_rows is not None:
         monkeypatch.setattr(SETTINGS, "triples_chunk_rows", chunk_rows)
+    store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     store._native = _OneCodeLonger()  # ty: ignore[invalid-assignment]
     with pytest.raises(ValueError, match="unequal lengths") as raised:
         list(store.triples((None, P0, None)))
@@ -928,6 +935,7 @@ def test_a_read_skips_chunks_without_rows(indexed_quads, monkeypatch):
             return getattr(native, name)
 
     monkeypatch.setattr(SETTINGS, "triples_chunk_rows", 7)
+    store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     store._native = _EmptyChunksFirst()  # ty: ignore[invalid-assignment]
     got = list(store.triples((None, None, None), context))
     assert asked == [("s", "p", "o")] and len(got) > 7
@@ -989,6 +997,7 @@ def test_a_chunked_read_holds_one_chunk_of_codes_at_a_time(indexed_quads, monkey
             return getattr(native, name)
 
     monkeypatch.setattr(SETTINGS, "triples_chunk_rows", 7)
+    store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     store._native = _WatchedColumns()  # ty: ignore[invalid-assignment]
     assert len(list(store.triples((None, None, None)))) == 300
     assert len(first) == 4 and alive_at_chunk_call == [0]

@@ -121,15 +121,17 @@ KEEP_SCAN_QUADS = """\
 #: union of the graphs, the query and the rows rdflib answers.
 KEEP_SCAN_MULTIPLICITY = {
     # The shared `?v` sits at both positions of `?v :r ?v`, the pattern a
-    # step keep-scans: of the five rows its keep selects, the three that
-    # repeat a code join, `x`'s four rows with two quads, `y`'s one with one.
-    "shared-twice": (True, EX_PREFIX + "SELECT ?s ?v WHERE { ?s :q ?v . ?v :r ?v }", 9),
+    # step keep-scans: of the triples its keep selects, the two that repeat a
+    # code join, `x`'s three subjects and `y`'s one, each triple once however
+    # many graphs hold it.
+    "shared-twice": (True, EX_PREFIX + "SELECT ?s ?v WHERE { ?s :q ?v . ?v :r ?v }", 4),
     # The FILTER's keep on `?s` is on the pattern before the keep-scan
-    # narrows it to the relation's codes: `s1` joins 2 `q` quads with 3 `p`.
+    # narrows it to the relation's codes: `s1`, the one subject it keeps with
+    # both triples.
     "keep-before": (
         True,
         EX_PREFIX + "SELECT ?s WHERE { ?s :q :x . ?s :p :o1 FILTER(?s IN (:s1, :s2, :s3)) }",
-        6,
+        1,
     ),
 }
 
@@ -465,6 +467,7 @@ def test_a_probe_step_over_budget_discards_its_rows(file_graph, monkeypatch, cap
     monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: True)
     monkeypatch.setattr(SETTINGS, "cheap_batch_min", 1)
     watched = _WatchedBatches(file_graph.store._store())
+    file_graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     file_graph.store._native = watched
     if traced:
         monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
@@ -537,6 +540,7 @@ def test_a_batch_short_of_answers_raises(graph, monkeypatch, tokened):
     monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
     monkeypatch.setattr(SETTINGS, "scan_batch_min", 1)
     monkeypatch.setattr(SETTINGS, "memory_scan_batch_min", 1)
+    graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     graph.store._native = _ShortBatches(graph.store._store())
     probes = [((None, f"<{EX}p>", None, None), {}), ((None, f"<{EX}q>", None, None), {})]
     with _scope(tokened):
@@ -569,6 +573,7 @@ def test_a_batch_past_its_probes_raises(graph, monkeypatch, tokened):
     monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
     monkeypatch.setattr(SETTINGS, "scan_batch_min", 1)
     monkeypatch.setattr(SETTINGS, "memory_scan_batch_min", 1)
+    graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     graph.store._native = _LongBatches(graph.store._store())
     probes = [((None, f"<{EX}p>", None, None), {}), ((None, f"<{EX}q>", None, None), {})]
     with _scope(tokened):
@@ -1420,9 +1425,8 @@ def test_probe_multiplicity_under_keep_scan(
     multiplicity_vortex, monkeypatch, capsys, case, in_memory
 ):
     """Forced to probe with probes that scan, each step of a BGP keep-scans
-    and joins as many rows as the probes would: one per quad — in the union
-    default graph one per graph holding the triple, in a fixed graph at most
-    one — a shared variable at two positions only where the row repeats its
+    and joins as many rows as the probes would: one per triple of its graph,
+    the union default graph a set like any other — a shared variable at two positions only where the row repeats its
     code, and a keep already on the pattern narrowing it further. The joins
     above a BGP, OPTIONAL and EXISTS still probe."""
     if case in PROBE_MULTIPLICITY:
