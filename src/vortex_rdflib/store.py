@@ -126,10 +126,10 @@ class VortexRdflibStore(Store):
         self._contexts_by_spelling: dict[str, tuple] = {}
         self._contexts_by_code: dict[int, tuple] = {}
         self._all_contexts: list | None = None
-        # Whether the file holds more than one graph, so the union over them
-        # may hold a triple twice (:meth:`_union_has_repeats`), and the
-        # union's size as a set (:meth:`__len__`): both read once.
-        self._several_graphs: bool | None = None
+        # Whether some triple is in more than one graph, so a match over
+        # every graph may return it twice (:meth:`_union_has_repeats`), and
+        # the union's size as a set (:meth:`__len__`): both read once.
+        self._union_repeats: bool | None = None
         self._union_len: int | None = None
 
         # Whole-BGP pushdown into code space (no-op for non-Vortex graphs;
@@ -173,7 +173,7 @@ class VortexRdflibStore(Store):
         self._contexts_by_spelling = {}
         self._contexts_by_code = {}
         self._all_contexts = None
-        self._several_graphs = None
+        self._union_repeats = None
         self._union_len = None
         return VALID_STORE
 
@@ -187,7 +187,7 @@ class VortexRdflibStore(Store):
         self._contexts_by_spelling = {}
         self._contexts_by_code = {}
         self._all_contexts = None
-        self._several_graphs = None
+        self._union_repeats = None
         self._union_len = None
 
     def _store(self) -> VortexRdfStore:
@@ -200,25 +200,41 @@ class VortexRdflibStore(Store):
 
     def _union_has_repeats(self) -> bool:
         """Whether a match over every graph can return a triple more than
-        once: the file holds more than one graph. A file whose first row's
-        graph holds every row holds one, and its union is its one graph — a
-        set already, so the union pays nothing for being one (every
-        N-Triples file). Read once per open file: a match of one row and a
-        count of that graph. A store without term codes is taken to hold
-        several."""
-        if self._several_graphs is None:
-            store, term_dict = self._store(), self._dict
-            first = store.match_codes(limit=1) if term_dict is not None else None
-            if term_dict is None or first is None:
-                self._several_graphs = True
-            elif not len(first[0]):
-                self._several_graphs = False
-            else:
-                graph = term_dict.decode(memoryview(first[3]).cast("Q")[0])
-                self._several_graphs = (
-                    store.count_quads(None, None, None, graph) != store.count_quads()
-                )
-        return self._several_graphs
+        once: some triple is in more than one graph. Where none is, the union
+        is read as the quads are and pays nothing for being a set: a file of
+        one graph (every N-Triples file), and graphs that partition the data.
+        Read once per open file (:meth:`_read_union_repeats`)."""
+        if self._union_repeats is None:
+            self._union_repeats = self._read_union_repeats()
+        return self._union_repeats
+
+    def _read_union_repeats(self) -> bool:
+        """:meth:`_union_has_repeats`, from the file's own codes, which the
+        code path's switch does not change. A file whose quads are all in its
+        first row's graph has no repeats: a match of one row and a count of
+        that graph tell. A file of several graphs has them when it holds
+        fewer distinct triples than quads, counted in one pass over its
+        triple codes (:func:`union.distinct_chunks`) and kept as the union's
+        size for ``len()``. A layout without codes has no such pass: a file
+        whose quads are not all in the default graph is taken to have them."""
+        store = self._store()
+        quads = store.count_quads()
+        if not quads:
+            return False
+        first = store.match_codes(limit=1)
+        term_dict = self._dict if self._dict is not None else store.term_dict()
+        if first is None or term_dict is None:
+            return store.count_quads(None, None, None, DEFAULT_GRAPH) != quads
+        graph = term_dict.decode(memoryview(first[3]).cast("Q")[0])
+        if store.count_quads(None, None, None, graph) == quads:
+            return False
+        chunks = store.match_code_chunks(
+            columns=("s", "p", "o"), batch_rows=SETTINGS.triples_chunk_rows, **cancel_kw()
+        )
+        if chunks is None:
+            return True
+        self._union_len = sum(len(cols[0]) for cols in union.distinct_chunks(chunks))
+        return self._union_len != quads
 
     def _union_view(self, context) -> bool:
         """Whether ``context`` selects the union over every graph."""
@@ -731,9 +747,10 @@ class VortexRdflibStore(Store):
     def __len__(self, context=None):
         """Triples in ``context``: the quads of its graph, or the distinct
         triples of the union view, as ``triples()`` yields them — the store's
-        quads when it holds one graph, else a count of one pass over the
-        store's triple columns (:func:`union.distinct_chunks`), read once. A
-        context that names no graph the file can hold has none.
+        quads when no triple is in two graphs, else the count
+        :meth:`_read_union_repeats` made, or, in a layout without codes, a
+        count of the union's rows, read once. A context that names no graph
+        the file can hold has none.
         """
         if self.path is None:
             return 0
@@ -745,17 +762,7 @@ class VortexRdflibStore(Store):
             if not self._union_has_repeats():
                 return len(self._store())
             if self._union_len is None:
-                chunks = None
-                if self._dict is not None:
-                    chunks = self._store().match_code_chunks(
-                        columns=("s", "p", "o"),
-                        batch_rows=SETTINGS.triples_chunk_rows,
-                        **cancel_kw(),
-                    )
-                if chunks is None:
-                    self._union_len = sum(1 for _ in self.triples((None, None, None)))
-                else:
-                    self._union_len = sum(len(cols[0]) for cols in union.distinct_chunks(chunks))
+                self._union_len = sum(1 for _ in self.triples((None, None, None)))
             return self._union_len
         pattern = (None, None, None, g_n3)
         return self._store().count_quads(*pattern, **cancel_kw_for(cancel_kw(), self, pattern))

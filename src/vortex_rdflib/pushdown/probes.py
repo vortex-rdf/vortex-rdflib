@@ -274,8 +274,8 @@ def _probe_join(
     :func:`_probe_lookahead` lets them. An existence probe keeps its row
     once when its triple is there: the quads are unique, and the union over
     every graph is a set, so its count stops at one row. A probe of a
-    ``distinct`` pattern (the union over the graphs of a store holding
-    several) keeps one row of each run of equal triples, adjacent in its
+    ``distinct`` pattern (the union over the graphs of a store where some
+    triple is in several) keeps one row of each run of equal triples, adjacent in its
     match (:mod:`vortex_rdflib.union`). The pattern's native keep narrows each probe on the
     positions it leaves free (a code range inside the native match, a code
     column over the rows it returns), as do ``row_preds`` over the extended

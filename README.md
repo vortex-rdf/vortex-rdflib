@@ -75,8 +75,12 @@ default graph of a `Dataset`, it is a set of triples — a triple in two graphs
 is yielded once, with both graphs as its contexts. A match over every graph
 returns a triple's quads next to each other (every sort order a store holds
 ends in the graph), so the store keeps one row of each run as it streams them
-(`vortex_rdflib.union`); a file of one graph, such as any N-Triples file, has
-no runs to drop and pays nothing for it.
+(`vortex_rdflib.union`). A file where no triple is in two graphs — a file of
+one graph, such as any N-Triples file, or graphs that partition the data — has
+no runs to drop and pays nothing for it: whether a triple repeats is read once
+per open file, from one pass over its triple codes when it holds several
+graphs. A layout without term codes takes a file of several graphs to have
+repeats.
 
 To produce a `.vortex` file from an RDF file, use the binding layer directly
 (or the [vortex-rdf CLI](https://github.com/vortex-rdf/vortex-rdf)):

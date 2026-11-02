@@ -7,7 +7,7 @@ import random
 
 import pytest
 from rdflib import Dataset, Graph
-from tests.support import both_ways, run
+from tests.support import both_ways, counting_native, run
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore
@@ -107,3 +107,65 @@ def test_a_store_of_one_graph_pays_nothing_for_the_union(tmp_path):
     store = VortexRdflibStore(str(out))
     assert not store._union_has_repeats()
     assert len(store) == 2
+
+
+#: Three graphs, the default one among them, that share no triple: graphs that
+#: partition the data, as the benchmark dataset's do (bench/dataset.py).
+PARTITIONED = (
+    f"<{EX}s0> <{EX}p0> <{EX}o0> .\n"
+    f"<{EX}s0> <{EX}p0> <{EX}o1> <{EX}g1> .\n"
+    f"<{EX}s1> <{EX}p0> <{EX}o0> <{EX}g1> .\n"
+    f"<{EX}s1> <{EX}p1> <{EX}o1> <{EX}g2> .\n"
+    f"<{EX}s2> <{EX}p0> <{EX}o2> <{EX}g2> .\n"
+)
+
+
+def _partitioned_store(tmp_path, layout="dictionary", **options) -> VortexRdflibStore:
+    source = tmp_path / "partitioned.nq"
+    source.write_text(PARTITIONED, encoding="utf-8")
+    out = tmp_path / f"partitioned-{layout}.vortex"
+    serialize_rdf(str(source), str(out), layout=layout, format="nquads")
+    return VortexRdflibStore(str(out), **options)
+
+
+@pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
+def test_graphs_that_share_no_triple_pay_nothing_for_the_union(tmp_path, in_memory):
+    """Several graphs, but no triple in two of them: the union has nothing to
+    drop, so it is read as the quads are. A count over every graph is the
+    store's count, not a match made distinct, and the answers are rdflib's."""
+    store = _partitioned_store(tmp_path, in_memory=in_memory)
+    assert not store._union_has_repeats()
+    assert len(store) == 5
+    memory = Dataset(default_union=True)
+    memory.parse(data=PARTITIONED, format="nquads")
+    dataset = Dataset(store=store, default_union=True)
+    for name in ("all", "predicate", "join", "count-group", "graph-variable"):
+        assert run(dataset, PREFIX + QUERIES[name]) == run(memory, PREFIX + QUERIES[name]), name
+    native = counting_native(dataset)
+    count_all = PREFIX + QUERIES["count-all"]
+    assert run(dataset, count_all) == run(memory, count_all)
+    assert native.matches == 0 and native.counts == 1
+
+
+def test_the_check_reads_the_files_codes_with_the_code_path_off(tmp_path, monkeypatch):
+    """With the code path off (``VORTEX_RDF_DISABLE_CODE_PATH``) queries read
+    the string columns, but the file still holds its codes: whether its union
+    repeats a triple is read from them all the same."""
+    monkeypatch.setenv("VORTEX_RDF_DISABLE_CODE_PATH", "1")
+    store = _partitioned_store(tmp_path)
+    assert store._dict is None
+    assert not store._union_has_repeats()
+    assert len(store) == 5
+
+
+@pytest.mark.parametrize("layout", ["default", "typed-object"])
+def test_a_layout_without_codes_is_checked_for_one_graph_only(tmp_path, layout):
+    """A layout without term codes has no native pass over its triples: a file
+    whose quads are all in the default graph (an N-Triples file) has no
+    repeats, and a file of several graphs is taken to have them."""
+    source = tmp_path / "one.nt"
+    source.write_text(f"<{EX}s> <{EX}p> <{EX}o> .\n<{EX}s> <{EX}p> <{EX}o2> .\n", encoding="utf-8")
+    out = tmp_path / f"one-{layout}.vortex"
+    serialize_rdf(str(source), str(out), layout=layout)
+    assert not VortexRdflibStore(str(out))._union_has_repeats()
+    assert _partitioned_store(tmp_path, layout=layout)._union_has_repeats()

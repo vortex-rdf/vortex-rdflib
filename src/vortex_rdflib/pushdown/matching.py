@@ -31,11 +31,12 @@ class Pattern:
     ``index`` is its place in the BGP, ``None`` outside one. ``nkeep``
     narrows its native match per position (a code range, or an ascending
     code column). ``distinct`` says it is matched in the union over every
-    graph of a store holding several, so its match is made a set of triples
-    (:func:`union.distinct_rows`). ``deferred`` maps variables to the conjuncts still to be
-    evaluated over the codes the pattern brings. Both mappings are replaced
-    when they change, never mutated (:func:`_set_native_keep`), so a keep
-    taken before stays whole and a copy (:meth:`copy`) shares them safely.
+    graph of a store where some triple is in several, so its match is made a
+    set of triples (:func:`union.distinct_rows`). ``deferred`` maps variables
+    to the conjuncts still to be evaluated over the codes the pattern brings.
+    Both mappings are replaced when they change, never mutated
+    (:func:`_set_native_keep`), so a keep taken before stays whole and a copy
+    (:meth:`copy`) shares them safely.
 
     Planning sets ``estimate`` (its count, ``None`` while uncounted; a lower
     bound when ``estimate_capped``) or marks it ``probe`` (left uncounted
