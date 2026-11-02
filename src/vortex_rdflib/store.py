@@ -207,15 +207,17 @@ class VortexRdflibStore(Store):
         count of that graph. A store without term codes is taken to hold
         several."""
         if self._several_graphs is None:
-            store = self._store()
-            first = store.match_codes(limit=1) if self._dict is not None else None
-            if first is None:
-                self._several_graphs = self._dict is None
+            store, term_dict = self._store(), self._dict
+            first = store.match_codes(limit=1) if term_dict is not None else None
+            if term_dict is None or first is None:
+                self._several_graphs = True
             elif not len(first[0]):
                 self._several_graphs = False
             else:
-                graph = self._dict.decode(memoryview(first[3]).cast("Q")[0])
-                self._several_graphs = store.count_quads(None, None, None, graph) != store.count_quads()
+                graph = term_dict.decode(memoryview(first[3]).cast("Q")[0])
+                self._several_graphs = (
+                    store.count_quads(None, None, None, graph) != store.count_quads()
+                )
         return self._several_graphs
 
     def _union_view(self, context) -> bool:
@@ -746,7 +748,9 @@ class VortexRdflibStore(Store):
                 chunks = None
                 if self._dict is not None:
                     chunks = self._store().match_code_chunks(
-                        columns=("s", "p", "o"), batch_rows=SETTINGS.triples_chunk_rows, **cancel_kw()
+                        columns=("s", "p", "o"),
+                        batch_rows=SETTINGS.triples_chunk_rows,
+                        **cancel_kw(),
                     )
                 if chunks is None:
                     self._union_len = sum(1 for _ in self.triples((None, None, None)))

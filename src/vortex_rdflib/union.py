@@ -35,7 +35,11 @@ def distinct_chunks(chunks: Iterable[tuple], key=TRIPLE) -> Iterator[tuple]:
     for cols in chunks:
         cols = distinct_rows(cols, key)
         rows = len(cols[0])
-        if rows and last is not None and all(_at(cols[i], 0) == v for i, v in zip(key, last, strict=True)):
+        if (
+            rows
+            and last is not None
+            and all(_at(cols[i], 0) == v for i, v in zip(key, last, strict=True))
+        ):
             cols = tuple(col.slice(1, rows) for col in cols)
             rows -= 1
         if rows:

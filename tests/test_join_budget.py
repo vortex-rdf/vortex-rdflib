@@ -1426,8 +1426,9 @@ def test_probe_multiplicity_under_keep_scan(
 ):
     """Forced to probe with probes that scan, each step of a BGP keep-scans
     and joins as many rows as the probes would: one per triple of its graph,
-    the union default graph a set like any other — a shared variable at two positions only where the row repeats its
-    code, and a keep already on the pattern narrowing it further. The joins
+    the union default graph a set like any other — a shared variable at two
+    positions only where the row repeats its code, and a keep already on the
+    pattern narrowing it further. The joins
     above a BGP, OPTIONAL and EXISTS still probe."""
     if case in PROBE_MULTIPLICITY:
         union, sparql, rows, _, _ = PROBE_MULTIPLICITY[case]

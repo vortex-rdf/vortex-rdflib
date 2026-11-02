@@ -7,12 +7,11 @@ import random
 
 import pytest
 from rdflib import Dataset, Graph
+from tests.support import both_ways, run
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore
 from vortex_rdflib.settings import SETTINGS
-
-from tests.support import both_ways, run
 
 EX = "http://ex.org/"
 PREFIX = f"PREFIX : <{EX}> "
@@ -39,11 +38,14 @@ def quads():
     graphs = ["", *(f" <{EX}g{i}>" for i in range(4))]
     objects = [f"<{EX}o{i}>" for i in range(8)] + ['"x"', '"y"@en']
     lines = {
-        f"<{EX}s{rng.randrange(8)}> <{EX}p{rng.randrange(2)}> {rng.choice(objects)}{rng.choice(graphs)} .\n"
+        f"<{EX}s{rng.randrange(8)}> <{EX}p{rng.randrange(2)}> "
+        f"{rng.choice(objects)}{rng.choice(graphs)} .\n"
         for _ in range(300)
     }
     # Objects that are subjects too, so the joins have something to join.
-    lines |= {f"<{EX}o{i}> <{EX}p1> <{EX}s{i}>{g} .\n" for i in range(8) for g in graphs[: 1 + i % 3]}
+    lines |= {
+        f"<{EX}o{i}> <{EX}p1> <{EX}s{i}>{g} .\n" for i in range(8) for g in graphs[: 1 + i % 3]
+    }
     return "".join(sorted(lines))
 
 
@@ -72,7 +74,9 @@ def expected(quads):
 @pytest.mark.parametrize("fanout", [0, 100])
 @pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
 @pytest.mark.parametrize("index", [None, "secondary-by-copy", "secondary-by-reference"])
-def test_the_union_holds_each_triple_once(stores, expected, monkeypatch, index, in_memory, fanout, small):
+def test_the_union_holds_each_triple_once(
+    stores, expected, monkeypatch, index, in_memory, fanout, small
+):
     answers, size = expected
     monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
     if small:

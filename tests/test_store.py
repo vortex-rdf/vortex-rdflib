@@ -660,7 +660,9 @@ def test_triples_yield_the_rows_and_contexts_of_the_match(chunked_quads, monkeyp
             assert rows == [(triple, ctx[0].identifier) for triple, ctx in want], (name, pattern)
             shared: dict = {}
             # a triple in several graphs carries all their contexts: a tuple of its own
-            assert all(len(ctx) > 1 or shared.setdefault(ctx[0].identifier, ctx) is ctx for _, ctx in got)
+            assert all(
+                len(ctx) > 1 or shared.setdefault(ctx[0].identifier, ctx) is ctx for _, ctx in got
+            )
     union = [ctx[0].identifier for _, ctx in store.triples((None, None, None))]
     graphs_per_chunk = [len(set(union[i:j])) for i, j in _chunk_bounds(len(union))]
     assert len(union) == 6001 and len(graphs_per_chunk) == 5  # 6,004 quads, one triple in 4 graphs
