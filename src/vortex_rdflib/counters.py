@@ -45,7 +45,7 @@ def snapshot() -> dict:
         pass
     # vortex-rdf's encoded-search counters: vortex-rdf builds with them only (same switch)
     try:
-        from vortex_rdf._native import engine_counters  # ty: ignore[unresolved-import]
+        from vortex_rdf._native import engine_counters
     except ImportError:
         pass
     else:

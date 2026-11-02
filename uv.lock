@@ -254,15 +254,15 @@ wheels = [
 
 [[package]]
 name = "vortex-rdf"
-version = "0.13.1"
+version = "0.14.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/fd/c8/e689fd980abf6a482403f6ac37b246961a655180b9086bc4e6ab0e76a61d/vortex_rdf-0.13.1.tar.gz", hash = "sha256:87198186f6fd4a6dfd77d3d06a548aff1b9cd9a09b245178ac534a6c28d969c4", size = 793022, upload-time = "2026-10-24T07:25:38.098Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d0/21/459572a061233e04e185f1fff12862b867a265d1b1b9c769c933565bfbb4/vortex_rdf-0.14.0.tar.gz", hash = "sha256:a09eb337925fbb32a17ea2983d9c64a598dcba32d412b9e2446d59b0d44b5d22", size = 932173, upload-time = "2026-11-02T18:09:57.456Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2c/d3/0e84b6a182c256a54c02a94cb5991585cec1e399fb7adb6fac580008f6cc/vortex_rdf-0.13.1-cp311-abi3-macosx_10_12_x86_64.whl", hash = "sha256:6acee0cebcbef1316c0dc316d456d2028a7c78d96aaf9490c39106ce549c3ede", size = 12728794, upload-time = "2026-10-24T07:25:22.231Z" },
-    { url = "https://files.pythonhosted.org/packages/74/9c/a983639c1b3cb8e4a4572ee6d2611396383fbaa8233dddf42dc7efb4498a/vortex_rdf-0.13.1-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:a8caebc9a52a7a8caec93751668bd4144b855ad6124b960ca4b99afd06bdd625", size = 11813446, upload-time = "2026-10-24T07:25:25.44Z" },
-    { url = "https://files.pythonhosted.org/packages/a1/81/cbda997e66cc7f42db209af18b182f54e54786ea94c974ea26ba3095e2ab/vortex_rdf-0.13.1-cp311-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:1a28bba8b7119bd45c3d0db2e83d530abd23c36b2f5307a74b1eaafc76664124", size = 12587103, upload-time = "2026-10-24T07:25:29.774Z" },
-    { url = "https://files.pythonhosted.org/packages/67/2c/1540dbd124f00745f7a37acaf9dbee46b8f1a763942a935145cdef0723d1/vortex_rdf-0.13.1-cp311-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:27683bafa13a42166570089e893a6a5e2732abc449ce47f7561aabd40278b48f", size = 13499561, upload-time = "2026-10-24T07:25:32.857Z" },
-    { url = "https://files.pythonhosted.org/packages/95/40/9cb2f38e6a02f517461aca8f6f5f04f816ce767daa3d8cf2df94eceb54fb/vortex_rdf-0.13.1-cp311-abi3-win_amd64.whl", hash = "sha256:6ad0303a0dfe7c6889dbcf62440db64c3da202eab4fa790d4f59dc6bc1276571", size = 13724741, upload-time = "2026-10-24T07:25:35.738Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/d0/383d6ad13fd23e3cc0033c9152b2d5db33358ae734e1a425b033b3d6b733/vortex_rdf-0.14.0-cp311-abi3-macosx_10_12_x86_64.whl", hash = "sha256:5ee797002022d913ccd4141f937e37d47cb2774ecd9d9d99213fbbd05a3a4d1b", size = 13436649, upload-time = "2026-11-02T18:09:45.495Z" },
+    { url = "https://files.pythonhosted.org/packages/da/6a/a19c1fc5e8b1d18c7b449029e9b8ec929cf191623d95b3e395590048bb8d/vortex_rdf-0.14.0-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:c2d24facb89f858c890822b9b0cc7325be1e72da820c57057a9de887216bf610", size = 12606148, upload-time = "2026-11-02T18:09:47.747Z" },
+    { url = "https://files.pythonhosted.org/packages/90/96/815d5259f2a91b7db6485e816c41bce63b03ba66a15419e9317ecc67c8f3/vortex_rdf-0.14.0-cp311-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:793136f4c36e82eca9704a299bc85e34a652d9056c22d67cbe92073323ad76d5", size = 13469903, upload-time = "2026-11-02T18:09:49.853Z" },
+    { url = "https://files.pythonhosted.org/packages/d2/2b/bc41770bc4ca68e00b770b77bb7e75165f768bb8f5f206e35932b6312fc0/vortex_rdf-0.14.0-cp311-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:a29c70aaed65cbe74eebc5931aad1c25c44b02d5531704843d414a3ba1d11fab", size = 14312003, upload-time = "2026-11-02T18:09:52.121Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/30/e9d7e17a45531c063cf0490f005d6f1ff8de39c3443244c27fee22421fb7/vortex_rdf-0.14.0-cp311-abi3-win_amd64.whl", hash = "sha256:db08f98d3a6698978ed57537d0aff24a199e566daf816b6c99cf14cea2475965", size = 14578961, upload-time = "2026-11-02T18:09:54.627Z" },
 ]
 
 [[package]]
@@ -289,7 +289,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "rdflib", specifier = ">=7.6,<8" },
-    { name = "vortex-rdf", specifier = ">=0.13.1,<0.14" },
+    { name = "vortex-rdf", specifier = ">=0.14.0,<0.15" },
 ]
 
 [package.metadata.requires-dev]

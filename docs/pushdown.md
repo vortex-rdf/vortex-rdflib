@@ -1116,8 +1116,9 @@ The tests check that the hook never changes an answer:
 - [`tests/test_native_contract.py`](../tests/test_native_contract.py) pins the
   vortex-rdf API this package relies on: how stores open, what `filter_codes`
   answers and leaves undecided, how keeps and limits narrow a count, and the
-  0.13 surface: the batch calls' answer iterators with `lookahead` and
-  `cancel`, `JoinTooLarge`, `groups` and `gather`, chunks and `slice`.
+  0.14 surface: the batch calls' answer iterators with `lookahead` and
+  `cancel`, `JoinTooLarge`, `groups` and `gather`, chunks and `slice`, and
+  the `take` and `run_starts` that keep the union default graph a set.
 - [`tests/test_join_budget.py`](../tests/test_join_budget.py) checks the pair
   budget and what it sets off: the product bound and the native count, the
   three tiers (streamed pieces, a pattern joined first, rdflib finishing the
