@@ -9,7 +9,7 @@ loops between native calls check it per step (:func:`check_cancelled`).
 """
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextvars import ContextVar
 
 from vortex_rdf import Cancelled, CancelToken
@@ -22,7 +22,7 @@ CANCEL_TOKEN: ContextVar[CancelToken | None] = ContextVar("vortex_rdflib_cancel"
 
 
 @contextlib.contextmanager
-def cancel_scope(token: CancelToken) -> Iterator[CancelToken]:
+def cancel_scope(token: CancelToken) -> Generator[CancelToken]:
     """Run the queries started inside the block under ``token``, which it
     yields.
 

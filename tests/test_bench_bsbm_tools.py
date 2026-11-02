@@ -11,7 +11,7 @@ import tarfile
 import threading
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -147,7 +147,7 @@ def test_an_unreachable_download_makes_the_tools_unavailable():
 
 
 @contextlib.contextmanager
-def loopback_reply(reply: bytes) -> Iterator[str]:
+def loopback_reply(reply: bytes) -> Generator[str]:
     """A loopback server that reads one request, answers it with the raw bytes ``reply``
     and closes: yields its URL. The thread is joined and the socket closed on the way out."""
     with socket.socket() as listener:

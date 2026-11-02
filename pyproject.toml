@@ -1,5 +1,5 @@
 [build-system]
-requires = ["uv_build>=0.12.20,<0.13.0"]
+requires = ["uv_build>=0.13.6,<0.14.0"]
 build-backend = "uv_build"
 
 [project]
@@ -41,10 +41,10 @@ dependencies = [
 # the bench group is for the comparative dashboard's third-party contenders,
 # which the CodSpeed run deliberately does not need.
 dev = [
-    "pytest>=9.1",
+    "pytest>=9.2",
     "pytest-codspeed>=5",
-    "ruff>=0.16.9",
-    "ty>=0.0.84",
+    "ruff>=0.17.3",
+    "ty>=0.0.95",
 ]
 # Comparative benchmark contenders (bench/): oxrdflib serves Oxigraph through
 # rdflib, and pyoxigraph is measured directly as well.
@@ -73,6 +73,10 @@ pythonpath = ["."]
 filterwarnings = [
   "ignore:Dataset.default_context is deprecated:DeprecationWarning",
   "ignore:Dataset.contexts is deprecated:DeprecationWarning",
+  # pytest 9.2 asks every module attribute for `_mock_name` while it collects
+  # fixtures, and rdflib's closed namespaces (`XSD`) warn about any name they
+  # do not define.
+  "ignore:Code. _mock_name is not defined in namespace:UserWarning",
 ]
 
 [tool.ruff]
