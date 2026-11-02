@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.4.0...v0.5.0) - 2026-11-02
+
+Requires vortex-rdf 0.14 (`vortex-rdf>=0.14.0,<0.15`, up from 0.13.1), and the
+union default graph is a set of triples. A plain `Graph` over the store, and a
+`Dataset` whose default graph is the union, yielded a triple that several graphs
+hold once per graph; they now yield it once, with every graph that holds it as
+its contexts, as rdflib's own `Dataset(default_union=True)` does and SPARQL 1.1
+§13 defines the merge. `len()`, `COUNT(*)` and every other query over the union
+count it once; `GRAPH ?g` and `quads()` still give one row per graph. A store
+whose quads are in one graph, or whose graphs share no triple, reads the union
+as before and pays nothing for it: whether a triple repeats is read once per
+open file, from one pass over its triple codes when it holds several graphs.
+The floor is 0.14.0 because a run of a triple's repeats is dropped with
+`U64Column.run_starts`, new in vortex-rdf 0.14. Ablation switches turn one
+mechanism of the pushdown off at a time for measurement
+(`VORTEX_RDF_CODE_PREDICATES=0`, `VORTEX_RDF_COUNT_ORDER=0`,
+`VORTEX_RDF_DECODE_EACH_STEP=1`, `VORTEX_RDF_DECODE_CHUNK=<n>`,
+`VORTEX_RDF_PROBE_BATCH=<n>`), and `VORTEX_RDF_COUNTERS=1` counts the native
+calls, rows, decodes and page faults a run makes. Inside, the pushdown and the
+FILTER code are packages of one module per concern, and the settings and the
+cancellation have modules of their own.
+
+### Breaking changes
+
+- vortex-rdf 0.13 is no longer supported: the dependency is
+  `vortex-rdf>=0.14.0,<0.15`.
+- The union default graph is a set of triples: a triple in several graphs is
+  one triple of the union in `triples()`, `len()` and every query over it. Code
+  that counted it once per graph through the union counts it per graph with
+  `GRAPH ?g` or `quads()`.
+
+### Added
+
+- Show the CPU that measured each history point (bench) ([`2407e54`](https://github.com/vortex-rdf/vortex-rdflib/commit/2407e54dc2e348e41ec5cddedb02ea390aad6b60) by @julianrojas87)
+- Query built stores in a fresh process, and count page faults per query (bench) ([`bee91bb`](https://github.com/vortex-rdf/vortex-rdflib/commit/bee91bbf1e8a11b3284e85ae834e40b3f7f57bbd) by @julianrojas87)
+- Compare two sides' synthetic runs round by round (bench) ([`8942239`](https://github.com/vortex-rdf/vortex-rdflib/commit/8942239891a81016c2b4566475bfed8fe56fef17) by @julianrojas87)
+- A BSBM cell on a store with the by-copy index (bench) ([`265d0f2`](https://github.com/vortex-rdf/vortex-rdflib/commit/265d0f229582b5e0548601082790b539b2eafdc9) by @julianrojas87)
+- Scripts/perf-gate.sh, a paired performance gate (bench) ([`8cd112e`](https://github.com/vortex-rdf/vortex-rdflib/commit/8cd112eeb07b9d89e10cc9fe12477eb51edf663e) by @julianrojas87)
+- Keep each query's median page faults in history records (bench) ([`88fb893`](https://github.com/vortex-rdf/vortex-rdflib/commit/88fb893b21f129d8d4bdb912a32e8b803b220170) by @julianrojas87)
+- Correct backfilled records for the runner's drift (bench) ([`0e917cb`](https://github.com/vortex-rdf/vortex-rdflib/commit/0e917cb48d7cd17ae0b2b95df19a945ed66ad74e) by @julianrojas87)
+- Ablation switches and work counters (pushdown) ([`d7daf62`](https://github.com/vortex-rdf/vortex-rdflib/commit/d7daf62d7baec05dc55e3dbda7bde34b056fc690) by @fothot2)
+- Name the dashboard's BSBM tab after its scale (BSBM_10K) (bench) ([`78a168e`](https://github.com/vortex-rdf/vortex-rdflib/commit/78a168ec798cbf5f3940f8a843a31f6adb867bec) by @julianrojas87)
+
+### Changed
+
+- Drop the Python frames around each scoped row and count (pushdown) ([`ebeff3d`](https://github.com/vortex-rdf/vortex-rdflib/commit/ebeff3d4fb3fa41bd91a6f23c931897fae35133e) by @julianrojas87)
+- Settings and cancellation get modules of their own ([`5d9ae65`](https://github.com/vortex-rdf/vortex-rdflib/commit/5d9ae655aa82e542dfc928edd18a5e63c1939391) by @claude)
+- A typed Pattern, and a Relation for the running join (pushdown) ([`32adfa7`](https://github.com/vortex-rdf/vortex-rdflib/commit/32adfa7665e78ee1127d271fb4e3b9b5f8ecded5) by @claude)
+- Build trace events outside the planner (pushdown) ([`49922f7`](https://github.com/vortex-rdf/vortex-rdflib/commit/49922f7971ae6e32234fc9cb7bc697e44733c983) by @claude)
+- A join step commits only once it completes (pushdown) ([`a5f6e9b`](https://github.com/vortex-rdf/vortex-rdflib/commit/a5f6e9b914769a92e55336e997aee3b2de7ce20d) by @claude)
+- One module per concern (pushdown) ([`5494f18`](https://github.com/vortex-rdf/vortex-rdflib/commit/5494f1829223c91f58bc8ab4cb95c7bd46eca93b) by @claude)
+- A package, and one home for the native shapes (filters) ([`2020e33`](https://github.com/vortex-rdf/vortex-rdflib/commit/2020e33844c5509df50ece0fe3852516cd57dcb8) by @claude)
+- Drop repeats only where a triple is in two graphs (union) ([`7623786`](https://github.com/vortex-rdf/vortex-rdflib/commit/76237865497d884ab2969d5f299876e684fb0073) by @claude)
+
+### Fixed
+
+- Keep a commit's newest measurement wherever records are placed (bench) ([`bcd5a98`](https://github.com/vortex-rdf/vortex-rdflib/commit/bcd5a98d8c614ab8e89ced1747981b35494dc7bf) by @julianrojas87)
+- Wrap() keeps the native types; ty-clean ablation test (counters) ([`ec67338`](https://github.com/vortex-rdf/vortex-rdflib/commit/ec67338f8f6a547d62c72dd8fcad338be6fef31c) by @fothot2)
+- Import resource only where it exists (not on Windows) (counters) ([`c531eb7`](https://github.com/vortex-rdf/vortex-rdflib/commit/c531eb7d4643e42ab76fba5e14f21f094a95aadf) by @fothot2)
+- The union default graph is a set of triples ([`33bde65`](https://github.com/vortex-rdf/vortex-rdflib/commit/33bde65b0c0fdf602008b83cb3e3bbccbecc1e50) by @fothot2)
+
 ## [0.4.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.3.0...v0.4.0) - 2026-10-24
 
 Requires vortex-rdf 0.13.1 (`vortex-rdf>=0.13.1,<0.14`, up from 0.12.1): joins
