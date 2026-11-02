@@ -1,4 +1,4 @@
-"""The vortex-rdf 0.13 API this package relies on, pinned where it relies on
+"""The vortex-rdf 0.14 API this package relies on, pinned where it relies on
 it. A failure here means the installed vortex-rdf differs from that API."""
 
 import ctypes
@@ -81,26 +81,26 @@ def _address(column: U64Column) -> int:
         ctypes.pythonapi.PyBuffer_Release(ctypes.byref(view))
 
 
-def test_version_is_0_13():
-    assert vortex_rdf.__version__.split(".")[:2] == ["0", "13"]
+def test_version_is_0_14():
+    assert vortex_rdf.__version__.split(".")[:2] == ["0", "14"]
 
 
-#: The 0.13 names, and the members of each that the batch, chunk, cancel and
-#: join code of this package calls.
-_SURFACE_0_13 = {
+#: The 0.14 names, and the members of each that the batch, chunk, cancel,
+#: join and union code of this package calls.
+_SURFACE_0_14 = {
     "VortexRdfStore": ("match_codes_many", "count_quads_many", "match_code_chunks"),
     "ProbeAnswers": ("__iter__", "__next__", "__len__"),
     "CodeChunks": ("__iter__", "__next__", "columns", "batch_rows"),
     "CancelToken": ("cancel", "cancelled"),
-    "U64Column": ("slice", "join_count", "join_indices", "groups"),
+    "U64Column": ("slice", "take", "run_starts", "join_count", "join_indices", "groups"),
     "CodeGroups": ("__len__", "count", "join", "gather"),
     "JoinTooLarge": ("pairs",),
     "Cancelled": (),
 }
 
 
-def test_surface_is_0_13():
-    for name, members in _SURFACE_0_13.items():
+def test_surface_is_0_14():
+    for name, members in _SURFACE_0_14.items():
         assert hasattr(vortex_rdf, name), name
         for member in members:
             assert hasattr(getattr(vortex_rdf, name), member), f"{name}.{member}"
