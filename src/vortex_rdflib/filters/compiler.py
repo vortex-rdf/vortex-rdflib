@@ -6,6 +6,7 @@ names no operator for) is left ``UNKNOWN`` for rdflib's evaluator.
 """
 
 from collections.abc import Callable
+from functools import partial
 
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import Literal, URIRef
@@ -38,13 +39,45 @@ def _const(value):
 
 
 def _as_term(value):
-    """A comparison's value as the ``xsd:boolean`` term it is, any other
-    value unchanged."""
+    """An operand as a function reads it — the operand protocol: an unbound
+    operand or an error is ``ERROR``, a comparison's bool the
+    ``xsd:boolean`` term it is, and a term view or ``UNKNOWN`` itself."""
+    if value is None or value is ERROR:
+        return ERROR
     if value is True:
         return _TRUE
     if value is False:
         return _FALSE
     return value
+
+
+def _strict(fn, arg):
+    """``fn``, a function of one term view, over the operand ``arg``
+    computes (:func:`_as_term`): an error is an error, and an operand this
+    route cannot evaluate leaves the call to rdflib's evaluator."""
+
+    def apply(env):
+        a = _as_term(arg(env))
+        return a if a is ERROR or a is UNKNOWN else fn(a)
+
+    return apply
+
+
+def _strict2(fn, left, right):
+    """``fn``, a function of two term views, over two operands: an error in
+    either is an error (a function of an error is one, §17.3), else an
+    operand this route cannot evaluate leaves the call to rdflib's
+    evaluator."""
+
+    def apply(env):
+        a, b = left(env), right(env)
+        if a is None or a is ERROR or b is None or b is ERROR:
+            return ERROR
+        if a is UNKNOWN or b is UNKNOWN:
+            return UNKNOWN
+        return fn(_as_term(a), _as_term(b))
+
+    return apply
 
 
 def _view(term):
@@ -106,17 +139,18 @@ def _compile_node(node, slots: dict, consts: dict):
     if name == "UnaryNot":
         inner = _compile(node.expr, slots, consts)
         return lambda env: values.logical_not(values.truth(inner(env)))
+    if name == "Builtin_BOUND":
+        if not isinstance(node.arg, VAR_LIKE):
+            raise _NotFast
+        arg = _compile(node.arg, slots, consts)
+        return lambda env: _bound(arg(env))
     one_arg = _ONE_ARG.get(name)
     if one_arg is not None:
-        if name == "Builtin_BOUND":
-            if not isinstance(node.arg, VAR_LIKE):
-                raise _NotFast
-        arg = _compile(node.arg, slots, consts)
-        return lambda env: one_arg(arg(env))
+        return _strict(one_arg, _compile(node.arg, slots, consts))
     two_args = _TWO_ARGS.get(name)
     if two_args is not None:
         a, b = _compile(node.arg1, slots, consts), _compile(node.arg2, slots, consts)
-        return lambda env: two_args(a(env), b(env))
+        return _strict2(two_args, a, b)
     if name == "Builtin_REGEX":
         return _compile_regex(node, slots, consts)
     raise _NotFast
@@ -174,11 +208,11 @@ def _compile_additive(node, slots, consts):
     ]
 
     def fn(env):
-        total = values.number(first(env))
+        total = _number(first(env))
         if total is ERROR or total is UNKNOWN:
             return total
         for subtract, operand in signed:
-            value = values.number(operand(env))
+            value = _number(operand(env))
             if value is ERROR or value is UNKNOWN:
                 return value
             total = values.add(total, value, subtract)
@@ -203,21 +237,13 @@ def _compile_relational(node, slots, consts):
             # A IN (B, ...) is A = B || ...: true when one comparison holds,
             # an error when none does and one errs (§17.4.1.9); NOT IN is its
             # negation, an error included.
-            a = left(env)
-            if a is None or a is ERROR:
-                return ERROR
-            if a is UNKNOWN:
-                return UNKNOWN
-            a = _as_term(a)
+            a = _as_term(left(env))
+            if a is ERROR or a is UNKNOWN:
+                return a
             pending = None
             for item in items:
-                b = item(env)
-                if b is None or b is ERROR:
-                    r = ERROR
-                elif b is UNKNOWN:
-                    r = UNKNOWN
-                else:
-                    r = values.value_eq(a, _as_term(b))
+                b = _as_term(item(env))
+                r = b if b is ERROR or b is UNKNOWN else values.value_eq(a, b)
                 if r is True:
                     return not negate
                 if r is not False and pending is not UNKNOWN:
@@ -228,49 +254,25 @@ def _compile_relational(node, slots, consts):
     if op not in ("=", "!=", "<", ">", "<=", ">="):
         raise _NotFast
     right = _compile(node.other, slots, consts)
-
-    def fn(env):
-        a, b = left(env), right(env)
-        if a is None or b is None or a is ERROR or b is ERROR:
-            return ERROR
-        if a is UNKNOWN or b is UNKNOWN:
-            return UNKNOWN
-        return values.compare(op, _as_term(a), _as_term(b))
-
-    return fn
+    return _strict2(partial(values.compare, op), left, right)
 
 
 def _is_kind(kind: str):
-    def fn(a):
-        if a is None or a is ERROR:
-            return ERROR
-        if a is UNKNOWN:
-            return UNKNOWN
-        return _as_term(a).kind == kind
-
-    return fn
+    return lambda a: a.kind == kind
 
 
 def _is_numeric(a):
-    if a is None or a is ERROR:
-        return ERROR
-    if a is UNKNOWN:
-        return UNKNOWN
-    return values.numeric_value(_as_term(a)) is not None
+    return values.numeric_value(a) is not None
 
 
 def _bound(a):
+    """``BOUND``, the one function of an unbound operand."""
     if a is UNKNOWN:
         return UNKNOWN
     return a is not None
 
 
 def _datatype(a):
-    if a is None or a is ERROR:
-        return ERROR
-    if a is UNKNOWN:
-        return UNKNOWN
-    a = _as_term(a)
     if a.kind != LITERAL:
         return ERROR
     if a.lang:
@@ -279,11 +281,6 @@ def _datatype(a):
 
 
 def _lang(a):
-    if a is None or a is ERROR:
-        return ERROR
-    if a is UNKNOWN:
-        return UNKNOWN
-    a = _as_term(a)
     if a.kind != LITERAL:
         return ERROR
     return TermView(LITERAL, a.lang or "")
@@ -292,42 +289,27 @@ def _lang(a):
 def _str(a):
     """``STR``: an IRI's string or a literal's lexical form as written; a
     blank node has none (§17.4.2.5)."""
-    if a is None or a is ERROR:
-        return ERROR
-    if a is UNKNOWN:
-        return UNKNOWN
-    a = _as_term(a)
     if a.kind == BLANK:
         return ERROR
     return TermView(LITERAL, a.lex)
 
 
-def _string_arg(a):
-    """A string function's argument: a simple, ``xsd:string`` or
-    language-tagged literal, or ``ERROR``."""
-    if a is UNKNOWN:
+def _number(value):
+    """An operand of ``+`` or ``-`` as the ``(rank, value)`` it contributes:
+    only a well-typed numeric literal is a number (§17.3), so any other
+    value — unbound, an error, a comparison's bool — is ``ERROR``; one this
+    route cannot evaluate stays ``UNKNOWN``."""
+    if value is UNKNOWN:
         return UNKNOWN
-    if values.string_like(a):
-        return a
-    return ERROR
-
-
-def _simple_arg(a):
-    """A simple literal (or ``xsd:string``) argument, or ``ERROR``."""
-    a = _string_arg(a)
-    if isinstance(a, TermView) and a.lang:
-        return ERROR
-    return a
+    operand = values.numeric_operand(value) if isinstance(value, TermView) else None
+    return ERROR if operand is None else operand
 
 
 def _lang_matches(tag, range_):
-    """``langMatches``: RFC 4647 basic filtering (§17.4.3.13). ``*`` matches
-    any non-empty tag; another range matches a tag equal to it or starting
-    with it and a hyphen, case-insensitively."""
-    tag, range_ = _simple_arg(tag), _simple_arg(range_)
-    if tag is UNKNOWN or range_ is UNKNOWN:
-        return UNKNOWN
-    if tag is ERROR or range_ is ERROR:
+    """``langMatches``: RFC 4647 basic filtering (§17.4.3.13), over two
+    simple literals. ``*`` matches any non-empty tag; another range matches a
+    tag equal to it or starting with it and a hyphen, case-insensitively."""
+    if not (values.simple_literal(tag) and values.simple_literal(range_)):
         return ERROR
     text, wanted = tag.lex.lower(), range_.lex.lower()
     if text == "":
@@ -338,31 +320,23 @@ def _lang_matches(tag, range_):
 
 
 def _str_op(op: Callable[[str, str], bool]):
+    """A string function of two string literals (§17.4.3), the second's
+    language tag, if any, the first's (argument compatibility,
+    §17.4.3.1.2)."""
+
     def fn(a, b):
-        a, b = _string_arg(a), _string_arg(b)
-        if a is UNKNOWN or b is UNKNOWN:
-            return UNKNOWN
-        if a is ERROR or b is ERROR:
+        if not (values.string_like(a) and values.string_like(b)):
             return ERROR
         if b.lang and a.lang != b.lang:
-            return ERROR  # argument compatibility (§17.4.3.1.2)
+            return ERROR
         return op(a.lex, b.lex)
 
     return fn
 
 
-def _same_term(a, b):
-    if a is None or b is None or a is ERROR or b is ERROR:
-        return ERROR
-    if a is UNKNOWN or b is UNKNOWN:
-        return UNKNOWN
-    return values.same_term(_as_term(a), _as_term(b))
-
-
 _ONE_ARG = {
     **{name: _is_kind(kind) for name, kind in exprs.KIND_BUILTINS.items()},
     "Builtin_isNUMERIC": _is_numeric,
-    "Builtin_BOUND": _bound,
     "Builtin_DATATYPE": _datatype,
     "Builtin_LANG": _lang,
     "Builtin_STR": _str,
@@ -374,7 +348,7 @@ _TWO_ARGS = {
     "Builtin_STRSTARTS": _str_op(str.startswith),
     "Builtin_STRENDS": _str_op(str.endswith),
     "Builtin_CONTAINS": _str_op(lambda a, b: b in a),
-    "Builtin_sameTerm": _same_term,
+    "Builtin_sameTerm": values.same_term,
 }
 
 
@@ -390,13 +364,15 @@ def _compile_regex(node, slots, consts):
     if spec is ERROR:
         return _const(ERROR)
     text = _compile(node.text, slots, consts)
-    regex = spec.regex
+    search = spec.regex.search
 
     def fn(env):
-        a = _string_arg(text(env))
-        if a is UNKNOWN or a is ERROR:
-            return a
-        return regex.search(a.lex) is not None
+        # Only a string literal has a text (§17.4.3.14): any other value —
+        # unbound, an error, a comparison's bool — is an error.
+        a = text(env)
+        if a is UNKNOWN:
+            return UNKNOWN
+        return search(a.lex) is not None if values.string_like(a) else ERROR
 
     return fn
 

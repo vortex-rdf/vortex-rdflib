@@ -250,10 +250,69 @@ SUMS = [
 def test_a_sum_is_spelled_as_rdflib_spells_it(left, right):
     values = filters.values
     total = values.add(
-        values.number(parse_spelling(left)), values.number(parse_spelling(right)), False
+        values.numeric_operand(parse_spelling(left)),
+        values.numeric_operand(parse_spelling(right)),
+        False,
     )
     [row] = Graph().query(f"SELECT ?r WHERE {{ BIND({left} + {right} AS ?r) }}")
     assert values.number_term(total) == parse_spelling(row[0].n3())
+
+
+#: One expression per leaf the fast route compiles, each a test of ``?v``.
+LEAVES = [
+    "isIRI(?v)",
+    "isBlank(?v)",
+    "isLiteral(?v)",
+    "isNumeric(?v)",
+    "datatype(?v) = xsd:string",
+    'lang(?v) = ""',
+    'str(?v) = ""',
+    "sameTerm(?v, <http://ex.org/x>)",
+    "?v = 5",
+    "?v < 5",
+    "?v IN (5, 6)",
+    "?v NOT IN (5, 6)",
+    "?v + 1 = 2",
+    'contains(?v, "a")',
+    'strstarts(?v, "a")',
+    'regex(?v, "a")',
+    'langMatches(?v, "*")',
+]
+
+
+@pytest.mark.parametrize("sparql_expr", LEAVES)
+def test_every_leaf_answers_the_operand_protocol_alike(sparql_expr):
+    """An unbound operand or an error makes a leaf an error — negated, still
+    an error, so no row passes — and an operand the fast route cannot
+    evaluate leaves the leaf to rdflib's evaluator."""
+    predicate = filters.compiler.compile_fast(filter_expr(f"!({sparql_expr})"), (V,), {})
+    assert predicate is not None
+    unknown = filters.values.UNKNOWN
+    assert predicate((None,)) is False
+    assert predicate((filters.values.ERROR,)) is False
+    assert predicate((unknown,)) is unknown
+
+
+@pytest.mark.parametrize(
+    "sparql_expr",
+    [
+        "sameTerm(?v, ?w)",
+        "?v = ?w",
+        "?v < ?w",
+        "contains(?v, ?w)",
+        "strends(?v, ?w)",
+        "langMatches(?v, ?w)",
+    ],
+)
+def test_an_error_operand_decides_before_an_unknown_one(sparql_expr):
+    """A function of an error is an error (§17.3), whatever its other
+    operand is: an error beside an operand the fast route cannot evaluate
+    is decided here, in either order."""
+    predicate = filters.compiler.compile_fast(filter_expr(sparql_expr), (V, W), {})
+    assert predicate is not None
+    error, unknown = filters.values.ERROR, filters.values.UNKNOWN
+    for env in ((error, unknown), (unknown, error), (None, unknown), (unknown, None)):
+        assert predicate(env) is False, env
 
 
 @pytest.mark.parametrize(

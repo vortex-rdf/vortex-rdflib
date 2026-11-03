@@ -252,19 +252,6 @@ def _common(a: tuple, b: tuple):
     return _promote(x, ra, rank), _promote(y, rb, rank)
 
 
-def number(value):
-    """The ``(rank, value)`` an evaluated value contributes to ``+`` or
-    ``-``, or ``ERROR``: only a well-typed numeric literal is a number
-    (§17.3); an unbound variable, a boolean, any other term or an error is a
-    type error."""
-    if value is UNKNOWN:
-        return UNKNOWN
-    if not isinstance(value, TermView):
-        return ERROR
-    operand = numeric_operand(value)
-    return ERROR if operand is None else operand
-
-
 def add(a: tuple, b: tuple, subtract: bool) -> tuple:
     """``A + B`` (or ``A - B``) over two numeric operands, in the wider of
     their types: exact for integers and decimals, IEEE for floats and

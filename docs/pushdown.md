@@ -648,7 +648,7 @@ Python evaluates a conjunct once per distinct value (or tuple of values), never
 once per row. It has two routes
 ([`evaluate_column`](../src/vortex_rdflib/filters/__init__.py#L215)):
 
-- **Fast route.** [`compile_fast`](../src/vortex_rdflib/filters/compiler.py#L404)
+- **Fast route.** [`compile_fast`](../src/vortex_rdflib/filters/compiler.py#L380)
   compiles a known set of expression shapes into a Python function that reads
   the term's spelling ([`parse_spelling`](../src/vortex_rdflib/terms.py#L76))
   instead of building an rdflib term. It covers comparisons, `IN`/`NOT IN`,
