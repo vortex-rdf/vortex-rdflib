@@ -7,7 +7,7 @@ row predicate applied to joined rows). No value is left to rdflib."""
 
 import pytest
 from rdflib import Graph
-from rdflib.term import Variable
+from rdflib.term import Literal, Variable
 from tests.corpus import SPELLINGS
 from tests.oracle import departs, spec_answer
 from tests.support import V, W, filter_expr, typed
@@ -430,3 +430,28 @@ def test_a_type_sparql_leaves_open_is_compared_by_rdflib(sparql_expr, expected):
     predicate = filters.compiler.compile_fast(filter_expr(sparql_expr), (V,), {})
     assert predicate is not None
     assert fast_answer(predicate, YEAR) is expected
+
+
+def test_a_filter_over_rdflib_rows_keeps_nothing_per_row(vortex_files):
+    """The FILTER above a block rdflib solved tests each solution from its
+    own terms: it registers none of them with the query and memoizes no
+    answer, so the query's memory does not grow with the rows it filters."""
+    from rdflib.plugins.sparql.algebra import translateQuery
+    from rdflib.plugins.sparql.parser import parseQuery
+    from rdflib.plugins.sparql.sparql import FrozenBindings, QueryContext
+
+    from vortex_rdflib import VortexRdflibStore, filters, query_scope
+
+    store = VortexRdflibStore(str(vortex_files["dictionary"]))
+    node = translateQuery(parseQuery("SELECT * WHERE { ?s ?p ?v FILTER(?v > 10) }")).algebra.p.p
+    ctx = QueryContext(graph=Graph(store=store), initBindings={})
+    v = Variable("v")
+    token = query_scope.enter(query_scope.QueryScope())
+    try:
+        keep = filters.solution_filter(store, node, ctx)
+        kept = [n for n in range(100) if keep(FrozenBindings(ctx, {v: Literal(n)}))]
+        terms = store._terms()
+        assert kept == list(range(11, 100))
+        assert terms.foreign == {} and terms.foreign_codes == {}
+    finally:
+        query_scope.leave(token)

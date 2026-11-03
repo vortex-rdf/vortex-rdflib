@@ -1379,8 +1379,8 @@ def test_str_of_a_number_is_answered_by_the_fast_route(graph, monkeypatch):
 
 def test_a_filter_over_a_block_rdflib_solves_answers_as_the_pushdown(graph, monkeypatch, capsys):
     """A join over the pair budget sends its block back to rdflib, which
-    solves the pattern; the FILTER above it is still the pushdown's, over the
-    stored terms, so the answer does not depend on how large the join got:
+    solves the pattern; the FILTER above it is still the pushdown's, over
+    rdflib's terms, so the answer does not depend on how large the join got:
     erin's ill-typed age orders against nothing (§17.3)."""
     sparql = (
         "SELECT ?a ?b WHERE { ?x <http://ex.org/age> ?a . ?y <http://ex.org/age> ?b "

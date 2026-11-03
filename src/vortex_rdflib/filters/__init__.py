@@ -322,48 +322,59 @@ def constant_predicate(conjunct: Conjunct) -> Callable[[Any], bool]:
 
 def solution_filter(store, node, ctx) -> Callable[[Any], bool]:
     """A ``Filter`` node's expression as a test of rdflib's own solutions —
-    the rows of a pattern the pushdown handed back to rdflib — answered as
-    the pushdown answers it, so the FILTER does not depend on which route
-    solved its pattern.
+    the rows of a pattern the pushdown handed back to rdflib — answered by
+    the pushdown's FILTER semantics, so the FILTER does not depend on which
+    route solved its pattern.
 
-    Each term goes back to the code it was decoded from
-    (:meth:`~vortex_rdflib.query_scope.QueryTerms.code_of`; a query constant
-    or a term of no code gets a negative one), and each conjunct is a
-    :func:`tuple_predicate` over those codes, memoized per distinct tuple. A
-    conjunct holding an EXISTS is rdflib's, over the whole solution, as
-    rdflib's ``evalFilter`` binds it. An expression the pushdown hands back
-    whole (a random or fresh-node call) raises ``NotImplementedError``."""
-    variables = tuple(exprs.expr_vars(node.expr))
-    position = {var: i for i, var in enumerate(variables)}
-    views: dict = {}
-    tests: list[Callable[[tuple, Any], bool]] = []
+    Each solution is tested from its own terms, each read as a data term is
+    (:func:`values.constant_view`): nothing is kept per solution, so the
+    query's memory does not grow with the rows it filters. A typed literal
+    rdflib normalized as it was decoded (``"042"^^xsd:integer`` reads
+    ``"42"``) is read as rdflib wrote it. A conjunct holding an EXISTS is
+    rdflib's, over the whole solution, as rdflib's ``evalFilter`` binds it.
+    An expression the pushdown hands back whole (a random or fresh-node
+    call) raises ``NotImplementedError``."""
+    tests: list[Callable[[Any], bool]] = []
     for conjunct_expr in exprs._flatten_and(node.expr, []):
         if exprs._is_impure(conjunct_expr):
             raise NotImplementedError
         if exprs.has_exists(conjunct_expr):
-            tests.append(lambda row, bound, expr=conjunct_expr: rdflib_ebv(expr, bound))
+            tests.append(lambda bound, expr=conjunct_expr: rdflib_ebv(expr, bound))
             continue
         referenced = tuple(exprs.expr_vars(conjunct_expr))
         conjunct = _compile_conjunct(conjunct_expr, referenced, {}, ctx, None)
         if not referenced:
             passes = evaluate_constant(conjunct)
-            tests.append(lambda row, bound, passes=passes: passes)
+            tests.append(lambda bound, passes=passes: passes)
             continue
-        predicate = tuple_predicate(store, conjunct, [position[v] for v in referenced], views)
-        tests.append(lambda row, bound, predicate=predicate: predicate(row))
-    terms = store._terms()
+        tests.append(_solution_test(conjunct, referenced))
     isolated = not getattr(node, "no_isolated_scope", False)
-
-    def code(term) -> int:
-        found = terms.code_of(term)
-        return store._foreign_code(term) if found is None else found
 
     def keep(solution) -> bool:
         bound = solution.forget(ctx, _except=node._vars) if isolated else solution
-        row = tuple(None if (term := bound.get(var)) is None else code(term) for var in variables)
-        return all(test(row, bound) for test in tests)
+        return all(test(bound) for test in tests)
 
     return keep
+
+
+def _solution_test(conjunct: Conjunct, variables: tuple) -> Callable[[Any], bool]:
+    """``conjunct`` as a test of one solution: its fast route over the views
+    of the solution's terms, rdflib's evaluator where that route leaves it
+    undecided."""
+    fast = conjunct.fast
+
+    def test(bound) -> bool:
+        terms = [bound.get(var) for var in variables]
+        r = UNKNOWN
+        if fast is not None:
+            r = fast(tuple(None if t is None else values.constant_view(t) for t in terms))
+        if r is UNKNOWN:
+            r = conjunct.generic(
+                {var: t for var, t in zip(variables, terms, strict=True) if t is not None}
+            )
+        return r is True
+
+    return test
 
 
 def tuple_fast_reject_predicate(

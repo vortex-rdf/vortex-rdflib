@@ -190,7 +190,7 @@ The head is what rdflib puts above a block:
 rdflib solutions, lazily:
 
 - It reads the rows in chunks that grow from 64 to 4096 rows
-  ([`SETTINGS.chunk_start`](../src/vortex_rdflib/settings.py#L210)), and checks the
+  ([`SETTINGS.chunk_start`](../src/vortex_rdflib/settings.py#L206)), and checks the
   query's cancel token before each one.
 - For each chunk, it decodes the codes the query's cache does not hold yet in
   one `TermDict.decode_many` call.
@@ -287,7 +287,7 @@ the join from the pattern sizes:
    back. Patterns with more bound terms are counted first — the point patterns
    (a bound subject, or a pattern a secondary index serves) one at a time —
    and a count of zero ends the block before anything is matched. A pattern
-   that counts at most [`SETTINGS.probe_fanout`](../src/vortex_rdflib/settings.py#L178)
+   that counts at most [`SETTINGS.probe_fanout`](../src/vortex_rdflib/settings.py#L174)
    (100) rows marks every pattern not yet counted that shares a variable with
    it: those join after it, so planning does not count them. When one's turn
    comes, it is counted only as far as the probe-or-match decision needs,
@@ -305,7 +305,7 @@ the join from the pattern sizes:
    product; an uncounted pattern ranks last) and joins it in one of three ways:
    - **Probe join** ([`_probe_join`](../src/vortex_rdflib/pushdown/probes.py#L241)),
      when the relation is at least
-     [`SETTINGS.probe_fanout`](../src/vortex_rdflib/settings.py#L178) (100) times
+     [`SETTINGS.probe_fanout`](../src/vortex_rdflib/settings.py#L174) (100) times
      smaller than the pattern's count and each probe is a point lookup (a
      bound subject, or a pattern a secondary index serves:
      [`OpenFile.point_lookup`](../src/vortex_rdflib/open_file.py#L64)). The pattern is
@@ -346,7 +346,7 @@ it is no term of the file.
 ### The pair budget
 
 A join can make as many rows as the product of its sides. The pair budget,
-[`SETTINGS.pair_budget`](../src/vortex_rdflib/settings.py#L172), bounds the pairs one
+[`SETTINGS.pair_budget`](../src/vortex_rdflib/settings.py#L168), bounds the pairs one
 join step of a BGP builds at once: 16,777,216 unless `VORTEX_RDF_PAIR_BUDGET`
 sets another value (see [Switches](#switches)). A step is guarded before it is
 built:
@@ -382,7 +382,7 @@ goes to the first of three tiers that takes it.
    when it shares exactly one variable with the relation, is gathered a piece
    at a time. The side with fewer rows is grouped on the shared variable
    (`U64Column.groups`), and the other side is fed through the groups in slices
-   of at most [`SETTINGS.piece_rows`](../src/vortex_rdflib/settings.py#L182) rows
+   of at most [`SETTINGS.piece_rows`](../src/vortex_rdflib/settings.py#L178) rows
    ([`_slices`](../src/vortex_rdflib/pushdown/relation.py#L253), `U64Column.slice`). A
    pattern that is not read yet and counts more rows than both the budget and
    the relation, or whose keep-scan came back over the budget, is not matched
@@ -418,7 +418,7 @@ goes to the first of three tiers that takes it.
    fewest unbound terms first
    ([`_most_bound_first`](../src/vortex_rdflib/pushdown/solutions.py#L88)). It reads
    them through `Store.triples`, which reads a pattern of more than
-   [`SETTINGS.triples_chunk_rows`](../src/vortex_rdflib/settings.py#L220) (65,536) rows
+   [`SETTINGS.triples_chunk_rows`](../src/vortex_rdflib/settings.py#L216) (65,536) rows
    from vortex-rdf in chunks of that many. Tier 3 has conditions, below.
 
 ### Streamed rows
@@ -454,7 +454,7 @@ the budget, and is dropped.
 
 `OPTIONAL`, a lazy group join and `EXISTS` keep their probes. A batch of probes
 that each scan is given a lookahead of
-[`SETTINGS.scan_lookahead`](../src/vortex_rdflib/settings.py#L203) (one per core,
+[`SETTINGS.scan_lookahead`](../src/vortex_rdflib/settings.py#L199) (one per core,
 eight at most): the native layer runs at most twice that many ahead of the
 pulls ([`_probe_lookahead`](../src/vortex_rdflib/pushdown/probes.py#L65)). A batch
 of point lookups names no lookahead and runs under the binding's default
@@ -503,12 +503,13 @@ A FILTER the hook evaluates follows SPARQL 1.1 (§17), not rdflib, where the
 two differ. That covers the fast route, the native predicates and the folding
 of constant subexpressions. It also covers a FILTER whose block the hook hands
 back to rdflib, such as a join over the pair budget: rdflib solves the
-pattern, and the hook filters its rows by the codes their terms were decoded
-from ([`solution_filter`](../src/vortex_rdflib/filters/__init__.py)), so the
-answer does not depend on which route solved the pattern. The hook reads every
-term as the data writes it. rdflib builds the terms a query returns with their
-lexical form normalized while `rdflib.NORMALIZE_LITERALS` is on, so
-`"042"^^xsd:integer` comes back as `"42"`.
+pattern, and the hook tests each of its rows from the row's own terms
+([`solution_filter`](../src/vortex_rdflib/filters/__init__.py)), keeping
+nothing per row, so the answer does not depend on which route solved the
+pattern. The hook reads every term as the data writes it, except on those
+rows: rdflib builds the terms it hands on, and those a query returns, with
+their lexical form normalized while `rdflib.NORMALIZE_LITERALS` is on, so
+`"042"^^xsd:integer` reaches such a FILTER, and comes back, as `"42"`.
 
 rdflib's semantics remain wherever rdflib evaluates:
 
@@ -832,7 +833,7 @@ SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p
   `value_counts` of the key column gives every group and its size. For
   `COUNT(DISTINCT ?v)`, each group's rows are gathered natively
   (`join_indices`, `take`, `distinct`) when there are few groups
-  ([`SETTINGS.native_groups_max`](../src/vortex_rdflib/settings.py#L215)), and read
+  ([`SETTINGS.native_groups_max`](../src/vortex_rdflib/settings.py#L211)), and read
   from the distinct (key, value) pairs otherwise. Other bodies are counted in a
   Python loop.
 
@@ -1138,7 +1139,7 @@ Every variable is read in [`settings.py`](../src/vortex_rdflib/settings.py),
 which says when, by one parser per kind of value: an on/off switch takes `1`,
 `true`, `yes` or `on`, and `0`, `false`, `no` or `off`; a size takes an
 integer. Nothing is read on import. Each time a store is constructed or the
-hook registered, [`apply_switches`](../src/vortex_rdflib/settings.py#L247)
+hook registered, [`apply_switches`](../src/vortex_rdflib/settings.py#L243)
 reads every switch but the trace — the README lists the ablation and debugging
 ones too — before it changes any setting; each moves a setting away from its
 default and never back, and a value it refuses raises `ValueError` naming the
