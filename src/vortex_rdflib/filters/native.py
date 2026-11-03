@@ -42,8 +42,8 @@ from .. import boundary, trace
 from ..settings import SETTINGS
 from ..terms import BLANK, IRI, LITERAL, KindRanges, canonical_spelling
 from . import exprs, values
-from .exprs import _VAR_LIKE
-from .values import _FLOAT, _RDF_NIL, _XSD_STRING, ERROR, NUMERIC_TYPES
+from .exprs import VAR_LIKE
+from .values import FLOAT, NUMERIC_TYPES, RDF_NIL
 
 
 class NativeShape(NamedTuple):
@@ -64,6 +64,7 @@ class NativeShape(NamedTuple):
 
 #: The kind tests, each its kind's code range.
 KIND_TESTS = {"is_literal": LITERAL, "is_iri": IRI, "is_blank": BLANK}
+_KIND_SHAPES = {kind: name for name, kind in KIND_TESTS.items()}
 
 
 #: IRI equality: true for exactly the IRIs ``NativeShape.arg`` spells.
@@ -128,10 +129,9 @@ def evaluate(store, shape: NativeShape, codes: Collection[int]) -> tuple[set, li
     iri_lo, iri_hi = ranges.range(IRI)
     blank_lo, blank_hi = ranges.range(BLANK)
     passed: set = set()
-    # str_prefix is STRSTARTS(STR(?v), ...): it reads STR() like the string
-    # kinds under as_str, and filter_codes reads an IRI or a typed literal as
-    # STR() only under as_str.
-    as_str = shape.kind == "str_prefix" or (shape.kind in STRING_KINDS and shape.as_str)
+    # Under as_str (STR(?v): str_prefix always, the string kinds when asked)
+    # filter_codes reads an IRI or a typed literal as STR().
+    as_str = shape.as_str
     if as_str:
         # STR(?v): an IRI reads as its string, a blank node as its label.
         undecided.extend(code for code in codes if blank_lo <= code < blank_hi)
@@ -151,7 +151,7 @@ def evaluate(store, shape: NativeShape, codes: Collection[int]) -> tuple[set, li
     if shape.kind in NUMERIC_KINDS:
         # vortex-rdf compares an xsd:float as a double, where XPath rounds it
         # to single precision: those go to the Python routes.
-        floats = _codes(store, "datatype", _FLOAT, column)
+        floats = _codes(store, "datatype", FLOAT, column)
         if floats is None:
             undecided.extend(inside)
             return passed, undecided
@@ -260,17 +260,14 @@ def _call_on(node, name: str, var) -> bool:
 
 
 def _string_literal(term) -> bool:
-    """rdflib's ``string()``: a plain, ``xsd:string`` or language-tagged
-    literal."""
-    return isinstance(term, Literal) and (
-        term.datatype is None or str(term.datatype) == _XSD_STRING
-    )
+    """A string literal SPARQL's string functions take (:func:`values.string_like`)."""
+    return term is not None and values.string_like(values.constant_view(term))
 
 
 def _string_constant(term) -> bool:
-    """A plain or ``xsd:string`` literal: what the native string predicates
-    take as their argument."""
-    return _string_literal(term) and term.language is None
+    """A simple literal: what the native string predicates take as their
+    argument (:func:`values.simple_literal`)."""
+    return term is not None and values.simple_literal(values.constant_view(term))
 
 
 #: The string functions with a native kind, by rdflib's builtin name.
@@ -292,7 +289,7 @@ def _text_shape(node, var) -> tuple[str | None, bool] | None:
     case = None
     if isinstance(node, CompValue) and node.name in _CASE_WRAPPERS:
         case, node = _CASE_WRAPPERS[node.name], node.arg
-    if isinstance(node, _VAR_LIKE) and node == var:
+    if isinstance(node, VAR_LIKE) and node == var:
         return case, False
     if _call_on(node, "Builtin_STR", var):
         return case, True
@@ -319,28 +316,23 @@ def _string_function_shape(expr, var, consts) -> NativeShape | None:
 
 
 def _regex_shape(expr, var, consts) -> NativeShape | None:
-    """REGEX of ``var``'s text with a constant string pattern and flags.
-
-    A pattern or flags the fast route reads as an error (an invalid pattern,
-    a flag outside XPath's), and XPath's ``x`` and ``q``, which vortex-rdf
-    does not read, stay with the Python routes."""
+    """REGEX of ``var``'s text with a pattern and flags read once, as the
+    fast route reads them (:func:`values.regex_spec`). A pattern or flags
+    every call errs on, a pattern only rdflib can compile, and XPath's ``x``
+    and ``q``, which vortex-rdf does not read, stay with the Python
+    routes."""
     text = _text_shape(expr.text, var)
-    pattern = _constant_term(expr.pattern, consts)
-    flags = None if expr.flags is None else _constant_term(expr.flags, consts)
-    if text is None or not _string_literal(pattern):
+    if text is None:
         return None
-    if expr.flags is not None and not _string_literal(flags):
+    pattern = values.fold(expr.pattern, consts)
+    flags = None if expr.flags is None else values.fold(expr.flags, consts)
+    if pattern is None or (expr.flags is not None and flags is None):
         return None
-    checked = values.regex_flags(None if flags is None else str(flags))
-    if checked is ERROR or "x" in checked or "q" in checked:
-        return None
-    try:
-        if values.compile_regex(str(pattern), checked) is ERROR:
-            return None
-    except values.COMPILE_ERRORS:
+    spec = values.regex_spec(pattern, flags)
+    if not isinstance(spec, values.RegexSpec) or "x" in spec.flags or "q" in spec.flags:
         return None
     case, as_str = text
-    return NativeShape("regex", str(pattern), flags=checked, case=case, as_str=as_str)
+    return NativeShape("regex", spec.pattern, flags=spec.flags, case=case, as_str=as_str)
 
 
 #: IRIs ``canonical_spelling`` spells as an N-Triples IRIREF.
@@ -361,7 +353,7 @@ def _iri_equality(left, right, var, consts) -> NativeShape | None:
     for exactly that IRI — rdflib's ``eq`` and ``==`` are term equality for
     an IRI, and no literal or blank node equals one."""
     for side, other in ((left, right), (right, left)):
-        if isinstance(side, _VAR_LIKE) and side == var:
+        if isinstance(side, VAR_LIKE) and side == var:
             spelling = _iri_spelling(other, consts)
             return None if spelling is None else NativeShape(IRI_IN, (spelling,))
     return None
@@ -371,10 +363,10 @@ def _iri_list(left, right, var, consts) -> NativeShape | None:
     """``var IN (<iri>, ...)``: true for exactly those IRIs. rdflib's parser
     spells an empty list as rdf:nil, which its evaluator reads back as the
     empty list."""
-    if not (isinstance(left, _VAR_LIKE) and left == var):
+    if not (isinstance(left, VAR_LIKE) and left == var):
         return None
     if not isinstance(right, list):
-        return NativeShape(IRI_IN, ()) if right == _RDF_NIL else None
+        return NativeShape(IRI_IN, ()) if right == RDF_NIL else None
     spellings = []
     for node in right:
         spelling = _iri_spelling(node, consts)
@@ -385,22 +377,10 @@ def _iri_list(left, right, var, consts) -> NativeShape | None:
 
 
 def _constant_term(node, consts: dict):
-    """The rdflib term an operand without block variables evaluates to: a
-    constant, a visible ctx-bound variable, or an expression over those,
-    which rdflib's own evaluator computes. ``None`` for an error or a value
-    that is not a term."""
-    if isinstance(node, (Literal, URIRef)):
-        return node
-    if isinstance(node, _VAR_LIKE):
-        term = consts.get(node)
-        return term if isinstance(term, (Literal, URIRef)) else None
-    if not isinstance(node, CompValue) or any(v not in consts for v in exprs.expr_vars(node)):
-        return None
-    try:
-        result = node.eval(dict(consts))
-    except Exception:  # noqa: BLE001 - not a value this route can rely on
-        return None
-    return result if isinstance(result, (Literal, URIRef)) else None
+    """The rdflib term an operand without block variables evaluates to
+    (:func:`values.fold`), or ``None`` — for an error too."""
+    term = values.fold(node, consts)
+    return term if isinstance(term, (Literal, URIRef)) else None
 
 
 def native_shape(expr, var, consts: dict) -> NativeShape | None:
@@ -436,13 +416,9 @@ def _native_shape(expr, var, consts: dict) -> NativeShape | None:
     if not isinstance(expr, CompValue):
         return None
     name = expr.name
-    if name in ("Builtin_isIRI", "Builtin_isURI", "Builtin_isBLANK", "Builtin_isLITERAL"):
-        if expr.arg != var:
-            return None
-        kind = {"Builtin_isBLANK": "is_blank", "Builtin_isLITERAL": "is_literal"}.get(
-            name, "is_iri"
-        )
-        return NativeShape(kind, "")
+    tested = exprs.KIND_BUILTINS.get(name)
+    if tested is not None:
+        return NativeShape(_KIND_SHAPES[tested], "") if expr.arg == var else None
     if name == "Builtin_LANGMATCHES":
         if not _call_on(expr.arg1, "Builtin_LANG", var):
             return None
@@ -455,7 +431,7 @@ def _native_shape(expr, var, consts: dict) -> NativeShape | None:
     if name == "Builtin_STRSTARTS" and _call_on(expr.arg1, "Builtin_STR", var):
         prefix = _constant_term(expr.arg2, consts)
         if _string_constant(prefix):
-            return NativeShape("str_prefix", str(prefix))
+            return NativeShape("str_prefix", str(prefix), as_str=True)
     if name in _STRING_FUNCTIONS:
         return _string_function_shape(expr, var, consts)
     if name == "Builtin_REGEX":
@@ -485,9 +461,9 @@ def _native_shape(expr, var, consts: dict) -> NativeShape | None:
     kind = _NUM_KINDS.get(op)
     if kind is None:
         return None
-    if isinstance(left, _VAR_LIKE) and left == var:
+    if isinstance(left, VAR_LIKE) and left == var:
         constant = _constant_term(right, consts)
-    elif isinstance(right, _VAR_LIKE) and right == var:
+    elif isinstance(right, VAR_LIKE) and right == var:
         constant = _constant_term(left, consts)
         kind = _NUM_KINDS[_SWAPPED[op]]
     else:
@@ -497,7 +473,7 @@ def _native_shape(expr, var, consts: dict) -> NativeShape | None:
     if (
         not isinstance(constant, Literal)
         or str(constant.datatype) not in NUMERIC_TYPES
-        or str(constant.datatype) == _FLOAT
+        or str(constant.datatype) == FLOAT
         or values.numeric_value(values.constant_view(constant)) is None
     ):
         return None

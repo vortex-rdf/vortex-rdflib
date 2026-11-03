@@ -7,7 +7,7 @@ row predicate applied to joined rows). No value is left to rdflib."""
 
 import pytest
 from rdflib import Graph
-from rdflib.term import Literal, Variable
+from rdflib.term import Literal, URIRef, Variable
 from tests.corpus import SPELLINGS
 from tests.oracle import departs, spec_answer
 from tests.support import V, W, filter_expr, typed
@@ -283,8 +283,8 @@ def test_an_out_of_range_typed_constant_equals_only_itself():
 
 def test_ctx_bound_constants_are_substituted():
     expr = filter_expr("?v = ?w")
-    view = parse_spelling(typed("5", "integer"))
-    predicate = filters.compiler.compile_fast(expr, (V,), {Variable("w"): view})
+    five = Literal("5", datatype=URIRef(f"{XSD}integer"))
+    predicate = filters.compiler.compile_fast(expr, (V,), {Variable("w"): five})
     assert predicate is not None
     assert fast_answer(predicate, typed("05", "integer")) is True
     assert fast_answer(predicate, typed("6", "integer")) is False

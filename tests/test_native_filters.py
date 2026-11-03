@@ -83,7 +83,7 @@ MAPPED: list[tuple[str, tuple]] = [
     ("datatype(?v) = xsd:integer", ("datatype", XSD + "integer")),
     ("xsd:integer = datatype(?v)", ("datatype", XSD + "integer")),
     ("datatype(?v) = xsd:string", ("datatype", XSD + "string")),
-    ("datatype(?v) = rdf:langString", ("datatype", f"{filters.values._RDF_LANGSTRING}")),
+    ("datatype(?v) = rdf:langString", ("datatype", f"{filters.values.RDF_LANGSTRING}")),
     ("datatype(?v) = <http://ex.org/dt>", ("datatype", "http://ex.org/dt")),
     ('lang(?v) = "en"', ("lang", "en")),
     ('"en" = lang(?v)', ("lang", "en")),
@@ -92,13 +92,13 @@ MAPPED: list[tuple[str, tuple]] = [
     ('langMatches(lang(?v), "EN")', ("lang_matches", "EN")),
     ('langMatches(lang(?v), "*")', ("lang_matches", "*")),
     ('langMatches(lang(?v), "en-US")', ("lang_matches", "en-US")),
-    ('strstarts(str(?v), "http")', ("str_prefix", "http")),
-    ('strstarts(str(?v), "http://ex.org/x")', ("str_prefix", "http://ex.org/x")),
-    ('strstarts(str(?v), "a")', ("str_prefix", "a")),
-    ('strstarts(str(?v), "")', ("str_prefix", "")),
-    ('strstarts(str(?v), "é")', ("str_prefix", "é")),
-    ('strstarts(str(?v), "tab\\t")', ("str_prefix", "tab\t")),
-    ('strstarts(str(?v), "b"^^xsd:string)', ("str_prefix", "b")),
+    ('strstarts(str(?v), "http")', ("str_prefix", "http", "", None, True)),
+    ('strstarts(str(?v), "http://ex.org/x")', ("str_prefix", "http://ex.org/x", "", None, True)),
+    ('strstarts(str(?v), "a")', ("str_prefix", "a", "", None, True)),
+    ('strstarts(str(?v), "")', ("str_prefix", "", "", None, True)),
+    ('strstarts(str(?v), "é")', ("str_prefix", "é", "", None, True)),
+    ('strstarts(str(?v), "tab\\t")', ("str_prefix", "tab\t", "", None, True)),
+    ('strstarts(str(?v), "b"^^xsd:string)', ("str_prefix", "b", "", None, True)),
 ]
 _INT = f'"5"^^<{XSD}integer>'
 for _op, _kind in filters.native._NUM_KINDS.items():
@@ -371,7 +371,9 @@ def test_str_of_a_blank_node_is_left_to_the_python_routes(spelling_store, monkey
     assert blanks and iris
     recording = RecordingTermDict(spelling_store._dict)
     monkeypatch.setattr(spelling_store, "_dict", recording)
-    _, undecided = native.evaluate(spelling_store, NativeShape("str_prefix", "a"), codes)
+    _, undecided = native.evaluate(
+        spelling_store, NativeShape("str_prefix", "a", as_str=True), codes
+    )
     assert blanks <= set(undecided)
     [sent] = recording.sent
     assert not set(sent) & blanks and iris <= set(sent)
@@ -406,7 +408,7 @@ def test_an_argument_vortex_rdf_cannot_take_leaves_every_candidate_undecided(spe
         NativeShape("iri_in", ("<http://ex.org/x>", "<urn:x>")),
         NativeShape("num_ne", f'"5"^^<{XSD}integer>'),
         NativeShape("num_lt", f'"5"^^<{XSD}integer>'),
-        NativeShape("str_prefix", "a"),
+        NativeShape("str_prefix", "a", as_str=True),
         NativeShape("regex", "a"),
         NativeShape("regex", "a|\ud800"),
     ],

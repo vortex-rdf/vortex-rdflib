@@ -8,28 +8,25 @@ names no operator for) is left ``UNKNOWN`` for rdflib's evaluator.
 from collections.abc import Callable
 
 from rdflib.plugins.sparql.parserutils import CompValue
-from rdflib.plugins.sparql.sparql import SPARQLError
 from rdflib.term import Literal, URIRef
 
 from ..terms import BLANK, IRI, LITERAL, TermView
 from . import exprs, values
-from .exprs import _VAR_LIKE
+from .exprs import VAR_LIKE
 from .values import (
-    _RDF_LANGSTRING,
-    _RDF_NIL,
-    _XSD_BOOLEAN,
-    _XSD_STRING,
     ERROR,
+    RDF_LANGSTRING,
+    RDF_NIL,
     UNKNOWN,
+    XSD_BOOLEAN,
+    XSD_STRING,
     constant_view,
 )
 
-_KIND_LEAVES = frozenset(
-    {"Builtin_isIRI", "Builtin_isURI", "Builtin_isBLANK", "Builtin_isLITERAL", "Builtin_BOUND"}
-)
+_KIND_LEAVES = frozenset({*exprs.KIND_BUILTINS, "Builtin_BOUND"})
 
-_TRUE = TermView(LITERAL, "true", dt=_XSD_BOOLEAN)
-_FALSE = TermView(LITERAL, "false", dt=_XSD_BOOLEAN)
+_TRUE = TermView(LITERAL, "true", dt=XSD_BOOLEAN)
+_FALSE = TermView(LITERAL, "false", dt=XSD_BOOLEAN)
 
 
 class _NotFast(Exception):
@@ -51,41 +48,48 @@ def _as_term(value):
     return value
 
 
-def _rdflib_fold(node):
-    """A variable-free subexpression the whitelist does not cover, evaluated
-    once by rdflib (the generic route's semantics); an error stays one."""
+def _view(term):
+    """A context-bound term's view; a value no view holds leaves the
+    conjunct to rdflib's evaluator."""
     try:
-        result = node.eval({})
-    except Exception as error:
+        return constant_view(term)
+    except TypeError as error:
         raise _NotFast from error
-    if isinstance(result, (Literal, URIRef)):
-        return constant_view(result)
-    if isinstance(result, SPARQLError):
-        return ERROR
-    raise _NotFast
+
+
+def _folded(node, consts: dict):
+    """A subexpression without block variables the whitelist leaves
+    undecided, evaluated once by rdflib (:func:`values.fold`); one rdflib
+    cannot evaluate leaves the conjunct to its evaluator."""
+    value = values.fold(node, consts)
+    if value is None:
+        raise _NotFast
+    return value if value is ERROR else constant_view(value)
 
 
 def _compile(node, slots: dict, consts: dict):
     """Compile an expression node to ``env -> value`` where ``env`` is the
     tuple of term views of the conjunct's block variables (``None`` for an
     unbound variable) and the value is a term view, a bool, ``None``
-    (unbound), ``ERROR`` or ``UNKNOWN``. A variable-free subexpression is
-    evaluated once, here."""
-    if isinstance(node, _VAR_LIKE):
+    (unbound), ``ERROR`` or ``UNKNOWN``. ``consts`` maps the context-bound
+    variables to rdflib terms. A subexpression that reads no block variable
+    is evaluated once, here: by the whitelist, else by rdflib."""
+    if isinstance(node, VAR_LIKE):
         if node in slots:
             index = slots[node]
             return lambda env: env[index]
-        return _const(consts.get(node))
+        term = consts.get(node)
+        return _const(None if term is None else _view(term))
     if isinstance(node, (Literal, URIRef)):
         return _const(constant_view(node))
     if not isinstance(node, CompValue):
         raise _NotFast
-    if not exprs.expr_vars(node):
+    if not any(v in slots for v in exprs.expr_vars(node)):
         try:
             value = _compile_node(node, slots, consts)(())
         except _NotFast:
             value = UNKNOWN
-        return _const(_rdflib_fold(node) if value is UNKNOWN else value)
+        return _const(_folded(node, consts) if value is UNKNOWN else value)
     return _compile_node(node, slots, consts)
 
 
@@ -106,7 +110,7 @@ def _compile_node(node, slots: dict, consts: dict):
     one_arg = _ONE_ARG.get(name)
     if one_arg is not None:
         if name == "Builtin_BOUND":
-            if not isinstance(node.arg, _VAR_LIKE):
+            if not isinstance(node.arg, VAR_LIKE):
                 raise _NotFast
         arg = _compile(node.arg, slots, consts)
         return lambda env: one_arg(arg(env))
@@ -192,7 +196,7 @@ def _compile_relational(node, slots, consts):
     if op in ("IN", "NOT IN"):
         others = node.other
         if not isinstance(others, list):
-            others = [] if others == _RDF_NIL else [others]
+            others = [] if others == RDF_NIL else [others]
         items = [_compile(x, slots, consts) for x in others]
         negate = op == "NOT IN"
 
@@ -271,8 +275,8 @@ def _datatype(a):
     if a.kind != LITERAL:
         return ERROR
     if a.lang:
-        return TermView(IRI, _RDF_LANGSTRING)
-    return TermView(IRI, a.dt or _XSD_STRING)
+        return TermView(IRI, RDF_LANGSTRING)
+    return TermView(IRI, a.dt or XSD_STRING)
 
 
 def _lang(a):
@@ -304,7 +308,7 @@ def _string_arg(a):
     language-tagged literal, or ``ERROR``."""
     if a is UNKNOWN:
         return UNKNOWN
-    if values._string_like(a):
+    if values.string_like(a):
         return a
     return ERROR
 
@@ -357,10 +361,7 @@ def _same_term(a, b):
 
 
 _ONE_ARG = {
-    "Builtin_isIRI": _is_kind(IRI),
-    "Builtin_isURI": _is_kind(IRI),
-    "Builtin_isBLANK": _is_kind(BLANK),
-    "Builtin_isLITERAL": _is_kind(LITERAL),
+    **{name: _is_kind(kind) for name, kind in exprs.KIND_BUILTINS.items()},
     "Builtin_isNUMERIC": _is_numeric,
     "Builtin_BOUND": _bound,
     "Builtin_DATATYPE": _datatype,
@@ -379,27 +380,22 @@ _TWO_ARGS = {
 
 
 def _compile_regex(node, slots, consts):
-    """``REGEX`` with a constant pattern and flags, read as XPath's
-    ``fn:matches`` (:func:`.values.compile_regex`). A pattern or flags that
-    are not simple literals, invalid flags or an invalid pattern make every
-    call an error; a pattern ``re`` cannot compile leaves the conjunct to
-    rdflib's evaluator, which raises where it reads one."""
-    pattern, flags = node.pattern, node.flags
-    if not isinstance(pattern, Literal) or (flags is not None and not isinstance(flags, Literal)):
+    """``REGEX`` with a pattern and flags that read no block variable, read
+    as XPath's ``fn:matches`` (:func:`.values.regex_spec`): a pattern or
+    flags every call errs on make it an error; a pattern ``re`` cannot
+    compile, or one read per row, leaves the conjunct to rdflib's
+    evaluator."""
+    pattern = values.fold(node.pattern, consts)
+    flags = None if node.flags is None else values.fold(node.flags, consts)
+    if pattern is None or (node.flags is not None and flags is None):
         raise _NotFast
+    spec = values.regex_spec(pattern, flags)
+    if spec is None:
+        raise _NotFast
+    if spec is ERROR:
+        return _const(ERROR)
     text = _compile(node.text, slots, consts)
-    pattern_view = constant_view(pattern)
-    flags_view = None if flags is None else constant_view(flags)
-    if _simple_arg(pattern_view) is ERROR or (
-        flags_view is not None and _simple_arg(flags_view) is ERROR
-    ):
-        return _const(ERROR)
-    try:
-        regex = values.compile_regex(str(pattern), None if flags is None else str(flags))
-    except values.COMPILE_ERRORS as error:
-        raise _NotFast from error
-    if regex is ERROR:
-        return _const(ERROR)
+    regex = spec.regex
 
     def fn(env):
         a = _string_arg(text(env))
@@ -414,7 +410,8 @@ def compile_fast(expr, variables: tuple, consts: dict) -> Callable | None:
     """Compile ``expr`` into a predicate ``env -> True | False | UNKNOWN``
     over the term views of ``variables`` (in order), or ``None`` when the
     expression is outside the whitelist. ``consts`` maps the visible
-    ctx-bound variables to their views; every other variable is unbound."""
+    ctx-bound variables to their rdflib terms; every other variable is
+    unbound."""
     slots = {v: i for i, v in enumerate(variables)}
     try:
         node = _compile(expr, slots, consts)
@@ -430,13 +427,13 @@ def compile_fast(expr, variables: tuple, consts: dict) -> Callable | None:
 
 def is_kind_only(expr) -> bool:
     """Whether the fast predicate only needs each variable's term kind."""
-    if isinstance(expr, _VAR_LIKE):
+    if isinstance(expr, VAR_LIKE):
         return False  # a bare variable is evaluated as a term
     if not isinstance(expr, CompValue):
         return True
     name = expr.name
     if name in _KIND_LEAVES:
-        return isinstance(expr.arg, _VAR_LIKE)
+        return isinstance(expr.arg, VAR_LIKE)
     if name in ("ConditionalAndExpression", "ConditionalOrExpression"):
         return expr.other is not None and all(is_kind_only(x) for x in [expr.expr, *expr.other])
     if name == "UnaryNot":

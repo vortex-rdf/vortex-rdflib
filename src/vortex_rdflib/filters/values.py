@@ -15,11 +15,15 @@ import re
 import struct
 from decimal import MAX_EMAX, MAX_PREC, MIN_EMIN, Context, Decimal, InvalidOperation
 from fractions import Fraction
+from typing import NamedTuple
 
 from rdflib.plugins.sparql.datatypes import XSD_DTs
-from rdflib.term import URIRef
+from rdflib.plugins.sparql.parserutils import CompValue
+from rdflib.plugins.sparql.sparql import SPARQLError
+from rdflib.term import Literal, URIRef
 
 from ..terms import LITERAL, TermView, canonical_spelling, parse_spelling
+from .exprs import VAR_LIKE, expr_vars
 
 
 class _Sentinel:
@@ -41,10 +45,10 @@ UNKNOWN = _Sentinel("UNKNOWN")
 _XSD = "http://www.w3.org/2001/XMLSchema#"
 
 
-_XSD_STRING = _XSD + "string"
+XSD_STRING = _XSD + "string"
 
 
-_XSD_BOOLEAN = _XSD + "boolean"
+XSD_BOOLEAN = _XSD + "boolean"
 
 
 _XSD_INTEGER = _XSD + "integer"
@@ -56,12 +60,12 @@ _XSD_DATETIME = _XSD + "dateTime"
 _XSD_DATE = _XSD + "date"
 
 
-_RDF_LANGSTRING = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+RDF_LANGSTRING = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
 
 
 #: How rdflib's parser spells ``IN ()``; its evaluator reads it back as the
 #: empty list.
-_RDF_NIL = URIRef("http://www.w3.org/1999/02/22-rdf-syntax-ns#nil")
+RDF_NIL = URIRef("http://www.w3.org/1999/02/22-rdf-syntax-ns#nil")
 
 
 _XSD_DTS = frozenset(str(dt) for dt in XSD_DTs)
@@ -92,13 +96,13 @@ _INT_LIKE = frozenset(
 _DECIMAL = _XSD + "decimal"
 
 
-_FLOAT = _XSD + "float"
+FLOAT = _XSD + "float"
 
 
 _DOUBLE = _XSD + "double"
 
 
-NUMERIC_TYPES = _INT_LIKE | {_DECIMAL, _FLOAT, _DOUBLE}
+NUMERIC_TYPES = _INT_LIKE | {_DECIMAL, FLOAT, _DOUBLE}
 
 
 _RANGES = {
@@ -130,7 +134,7 @@ _INTEGER_RANK, _DECIMAL_RANK, _FLOAT_RANK, _DOUBLE_RANK = range(4)
 
 _RANK = dict.fromkeys(_INT_LIKE, _INTEGER_RANK) | {
     _DECIMAL: _DECIMAL_RANK,
-    _FLOAT: _FLOAT_RANK,
+    FLOAT: _FLOAT_RANK,
     _DOUBLE: _DOUBLE_RANK,
 }
 
@@ -200,7 +204,7 @@ def _parsed_number(dt: str, lex: str):
     if not _FLOAT_LEX.fullmatch(lex):
         return None
     value = float(lex.replace("INF", "inf"))
-    return _nearest_single(value, lambda: Decimal(lex)) if dt == _FLOAT else value
+    return _nearest_single(value, lambda: Decimal(lex)) if dt == FLOAT else value
 
 
 def numeric_operand(view: TermView):
@@ -292,7 +296,7 @@ def _float_spelling(value: float, single: bool) -> str:
 
 
 #: The datatype of an arithmetic result of each rank.
-_RANK_TYPE = (_XSD_INTEGER, _DECIMAL, _FLOAT, _DOUBLE)
+_RANK_TYPE = (_XSD_INTEGER, _DECIMAL, FLOAT, _DOUBLE)
 
 
 def number_term(operand: tuple) -> TermView:
@@ -423,7 +427,7 @@ def _left_open(view: TermView) -> bool:
         dt is not None
         and dt.startswith(_XSD)
         and dt not in NUMERIC_TYPES
-        and dt not in (_XSD_STRING, _XSD_BOOLEAN, _XSD_DATETIME, _XSD_DATE)
+        and dt not in (XSD_STRING, XSD_BOOLEAN, _XSD_DATETIME, _XSD_DATE)
     )
 
 
@@ -434,12 +438,12 @@ def literal_value(view: TermView):
     if view.lang:
         return _LANG, (view.lex, view.lang.lower())
     dt = view.dt
-    if dt is None or dt == _XSD_STRING:
+    if dt is None or dt == XSD_STRING:
         return _STRING, view.lex
     if dt in NUMERIC_TYPES:
         operand = numeric_operand(view)
         return None if operand is None else (_NUMERIC, operand)
-    if dt == _XSD_BOOLEAN:
+    if dt == XSD_BOOLEAN:
         if view.lex in ("true", "1"):
             return _BOOLEAN, True
         if view.lex in ("false", "0"):
@@ -460,14 +464,44 @@ def constant_view(node) -> TermView:
     return parse_spelling(canonical_spelling(node))
 
 
-def _string_like(view) -> bool:
+def string_like(view) -> bool:
     """A string literal SPARQL's string functions accept: simple, xsd:string
     or language-tagged."""
     return (
         isinstance(view, TermView)
         and view.kind == LITERAL
-        and (view.dt is None or view.dt == _XSD_STRING)
+        and (view.dt is None or view.dt == XSD_STRING)
     )
+
+
+def simple_literal(view) -> bool:
+    """A simple literal (or its ``xsd:string`` twin): a :func:`string_like`
+    without a language tag."""
+    return string_like(view) and not view.lang
+
+
+def fold(node, consts: dict):
+    """An operand without block variables — a constant, a context-bound
+    variable (``consts`` maps those to rdflib terms), or an expression over
+    them — evaluated once by rdflib's own evaluator: the rdflib term it
+    evaluates to, ``ERROR`` for an error value, or ``None`` for an operand
+    that reads any other variable, one rdflib cannot evaluate, or a value no
+    term holds. The fast route's compiler reads what its whitelist leaves
+    through it, and the native recognizer every constant."""
+    if isinstance(node, (Literal, URIRef)):
+        return node
+    if isinstance(node, VAR_LIKE):
+        term = consts.get(node)
+        return term if isinstance(term, (Literal, URIRef)) else None
+    if not isinstance(node, CompValue) or any(v not in consts for v in expr_vars(node)):
+        return None
+    try:
+        result = node.eval(dict(consts))
+    except Exception:  # noqa: BLE001 - an operand this route cannot rely on
+        return None
+    if isinstance(result, SPARQLError):
+        return ERROR
+    return result if isinstance(result, (Literal, URIRef)) else None
 
 
 def same_term(a: TermView, b: TermView) -> bool:
@@ -477,8 +511,8 @@ def same_term(a: TermView, b: TermView) -> bool:
         return False
     if a.kind != LITERAL:
         return True
-    dta = None if a.dt == _XSD_STRING else a.dt
-    dtb = None if b.dt == _XSD_STRING else b.dt
+    dta = None if a.dt == XSD_STRING else a.dt
+    dtb = None if b.dt == XSD_STRING else b.dt
     return dta == dtb and (a.lang or "").lower() == (b.lang or "").lower()
 
 
@@ -569,9 +603,9 @@ def truth(value):
     if value.lang:
         return len(value.lex) > 0
     dt = value.dt
-    if dt is None or dt == _XSD_STRING:
+    if dt is None or dt == XSD_STRING:
         return len(value.lex) > 0
-    if dt == _XSD_BOOLEAN:
+    if dt == XSD_BOOLEAN:
         return value.lex in ("true", "1")
     if dt in NUMERIC_TYPES:
         number = numeric_value(value)
@@ -607,6 +641,41 @@ _XPATH_ONLY_ESCAPE = re.compile(r"\\[pPiIcC]")
 
 #: XPath's whitespace, which flag ``x`` removes outside character classes.
 _XPATH_SPACE = frozenset("\t\n\r ")
+
+
+class RegexSpec(NamedTuple):
+    """A REGEX's pattern and flags once checked, and the pattern compiled
+    (:func:`regex_spec`)."""
+
+    pattern: str
+    flags: str
+    regex: re.Pattern
+
+
+def regex_spec(pattern, flags):
+    """REGEX's pattern and flags — rdflib terms, ``flags`` ``None`` when
+    absent — as XPath's ``fn:matches`` reads them (§17.4.3.14): a
+    :class:`RegexSpec`; ``ERROR`` when they make every call an error — the
+    pattern or the flags no simple literal, a flag not XPath's, a pattern
+    XPath rejects; ``None`` for a pattern XPath accepts and ``re`` cannot
+    compile (:data:`COMPILE_ERRORS`), which only rdflib's evaluator can try.
+    The fast route and the native recognizer read a REGEX through it."""
+    if not _simple_term(pattern) or (flags is not None and not _simple_term(flags)):
+        return ERROR
+    checked = regex_flags(str(flags) if flags is not None else None)
+    if checked is ERROR:
+        return ERROR
+    try:
+        regex = compile_regex(str(pattern), checked)
+    except COMPILE_ERRORS:
+        return None
+    if regex is ERROR:
+        return ERROR
+    return RegexSpec(str(pattern), checked, regex)
+
+
+def _simple_term(term) -> bool:
+    return isinstance(term, Literal) and simple_literal(constant_view(term))
 
 
 def regex_flags(flags: str | None):

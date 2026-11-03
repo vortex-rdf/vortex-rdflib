@@ -9,10 +9,21 @@ from collections.abc import Iterator
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import BNode, Variable
 
+from ..terms import BLANK, IRI, LITERAL
+
 _IMPURE = frozenset({"Builtin_RAND", "Builtin_UUID", "Builtin_STRUUID", "Builtin_BNODE"})
 
 
-_VAR_LIKE = (Variable, BNode)
+VAR_LIKE = (Variable, BNode)
+
+
+#: The builtins that test a term's kind, and the kind each is true for.
+KIND_BUILTINS = {
+    "Builtin_isIRI": IRI,
+    "Builtin_isURI": IRI,
+    "Builtin_isBLANK": BLANK,
+    "Builtin_isLITERAL": LITERAL,
+}
 
 
 _EXISTS = ("Builtin_EXISTS", "Builtin_NOTEXISTS")
@@ -52,7 +63,7 @@ def _named(node, names) -> bool:
 def expr_vars(node) -> list:
     """The variable-like terms an expression references, in first-seen
     order, an EXISTS body's included."""
-    return list(dict.fromkeys(n for n in _walk(node) if isinstance(n, _VAR_LIKE)))
+    return list(dict.fromkeys(n for n in _walk(node) if isinstance(n, VAR_LIKE)))
 
 
 def has_minus(node) -> bool:
@@ -66,17 +77,17 @@ def has_exists(node) -> bool:
     return any(_named(n, _EXISTS) for n in _walk(node))
 
 
-def _is_impure(node) -> bool:
+def is_impure(node) -> bool:
     """Whether an expression calls a builtin that draws anew on each call
     (``RAND``, ``UUID``, ``STRUUID``, ``BNODE``), one in an EXISTS body
     included."""
     return any(_named(n, _IMPURE) for n in _walk(node))
 
 
-def _flatten_and(expr, out: list) -> list:
+def flatten_and(expr, out: list) -> list:
     if isinstance(expr, CompValue) and expr.name == "ConditionalAndExpression" and expr.other:
         for x in [expr.expr, *expr.other]:
-            _flatten_and(x, out)
+            flatten_and(x, out)
     else:
         out.append(expr)
     return out

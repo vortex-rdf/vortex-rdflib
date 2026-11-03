@@ -120,14 +120,7 @@ def _compile_conjunct(
     term view or the expression is outside the whitelist), kind-only when it
     reads nothing but term kinds. ``native`` is the predicate vortex-rdf
     decides it by, if any."""
-    fast = None
-    if SETTINGS.fast_filters:
-        try:
-            const_views = {v: values.constant_view(term) for v, term in consts.items()}
-        except TypeError:  # a constant that is no RDF term
-            const_views = None
-        if const_views is not None:
-            fast = compiler.compile_fast(expr, variables, const_views)
+    fast = compiler.compile_fast(expr, variables, consts) if SETTINGS.fast_filters else None
     return Conjunct(
         expr,
         variables,
@@ -150,9 +143,9 @@ def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
     row, which that MINUS then always shares."""
     block_set = set(block_vars)
     plan = FilterPlan([], {}, [], [])
-    for conjunct_expr in exprs._flatten_and(expr, []):
+    for conjunct_expr in exprs.flatten_and(expr, []):
         expr = conjunct_expr
-        if exprs._is_impure(expr):
+        if exprs.is_impure(expr):
             raise NotImplementedError
         shape = exprs.exists_shape(expr)
         if shape is None and exprs.has_minus(expr):
@@ -335,8 +328,8 @@ def solution_filter(store, node, ctx) -> Callable[[Any], bool]:
     An expression the pushdown hands back whole (a random or fresh-node
     call) raises ``NotImplementedError``."""
     tests: list[Callable[[Any], bool]] = []
-    for conjunct_expr in exprs._flatten_and(node.expr, []):
-        if exprs._is_impure(conjunct_expr):
+    for conjunct_expr in exprs.flatten_and(node.expr, []):
+        if exprs.is_impure(conjunct_expr):
             raise NotImplementedError
         if exprs.has_exists(conjunct_expr):
             tests.append(lambda bound, expr=conjunct_expr: rdflib_ebv(expr, bound))

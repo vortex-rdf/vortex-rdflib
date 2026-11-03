@@ -497,3 +497,23 @@ def test_values_only_rdflib_answers_are_decoded_in_one_batch(tmp_path, monkeypat
     assert len(run(graph, query)) == sum(1 for i in range(200) if len(f"product {i}") > 10)
     assert "decode" not in calls
     assert "decode_many" in calls
+
+
+def test_a_context_bound_operand_takes_the_fast_route(tmp_path, monkeypatch, capsys):
+    """An operand that reads only context-bound variables is evaluated once,
+    for the fast route as for the native one: ``?v < ?w * 2`` with ``?w``
+    bound compiles to a fast predicate over the codes vortex-rdf leaves,
+    where rdflib's evaluator took them before."""
+    store = VortexRdflibStore(products_file(tmp_path), in_memory=True)
+    graph = Graph(store=store)
+    register_sparql_pushdown()
+    store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
+    query = "SELECT ?s WHERE { ?s <http://ex.org/price> ?v FILTER(?v < ?w * 2) }"
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    rows = list(graph.query(query, initBindings={"w": Literal(50)}))
+    events = captured_trace(capsys)
+    assert len(rows) == sum((i * 37) % 1000 < 100 for i in range(200))
+    [record] = [e for e in events if e["event"] == "bgp_restriction_complete"]
+    assert record["native_predicate_count"] == 1
+    assert (record["fast_predicate_count"], record["generic_only_predicate_count"]) == (1, 0)

@@ -331,6 +331,21 @@ SPEC_CASES: list[SpecCase] = [
         'SELECT ?s WHERE { ?s ex:p ?o FILTER(regex(?o, "(") || !regex(?o, "a{2,1}")) }',
         [],
     ),
+    # A REGEX's pattern and flags are simple literals (§17.4.3.14): a
+    # language-tagged one is an error on every route — rdflib reads it as
+    # its string.
+    SpecCase(
+        "regex-tagged-pattern",
+        f'<{EX}a> <{EX}p> "abc" .\n',
+        'SELECT ?s WHERE { ?s ex:p ?o FILTER(regex(?o, "a"@en)) }',
+        [],
+    ),
+    SpecCase(
+        "regex-tagged-flags",
+        f'<{EX}a> <{EX}p> "abc" .\n',
+        'SELECT ?s WHERE { ?s ex:p ?o FILTER(regex(?o, "A", "i"@en)) }',
+        [],
+    ),
     # `+` and `-` take numbers (§17.3): XPath promotes both operands to the
     # wider of integer < decimal < float < double (F&O §B.1), and anything
     # else — an ill-typed number, a string, a date, an IRI — is a type error.
@@ -495,4 +510,4 @@ def test_impure_function_inside_exists_is_seen():
         + "SELECT ?s WHERE { ?s ex:p ?o FILTER(!EXISTS { ?s ex:p ?x FILTER(RAND() < 0.5) }) }"
     )
     expr = query.algebra.p.p.expr
-    assert exprs._is_impure(expr)
+    assert exprs.is_impure(expr)
