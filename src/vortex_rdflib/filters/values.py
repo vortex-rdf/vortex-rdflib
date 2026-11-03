@@ -102,9 +102,6 @@ FLOAT = _XSD + "float"
 _DOUBLE = _XSD + "double"
 
 
-NUMERIC_TYPES = _INT_LIKE | {_DECIMAL, FLOAT, _DOUBLE}
-
-
 _RANGES = {
     _XSD + "long": (-(2**63), 2**63 - 1),
     _XSD + "int": (-(2**31), 2**31 - 1),
@@ -137,6 +134,10 @@ _RANK = dict.fromkeys(_INT_LIKE, _INTEGER_RANK) | {
     FLOAT: _FLOAT_RANK,
     _DOUBLE: _DOUBLE_RANK,
 }
+
+
+#: The numeric datatypes: the ones XPath's promotion ranks.
+NUMERIC_TYPES = frozenset(_RANK)
 
 
 #: Exact decimal arithmetic: xsd:decimal has no precision limit.
@@ -403,46 +404,53 @@ def _instant_order(a, b):
 _NUMERIC, _STRING, _LANG, _BOOLEAN, _DATETIME, _DATE = range(6)
 
 
+def _lexical_form(view: TermView) -> str:
+    return view.lex
+
+
+def _boolean_value(view: TermView):
+    if view.lex in ("true", "1"):
+        return True
+    if view.lex in ("false", "0"):
+        return False
+    return None
+
+
+#: The value spaces SPARQL compares, by datatype: each datatype's space and
+#: the reader of a literal's value in it, ``None`` for an ill-typed one. A
+#: language-tagged literal is in a space of its own.
+_SPACES = {
+    XSD_STRING: (_STRING, _lexical_form),
+    XSD_BOOLEAN: (_BOOLEAN, _boolean_value),
+    _XSD_DATETIME: (_DATETIME, _datetime_value),
+    _XSD_DATE: (_DATE, _date_value),
+    **dict.fromkeys(NUMERIC_TYPES, (_NUMERIC, numeric_operand)),
+}
+
+
 def _left_open(view: TermView) -> bool:
     """A literal of an XML Schema type SPARQL 1.1 names no operator for (time,
-    the durations, gYear and the other XSD types besides the numbers, strings,
-    booleans, dateTimes and dates compared here): the specification leaves
-    what its values equal, and how they order, to the implementation
-    (§17.4.1.7), and rdflib's evaluator decides it."""
+    the durations, gYear and the other XSD types outside :data:`_SPACES`):
+    the specification leaves what its values equal, and how they order, to
+    the implementation (§17.4.1.7), and rdflib's evaluator decides it."""
     dt = view.dt
-    return (
-        dt is not None
-        and dt.startswith(_XSD)
-        and dt not in NUMERIC_TYPES
-        and dt not in (XSD_STRING, XSD_BOOLEAN, _XSD_DATETIME, _XSD_DATE)
-    )
+    return dt is not None and dt.startswith(_XSD) and dt not in _SPACES
 
 
 def literal_value(view: TermView):
-    """``(space, value)`` of a literal in a value space SPARQL compares, or
-    ``None`` for one it does not: an unknown datatype, or an ill-typed
-    literal of a known one."""
+    """``(space, value)`` of a literal in a value space SPARQL compares
+    (:data:`_SPACES`), or ``None`` for one it does not: an unknown datatype,
+    or an ill-typed literal of a known one."""
     if view.lang:
         return _LANG, (view.lex, view.lang.lower())
     dt = view.dt
     if dt is None or dt == XSD_STRING:
         return _STRING, view.lex
-    if dt in NUMERIC_TYPES:
-        operand = numeric_operand(view)
-        return None if operand is None else (_NUMERIC, operand)
-    if dt == XSD_BOOLEAN:
-        if view.lex in ("true", "1"):
-            return _BOOLEAN, True
-        if view.lex in ("false", "0"):
-            return _BOOLEAN, False
+    if dt not in _SPACES:
         return None
-    if dt == _XSD_DATETIME:
-        value = _datetime_value(view)
-        return None if value is None else (_DATETIME, value)
-    if dt == _XSD_DATE:
-        value = _date_value(view)
-        return None if value is None else (_DATE, value)
-    return None
+    space, read = _SPACES[dt]
+    value = read(view)
+    return None if value is None else (space, value)
 
 
 def string_like(view) -> bool:
@@ -581,21 +589,21 @@ def truth(value):
         return value
     if value is None or value.kind != LITERAL:
         return ERROR
-    if value.lang:
+    dt = value.dt or XSD_STRING
+    if value.lang or dt == XSD_STRING:
         return len(value.lex) > 0
-    dt = value.dt
-    if dt is None or dt == XSD_STRING:
-        return len(value.lex) > 0
-    if dt == XSD_BOOLEAN:
-        return value.lex in ("true", "1")
-    if dt in NUMERIC_TYPES:
-        number = numeric_value(value)
-        if number is None:
-            return False
-        if isinstance(number, float) and math.isnan(number):
-            return False
-        return number != 0
-    return ERROR
+    if dt not in _SPACES:
+        return ERROR
+    space, read = _SPACES[dt]
+    if space != _BOOLEAN and space != _NUMERIC:
+        return ERROR  # a dateTime or a date has no effective boolean value
+    read_value = read(value)
+    if read_value is None:
+        return False  # an ill-typed boolean or number
+    if space == _BOOLEAN:
+        return read_value
+    number = read_value[1]
+    return not (isinstance(number, float) and math.isnan(number)) and number != 0
 
 
 def logical_not(value):
