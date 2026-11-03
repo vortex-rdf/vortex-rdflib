@@ -96,8 +96,8 @@ from bench.dataset import (
 from bench.queries import Query, build_queries
 from vortex_rdflib import (
     VortexRdflibStore,
-    pushdown,
     register_sparql_pushdown,
+    trace,
     unregister_sparql_pushdown,
 )
 from vortex_rdflib.settings import SETTINGS
@@ -265,7 +265,7 @@ def _traced_run(graph: Graph, query: Query, monkeypatch, capsys) -> list[dict]:
         assert _consume_query(graph, query) > 0
     finally:
         monkeypatch.delenv("VORTEX_RDF_TRACE_QUERY")
-    prefix = pushdown.tracing._TRACE_PREFIX
+    prefix = trace.PREFIX
     return [
         json.loads(line[len(prefix) :])
         for line in capsys.readouterr().err.splitlines()

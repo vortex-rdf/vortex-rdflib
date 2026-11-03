@@ -11,10 +11,10 @@ from operator import itemgetter
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.term import Variable
 
+from .. import trace
 from ..settings import SETTINGS
-from . import algebra, aliasing, blocks, relation, solutions, tracing
+from . import algebra, aliasing, blocks, relation, solutions
 from .relation import Relation
-from .tracing import _TRACE
 
 
 @dataclass(slots=True)
@@ -64,9 +64,9 @@ def _plan_head(part) -> _Head:
 
 
 def _eval_head(ctx, store, part):
-    started = tracing._stopwatch()
+    started = trace.stopwatch()
     head = _plan_head(part)
-    tracing._trace_event(
+    trace.event(
         "head_planned",
         entry_node=part.name,
         project_variable_count=0 if head.pv is None else len(head.pv),
@@ -82,7 +82,7 @@ def _eval_head(ctx, store, part):
     stream = not head.order and not head.distinct
     limit = head.stop if stream else None
     rel = blocks._solve_block(ctx, store, head.block, limit=limit, stream=stream)
-    tracing._trace_event(
+    trace.event(
         "block_solve_complete",
         rows=relation._relation_rows(rel),
         columns=len(rel.schema),
@@ -109,9 +109,9 @@ def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
     keeps only the top ``stop`` rows. A variable the block does not bind
     ties every row, as it does for rdflib.
     """
-    started = tracing._stopwatch()
+    started = trace.stopwatch()
     rows = relation._rows_of(rel)
-    tracing._trace_event(
+    trace.event(
         "order_start",
         input_rows=len(rows),
         order_key_count=len(order),
@@ -124,9 +124,9 @@ def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
             continue
         index = rel.schema.index(var)
         distinct_codes = {row[index] for row in rows}
-        key_started = tracing._stopwatch()
+        key_started = trace.stopwatch()
         ranks = _rank_codes(store, rel.foreign, distinct_codes)
-        tracing._trace_event(
+        trace.event(
             "order_key_ranked",
             key_index=key_index,
             descending=descending,
@@ -147,7 +147,7 @@ def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
     else:
         output = sorted(rows, key=sort_key)
         algorithm = "full_stable_sort"
-    tracing._trace_event(
+    trace.event(
         "order_complete",
         algorithm=algorithm,
         input_rows=len(rows),
@@ -173,7 +173,7 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
     comparator. Adjacent keys that compare equal share a rank, so the stable
     sort keeps their input order. With a query constant outside the
     dictionary among the codes, every code ranks as the literals do."""
-    elapsed = tracing._stopwatch()
+    elapsed = trace.stopwatch()
     codes = set(codes)
     ranks = {None: -1}
     literal_lo, iri_lo, blank_lo = store._term_kind_bounds()
@@ -202,7 +202,7 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
         keyed = [(spelling[1:-1], code) for spelling, code in zip(spellings, iris, strict=True)]
         rank = _rank_keyed(ranks, keyed, rank)
     local = [code for code in others if code >= 0]
-    traced = _TRACE.get() is not None
+    traced = trace.active() is not None
     # For the trace: the literals the query's term cache holds already.
     hits = sum(code in store._terms().decode for code in local) if traced else 0
     if others:
@@ -210,7 +210,7 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
         keyed = [(_val(cached[code] if code >= 0 else foreign[code]), code) for code in others]
         _rank_keyed(ranks, keyed, rank)
     if traced:
-        tracing._trace_event(
+        trace.event(
             "rank_codes_complete",
             input_codes=len(codes),
             unique_codes=len(codes),

@@ -9,13 +9,12 @@ from collections.abc import Iterator, Sequence
 
 from vortex_rdf import CodeGroups, U64Column
 
-from .. import union
+from .. import trace, union
 from ..cancel import cancel_kw, check_cancelled
 from ..settings import SETTINGS
 from . import matching, relation, tracing
 from .matching import Pattern
 from .relation import Relation
-from .tracing import _TRACE
 
 
 def _gather_pieces(
@@ -41,7 +40,7 @@ def _gather_pieces(
     ``bgp_stream_complete`` is traced then: the pieces gathered, their rows,
     and the time spent here (pulling the feed, counting, gathering), not in
     the consumer."""
-    traced = _TRACE.get() is not None
+    traced = trace.active() is not None
     pieces = output_rows = elapsed_ns = 0
     resumed = time.perf_counter_ns() if traced else 0
     try:
@@ -83,7 +82,7 @@ def _gather_pieces(
         close = getattr(fed, "close", None)
         if close is not None:
             close()
-        tracing._trace_event(
+        trace.event(
             "bgp_stream_complete", pieces=pieces, output_rows=output_rows, elapsed_ns=elapsed_ns
         )
 

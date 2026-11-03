@@ -7,15 +7,16 @@ makes every capability check, and every native call that can decline,
 before it hands a generator back.
 """
 
+import time
+
 from rdflib.plugins.sparql import CUSTOM_EVALS
 from rdflib.plugins.sparql.evaluate import evalPart
 from vortex_rdf import Cancelled
 
-from .. import query_scope, settings
+from .. import query_scope, settings, trace
 from ..cancel import CANCEL_TOKEN
 from ..settings import SETTINGS
-from . import aggregate, blocks, head, tracing
-from .tracing import _TRACE, _QueryTrace
+from . import aggregate, blocks, head
 
 _EVAL_KEY = "vortex_rdflib_bgp"
 
@@ -67,51 +68,31 @@ def _eval_part(ctx, part):
     if not isinstance(store, VortexRdflibStore) or store._dict is None:
         raise NotImplementedError
     run = getattr(*handler)
-    active = _TRACE.get()
-    if active is None and not settings.trace_enabled():
+    if trace.active() is None:
         return run(ctx, store, part)
-    return _traced_eval(active, run, ctx, store, part)
+    return _traced_eval(run, ctx, store, part)
 
 
-def _traced_eval(active: _QueryTrace | None, run, ctx, store, part):
-    """``run(ctx, store, part)`` as a traced step: under the query's trace
-    ``active`` or, when there is none, a trace of its own, kept current
-    around each step of a lazy result (:func:`_trace_generator`). The
-    node's start is an event, and so is how it ends: completed, handed back
-    to rdflib, cancelled or failed. The trace's lines are flushed once the
+def _traced_eval(run, ctx, store, part):
+    """``run(ctx, store, part)`` as a step of the query's trace: the node's
+    start is an event, and so is how it ends — completed, handed back to
+    rdflib, cancelled or failed. The trace's lines are flushed once the
     planning is over, so nothing after it is timed."""
-    token = None
-    if active is None:
-        active = _QueryTrace(settings.trace_query_id())
-        token = _TRACE.set(active)
-    elapsed = tracing._stopwatch()
-    tracing._trace_event(
-        "eval_part_start", algebra_node=part.name, enabled_ops=sorted(SETTINGS.enabled_ops)
-    )
+    elapsed = trace.stopwatch()
+    trace.event("eval_part_start", algebra_node=part.name, enabled_ops=sorted(SETTINGS.enabled_ops))
     try:
         result = run(ctx, store, part)
     except Exception as error:
         if isinstance(error, NotImplementedError):
-            tracing._trace_event("eval_part_fallback", algebra_node=part.name)
+            trace.event("eval_part_fallback", algebra_node=part.name)
         elif isinstance(error, Cancelled):
-            tracing._trace_event("eval_part_cancelled", algebra_node=part.name)
+            trace.event("eval_part_cancelled", algebra_node=part.name)
         else:
-            tracing._trace_event(
-                "eval_part_failed", algebra_node=part.name, error_type=type(error).__name__
-            )
-        active.flush()
-        if token is not None:
-            _TRACE.reset(token)
+            trace.event("eval_part_failed", algebra_node=part.name, error_type=type(error).__name__)
+        trace.flush()
         raise
-    tracing._trace_event(
-        "eval_part_complete", algebra_node=part.name, handled=True, elapsed_ns=elapsed()
-    )
-    active.flush()
-    if token is None:
-        return result
-    if hasattr(result, "__next__"):
-        return tracing._trace_generator(result, active, token)
-    _TRACE.reset(token)
+    trace.event("eval_part_complete", algebra_node=part.name, handled=True, elapsed_ns=elapsed())
+    trace.flush()
     return result
 
 
@@ -127,8 +108,10 @@ def _eval_scoped(ctx, part):
     so every node below runs in the scope; a lazy result keeps it current
     around each step and clears it at the end (:func:`_scoped_iterator`). The
     scope holds the cancel token current when the query starts
-    (:func:`~.cancel.cancel_scope`), which every step of a lazy result runs under. A
-    graph whose store is not a VortexRdflibStore is left alone.
+    (:func:`~.cancel.cancel_scope`), which every step of a lazy result runs under,
+    and the query's trace, made here when tracing is on (the environment is
+    read once per query). A graph whose store is not a VortexRdflibStore is
+    left alone.
     """
     from ..store import VortexRdflibStore
 
@@ -137,19 +120,49 @@ def _eval_scoped(ctx, part):
         raise NotImplementedError
     opened = query_scope.QueryScope()
     opened.cancel = CANCEL_TOKEN.get()
+    if settings.trace_enabled():
+        opened.trace = trace.QueryTrace(settings.trace_query_id())
     token = query_scope.enter(opened)
     try:
         result = evalPart(ctx, part)
     finally:
         query_scope.leave(token)
     if hasattr(result, "__next__"):
-        return _scoped_iterator(result, opened)
+        return _scoped_iterator(_counted(result, opened), opened)
     bindings = result.get("bindings") if isinstance(result, dict) else None
     if hasattr(bindings, "__next__"):
-        result = {**result, "bindings": _scoped_iterator(bindings, opened)}
+        result = {**result, "bindings": _scoped_iterator(_counted(bindings, opened), opened)}
     else:
         opened.clear()
     return result
+
+
+class _Counted:
+    """A traced query's result, its rows counted for ``query_iterator_complete``."""
+
+    __slots__ = ("_inner", "rows")
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.rows = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = next(self._inner)
+        self.rows += 1
+        return item
+
+    def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        if close is not None:
+            close()
+
+
+def _counted(iterator, opened):
+    """``iterator``, its rows counted when the query is traced."""
+    return iterator if opened.trace is None else _Counted(iterator)
 
 
 def _scoped_iterator(iterator, opened):
@@ -161,6 +174,7 @@ def _scoped_iterator(iterator, opened):
     cancel = opened.cancel
     enter, leave = query_scope.enter, query_scope.leave
     get_cancel, set_cancel, reset_cancel = CANCEL_TOKEN.get, CANCEL_TOKEN.set, CANCEL_TOKEN.reset
+    started = 0 if opened.trace is None else time.perf_counter_ns()
     try:
         while True:
             token = enter(opened)
@@ -184,5 +198,16 @@ def _scoped_iterator(iterator, opened):
             finally:
                 if reset is not None:
                     CANCEL_TOKEN.reset(reset)
+                query_scope.leave(token)
+        if opened.trace is not None:
+            token = query_scope.enter(opened)
+            try:
+                trace.event(
+                    "query_iterator_complete",
+                    rows_yielded=getattr(iterator, "rows", 0),
+                    elapsed_ns=time.perf_counter_ns() - started,
+                )
+                trace.flush()
+            finally:
                 query_scope.leave(token)
         opened.clear()

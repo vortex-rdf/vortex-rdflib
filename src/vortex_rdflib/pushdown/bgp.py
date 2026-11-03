@@ -11,13 +11,12 @@ from dataclasses import dataclass, field
 
 from vortex_rdf import U64Column
 
-from .. import filters
+from .. import filters, trace
 from ..cancel import cancel_kw
 from ..settings import SETTINGS
 from . import algebra, matching, probes, relation, streaming, tracing
 from .matching import Pattern
 from .relation import Relation, _OverBudget
-from .tracing import _TRACE
 
 
 @dataclass(slots=True)
@@ -56,11 +55,11 @@ def _solve_bgp(ctx, store, triples, scope, var_preds=None, limit=None, stream=Fa
     the pair budget to rdflib: the relation then carries their triples as
     ``rest``.
     """
-    elapsed = tracing._stopwatch()
-    tracing._trace_event("bgp_start", pattern_count=len(triples), initial_bound_variable_count=0)
+    elapsed = trace.stopwatch()
+    trace.event("bgp_start", pattern_count=len(triples), initial_bound_variable_count=0)
     if not triples:
         # One empty solution, and nothing ran.
-        rel, stats, elapsed = Relation.from_rows((), [()]), _BgpStats(), tracing._no_time
+        rel, stats, elapsed = Relation.from_rows((), [()]), _BgpStats(), lambda: 0
     elif len(triples) == 1:
         rel, stats = _solve_pattern(ctx, store, triples[0], scope, var_preds, limit)
     else:
@@ -81,11 +80,11 @@ def _solve_pattern(ctx, store, triple, scope, var_preds, limit) -> tuple[Relatio
     stats = _BgpStats(initial_calls=1)
     _, stats.native_ns = matching._match_resolved_pattern(store, pat, limit=limit)
     _trace_pattern_complete(0, shape, pat.nrows, stats.native_ns)
-    clock = tracing._stopwatch()
+    clock = trace.stopwatch()
     if residual:
         matching._restrict_pattern(store, pat, residual)
     stats.restriction_ns = clock()
-    clock = tracing._stopwatch()
+    clock = trace.stopwatch()
     rel = matching._rel_from_pattern(pat)
     stats.join_ns = clock()
     return rel, stats
@@ -110,7 +109,7 @@ def _solve_patterns(ctx, store, triples, scope, var_preds, stream) -> tuple[Rela
         patterns.append(pat)
         _trace_pattern_complete(index, shape, None, 0)
     stats = _BgpStats()
-    clock = tracing._stopwatch()
+    clock = trace.stopwatch()
     finishable = stream and scope == algebra._active_scope(ctx, store)
     rel = _join_incremental_bgp(store, patterns, stats, var_preds, finishable)
     if stats.rest:
@@ -123,7 +122,7 @@ def _trace_pattern_start(ctx, index: int, triple) -> dict | None:
     """Trace a BGP pattern's start as ``bgp_pattern_start``, with its shape
     in the context; returns the shape, for :func:`_trace_pattern_complete`
     (``None`` when the query is not traced)."""
-    if _TRACE.get() is None:
+    if trace.active() is None:
         return None
     resolved = [ctx[term] for term in triple]
     bound = [value is not None for value in resolved]
@@ -136,7 +135,7 @@ def _trace_pattern_start(ctx, index: int, triple) -> dict | None:
         "repeated_variable_count": len(variables) - len(set(variables)),
         "pattern_shape": "".join("B" if item else "V" for item in bound),
     }
-    tracing._trace_event("bgp_pattern_start", original_pattern_index=index, **shape)
+    trace.event("bgp_pattern_start", original_pattern_index=index, **shape)
     return shape
 
 
@@ -147,7 +146,7 @@ def _trace_pattern_complete(
     its rows and match time, or left unmatched for the planner (``None``)."""
     if shape is None:
         return
-    tracing._trace_event(
+    trace.event(
         "bgp_pattern_complete",
         original_pattern_index=index,
         cardinality_source="unmatched" if matched_rows is None else "matched",
@@ -171,7 +170,7 @@ def _trace_bgp_complete(pattern_count: int, rel: Relation, stats: _BgpStats, ela
     other_ns = max(0, elapsed - known)
     # Only a BGP of several patterns is planned, and counted to plan it.
     planned = {"estimate_calls": stats.estimate_calls} if pattern_count > 1 else {}
-    tracing._trace_event(
+    trace.event(
         "bgp_complete",
         pattern_count=pattern_count,
         output_rows=relation._relation_rows(rel),
@@ -323,7 +322,7 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
     tuples = pushed.tuples if pushed is not None else ()
     views = pushed.views if pushed is not None else {}
 
-    clock = tracing._stopwatch()
+    clock = trace.stopwatch()
     if any(pat.unsatisfiable for pat in patterns):
         # A literal bound into subject or predicate position, or a keep that
         # is an empty code column (IRIs the dictionary lacks, an empty ``IN``
@@ -353,14 +352,14 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
     calls, native_ns = matching._match_resolved_pattern(store, seed, memo)
     stats.initial_calls += calls
     stats.native_ns += native_ns
-    clock = tracing._stopwatch()
+    clock = trace.stopwatch()
     _materialize_eager_restrictions(store, seed, ())
     stats.restriction_ns += clock()
     # The relation so far: a columnar or row body, then — after a streamed
     # last step — its pieces.
     rel = matching._rel_from_pattern(seed)
     order = [seed.index]
-    tracing._trace_event(
+    trace.event(
         "bgp_seed_complete",
         original_pattern_index=order[0],
         cardinality_source="matched",
@@ -396,7 +395,7 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
         position = next(i for i, other in enumerate(remaining) if other is pat)
         del remaining[position]
         shared = [v for v in pat.varpos if v in rel.schema]
-        elapsed = tracing._stopwatch()
+        elapsed = trace.stopwatch()
         # The step works on a copy and keeps it only once it completes: a
         # step over the budget leaves the pattern as it was planned — unread,
         # its keep and deferred restrictions its own — for a later step.
@@ -413,7 +412,7 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
             # probe-or-match decision needs; a capped answer means probe. The
             # count is the pattern's, kept whether or not the step completes.
             count_limit = running * SETTINGS.probe_fanout + 1
-            clock = tracing._stopwatch()
+            clock = trace.stopwatch()
             estimate = pat.estimate = matching._count_pattern(store, pat, counts, limit=count_limit)
             # An answer at the cap is a lower bound of the count (_fits).
             pat.estimate_capped = estimate >= count_limit
@@ -440,7 +439,7 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
             if step.strategy == "probe":
                 step.source = "probed"
                 step.probe_calls = running
-                clock = tracing._stopwatch()
+                clock = trace.stopwatch()
                 try:
                     probed = probes._probe_join(
                         store, rel.schema, rel.row_list(), work, max_rows=SETTINGS.pair_budget // 4
@@ -469,7 +468,7 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
                     calls, native_ns = matching._match_resolved_pattern(store, work, memo)
                 stats.initial_calls += calls
                 stats.native_ns += native_ns
-                clock = tracing._stopwatch()
+                clock = trace.stopwatch()
                 _materialize_eager_restrictions(store, work, rel.schema)
                 stats.restriction_ns += clock()
                 step.match_rows, step.restricted_rows = work.match_rows, work.nrows
@@ -607,8 +606,8 @@ def _specialize_tuple_conjuncts(store, pat: Pattern, rel: Relation, tuples, push
             deferred = pat.deferred or {}
             pat.deferred = {**deferred, var: [*deferred.get(var, ()), proxy]}
             specialized.append((conjunct, var, proxy))
-            if _TRACE.get() is not None:
-                tracing._trace_event(
+            if trace.active() is not None:
+                trace.event(
                     "bgp_tuple_specialized",
                     original_pattern_index=pat.index,
                     variable=str(var),
@@ -681,7 +680,7 @@ def _prune_early(store, rel: Relation, pending, remaining, views) -> tuple[Relat
     )
     if SETTINGS.probe_fanout >= probeable:  # not even one survivor would be probed
         return rel, pending
-    started = tracing._stopwatch()
+    started = trace.stopwatch()
     predicates = tuple(
         filters.tuple_fast_reject_predicate(
             store, conjunct, [rel.schema.index(variable) for variable in conjunct.vars], views
@@ -699,7 +698,7 @@ def _prune_early(store, rel: Relation, pending, remaining, views) -> tuple[Relat
             if len(kept) * SETTINGS.probe_fanout >= probeable:
                 deferred = True
                 break
-    tracing._trace_event(
+    trace.event(
         "bgp_prune_complete",
         conjunct_count=len(ready),
         probe_estimate=probeable,
@@ -823,9 +822,9 @@ class _JoinStep:
 def _trace_join_step(step: _JoinStep, rel: Relation, put_back: list, elapsed_ns: int) -> None:
     """Trace a completed join step as ``bgp_join_step_complete``: the step,
     the patterns it was reordered around, and the relation it made."""
-    if _TRACE.get() is None:
+    if trace.active() is None:
         return
-    tracing._trace_event(
+    trace.event(
         "bgp_join_step_complete",
         execution_index=step.execution_index,
         original_pattern_index=step.pat.index,
@@ -853,7 +852,7 @@ def _trace_over_budget(step: _JoinStep, pairs: int | None) -> None:
     """Trace a join step over ``SETTINGS.pair_budget`` as ``bgp_over_budget``:
     its place in the plan, its strategy, its pair count (``None`` where it
     stopped on its rows), the relation's rows and the pattern's count."""
-    tracing._trace_event(
+    trace.event(
         "bgp_over_budget",
         execution_index=step.execution_index,
         original_pattern_index=step.pat.index,
@@ -870,7 +869,7 @@ def _trace_plan_complete(
     """Trace a BGP's plan as ``bgp_plan_complete``: the order its patterns
     joined in, its seed (``None`` when a count emptied it first), its native
     calls and the patterns left to rdflib."""
-    tracing._trace_event(
+    trace.event(
         "bgp_plan_complete",
         pattern_count=pattern_count,
         execution_order=order,

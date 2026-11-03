@@ -6,14 +6,13 @@ handlers.
 
 from rdflib.plugins.sparql.evaluate import evalPart
 
-from .. import filters
+from .. import filters, trace
 from ..cancel import check_cancelled
 from ..settings import SETTINGS
 from ..terms import canonical_spelling, unparseable_iri
 from . import algebra, bgp, matching, probes, relation, solutions, tracing
 from .matching import Pattern
 from .relation import Relation
-from .tracing import _TRACE
 
 
 def _eval_block_node(ctx, store, part):
@@ -31,7 +30,7 @@ def _eval_filter(ctx, store, part):
         return _eval_block_node(ctx, store, part)
     except NotImplementedError:
         keep = filters.solution_filter(store, part, ctx)
-    tracing._trace_event("filter_over_rdflib_rows", algebra_node=part.p.name)
+    trace.event("filter_over_rdflib_rows", algebra_node=part.p.name)
     return (solution for solution in evalPart(ctx, part.p) if keep(solution))
 
 
@@ -138,10 +137,10 @@ def _solve_block(
     if scope is None:
         scope = algebra._active_scope(ctx, store)
     name = node.name
-    trace = _TRACE.get()
-    started = tracing._stopwatch()
-    if trace is not None:
-        trace.depth += 1
+    active = trace.active()
+    started = trace.stopwatch()
+    if active is not None:
+        active.depth += 1
     try:
         if name == "BGP":
             rel = bgp._solve_bgp(ctx, store, node.triples, scope, var_preds, limit, stream)
@@ -163,12 +162,12 @@ def _solve_block(
         else:
             raise NotImplementedError
     finally:
-        if trace is not None:
-            trace.depth -= 1
-    tracing._trace_event(
+        if active is not None:
+            active.depth -= 1
+    trace.event(
         "block_operator_complete",
         operator=name,
-        depth=0 if trace is None else trace.depth,
+        depth=0 if active is None else active.depth,
         rows=relation._relation_rows(rel),
         columns=len(rel.schema),
         nullable_columns=len(rel.nullable),
@@ -470,7 +469,7 @@ def _solve_join(ctx, store, node, env, var_preds, scope) -> Relation:
         )
         if probe:
             schema, rows = probes._probe_join(store, left.schema, left_rows, pat)
-            tracing._trace_event(
+            trace.event(
                 "join_plan_complete",
                 strategy="probe",
                 input_rows=len(left_rows),
@@ -479,7 +478,7 @@ def _solve_join(ctx, store, node, env, var_preds, scope) -> Relation:
                 output_rows=len(rows),
             )
             return Relation(schema, None, rows, len(rows), left.nullable, left.foreign)
-        tracing._trace_event(
+        trace.event(
             "join_plan_complete",
             strategy="hash",
             input_rows=len(left_rows),
@@ -573,7 +572,7 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
     if p2.name == "BGP" and len(p2.triples) == 1:
         # Counted before it is matched: a selective left relation drives the
         # probes without the complete right match the probes exist to avoid.
-        plan_started = tracing._stopwatch()
+        plan_started = trace.stopwatch()
         pat, estimate, probe = _plan_pattern_side(
             ctx, store, p2.triples[0], scope, left, left_rows, None
         )
@@ -589,7 +588,7 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
                 )
                 free_count = len(schema) - len(left.schema)
                 unmatched = sum(row[-1] is None for row in rows) if free_count else 0
-            tracing._trace_event(
+            trace.event(
                 "left_join_plan_complete",
                 strategy="constant_false" if preds is None else "probe",
                 input_rows=len(left_rows),
@@ -602,7 +601,7 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
                 elapsed_ns=plan_started(),
             )
             return Relation(schema, None, rows, len(rows), nullable, left.foreign)
-        tracing._trace_event(
+        trace.event(
             "left_join_plan_complete",
             strategy="hash",
             input_rows=len(left_rows),

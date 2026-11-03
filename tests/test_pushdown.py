@@ -40,8 +40,10 @@ import vortex_rdflib.pushdown as pd
 from vortex_rdflib import (
     VortexRdflibStore,
     filters,
+    query_scope,
     register_sparql_pushdown,
     settings,
+    trace,
     unregister_sparql_pushdown,
 )
 from vortex_rdflib.settings import SETTINGS
@@ -768,12 +770,13 @@ def test_filter_reuses_the_terms_its_early_pass_decoded(tmp_path):
 def _tracing():
     """A query trace around the native wrapper under test; the events it
     emits wait in the trace's pending lines (:func:`_pending_events`)."""
-    trace = pd.tracing._QueryTrace(query_id=None)
-    token = pd.tracing._TRACE.set(trace)
+    scope = query_scope.QueryScope()
+    scope.trace = trace.QueryTrace(query_id=None)
+    token = query_scope.enter(scope)
     try:
-        yield trace
+        yield scope.trace
     finally:
-        pd.tracing._TRACE.reset(token)
+        query_scope.leave(token)
 
 
 def _pending_events(trace) -> list[dict]:
@@ -808,9 +811,9 @@ def test_trace_records_every_native_call(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
     run(graph, _PRUNED_SQL)
-    trace = trace_events(capsys.readouterr().err)
-    calls = [e for e in trace if e["event"] == "native_call_complete"]
-    batches = [e for e in trace if e["event"] == "native_batch_complete"]
+    events = trace_events(capsys.readouterr().err)
+    calls = [e for e in events if e["event"] == "native_call_complete"]
+    batches = [e for e in events if e["event"] == "native_batch_complete"]
     assert (native.counts, native.matches, native.batches) == (3, 3, 1)
     assert [e["operation"] for e in batches] == ["count_quads_many"]
     assert len(calls) + sum(e["probe_count"] for e in batches) == native.counts + native.matches
@@ -933,9 +936,9 @@ def test_trace_reports_a_mid_join_prune_between_the_steps_it_links(tmp_path, mon
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
     run(graph, _PRUNED_SQL)
-    trace = trace_events(capsys.readouterr().err)
-    steps = [e for e in trace if e["event"] == "bgp_join_step_complete"]
-    prunes = [e for e in trace if e["event"] == "bgp_prune_complete"]
+    events = trace_events(capsys.readouterr().err)
+    steps = [e for e in events if e["event"] == "bgp_join_step_complete"]
+    prunes = [e for e in events if e["event"] == "bgp_prune_complete"]
     assert len(prunes) == 1 and prunes[0]["pruned"] is True
     prune = prunes[0]
     assert (steps[0]["output_rows"], prune["input_rows"]) == (50, 50)

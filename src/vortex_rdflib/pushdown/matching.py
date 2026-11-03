@@ -9,14 +9,13 @@ from dataclasses import dataclass, replace
 from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
 
-from .. import filters, union
+from .. import filters, trace, union
 from ..cancel import CANCEL_TOKEN, cancel_kw_for
 from ..settings import SETTINGS
 from ..terms import unparseable_iri
 from . import relation, tracing
 from .algebra import _VAR_LIKE
 from .relation import Relation
-from .tracing import _TRACE
 
 
 @dataclass(slots=True, eq=False)
@@ -192,7 +191,7 @@ def _match_resolved_pattern(store, pat: Pattern, memo=None, limit=None) -> tuple
     ``varpos`` stays per pattern, since two triples matching the same rows
     still bind different variables.
     """
-    then = tracing._stopwatch()
+    then = trace.stopwatch()
     if pat.unsatisfiable:
         pat.set_match((), 0)
         return 0, 0
@@ -338,8 +337,8 @@ def _push_native_restrictions(store, pat: Pattern, var_preds) -> dict:
         if keep is not None:
             for position in positions:
                 _set_native_keep(pat, position, keep)
-            if _TRACE.get() is not None:
-                tracing._trace_event(
+            if trace.active() is not None:
+                trace.event(
                     "bgp_native_restriction",
                     original_pattern_index=pat.index,
                     variable=str(var),
@@ -362,7 +361,7 @@ def _restrict_pattern(store, pat: Pattern, var_preds) -> None:
     its real size is what a join sees."""
     if pat.nrows == 0:
         return
-    traced = _TRACE.get() is not None
+    traced = trace.active() is not None
     keep: dict = {}
     input_rows = pat.nrows
     records = []
@@ -370,7 +369,7 @@ def _restrict_pattern(store, pat: Pattern, var_preds) -> None:
         conjuncts = var_preds.get(var)
         if not conjuncts:
             continue
-        elapsed = tracing._stopwatch()
+        elapsed = trace.stopwatch()
         values = set(relation._distinct_codes(pat.cols[positions[0]]))
         distinct_binding_count = len(values)
         allowed = filters.evaluate_column(store, conjuncts, values)
@@ -390,7 +389,7 @@ def _restrict_pattern(store, pat: Pattern, var_preds) -> None:
     if keep:
         _compact_pattern(pat, keep)
     for record in records:
-        tracing._trace_event(
+        trace.event(
             "bgp_restriction_complete",
             original_pattern_index=pat.index,
             input_rows=input_rows,

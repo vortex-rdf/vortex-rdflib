@@ -11,8 +11,7 @@ from rdflib.plugins.sparql.parser import parseQuery
 from rdflib.plugins.sparql.sparql import QueryContext
 from vortex_rdf import serialize_rdf
 
-import vortex_rdflib.pushdown as pd
-from vortex_rdflib import register_sparql_pushdown, unregister_sparql_pushdown
+from vortex_rdflib import register_sparql_pushdown, trace, unregister_sparql_pushdown
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 
@@ -51,7 +50,7 @@ def both_ways(graph, sparql, runner=run):
 
 def trace_events(text: str) -> list[dict]:
     """The query-trace events printed to ``text`` (captured stderr)."""
-    prefix = pd.tracing._TRACE_PREFIX
+    prefix = trace.PREFIX
     return [
         json.loads(line[len(prefix) :]) for line in text.splitlines() if line.startswith(prefix)
     ]
@@ -166,9 +165,9 @@ def products_file(tmp_path, n=200, indexes=()) -> str:
 
 def captured_trace(capsys) -> list[dict]:
     return [
-        json.loads(line[len(pd.tracing._TRACE_PREFIX) :])
+        json.loads(line[len(trace.PREFIX) :])
         for line in capsys.readouterr().err.splitlines()
-        if line.startswith(pd.tracing._TRACE_PREFIX)
+        if line.startswith(trace.PREFIX)
     ]
 
 

@@ -14,8 +14,7 @@ from tests.oracle import departs, spec_answer
 from tests.support import RecordingTermDict, filter_expr, typed
 from vortex_rdf import U64Column, serialize_rdf
 
-import vortex_rdflib.pushdown as pd
-from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
+from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown, trace
 from vortex_rdflib.filters import native
 from vortex_rdflib.filters.native import NativeShape
 from vortex_rdflib.terms import BLANK, IRI, LITERAL, parse_spelling
@@ -515,12 +514,14 @@ def test_a_mid_size_code_set_goes_to_the_native_layer_whole(tmp_path, monkeypatc
     with_pushdown, without_pushdown = both_ways(Graph(store=store), query)
     assert with_pushdown == without_pushdown
     assert len(with_pushdown) == 100
-    trace = [
-        json.loads(line[len(pd.tracing._TRACE_PREFIX) :])
+    events = [
+        json.loads(line[len(trace.PREFIX) :])
         for line in capsys.readouterr().err.splitlines()
-        if line.startswith(pd.tracing._TRACE_PREFIX)
+        if line.startswith(trace.PREFIX)
     ]
     match = next(
-        e for e in trace if e["event"] == "native_call_complete" and e["operation"] == "match_codes"
+        e
+        for e in events
+        if e["event"] == "native_call_complete" and e["operation"] == "match_codes"
     )
     assert match["keep"] == {"0": {"codes": 100}}

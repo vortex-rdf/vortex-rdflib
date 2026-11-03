@@ -7,7 +7,7 @@ join they make (:func:`_probe_join`), and the existence probes of
 from collections.abc import Iterator, Sequence
 from itertools import islice
 
-from .. import filters
+from .. import filters, trace
 from ..cancel import cancel_kw, cancel_kw_for
 from ..settings import SETTINGS
 from ..terms import canonical_spelling, unparseable_iri
@@ -367,11 +367,11 @@ def _probe_join(
                 continue
             position = combined_schema.index(var)
             values = {row[position] for row in out}
-            started = tracing._stopwatch()
+            started = trace.stopwatch()
             allowed = filters.evaluate_column(store, conjuncts, values)
             elapsed_ns = started()
             out = [row for row in out if row[position] in allowed]
-            tracing._trace_event(
+            trace.event(
                 "bgp_restriction_complete",
                 original_pattern_index=pat.index,
                 variable=str(var),

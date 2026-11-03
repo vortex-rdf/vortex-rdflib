@@ -1,103 +1,13 @@
-"""The query trace (``VORTEX_RDF_TRACE_QUERY=1``): one JSON line per planning
-step, held until the planning it describes is over and printed to stderr
-prefixed ``VORTEX_RDF_QUERY_TRACE``.
-
-The trace is current through a context variable; :func:`_trace_event` and
-:func:`_stopwatch` cost nothing without one. While a query is traced, its
-native calls go through :class:`_TracedNative` (:func:`_native`), so each is
-an event too.
+"""What the pushdown's query trace (:mod:`vortex_rdflib.trace`) reports beyond
+its events' own fields: a native keep and a batch probe as JSON, how a
+variable's conjuncts are decided, and the native handle with every call an
+event (:func:`_native`, while the query is traced).
 """
 
 import abc
-import json
-import sys
 import time
-from collections.abc import Callable
-from contextvars import ContextVar
-from dataclasses import dataclass, field
 
-from ..filters import native
-
-_TRACE_PREFIX = "VORTEX_RDF_QUERY_TRACE "
-
-
-_TRACE_SCHEMA = "vortex-rdf-query-trace-v1"
-
-
-@dataclass(slots=True)
-class _QueryTrace:
-    query_id: str | None
-    sequence: int = 0
-    depth: int = 0
-    # Lines wait here until flush(), which runs once the planning (or the
-    # iteration) they describe is over, so a slow stderr never lands in the
-    # timed windows the events report.
-    pending: list = field(default_factory=list)
-
-    def emit(self, event: str, **fields) -> None:
-        self.sequence += 1
-        payload = {
-            "schema": _TRACE_SCHEMA,
-            "event": event,
-            "sequence": self.sequence,
-            "query_id": self.query_id,
-            **fields,
-        }
-        try:
-            line = json.dumps(payload, separators=(",", ":"), allow_nan=False)
-        except (TypeError, ValueError):
-            _TRACE.set(None)
-            return
-        self.pending.append(_TRACE_PREFIX + line)
-
-    def flush(self) -> None:
-        if not self.pending:
-            return
-        lines, self.pending = self.pending, []
-        try:
-            print("\n".join(lines), file=sys.stderr, flush=True)
-        except OSError:
-            _TRACE.set(None)
-
-
-_TRACE: ContextVar[_QueryTrace | None] = ContextVar("vortex_rdf_query_trace", default=None)
-
-
-def _trace_event(event: str, **fields) -> None:
-    trace = _TRACE.get()
-    if trace is not None:
-        trace.emit(event, **fields)
-
-
-def _no_time() -> int:
-    return 0
-
-
-def _stopwatch() -> Callable[[], int]:
-    """A clock for a trace field: called, the nanoseconds since this call
-    while the query is traced; ``0``, and no clock read, otherwise."""
-    if _TRACE.get() is None:
-        return _no_time
-    started = time.perf_counter_ns()
-    return lambda: time.perf_counter_ns() - started
-
-
-def _trace_native_filter(
-    kind: str, sent: int, passed: int, undecided: int, elapsed_ns: int
-) -> None:
-    """One ``TermDict.filter_codes`` call (:func:`native.evaluate`) as a
-    trace event."""
-    _trace_event(
-        "native_filter_complete",
-        kind=kind,
-        candidate_codes=sent,
-        passed_codes=passed,
-        undecided_codes=undecided,
-        elapsed_ns=elapsed_ns,
-    )
-
-
-native.TRACE = _trace_native_filter
+from .. import trace
 
 
 def _keep_summary(keep) -> dict | None:
@@ -180,7 +90,7 @@ class _TracedAnswers(_TracedIterator):
         return self._probe_count
 
     def _emit(self) -> None:
-        _trace_event(
+        trace.event(
             "native_batch_complete",
             operation="match_codes_many",
             probe_count=self._probe_count,
@@ -203,7 +113,7 @@ class _TracedChunks(_TracedIterator):
         self._columns = list(options.get("columns", ("s", "p", "o", "g")))
 
     def _emit(self) -> None:
-        _trace_event(
+        trace.event(
             "native_chunks_complete",
             operation="match_code_chunks",
             pattern=self._pattern,
@@ -236,7 +146,7 @@ class _TracedNative:
         started = time.perf_counter_ns()
         result = self._inner.count_quads(*pattern, **options)
         elapsed = time.perf_counter_ns() - started
-        _trace_event(
+        trace.event(
             "native_call_complete",
             operation="count_quads",
             pattern=list(pattern),
@@ -251,7 +161,7 @@ class _TracedNative:
         started = time.perf_counter_ns()
         result = self._inner.match_codes(*pattern, **options)
         elapsed = time.perf_counter_ns() - started
-        _trace_event(
+        trace.event(
             "native_call_complete",
             operation="match_codes",
             pattern=list(pattern),
@@ -266,7 +176,7 @@ class _TracedNative:
         started = time.perf_counter_ns()
         result = self._inner.count_quads_many(probes, **options)
         elapsed = time.perf_counter_ns() - started
-        _trace_event(
+        trace.event(
             "native_batch_complete",
             operation="count_quads_many",
             probe_count=len(probes),
@@ -295,35 +205,7 @@ class _TracedNative:
 def _native(store):
     """The store's native handle, traced while the query is."""
     native = store._store()
-    return native if _TRACE.get() is None else _TracedNative(native)
-
-
-def _trace_generator(iterator, trace: _QueryTrace, token):
-    _TRACE.reset(token)
-    started = time.perf_counter_ns()
-    rows = 0
-    try:
-        while True:
-            inner_token = _TRACE.set(trace)
-            try:
-                item = next(iterator)
-            except StopIteration:
-                return
-            finally:
-                _TRACE.reset(inner_token)
-            rows += 1
-            yield item
-    finally:
-        inner_token = _TRACE.set(trace)
-        try:
-            _trace_event(
-                "query_iterator_complete",
-                rows_yielded=rows,
-                elapsed_ns=time.perf_counter_ns() - started,
-            )
-            trace.flush()
-        finally:
-            _TRACE.reset(inner_token)
+    return native if trace.active() is None else _TracedNative(native)
 
 
 def _restriction_counts(conjuncts) -> dict:

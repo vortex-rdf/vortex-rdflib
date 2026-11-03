@@ -9,11 +9,11 @@ from itertools import islice
 from rdflib.plugins.sparql.evaluate import evalBGP
 from rdflib.plugins.sparql.sparql import FrozenBindings
 
+from .. import trace
 from ..cancel import check_cancelled
 from ..settings import SETTINGS
-from . import relation, tracing
+from . import relation
 from .relation import Relation
-from .tracing import _TRACE
 
 
 class _Solution(FrozenBindings):
@@ -138,8 +138,8 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, sta
         base = {v: outer[v] for v in project if v not in schema and v in outer}
     rows = islice(rows, start, stop)
     size = SETTINGS.chunk_start
-    traced = _TRACE.get() is not None
-    elapsed = tracing._stopwatch()
+    traced = trace.active() is not None
+    elapsed = trace.stopwatch()
     yielded = chunks = submitted = 0
     try:
         while True:
@@ -163,7 +163,7 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, sta
             size = min(size * 4, SETTINGS.chunk_max)
     finally:
         if traced:
-            tracing._trace_event(
+            trace.event(
                 "yield_rows_complete",
                 offset=start,
                 stop=stop,

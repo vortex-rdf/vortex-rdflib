@@ -30,7 +30,6 @@ native match takes, :func:`native_restriction`.
 """
 
 import re
-import time
 from bisect import bisect_left
 from collections.abc import Callable, Collection
 from typing import NamedTuple
@@ -39,6 +38,7 @@ from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import Literal, URIRef
 from vortex_rdf import U64Column
 
+from .. import trace
 from ..settings import SETTINGS
 from ..terms import BLANK, IRI, LITERAL, canonical_spelling
 from . import exprs, values
@@ -73,13 +73,6 @@ IRI_IN = "iri_in"
 #: The string functions; their text is ``?v`` under rdflib's ``string()``
 #: (string literals only) or, with ``as_str``, ``STR(?v)``.
 STRING_KINDS = frozenset({"regex", "contains", "strstarts", "strends"})
-
-
-#: The pushdown's query trace (``pushdown.tracing._trace_native_filter``), installed
-#: when that module is imported; called after every ``filter_codes`` call
-#: that answers, with the kind, how many codes were sent, passed and left
-#: undecided, and the call's nanoseconds.
-TRACE: Callable[[str, int, int, int, int], None] | None = None
 
 
 def keep_of(store, shape: NativeShape):
@@ -176,7 +169,7 @@ def evaluate(store, shape: NativeShape, codes: Collection[int]) -> tuple[set, li
         options["case"] = shape.case
     if as_str:
         options["as_str"] = True
-    started = time.perf_counter_ns()
+    elapsed = trace.stopwatch()
     try:
         yes, maybe = store._dict.filter_codes(shape.kind, shape.arg, column, **options)
     except ValueError:
@@ -192,8 +185,14 @@ def evaluate(store, shape: NativeShape, codes: Collection[int]) -> tuple[set, li
             undecided.extend(code for code in yes_codes if code not in numbers)
             yes_codes = [code for code in yes_codes if code in numbers]
     passed.update(yes_codes)
-    if TRACE is not None:
-        TRACE(shape.kind, len(inside), len(yes), len(maybe), time.perf_counter_ns() - started)
+    trace.event(
+        "native_filter_complete",
+        kind=shape.kind,
+        candidate_codes=len(inside),
+        passed_codes=len(yes),
+        undecided_codes=len(maybe),
+        elapsed_ns=elapsed(),
+    )
     return passed, undecided
 
 

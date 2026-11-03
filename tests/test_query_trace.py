@@ -86,3 +86,82 @@ def test_trace_reports_native_call_shape_and_rows(traced_graph, capsys, monkeypa
     assert "match_codes" in {event["operation"] for event in native_calls}
     assert all(len(event["pattern"]) == 4 for event in native_calls)
     assert all(event["returned_rows"] is not None for event in native_calls)
+
+
+_NAMES = "SELECT ?s WHERE { ?s <http://ex.org/name> ?n }"
+
+
+def test_an_unread_result_leaves_no_trace(traced_graph, capsys, monkeypatch):
+    """A traced query's result never read keeps its trace to itself: a later
+    query, untraced, prints nothing, and nothing is traced outside a query."""
+    from vortex_rdflib import trace
+
+    register_sparql_pushdown()
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    unread = traced_graph.query(_NAMES)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "0")
+    capsys.readouterr()
+    assert len(list(traced_graph.query(_NAMES))) == 40
+    assert trace_events(capsys.readouterr().err) == []
+    assert trace.active() is None
+    del unread
+
+
+def test_unread_results_keep_their_own_traces(traced_graph, capsys, monkeypatch):
+    """Two traced results made before either is read: each query's events
+    carry its own id, and each ends with one ``query_iterator_complete``."""
+    register_sparql_pushdown()
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY_ID", "first")
+    first = traced_graph.query(_NAMES)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY_ID", "second")
+    second = traced_graph.query(_NAMES + " LIMIT 3")
+    assert (len(list(first)), len(list(second))) == (40, 3)
+    events = trace_events(capsys.readouterr().err)
+    for query_id in ("first", "second"):
+        own = [event["event"] for event in events if event["query_id"] == query_id]
+        assert "eval_part_start" in own, query_id
+        assert own.count("query_iterator_complete") == 1, query_id
+    assert {event["query_id"] for event in events} == {"first", "second"}
+
+
+def test_a_query_is_one_trace(traced_graph, capsys, monkeypatch):
+    """rdflib evaluates a UNION itself and offers each branch to the hook:
+    the query is still one trace, numbered without restarting."""
+    register_sparql_pushdown()
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY_ID", "union")
+    capsys.readouterr()
+    union = (
+        "SELECT ?s WHERE { { ?s <http://ex.org/name> ?n } UNION { ?s <http://ex.org/date> ?d } }"
+    )
+    rows = list(traced_graph.query(union))
+    assert len(rows) == 80
+    events = trace_events(capsys.readouterr().err)
+    assert {event["query_id"] for event in events} == {"union"}
+    assert [event["sequence"] for event in events] == list(range(1, len(events) + 1))
+    assert [event["event"] for event in events].count("query_iterator_complete") == 1
+
+
+def test_a_result_read_in_another_thread(traced_graph, capsys, monkeypatch):
+    """A traced result read in another thread completes its trace there."""
+    import threading
+
+    register_sparql_pushdown()
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    result = traced_graph.query(_NAMES)
+    capsys.readouterr()
+    rows, errors = [], []
+
+    def read():
+        try:
+            rows.extend(result)
+        except Exception as error:  # noqa: BLE001 - the test reports it
+            errors.append(error)
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    reader.join()
+    assert errors == [] and len(rows) == 40
+    events = [event["event"] for event in trace_events(capsys.readouterr().err)]
+    assert events.count("query_iterator_complete") == 1
