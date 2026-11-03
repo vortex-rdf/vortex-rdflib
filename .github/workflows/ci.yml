@@ -47,7 +47,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.12", "3.13", "3.14", "3.15"]
         include:
           # The package is pure Python; one job per extra OS confirms the
           # vortex-rdf native wheels resolve and behave there too.

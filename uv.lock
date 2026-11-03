@@ -1,6 +1,6 @@
 version = 1
 revision = 5
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 
 [[package]]
 name = "colorama"
@@ -87,8 +87,6 @@ version = "0.5.13"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f3/c0/1e3703a8d0d084c1ecb4508e3f48d66a84b6809bc20f51d63be6492c8ea1/pyoxigraph-0.5.13.tar.gz", hash = "sha256:1805b92b51293f658557ae53b4eb42ac4dc826959ccff1c5c0f5067ac570b073", size = 5310796, upload-time = "2026-10-22T19:30:25.401Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f8/ba/244c2d17ab761da7820c3c76e96d3668c4f97e1a2bf8a960c0183172e8d7/pyoxigraph-0.5.13-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:f4c81f3588e6a417a537e1155785e99331dd3e03c4362e0688d21963c2fcc0b1", size = 7702315, upload-time = "2026-10-22T19:29:12.631Z" },
-    { url = "https://files.pythonhosted.org/packages/99/29/b44693479e601405df8a57c6866dd245c307c2df361f5dc5e81691301781/pyoxigraph-0.5.13-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:20eeebb6ead914eb7030870b6d7e43f854c7a556cb75ce0375e12aa3bf4a90e5", size = 8236538, upload-time = "2026-10-22T19:29:15.238Z" },
     { url = "https://files.pythonhosted.org/packages/b4/f5/2ed07d264ff3d58454ec92a3641c60de07e96bd2f94e9000ba7173d6cb6a/pyoxigraph-0.5.13-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:9f4ab8a252f198e9d414be38886bf54018d69cd0719c2d14d470c096e646bda6", size = 7704054, upload-time = "2026-10-22T19:29:17.677Z" },
     { url = "https://files.pythonhosted.org/packages/98/72/9f2e48bb184dfed90bb01c1933470e80e1b1039114bf045da02b63aaff9f/pyoxigraph-0.5.13-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:afb4d4ac972c17da77b5f5f17fd1b20f3a95d6a56c7dc6815bf701d1e4a0d255", size = 8236072, upload-time = "2026-10-22T19:29:19.517Z" },
     { url = "https://files.pythonhosted.org/packages/4e/aa/7c08248418af31730019cd9eab3b1fd0a3aa50a3b2a802d5c9af08f2a387/pyoxigraph-0.5.13-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:7ad11cc64424fffb65e407ad6a88ce1483c8597cf196788aa2e4b89287eef860", size = 7704303, upload-time = "2026-10-22T19:29:21.62Z" },
@@ -117,8 +115,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c9/6a/b7ac582c1d2a63b360d744402e40e4325421010b8d0a4eda6992c2602497/pyoxigraph-0.5.13-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:249e5eff4f94b646ec4dcd5c152fdd8db54d2979610790ec00f0c210d2e2b934", size = 9461002, upload-time = "2026-10-22T19:30:14.705Z" },
     { url = "https://files.pythonhosted.org/packages/87/f1/521becfb1cfd4f01603abe4ad8c37fd1d52134bc82bc3a72c4d1c4da3204/pyoxigraph-0.5.13-cp39-abi3-win_amd64.whl", hash = "sha256:5497c901b2a74a76a8ec3aad44ad79d002047b965425570f349b6d08bfdab8ea", size = 5471556, upload-time = "2026-10-22T19:30:17.107Z" },
     { url = "https://files.pythonhosted.org/packages/07/a3/a42eb852e65efbc55a8b87ee5f0537d5712b959d052c4067e24d4c954a4c/pyoxigraph-0.5.13-cp39-abi3-win_arm64.whl", hash = "sha256:0e195f1db8aeba5964b31e40a877da0c42e10fd3ad765c4348f8cf3a1f52fc17", size = 5129516, upload-time = "2026-10-22T19:30:19.089Z" },
-    { url = "https://files.pythonhosted.org/packages/db/5b/c941369726a6bf5a12e7d0d9aca2188e0f94aa76b95080f2019c9db4f382/pyoxigraph-0.5.13-pp311-pypy311_pp73-manylinux_2_28_aarch64.whl", hash = "sha256:99a8bc52f76e1474f16e724bf11b4388ce44d255b70480c51bc029170f64d4ac", size = 7711110, upload-time = "2026-10-22T19:30:21.037Z" },
-    { url = "https://files.pythonhosted.org/packages/32/e0/39a9985979674b8129de00d4310b9109d864ffb71f81b644a1ad900a220a/pyoxigraph-0.5.13-pp311-pypy311_pp73-manylinux_2_28_x86_64.whl", hash = "sha256:9d8d6c67b275ab165d2989ad043a07d7fb1d1b994c4fd0961673a6fd19470f80", size = 8245148, upload-time = "2026-10-22T19:30:23.386Z" },
 ]
 
 [[package]]
@@ -156,9 +152,6 @@ dependencies = [
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/34/ef/b7c82bcb823e0d08cf78e518efd8dee2ef6f34b67c4ec82bb250e707b414/pytest_codspeed-5.0.4.tar.gz", hash = "sha256:5098065fb9f91d80a7a81752d1970153e44036fe36ce0b6a7afa6bf7881b9d3e", size = 325049, upload-time = "2026-10-31T08:35:41.932Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/53/cf/f34c713063c2817bdb0f553b59de0b20e8d28004a1972c9e12d51da26684/pytest_codspeed-5.0.4-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:60e3797f68bd0de741eedeb755f71bad1f7927384fe89305c5a49fdff052452a", size = 366758, upload-time = "2026-10-31T08:35:20.841Z" },
-    { url = "https://files.pythonhosted.org/packages/de/d6/00b51102b21f78bd5828a3ffeb023cf79994f5b2c624e6e92ecd1a494af3/pytest_codspeed-5.0.4-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7b6bf8579fb6a2428cee9f065a7c15694c06281e8de815b183c60cd39d72b50e", size = 933188, upload-time = "2026-10-31T08:35:44.069Z" },
-    { url = "https://files.pythonhosted.org/packages/96/c0/47010e742c664e059a4d3348747cd0e3b9bf1b16a1f2fe24cadbde198c04/pytest_codspeed-5.0.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:96d1f622b2700220c6d28f972bfb4f6840045578c17bc93cbb2d4c8eb13cd719", size = 935589, upload-time = "2026-10-31T08:35:32.356Z" },
     { url = "https://files.pythonhosted.org/packages/6e/3c/d4102d26388c6b37b8911d42e1b961250c0b3e6f107b8b453087bf01a26a/pytest_codspeed-5.0.4-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:0d340c88b74cc9eb6df277cec7ad0d480c7796a495bac00f2a1d0cdb239e14e1", size = 366803, upload-time = "2026-10-31T08:35:45.196Z" },
     { url = "https://files.pythonhosted.org/packages/51/8f/ebf8d33bf2fff8e089d887f89ef3fe450f7eaa5ba71d16900f05e0e69593/pytest_codspeed-5.0.4-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:289b0f4422058220639add8320958381c51dfc775822082463fc4dce157e12a4", size = 933051, upload-time = "2026-10-31T08:35:27.868Z" },
     { url = "https://files.pythonhosted.org/packages/26/7d/6b3d8ed57862e5a6959e684aa8b2776e7cbad68e9ad235e15f826225a052/pytest_codspeed-5.0.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:049e0d3ed0c2d75bdf20c839ce6d97b9ea47fd9cab3b32de3cff8575dd2785c5", size = 935538, upload-time = "2026-10-31T08:35:40.805Z" },

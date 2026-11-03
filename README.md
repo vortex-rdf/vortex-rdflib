@@ -24,7 +24,7 @@ structure and queried.
 pip install vortex-rdflib
 ```
 
-Python 3.11+. The `vortex-rdf` dependency ships prebuilt wheels for Linux
+Python 3.12+ (tested on 3.12–3.15). The `vortex-rdf` dependency ships prebuilt wheels for Linux
 (x86_64, aarch64), macOS (x86_64, arm64) and Windows (x64); on other
 platforms it builds from source.
 
