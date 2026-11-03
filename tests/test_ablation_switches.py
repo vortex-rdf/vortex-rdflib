@@ -7,16 +7,9 @@ multisets) are compared with the run with none set."""
 
 import pytest
 from rdflib import Graph, Literal, URIRef
-from tests.corpus import (
-    FIXTURE_NT,
-    QUERIES,
-)
+from tests.corpus import FIXTURE_NT, QUERIES
 from tests.divergences import RDFLIB_DIVERGES
-from tests.support import (
-    both_ways,
-    file_codes,
-    run,
-)
+from tests.support import both_ways, file_codes, run
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import (

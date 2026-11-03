@@ -9,26 +9,12 @@ from typing import Any
 
 import pytest
 from rdflib import Dataset, Graph
-from tests.corpus import (
-    FIXTURE_NT,
-    GRAPH_QUERIES,
-    ORDER_QUERIES,
-    QUERIES,
-)
+from tests.corpus import FIXTURE_NT, GRAPH_QUERIES, ORDER_QUERIES, QUERIES
 from tests.divergences import RDFLIB_DIVERGES, spec_corrected
-from tests.support import (
-    both_ways,
-    file_codes,
-    run,
-    run_ordered,
-    trace_events,
-)
+from tests.support import both_ways, file_codes, run, run_ordered, trace_events
 from vortex_rdf import serialize_rdf
 
-from vortex_rdflib import (
-    VortexRdflibStore,
-    register_sparql_pushdown,
-)
+from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
 from vortex_rdflib.open_file import OpenFile
 from vortex_rdflib.settings import SETTINGS
 

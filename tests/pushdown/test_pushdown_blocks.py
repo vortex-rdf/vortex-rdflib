@@ -3,16 +3,10 @@ MINUS as an anti-join, EXISTS as a semi-join, VALUES as a relation, and a
 scope it cannot keep handed back to rdflib."""
 
 from rdflib import Literal, URIRef
-from tests.support import (
-    both_ways,
-    run,
-)
+from tests.support import both_ways, run
 
 import vortex_rdflib.pushdown as pd
-from vortex_rdflib import (
-    filters,
-    register_sparql_pushdown,
-)
+from vortex_rdflib import filters, register_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
 
 

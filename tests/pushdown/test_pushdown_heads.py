@@ -5,22 +5,11 @@ DISTINCT and COUNT in code space, term aliases, and ORDER BY's rank sort."""
 import pytest
 from rdflib import Graph, Literal, URIRef
 from rdflib.plugins.sparql.sparql import QueryContext
-from tests.support import (
-    both_ways,
-    counting_native,
-    counting_term_dict,
-    row_key,
-    run,
-    run_ordered,
-)
+from tests.support import both_ways, counting_native, counting_term_dict, row_key, run, run_ordered
 from vortex_rdf import CancelToken, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from vortex_rdflib import (
-    VortexRdflibStore,
-    register_sparql_pushdown,
-    unregister_sparql_pushdown,
-)
+from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
 
 

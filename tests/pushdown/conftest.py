@@ -5,15 +5,10 @@ in memory (``graph``, ``dataset``) or file-backed only (``file_graph``,
 
 import pytest
 from rdflib import Dataset, Graph
-from tests.corpus import (
-    FIXTURE_NQ,
-    FIXTURE_NT,
-)
+from tests.corpus import FIXTURE_NQ, FIXTURE_NT
 from vortex_rdf import serialize_rdf
 
-from vortex_rdflib import (
-    VortexRdflibStore,
-)
+from vortex_rdflib import VortexRdflibStore
 
 
 @pytest.fixture(scope="module")

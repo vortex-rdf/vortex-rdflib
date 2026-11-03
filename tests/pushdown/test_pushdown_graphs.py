@@ -4,20 +4,11 @@ the parser rejects matches nothing."""
 
 import pytest
 from rdflib import Dataset, Graph, Literal, URIRef
-from tests.corpus import (
-    FIXTURE_NQ,
-    FIXTURE_NT,
-)
-from tests.support import (
-    run,
-)
+from tests.corpus import FIXTURE_NQ, FIXTURE_NT
+from tests.support import run
 
 import vortex_rdflib.pushdown as pd
-from vortex_rdflib import (
-    VortexRdflibStore,
-    register_sparql_pushdown,
-    unregister_sparql_pushdown,
-)
+from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
 
 

@@ -4,10 +4,7 @@ against a nested loop, and a repeated pattern matched once."""
 
 import pytest
 from rdflib import Dataset, Graph, URIRef, Variable
-from tests.corpus import (
-    PROBE_MULTIPLICITY,
-    PROBE_QUADS,
-)
+from tests.corpus import PROBE_MULTIPLICITY, PROBE_QUADS
 from tests.support import (
     both_ways,
     counting_native,
@@ -19,10 +16,7 @@ from tests.support import (
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from vortex_rdflib import (
-    VortexRdflibStore,
-    register_sparql_pushdown,
-)
+from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
 
 

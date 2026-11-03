@@ -6,9 +6,7 @@ from typing import Any
 
 import pytest
 from rdflib import Graph
-from tests.corpus import (
-    FIXTURE_NT,
-)
+from tests.corpus import FIXTURE_NT
 from tests.support import (
     both_ways,
     counting_native,

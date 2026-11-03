@@ -14,11 +14,7 @@ from tests.support import (
 )
 
 import vortex_rdflib.pushdown as pd
-from vortex_rdflib import (
-    filters,
-    register_sparql_pushdown,
-    unregister_sparql_pushdown,
-)
+from vortex_rdflib import filters, register_sparql_pushdown, unregister_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
 
 
