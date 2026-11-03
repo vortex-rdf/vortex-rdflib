@@ -67,6 +67,29 @@ def _plan_head(part) -> _Head:
 def _eval_head(ctx, store, part):
     started = trace.stopwatch()
     head = _plan_head(part)
+    _trace_head_planned(part, head)
+    # Without an ORDER BY or a DISTINCT between them, a LIMIT bounds the
+    # block's rows themselves; a block that is one native match takes it.
+    # The relation then goes straight to the emitter (``stream``).
+    stream = not head.order and not head.distinct
+    limit = head.stop if stream else None
+    rel = blocks._solve_block(ctx, store, head.block, limit=limit, stream=stream)
+    _trace_block_solved(store, rel, started())
+    if head.order:
+        # DISTINCT narrows the rows after the sort, so only a plain LIMIT
+        # can stop the sort at the top k.
+        rows = _order_rows(ctx, store, rel, head.order, None if head.distinct else head.stop)
+        rel = rel.with_rows(rows)
+    if head.distinct:
+        return _eval_distinct(ctx, store, rel, head)
+    return solutions._yield_solutions(ctx, store, rel, head.pv, head.start, head.stop)
+
+
+def _trace_head_planned(part, head: _Head) -> None:
+    """Trace the head as ``head_planned``: the node it enters at, its
+    projection, sort keys, DISTINCT and window."""
+    if trace.active() is None:
+        return
     trace.event(
         "head_planned",
         entry_node=part.name,
@@ -77,28 +100,21 @@ def _eval_head(ctx, store, part):
         offset=head.start,
         limit=None if head.stop is None else head.stop - head.start,
     )
-    # Without an ORDER BY or a DISTINCT between them, a LIMIT bounds the
-    # block's rows themselves; a block that is one native match takes it.
-    # The relation then goes straight to the emitter (``stream``).
-    stream = not head.order and not head.distinct
-    limit = head.stop if stream else None
-    rel = blocks._solve_block(ctx, store, head.block, limit=limit, stream=stream)
+
+
+def _trace_block_solved(store, rel: Relation, elapsed_ns: int) -> None:
+    """Trace the head's block as ``block_solve_complete``: the relation it
+    was solved into and the query's terms outside the dictionary."""
+    if trace.active() is None:
+        return
     trace.event(
         "block_solve_complete",
         rows=relation._relation_rows(rel),
         columns=len(rel.schema),
         nullable_columns=len(rel.nullable),
         foreign_terms=len(store._terms().foreign),
-        elapsed_ns=started(),
+        elapsed_ns=elapsed_ns,
     )
-    if head.order:
-        # DISTINCT narrows the rows after the sort, so only a plain LIMIT
-        # can stop the sort at the top k.
-        rows = _order_rows(ctx, store, rel, head.order, None if head.distinct else head.stop)
-        rel = rel.with_rows(rows)
-    if head.distinct:
-        return _eval_distinct(ctx, store, rel, head)
-    return solutions._yield_solutions(ctx, store, rel, head.pv, head.start, head.stop)
 
 
 def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
@@ -112,29 +128,12 @@ def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
     """
     started = trace.stopwatch()
     rows = relation._rows_of(rel)
-    trace.event(
-        "order_start",
-        input_rows=len(rows),
-        order_key_count=len(order),
-        descending_key_count=sum(descending for _, descending in order),
-        limit=stop,
-    )
     keys = []
-    for key_index, (var, descending) in enumerate(order):
+    for var, descending in order:
         if var not in rel.schema:
             continue
         index = rel.schema.index(var)
-        distinct_codes = {row[index] for row in rows}
-        key_started = trace.stopwatch()
-        ranks = _rank_codes(store, distinct_codes)
-        trace.event(
-            "order_key_ranked",
-            key_index=key_index,
-            descending=descending,
-            input_rows=len(rows),
-            distinct_codes=len(distinct_codes),
-            elapsed_ns=key_started(),
-        )
+        ranks = _rank_codes(store, {row[index] for row in rows})
         keys.append((index, ranks, -1 if descending else 1))
     if not keys:
         return rows
@@ -154,7 +153,6 @@ def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
         input_rows=len(rows),
         output_rows=len(output),
         limit=stop,
-        limit_applied_during_order=algorithm == "bounded_heap_nsmallest",
         elapsed_ns=started(),
     )
     return output
@@ -212,7 +210,6 @@ def _rank_codes(store, codes) -> dict:
     if traced:
         trace.event(
             "rank_codes_complete",
-            input_codes=len(codes),
             unique_codes=len(codes),
             null_codes=int(None in codes),
             blank_codes=len(blanks),

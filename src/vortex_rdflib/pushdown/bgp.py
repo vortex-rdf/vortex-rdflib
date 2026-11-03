@@ -161,6 +161,8 @@ def _trace_bgp_complete(pattern_count: int, rel: Relation, stats: _BgpStats, ela
     """Trace a solved BGP as ``bgp_complete``: its relation, its native
     calls, and its time split into the native calls', the restrictions',
     the joins' and the rest, which add up to the whole."""
+    if trace.active() is None:
+        return
     known = stats.native_ns + stats.restriction_ns + stats.join_ns
     other_ns = max(0, elapsed - known)
     # Only a BGP of several patterns is planned, and counted to plan it.
@@ -882,6 +884,8 @@ def _trace_plan_complete(
     """Trace a BGP's plan as ``bgp_plan_complete``: the order its patterns
     joined in, its seed (``None`` when a count emptied it first), its native
     calls and the patterns left to rdflib (``rest``, by index)."""
+    if trace.active() is None:
+        return
     trace.event(
         "bgp_plan_complete",
         pattern_count=pattern_count,

@@ -3,6 +3,7 @@ from rdflib import Graph
 from tests.support import trace_events
 from vortex_rdf import serialize_rdf
 
+import vortex_rdflib.pushdown as pd
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, settings
 
 
@@ -165,3 +166,41 @@ def test_a_result_read_in_another_thread(traced_graph, capsys, monkeypatch):
     assert errors == [] and len(rows) == 40
     events = [event["event"] for event in trace_events(capsys.readouterr().err)]
     assert events.count("query_iterator_complete") == 1
+
+
+def test_order_by_traces_each_measure_once(traced_graph, capsys, monkeypatch):
+    """ORDER BY is traced by ``order_complete`` and, per sort key, the
+    ``rank_codes_complete`` of its ranking — no start event, no second
+    event timing the same ranking, and no field that repeats another."""
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    register_sparql_pushdown()
+    query = """SELECT ?s ?d WHERE { ?s <http://ex.org/date> ?d } ORDER BY DESC(?d) LIMIT 5"""
+    assert len(list(traced_graph.query(query))) == 5
+    payloads = trace_events(capsys.readouterr().err)
+    names = [item["event"] for item in payloads]
+    assert "order_start" not in names and "order_key_ranked" not in names
+    [ordered] = [item for item in payloads if item["event"] == "order_complete"]
+    assert "limit_applied_during_order" not in ordered
+    [ranked] = [item for item in payloads if item["event"] == "rank_codes_complete"]
+    assert "input_codes" not in ranked and ranked["unique_codes"] == 40
+
+
+def test_an_untraced_query_builds_no_trace_payload(traced_graph, monkeypatch):
+    """Untraced, no trace event's fields are computed: the trace helpers
+    return before they build them. A row count the trace reads is one."""
+    monkeypatch.delenv("VORTEX_RDF_TRACE_QUERY", raising=False)
+
+    def traced_only(*args, **kwargs):
+        raise AssertionError("a trace payload was built for an untraced query")
+
+    monkeypatch.setattr(pd.relation, "_relation_rows", traced_only)
+    register_sparql_pushdown()
+    queries = [
+        "SELECT ?s ?d WHERE { ?s <http://ex.org/date> ?d } ORDER BY ?d LIMIT 3",
+        "SELECT ?s WHERE { ?s <http://ex.org/date> ?d FILTER(?d > 30) }",
+        """SELECT ?s ?n WHERE {
+            ?s <http://ex.org/date> 3
+            OPTIONAL { ?s <http://ex.org/name> ?n } }""",
+    ]
+    for query in queries:
+        assert list(traced_graph.query(query))

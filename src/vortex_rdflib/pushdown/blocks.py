@@ -166,17 +166,24 @@ def _solve_block(
     finally:
         if active is not None:
             active.depth -= 1
+    if active is not None:
+        _trace_block(node, rel, active.depth, started())
+    return rel
+
+
+def _trace_block(node, rel: Relation, depth: int, elapsed_ns: int) -> None:
+    """Trace a solved block as ``block_operator_complete``: its operator,
+    how deep it sits, and the relation it was solved into."""
     trace.event(
         "block_operator_complete",
-        operator=name,
-        depth=0 if active is None else active.depth,
+        operator=node.name,
+        depth=depth,
         rows=relation._relation_rows(rel),
         columns=len(rel.schema),
         nullable_columns=len(rel.nullable),
-        elapsed_ns=started(),
-        pattern_count=len(node.triples) if name == "BGP" else None,
+        elapsed_ns=elapsed_ns,
+        pattern_count=len(node.triples) if node.name == "BGP" else None,
     )
-    return rel
 
 
 def _solve_values(ctx, store, node, var_preds=None) -> Relation:
@@ -581,20 +588,8 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
                 row_preds=_condition_preds(store, conjuncts, schema),
             )
             if rows is not None:
-                free_count = len(schema) - len(left.schema)
-                unmatched = sum(row[-1] is None for row in rows) if free_count else 0
-                trace.event(
-                    "left_join_plan_complete",
-                    strategy="probe",
-                    input_rows=len(left_rows),
-                    estimated_right_rows=side.pat.estimate,
-                    native_initial_match_count=0,
-                    native_probe_call_count=calls,
-                    matched_left_rows=len(left_rows) - unmatched,
-                    unmatched_left_rows=unmatched,
-                    output_rows=len(rows),
-                    elapsed_ns=plan_started(),
-                )
+                padded = len(schema) > len(left.schema)
+                _trace_probed_left_join(side, left_rows, rows, padded, calls, plan_started())
                 return Relation(schema, None, rows, len(rows), nullable)
             side = replace(side, strategy="keep_scan")
         right = _matched_side(store, side, left.schema, left_rows)
@@ -621,6 +616,30 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
         _condition_preds(store, conjuncts, schema),
     )
     return Relation(schema, None, rows, len(rows), nullable)
+
+
+def _trace_probed_left_join(
+    side: "_PatternSide", left_rows, rows, padded: bool, calls: int, elapsed_ns: int
+) -> None:
+    """Trace a probed OPTIONAL as ``left_join_plan_complete``: its probes,
+    and the left rows they matched and left unmatched — told apart where a
+    row is ``padded`` with the free variables, unbound in an unmatched
+    row."""
+    if trace.active() is None:
+        return
+    unmatched = sum(row[-1] is None for row in rows) if padded else 0
+    trace.event(
+        "left_join_plan_complete",
+        strategy="probe",
+        input_rows=len(left_rows),
+        estimated_right_rows=side.pat.estimate,
+        native_initial_match_count=0,
+        native_probe_call_count=calls,
+        matched_left_rows=len(left_rows) - unmatched,
+        unmatched_left_rows=unmatched,
+        output_rows=len(rows),
+        elapsed_ns=elapsed_ns,
+    )
 
 
 def _left_join_condition(ctx, store, node, scope) -> tuple | None:
