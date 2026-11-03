@@ -50,7 +50,6 @@ from typing import Any
 from rdflib.plugins.sparql.evalutils import _ebv as rdflib_ebv
 from rdflib.plugins.sparql.sparql import FrozenBindings
 
-from .. import ablation
 from ..settings import SETTINGS
 from ..terms import TermView, kind_of, parse_spelling
 from . import compiler, exprs, native, values
@@ -133,7 +132,7 @@ def _compile_conjunct(
         expr,
         variables,
         fast,
-        fast is not None and compiler.is_kind_only(expr) and ablation.CODE_PREDICATES,
+        fast is not None and compiler.is_kind_only(expr) and SETTINGS.code_predicates,
         consts,
         ctx,
         native,

@@ -1,5 +1,5 @@
-"""Work counters (``VORTEX_RDF_COUNTERS=1``, read once at import; off by default, and then nothing
-is wrapped).
+"""Work counters (``VORTEX_RDF_COUNTERS=1``, ``SETTINGS.counters``, read when a store is opened;
+off by default, and then nothing is wrapped).
 
 When on, the store wraps its native handle and term dictionary at open, and every call through them
 is counted: native calls, count calls, rows the native layer returned to Python, decode calls and
@@ -11,9 +11,7 @@ memory map). The counts are cumulative; a caller takes the difference around a q
 import threading
 from typing import cast
 
-from .ablation import flag
-
-ON = flag("VORTEX_RDF_COUNTERS", False)
+from .settings import SETTINGS
 
 _NAMES = (
     "native_calls",
@@ -159,7 +157,7 @@ class CountingDict:
 def wrap[N, D](native: N, term_dict: D) -> tuple[N, D]:
     """``(native, term_dict)``, counted when the counters are on. Typed as what it was given: the
     proxies forward every call, so callers keep the native types."""
-    if not ON:
+    if not SETTINGS.counters:
         return native, term_dict
     counted_dict = None if term_dict is None else CountingDict(term_dict)
     return cast(N, CountingNative(native)), cast(D, counted_dict)

@@ -250,17 +250,29 @@ budget works is described in [docs/pushdown.md](docs/pushdown.md#the-pair-budget
 
 ## Environment variables
 
+Every switch is read when a store is constructed (the pushdown's also when it
+is registered), never on import. An on/off switch takes `1`, `true`, `yes` or
+`on`, and `0`, `false`, `no` or `off`, in any case; a size takes an integer. A
+value it refuses raises `ValueError`, naming the variable.
+
 | Variable | Effect |
 | --- | --- |
 | `VORTEX_RDF_IN_MEMORY=1` | Load stores into memory instead of memory-mapping the file |
 | `VORTEX_RDF_DISABLE_CODE_PATH=1` | Force the N-Triples string path instead of `u64` codes |
 | `VORTEX_RDF_DISABLE_PUSHDOWN=1` | Keep rdflib's default evaluator for every operator (see [docs/pushdown.md](docs/pushdown.md)) |
-| `VORTEX_RDF_PUSHDOWN_OPS=<list>` | Only push down the listed algebra nodes (`bgp` = basic graph patterns only) |
+| `VORTEX_RDF_PUSHDOWN_OPS=<list>` | Only push down the listed algebra nodes (`BGP,Filter,Project,...`; `bgp` = basic graph patterns only) |
 | `VORTEX_RDF_FILTER_FAST=0` | Evaluate every FILTER value through rdflib's expression evaluator (still once per distinct value), with rdflib's semantics |
 | `VORTEX_RDF_NATIVE_FILTERS=0` | Evaluate no FILTER conjunct inside vortex-rdf (no `filter_codes` calls, no kind-test or IRI-equality keeps on the scans): every value goes through the Python routes |
 | `VORTEX_RDF_PAIR_BUDGET=<n>` | The most row pairs one join step of a basic graph pattern builds at once: an integer of at least 0, 16,777,216 by default. A step over it is streamed, reordered around or left to rdflib (see [docs/pushdown.md](docs/pushdown.md#the-pair-budget)) |
+| `VORTEX_RDF_CODE_PREDICATES=0` | Ablation: answer kind tests and IRI equality through decoded values, not as code ranges and code sets |
+| `VORTEX_RDF_COUNT_ORDER=0` | Ablation: order a pattern's joins by their bound positions, with no native counts, and probe every connected step |
+| `VORTEX_RDF_DECODE_EACH_STEP=1` | Ablation: decode a join's codes to spellings and encode them again after every step |
+| `VORTEX_RDF_DECODE_CHUNK=<n>` | Ablation: decode rows `n` at a time (by default 64, growing to 4,096) |
+| `VORTEX_RDF_PROBE_BATCH=<n>` | Ablation: `n` probes per batch call (4,096 by default), and every probe step batched |
+| `VORTEX_RDF_COUNTERS=1` | Count every native call, row returned, decode and encode (`vortex_rdflib.counters.snapshot()`) |
 | `VORTEX_RDF_TRACE_TRIPLES=1` | Print every `triples()` pattern (debugging) |
-| `VORTEX_RDF_TRACE_QUERY=1` | Print the pushdown's query plan as JSON lines on stderr — counts, matches, probes, restrictions, joins, mid-join FILTER prunes and every native call, with row counts and timings (debugging; `VORTEX_RDF_TRACE_QUERY_ID` labels the lines) |
+| `VORTEX_RDF_TRACE_QUERY=1` | Print the pushdown's query plan as JSON lines on stderr — counts, matches, probes, restrictions, joins, mid-join FILTER prunes and every native call, with row counts and timings (debugging; read on each query) |
+| `VORTEX_RDF_TRACE_QUERY_ID=<id>` | The `query_id` the trace's lines carry |
 
 ## Benchmarks
 

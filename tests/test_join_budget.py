@@ -276,7 +276,8 @@ def _fields(events, name) -> list[dict]:
 
 
 def _budget_in_a_fresh_interpreter(value: str | None) -> subprocess.CompletedProcess:
-    """``SETTINGS.pair_budget`` as a new interpreter imports it, with
+    """``SETTINGS.pair_budget`` as a new interpreter reads its switches
+    (``apply_switches``, which every store construction calls), with
     ``VORTEX_RDF_PAIR_BUDGET`` set to ``value`` (unset for ``None``)."""
     env = {key: item for key, item in os.environ.items() if key != "VORTEX_RDF_PAIR_BUDGET"}
     if value is not None:
@@ -285,7 +286,8 @@ def _budget_in_a_fresh_interpreter(value: str | None) -> subprocess.CompletedPro
         [
             sys.executable,
             "-c",
-            "from vortex_rdflib.settings import SETTINGS; print(SETTINGS.pair_budget)",
+            "from vortex_rdflib import settings; settings.apply_switches(); "
+            "print(settings.SETTINGS.pair_budget)",
         ],
         env=env,
         capture_output=True,
@@ -295,8 +297,8 @@ def _budget_in_a_fresh_interpreter(value: str | None) -> subprocess.CompletedPro
 
 
 def test_the_budget_reads_its_environment_variable():
-    """The budget is read once, at import: an integer of at least 0, or
-    ``1 << 24`` when the variable is unset; anything else is refused by
+    """The budget is read with the other switches: an integer of at least 0,
+    or ``1 << 24`` when the variable is unset; anything else is refused by
     name."""
     done = _budget_in_a_fresh_interpreter("123")
     assert done.stdout == "123\n", done.stderr

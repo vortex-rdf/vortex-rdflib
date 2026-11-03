@@ -106,6 +106,9 @@ class VortexRdflibStore(Store):
         # touches. vortex-rdf keeps a bounded cache of the dictionary windows
         # it reads; the OS page cache holds the rest. in_memory loads the whole
         # store up front instead. Env override for benchmark sweeps.
+        # Every switch is read here, once per store (settings.apply_switches),
+        # the pushdown's too when it is off.
+        settings.apply_switches()
         if in_memory is None:
             in_memory = settings.in_memory_by_default()
         self.in_memory = in_memory
@@ -430,7 +433,7 @@ class VortexRdflibStore(Store):
         # that matches nothing leaves no state behind.
         fixed = None
 
-        if settings.trace_triples():
+        if SETTINGS.trace_triples:
             print(
                 "[VortexRdflibStore.triples:start] "
                 f"layout={self.layout} "

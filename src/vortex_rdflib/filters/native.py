@@ -39,7 +39,6 @@ from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import Literal, URIRef
 from vortex_rdf import U64Column
 
-from .. import ablation
 from ..settings import SETTINGS
 from ..terms import BLANK, IRI, LITERAL, canonical_spelling
 from . import exprs, values
@@ -408,7 +407,7 @@ def native_shape(expr, var, consts: dict) -> NativeShape | None:
     shape = _native_shape(expr, var, consts)
     if (
         shape is not None
-        and not ablation.CODE_PREDICATES
+        and not SETTINGS.code_predicates
         and (shape.kind in KIND_TESTS or shape.kind == IRI_IN)
     ):
         return None

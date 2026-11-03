@@ -62,9 +62,12 @@ def test_trace_reports_bounded_order_and_decoding(traced_graph, capsys, monkeypa
     assert traced == untraced
 
 
-def test_trace_rejects_invalid_switch(monkeypatch):
+def test_trace_switch_reads_as_every_switch(monkeypatch):
+    """The trace switch is parsed as every on/off switch is (``settings.flag``)."""
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "yes")
-    with pytest.raises(ValueError, match="must be 0 or 1"):
+    assert settings.trace_enabled()
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "maybe")
+    with pytest.raises(ValueError, match="VORTEX_RDF_TRACE_QUERY"):
         settings.trace_enabled()
 
 

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from vortex_rdf import U64Column
 
-from .. import ablation, filters
+from .. import filters
 from ..cancel import cancel_kw
 from ..settings import SETTINGS
 from . import algebra, matching, probes, relation, streaming, tracing
@@ -207,9 +207,9 @@ def _count_patterns(store, patterns, counts: dict) -> int:
     release for all — after the point counts (``store._point_lookup``: those
     the native layer answers without a scan), any of which may still end the
     block first. Returns the counts made."""
-    if not ablation.COUNT_ORDER:  # VORTEX_RDF_COUNT_ORDER=0: static estimates, no native counts
+    if not SETTINGS.count_order:  # VORTEX_RDF_COUNT_ORDER=0: static estimates, no native counts
         for pat in patterns:
-            pat.estimate = matching._planning_count(store, pat, counts)
+            pat.estimate = 0 if pat.unsatisfiable else matching._static_estimate(pat)
         return 0
     before = len(counts)
     ordered = sorted(patterns, key=matching._pattern_static_rank)
@@ -369,7 +369,7 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
         native_call_count=calls,
         native_match_ns=native_ns,
     )
-    if ablation.DECODE_EACH_STEP:
+    if SETTINGS.decode_each_step:
         rel = _decode_each_step(store, rel)
     rel, tuples = _prune_early(store, rel, tuples, remaining, views)
 
@@ -536,7 +536,7 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
         order.append(pat.index)
         if rel.pieces is not None:
             break
-        if ablation.DECODE_EACH_STEP:
+        if SETTINGS.decode_each_step:
             rel = _decode_each_step(store, rel)
         rel, tuples = _prune_early(store, rel, tuples, remaining, views)
         execution_index += 1

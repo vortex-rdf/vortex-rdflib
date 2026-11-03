@@ -9,8 +9,9 @@ from dataclasses import dataclass, replace
 from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
 
-from .. import ablation, filters, union
+from .. import filters, union
 from ..cancel import CANCEL_TOKEN, cancel_kw_for
+from ..settings import SETTINGS
 from ..terms import unparseable_iri
 from . import relation, tracing
 from .algebra import _VAR_LIKE
@@ -159,7 +160,7 @@ def _static_estimate(pat: Pattern) -> int:
 def _planning_count(store, pat: Pattern, counts: dict, limit: int | None = None) -> int:
     """:func:`_count_pattern` for a planning decision, or the static estimate when counts do not
     plan."""
-    if not ablation.COUNT_ORDER:
+    if not SETTINGS.count_order:
         return 0 if pat.unsatisfiable else _static_estimate(pat)
     return _count_pattern(store, pat, counts, limit=limit)
 
