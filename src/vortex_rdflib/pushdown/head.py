@@ -11,7 +11,7 @@ from operator import itemgetter
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.term import Variable
 
-from .. import trace
+from .. import boundary, trace
 from ..settings import SETTINGS
 from . import algebra, aliasing, blocks, relation, solutions
 from .relation import Relation
@@ -195,7 +195,7 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
     if iris:
         # ``<iri>`` decodes to ``URIRef(iri)``, so the string rdflib compares
         # is the spelling without its brackets.
-        spellings = store._dict.decode_many(iris)
+        spellings = boundary.term_dict(store).decode_many(iris)
         if None in spellings:
             code = iris[spellings.index(None)]
             raise ValueError(f"term code {code} is not in the store dictionary")

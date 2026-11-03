@@ -29,16 +29,18 @@ from tests.support import (
     both_ways,
     counting_native,
     counting_term_dict,
+    is_graph_name_check,
     row_key,
     run,
     run_ordered,
     trace_events,
 )
-from vortex_rdf import Cancelled, CancelToken, VortexRdfStore, serialize_rdf
+from vortex_rdf import Cancelled, CancelToken, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
 from vortex_rdflib import (
     VortexRdflibStore,
+    boundary,
     filters,
     query_scope,
     register_sparql_pushdown,
@@ -46,6 +48,7 @@ from vortex_rdflib import (
     trace,
     unregister_sparql_pushdown,
 )
+from vortex_rdflib.cancel import cancel_scope
 from vortex_rdflib.settings import SETTINGS
 
 
@@ -804,7 +807,8 @@ def test_trace_records_every_native_call(tmp_path, monkeypatch, capsys):
     `native_call_complete`, a batch a `native_batch_complete` carrying its
     probe count — the per-row probes included, so the events add up to the
     calls the store served: 3 counts (one batch), the `p` and `q` matches
-    and 1 probe of `r`."""
+    and 1 probe of `r`. The store's own graph-name check is traced too, and
+    left out here as the counter leaves it out (`is_graph_name_check`)."""
     graph = _pruned_graph(tmp_path)
     register_sparql_pushdown()
     native = counting_native(graph)
@@ -812,7 +816,11 @@ def test_trace_records_every_native_call(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     run(graph, _PRUNED_SQL)
     events = trace_events(capsys.readouterr().err)
-    calls = [e for e in events if e["event"] == "native_call_complete"]
+    calls = [
+        e
+        for e in events
+        if e["event"] == "native_call_complete" and not is_graph_name_check(tuple(e["pattern"]))
+    ]
     batches = [e for e in events if e["event"] == "native_batch_complete"]
     assert (native.counts, native.matches, native.batches) == (3, 3, 1)
     assert [e["operation"] for e in batches] == ["count_quads_many"]
@@ -858,8 +866,10 @@ def test_closing_a_traced_batch_reports_the_pulls_it_made(file_graph):
     """A batch closed early has pulled only what its caller took, and reports
     that once: its probe count is the batch's, its rows the pulled answers'."""
     native = _PullCountingNative(file_graph.store._store())
+    file_graph.store._native = native
     with _tracing() as trace:
-        answers = pd.tracing._TracedNative(native).match_codes_many(_FOUR_PROBES)
+        traced: Any = boundary.native(file_graph.store)  # the proxy closes what it hands out
+        answers = traced.match_codes_many(_FOUR_PROBES)
         assert len(answers) == len(_FOUR_PROBES)
         pulled = [next(answers), next(answers)]
         assert native.answers[0].pulls == 2 and _pending_events(trace) == []
@@ -877,14 +887,12 @@ def test_closing_a_traced_batch_reports_the_pulls_it_made(file_graph):
 def test_traced_chunks_report_the_chunks_pulled(file_graph):
     """A chunk iterator reports once, when it is exhausted: the pattern, its
     keep, the columns and the chunks and rows pulled."""
-    store = file_graph.store._store()
     pattern = (None, "<http://ex.org/knows>", None, None)
     keep = {"o": (0, 1_000_000)}
-    rows = store.count_quads(*pattern)
+    rows = file_graph.store._store().count_quads(*pattern)
     with _tracing() as trace:
-        chunks = pd.tracing._TracedNative(store).match_code_chunks(
-            *pattern, keep=keep, columns=("s", "o"), batch_rows=4
-        )
+        traced: Any = boundary.native(file_graph.store)  # the proxy closes what it hands out
+        chunks = traced.match_code_chunks(*pattern, keep=keep, columns=("s", "o"), batch_rows=4)
         pulled = [next(chunks)]
         assert _pending_events(trace) == []
         pulled.extend(chunks)
@@ -905,15 +913,16 @@ def test_a_traced_chunk_call_without_codes_returns_none(tmp_path):
     out = tmp_path / "plain.vortex"
     serialize_rdf(str(source), str(out), layout="default")
     with _tracing():
-        assert pd.tracing._TracedNative(VortexRdfStore(str(out))).match_code_chunks() is None
+        assert boundary.native(VortexRdflibStore(str(out))).match_code_chunks() is None
 
 
 def test_the_traced_native_forwards_the_native_keywords(file_graph):
-    traced = pd.tracing._TracedNative(file_graph.store._store())
-    token = CancelToken()
-    with _tracing():
-        counts = traced.count_quads_many(_FOUR_PROBES, lookahead=1, cancel=token)
-        answers = traced.match_codes_many(_FOUR_PROBES, lookahead=1, cancel=token)
+    """Traced, the boundary passes a call's keywords on and gives it the
+    query's cancel token, which a scan, a chunked match and a batch race."""
+    with _tracing(), cancel_scope(CancelToken()) as token:
+        traced: Any = boundary.native(file_graph.store)
+        counts = traced.count_quads_many(_FOUR_PROBES, lookahead=1)
+        answers = traced.match_codes_many(_FOUR_PROBES, lookahead=1)
         assert counts == [len(answer[0]) for answer in answers]
         for many in (traced.count_quads_many, traced.match_codes_many):
             with pytest.raises(ValueError, match="lookahead"):
@@ -921,10 +930,10 @@ def test_the_traced_native_forwards_the_native_keywords(file_graph):
         token.cancel()
         for single in (traced.count_quads, traced.match_codes, traced.match_code_chunks):
             with pytest.raises(Cancelled):
-                single(cancel=token)
+                single()
         for many in (traced.count_quads_many, traced.match_codes_many):
             with pytest.raises(Cancelled):
-                many(_FOUR_PROBES, cancel=token)
+                many(_FOUR_PROBES)
 
 
 def test_trace_reports_a_mid_join_prune_between_the_steps_it_links(tmp_path, monkeypatch, capsys):

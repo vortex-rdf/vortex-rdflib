@@ -38,7 +38,7 @@ from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import Literal, URIRef
 from vortex_rdf import U64Column
 
-from .. import trace
+from .. import boundary, trace
 from ..settings import SETTINGS
 from ..terms import BLANK, IRI, LITERAL, canonical_spelling
 from . import exprs, values
@@ -85,7 +85,7 @@ def keep_of(store, shape: NativeShape):
         return store._kind_ranges()[KIND_TESTS[shape.kind]]
     if shape.kind == IRI_IN:
         spellings = list(shape.arg)
-        found = store._dict.encode_many(spellings) if spellings else []
+        found = boundary.term_dict(store).encode_many(spellings) if spellings else []
         return U64Column(sorted({code for code in found if code is not None}))
     return None
 
@@ -171,7 +171,9 @@ def evaluate(store, shape: NativeShape, codes: Collection[int]) -> tuple[set, li
         options["as_str"] = True
     elapsed = trace.stopwatch()
     try:
-        yes, maybe = store._dict.filter_codes(shape.kind, shape.arg, column, **options)
+        yes, maybe = boundary.term_dict(store).filter_codes(
+            shape.kind, shape.arg, column, **options
+        )
     except ValueError:
         # An argument vortex-rdf refuses (a constant outside its value
         # model): every candidate goes to the Python routes.
@@ -200,7 +202,7 @@ def _codes(store, kind: str, arg: str, column: U64Column) -> U64Column | None:
     """The codes of ``column`` that ``kind`` passes, or ``None`` when
     vortex-rdf refuses the argument."""
     try:
-        return store._dict.filter_codes(kind, arg, column)[0]
+        return boundary.term_dict(store).filter_codes(kind, arg, column)[0]
     except ValueError:
         return None
 

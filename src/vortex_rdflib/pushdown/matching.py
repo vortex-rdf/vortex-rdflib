@@ -9,8 +9,7 @@ from dataclasses import dataclass, replace
 from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
 
-from .. import filters, trace, union
-from ..cancel import CANCEL_TOKEN, cancel_kw_for
+from .. import boundary, filters, trace, union
 from ..settings import SETTINGS
 from ..terms import unparseable_iri
 from . import relation, tracing
@@ -130,9 +129,7 @@ def _count_pattern(
     if pat.unsatisfiable:
         return 0
     if exact and pat.distinct:
-        token = CANCEL_TOKEN.get()
-        cancel = {} if token is None else cancel_kw_for({"cancel": token}, store, pat.n3)
-        cols = tracing._native(store).match_codes(*pat.n3, **_narrowing(pat.nkeep), **cancel)
+        cols = boundary.native(store).match_codes(*pat.n3, **_narrowing(pat.nkeep))
         if cols is None:
             raise NotImplementedError
         n = len(union.distinct_rows(cols)[0])
@@ -141,9 +138,7 @@ def _count_pattern(
     key = _pattern_key(pat) if nkeep else tuple(pat.n3)
     n = counts.get(key)
     if n is None:
-        token = CANCEL_TOKEN.get()
-        cancel = {} if token is None else cancel_kw_for({"cancel": token}, store, pat.n3, limit)
-        n = tracing._native(store).count_quads(*pat.n3, **_narrowing(nkeep, limit), **cancel)
+        n = boundary.native(store).count_quads(*pat.n3, **_narrowing(nkeep, limit))
         if limit is None or n < limit:
             counts[key] = n
     return n
@@ -200,13 +195,11 @@ def _match_resolved_pattern(store, pat: Pattern, memo=None, limit=None) -> tuple
     cols = memo.get(key) if memo is not None and limit is None else None
     calls = 0
     if cols is None:
-        native = tracing._native(store)
-        token = CANCEL_TOKEN.get()
-        cancel = {} if token is None else cancel_kw_for({"cancel": token}, store, pat.n3, limit)
+        native = boundary.native(store)
         if nkeep or limit is not None:
-            cols = native.match_codes(*pat.n3, **_narrowing(nkeep, limit), **cancel)
+            cols = native.match_codes(*pat.n3, **_narrowing(nkeep, limit))
         else:
-            cols = native.match_codes(*pat.n3, **cancel)
+            cols = native.match_codes(*pat.n3)
         if cols is None:
             raise NotImplementedError
         if pat.distinct and (limit is None or len(cols[0]) < limit):

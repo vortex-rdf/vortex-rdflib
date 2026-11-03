@@ -6,8 +6,7 @@ from rdflib.store import NO_STORE, VALID_STORE, Store
 from rdflib.term import BNode, IdentifiedNode, Node, URIRef
 from vortex_rdf import VortexRdfStore
 
-from . import counters, query_scope, settings, union
-from .cancel import cancel_kw, cancel_kw_for, check_cancelled
+from . import boundary, query_scope, settings, union
 from .pushdown import register_sparql_pushdown
 from .query_scope import QueryTerms
 from .settings import SETTINGS
@@ -169,7 +168,6 @@ class VortexRdflibStore(Store):
         # each distinct code is decoded to an rdflib term once per query. None
         # on other layouts -> string fallback path.
         self._dict = self._native.term_dict() if self._use_codes else None
-        self._native, self._dict = counters.wrap(self._native, self._dict)  # VORTEX_RDF_COUNTERS
         self._kind_bounds = None
         self._ranges = None
         self._default_code = _UNRESOLVED
@@ -220,19 +218,21 @@ class VortexRdflibStore(Store):
         triple codes (:func:`union.distinct_chunks`) and kept as the union's
         size for ``len()``. A layout without codes has no such pass: a file
         whose quads are not all in the default graph is taken to have them."""
-        store = self._store()
-        quads = store.count_quads()
+        native = boundary.native(self)
+        quads = native.count_quads()
         if not quads:
             return False
-        first = store.match_codes(limit=1)
-        term_dict = self._dict if self._dict is not None else store.term_dict()
+        first = native.match_codes(limit=1)
+        term_dict = boundary.term_dict(self)
+        if term_dict is None:
+            term_dict = native.term_dict()
         if first is None or term_dict is None:
-            return store.count_quads(None, None, None, DEFAULT_GRAPH) != quads
+            return native.count_quads(None, None, None, DEFAULT_GRAPH) != quads
         graph = term_dict.decode(memoryview(first[3]).cast("Q")[0])
-        if store.count_quads(None, None, None, graph) == quads:
+        if native.count_quads(None, None, None, graph) == quads:
             return False
-        chunks = store.match_code_chunks(
-            columns=("s", "p", "o"), batch_rows=SETTINGS.triples_chunk_rows, **cancel_kw()
+        chunks = native.match_code_chunks(
+            columns=("s", "p", "o"), batch_rows=SETTINGS.triples_chunk_rows
         )
         if chunks is None:
             return True
@@ -297,9 +297,8 @@ class VortexRdflibStore(Store):
             raise _NoGraph
         spelling = canonical_spelling(identifier)
         if spelling not in self._contexts_by_spelling:
-            check_cancelled()
             try:
-                self._store().count_quads(None, None, None, spelling, limit=0)
+                boundary.native(self).count_quads(None, None, None, spelling, limit=0)
             except ValueError:
                 raise _NoGraph from None
         return spelling
@@ -321,8 +320,7 @@ class VortexRdflibStore(Store):
         names_a_graph = known.get(spelling)
         if names_a_graph is None:
             pattern = (None, None, None, spelling)
-            cancel = cancel_kw_for(cancel_kw(), self, pattern)
-            names_a_graph = known[spelling] = self._store().count_quads(*pattern, **cancel) > 0
+            names_a_graph = known[spelling] = boundary.native(self).count_quads(*pattern) > 0
         return spelling if names_a_graph else None
 
     def _context_tuple(self, spelling: str, by_spelling: dict | None = None) -> tuple:
@@ -397,15 +395,14 @@ class VortexRdflibStore(Store):
         first of 64 rows, so a consumer that stops early decodes only the
         slices, and pulls only the chunks, it reached. The query's cancel
         token (``cancel.cancel_scope``) is read once, when the iteration
-        starts: a one-shot native match or count races it where the token
-        can stop that call — a scan of a file-backed store — and checks it
-        before the call otherwise (``cancel.cancel_kw_for``), every pull
-        of a chunk races it, and a read through the string fallback, which
-        takes no token, checks it before the call.
+        starts, and the native boundary (:mod:`.boundary`) applies it: a
+        one-shot native match or count races it where the token can stop
+        that call — a scan of a file-backed store — and checks it before the
+        call otherwise, every pull of a chunk races it, and a read through
+        the string fallback, which takes no token, checks it before the call.
         """
         if self.path is None:
             return
-        cancel = cancel_kw()
 
         s, p, o = triple_pattern
 
@@ -442,11 +439,8 @@ class VortexRdflibStore(Store):
                 flush=True,
             )
 
-        store = self._store()
+        native = boundary.native(self)
         pattern = (s_n3, p_n3, o_n3, g_n3)
-        # The keyword of the one native call below, decided once for the
-        # store's residency and the pattern's shape.
-        one_shot = cancel_kw_for(cancel, self, pattern)
 
         # Fully-ground pattern: no term needs materializing. In one graph it
         # is an existence check — counting from the row selection preserves
@@ -456,22 +450,21 @@ class VortexRdflibStore(Store):
         if s_n3 is not None and p_n3 is not None and o_n3 is not None:
             triple = (s, p, o)
             if g_n3 is not None:
-                count = store.count_quads(*pattern, **one_shot)
+                count = native.count_quads(*pattern)
                 if count:
                     fixed = self._context_tuple(g_n3)
                     for _ in range(count):
                         yield triple, fixed
                 return
             if self._dict is not None:
-                cols = store.match_codes(s_n3, p_n3, o_n3, None, **one_shot)
+                cols = native.match_codes(s_n3, p_n3, o_n3, None)
                 if cols is not None:
-                    term_dict, by_code = self._dict, self._contexts_by_code
+                    term_dict, by_code = boundary.term_dict(self), self._contexts_by_code
                     by_spelling = self._contexts_by_spelling
                     for code in memoryview(cols[3]).cast("Q").tolist():
                         yield triple, self._context_of_code(code, term_dict, by_code, by_spelling)
                     return
-            check_cancelled()
-            *_, graphs = store.match_columns(s_n3, p_n3, o_n3, None)
+            *_, graphs = native.match_columns(s_n3, p_n3, o_n3, None)
             by_spelling = self._contexts_by_spelling
             for g_raw in graphs:
                 yield triple, self._context_tuple(g_raw, by_spelling)
@@ -480,11 +473,11 @@ class VortexRdflibStore(Store):
         # The dictionary, the graph-context caches and a large pattern's chunk
         # iterator are bound once: rows read after a close(), or an open() of
         # another file, still come from the file the call started on.
-        term_dict, by_code = self._dict, self._contexts_by_code
+        term_dict, by_code = boundary.term_dict(self), self._contexts_by_code
         by_spelling = self._contexts_by_spelling
         matches = None
         if term_dict is not None:
-            matches = self._code_matches(store, pattern, cancel, one_shot)
+            matches = self._code_matches(native, pattern)
         if matches is not None:
             cache = None
             contexts: dict[int, tuple] = {}
@@ -561,9 +554,8 @@ class VortexRdflibStore(Store):
         # match_columns shares one Python string object across repeats of a
         # term, so memoizing the parse by string turns per-row term
         # construction into per-distinct-term construction. It takes no
-        # cancel token, so the token is checked before it.
-        check_cancelled()
-        subjects, predicates, objects, graphs = store.match_columns(s_n3, p_n3, o_n3, g_n3)
+        # cancel token, so the boundary checks the token before it.
+        subjects, predicates, objects, graphs = native.match_columns(s_n3, p_n3, o_n3, g_n3)
         if g_n3 is not None and subjects:
             fixed = self._context_tuple(g_n3, by_spelling)
         parse = self._from_n3_safe
@@ -580,9 +572,7 @@ class VortexRdflibStore(Store):
                 (fixed if fixed is not None else self._context_tuple(g_raw, by_spelling)),
             )
 
-    def _code_matches(
-        self, store: VortexRdfStore, pattern: tuple, cancel: dict, one_shot: dict
-    ) -> Iterable[tuple] | None:
+    def _code_matches(self, native: VortexRdfStore, pattern: tuple) -> Iterable[tuple] | None:
         """The code columns :meth:`triples` reads for the quad pattern
         ``pattern``, as matches to read in turn: ``match_codes``'s one match of
         a pattern of at most ``SETTINGS.triples_chunk_rows`` rows, or, for a pattern of
@@ -592,20 +582,19 @@ class VortexRdflibStore(Store):
 
         The match is asked for one row more than ``SETTINGS.triples_chunk_rows``: one
         that holds at most that many is the whole pattern, and a full one is
-        dropped before the chunks are read. It races the query's token where
-        the token can stop it (``one_shot``, ``cancel.cancel_kw_for``); the
-        chunk call is given ``cancel`` as it is, since every pull of a chunk
-        waits for the native layer, in memory as on file.
+        dropped before the chunks are read. ``native`` is the store's handle
+        through the boundary (:mod:`.boundary`), which gives each call the
+        query's token as its policy says.
         """
         chunk_rows = SETTINGS.triples_chunk_rows
-        cols = store.match_codes(*pattern, limit=chunk_rows + 1, **one_shot)
+        cols = native.match_codes(*pattern, limit=chunk_rows + 1)
         if cols is None:
             return None
         if len(cols[0]) <= chunk_rows:
             return (cols,)
         del cols
         columns = ("s", "p", "o", "g") if pattern[3] is None else ("s", "p", "o")
-        return store.match_code_chunks(*pattern, columns=columns, batch_rows=chunk_rows, **cancel)
+        return native.match_code_chunks(*pattern, columns=columns, batch_rows=chunk_rows)
 
     def contexts(self, triple=None):
         """RDFLib Store API: the graphs holding ``triple``, or every graph.
@@ -633,21 +622,19 @@ class VortexRdflibStore(Store):
 
     def _distinct_graphs(self, s_n3, p_n3, o_n3) -> list:
         """The distinct graphs of a pattern's match, in first-seen order."""
-        store = self._store()
+        native = boundary.native(self)
         if self._dict is not None:
-            pattern = (s_n3, p_n3, o_n3, None)
-            cols = store.match_codes(*pattern, **cancel_kw_for(cancel_kw(), self, pattern))
+            cols = native.match_codes(s_n3, p_n3, o_n3, None)
             if cols is not None:
                 # Native distinct, in first-seen order.
                 codes = memoryview(cols[3].distinct()).cast("Q").tolist()
-                term_dict, by_code = self._dict, self._contexts_by_code
+                term_dict, by_code = boundary.term_dict(self), self._contexts_by_code
                 by_spelling = self._contexts_by_spelling
                 return [
                     self._context_of_code(code, term_dict, by_code, by_spelling)[0]
                     for code in codes
                 ]
-        check_cancelled()
-        *_spo, graphs = store.match_columns(s_n3, p_n3, o_n3, None)
+        *_spo, graphs = native.match_columns(s_n3, p_n3, o_n3, None)
         return [self._context_tuple(name)[0] for name in dict.fromkeys(graphs)]
 
     def _terms(self) -> QueryTerms:
@@ -659,7 +646,7 @@ class VortexRdflibStore(Store):
         """Decode every code the query's term cache lacks in one native call
         (:meth:`_decode_into`), and return that cache (code -> term)."""
         cache = self._terms().decode
-        self._decode_into(self._dict, cache, code_columns)
+        self._decode_into(boundary.term_dict(self), cache, code_columns)
         return cache
 
     def _decode_into(self, term_dict, cache: dict, code_columns) -> None:
@@ -697,7 +684,7 @@ class VortexRdflibStore(Store):
         if self._default_code is _UNRESOLVED:
             if self._dict is None:
                 raise ValueError("store has no term dictionary (code path inactive)")
-            self._default_code = self._dict.encode(DEFAULT_GRAPH)
+            self._default_code = boundary.term_dict(self).encode(DEFAULT_GRAPH)
         return self._default_code  # ty: ignore[invalid-return-type]
 
     def _term_kind_bounds(self) -> tuple[int, int, int]:
@@ -706,7 +693,7 @@ class VortexRdflibStore(Store):
         if self._kind_bounds is None:
             if self._dict is None:
                 raise ValueError("store has no term dictionary (code path inactive)")
-            self._kind_bounds = kind_bounds(self._dict)
+            self._kind_bounds = kind_bounds(boundary.term_dict(self))
         return self._kind_bounds
 
     def _kind_ranges(self) -> dict:
@@ -716,10 +703,11 @@ class VortexRdflibStore(Store):
         if self._ranges is None:
             if self._dict is None:
                 raise ValueError("store has no term dictionary (code path inactive)")
+            term_dict = boundary.term_dict(self)
             self._ranges = {
-                LITERAL: tuple(self._dict.prefix_range('"')),
-                IRI: tuple(self._dict.prefix_range("<")),
-                BLANK: tuple(self._dict.prefix_range("_:")),
+                LITERAL: tuple(term_dict.prefix_range('"')),
+                IRI: tuple(term_dict.prefix_range("<")),
+                BLANK: tuple(term_dict.prefix_range("_:")),
             }
         return self._ranges
 
@@ -741,7 +729,7 @@ class VortexRdflibStore(Store):
         if node is None:
             if self._dict is None:
                 raise ValueError("store has no term dictionary (code path inactive)")
-            raw = self._dict.decode(code)
+            raw = boundary.term_dict(self).decode(code)
             if raw is None:
                 raise ValueError(f"term code {code} is not in the store dictionary")
             node = terms.decode[code] = self._from_n3_safe(raw)
@@ -767,8 +755,7 @@ class VortexRdflibStore(Store):
             if self._union_len is None:
                 self._union_len = sum(1 for _ in self.triples((None, None, None)))
             return self._union_len
-        pattern = (None, None, None, g_n3)
-        return self._store().count_quads(*pattern, **cancel_kw_for(cancel_kw(), self, pattern))
+        return boundary.native(self).count_quads(None, None, None, g_n3)
 
     def add(self, triple, context=None, quoted=False):
         raise NotImplementedError("VortexRdflibStore is read-only")

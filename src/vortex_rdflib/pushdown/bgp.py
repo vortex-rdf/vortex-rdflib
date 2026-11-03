@@ -11,10 +11,9 @@ from dataclasses import dataclass, field
 
 from vortex_rdf import U64Column
 
-from .. import filters, trace
-from ..cancel import cancel_kw
+from .. import boundary, filters, trace
 from ..settings import SETTINGS
-from . import algebra, matching, probes, relation, streaming, tracing
+from . import algebra, matching, probes, relation, streaming
 from .matching import Pattern
 from .relation import Relation, _OverBudget
 
@@ -245,9 +244,7 @@ def _count_patterns(store, patterns, counts: dict) -> int:
             rest.append(pat)
     if len({tuple(pat.n3) for pat in rest}) >= minimum:
         keys = list(dict.fromkeys(tuple(pat.n3) for pat in rest))
-        counts.update(
-            zip(keys, tracing._native(store).count_quads_many(keys, **cancel_kw()), strict=True)
-        )
+        counts.update(zip(keys, boundary.native(store).count_quads_many(keys), strict=True))
         for pat in rest:
             pat.estimate = counts[tuple(pat.n3)]
     else:
@@ -628,7 +625,7 @@ def _decode_each_step(store, rel: Relation) -> Relation:
     encoded again — the same codes (tests/test_ablation_switches.py checks it), after the term round
     trip a term-space evaluator pays at every step. Codes outside the dictionary (negative: query
     constants) pass through; a streamed relation (pieces) is left as it is."""
-    term_dict = store._dict
+    term_dict = boundary.term_dict(store)
 
     def again(codes: list) -> list:
         mine = [c for c in codes if c >= 0]

@@ -9,10 +9,10 @@ from collections.abc import Iterator, Sequence
 
 from vortex_rdf import CodeGroups, U64Column
 
-from .. import trace, union
-from ..cancel import cancel_kw, check_cancelled
+from .. import boundary, trace, union
+from ..cancel import check_cancelled
 from ..settings import SETTINGS
-from . import matching, relation, tracing
+from . import matching, relation
 from .matching import Pattern
 from .relation import Relation
 
@@ -125,12 +125,11 @@ def _streamed_step(
         if pattern is not None:
             fed = relation._slices(pattern, len(pattern[0]))
         else:
-            fed = tracing._native(store).match_code_chunks(
+            fed = boundary.native(store).match_code_chunks(
                 *pat.n3,
                 columns=[("s", "p", "o", "g")[varpos[v][0]] for v in pattern_schema],
                 batch_rows=SETTINGS.piece_rows,
                 **matching._narrowing(pat.nkeep),
-                **cancel_kw(),
             )
             if fed is None:
                 raise NotImplementedError

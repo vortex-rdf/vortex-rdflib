@@ -1,11 +1,11 @@
-"""A query's cancel token, and how each native call is given it.
+"""A query's cancel token.
 
 ``cancel_scope(token)`` gives the queries started inside it ``token``. A
 query keeps it in its scope (:mod:`.query_scope`), so every step of its lazy
-result runs under it. The store and the pushdown read the current token here:
-a native call the token can stop is given it (``cancel=``) and races it, any
-other one-shot call checks it as it is made (:func:`cancel_kw_for`), and the
-loops between native calls check it per step (:func:`check_cancelled`).
+result runs under it. The native boundary (:mod:`.boundary`) gives each native
+call the current token by one policy — a call the token can stop races it,
+any other checks it as it is made — and the loops between native calls check
+it per step (:func:`check_cancelled`).
 """
 
 import contextlib
@@ -49,35 +49,11 @@ def cancel_scope(token: CancelToken) -> Generator[CancelToken]:
         CANCEL_TOKEN.reset(reset)
 
 
-def cancel_kw() -> dict:
-    """The keyword that gives a native call the current query's cancel token:
-    ``{"cancel": token}``, or none without a token."""
-    token = CANCEL_TOKEN.get()
-    return {} if token is None else {"cancel": token}
-
-
 def check_cancelled() -> None:
     """Raise ``vortex_rdf.Cancelled`` when the current query's cancel token is
     cancelled: the check made per step of a loop that makes no native call,
     and before a one-shot native call that does not race the token
-    (:func:`cancel_kw_for`)."""
+    (:mod:`.boundary`)."""
     token = CANCEL_TOKEN.get()
     if token is not None and token.cancelled:
         raise Cancelled("cancelled through its CancelToken")
-
-
-def cancel_kw_for(cancel: dict, store, n3, limit: int | None = None) -> dict:
-    """The cancel keyword of one one-shot native call (``match_codes``,
-    ``count_quads``) on ``store`` over the quad pattern ``n3``, given the
-    query's (``cancel``, :func:`cancel_kw`): ``cancel`` for a call the token
-    can stop — one that can scan a file-backed store — which races it; none
-    for any other — any call on an in-memory store, which finishes without
-    waiting, a point lookup (``VortexRdflibStore._point_lookup``) or a call
-    capped at one row (``limit``) — which checks the token as it is made
-    (:func:`check_cancelled`)."""
-    if cancel and (
-        store.in_memory or (limit is not None and limit <= 1) or store._point_lookup(n3)
-    ):
-        check_cancelled()
-        return {}
-    return cancel

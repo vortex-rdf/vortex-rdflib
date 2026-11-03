@@ -6,11 +6,11 @@ handlers.
 
 from rdflib.plugins.sparql.evaluate import evalPart
 
-from .. import filters, trace
+from .. import boundary, filters, trace
 from ..cancel import check_cancelled
 from ..settings import SETTINGS
 from ..terms import canonical_spelling, unparseable_iri
-from . import algebra, bgp, matching, probes, relation, solutions, tracing
+from . import algebra, bgp, matching, probes, relation, solutions
 from .matching import Pattern
 from .relation import Relation
 
@@ -53,7 +53,7 @@ def _block_nonempty(ctx, store, block) -> bool:
             # file-backed scan at its first match.
             narrowing = matching._narrowing(pat.nkeep, limit=1)
             check_cancelled()
-            return tracing._native(store).count_quads(*pat.n3, **narrowing) > 0
+            return boundary.native(store).count_quads(*pat.n3, **narrowing) > 0
     rel = _solve_block(ctx, store, block, scope=scope, limit=1)
     # One row is pulled, and the rows are closed after it: a streamed join
     # gathers one piece and releases its feed.
@@ -225,7 +225,8 @@ def _constant_codes(store, terms: list) -> list:
     rejected = [unparseable_iri(term) for term in terms]
     spellings = [canonical_spelling(t) for t, out in zip(terms, rejected, strict=True) if not out]
     try:
-        encoded = iter(store._dict.encode_many(spellings) if spellings else ())
+        term_dict = boundary.term_dict(store)
+        encoded = iter(term_dict.encode_many(spellings) if spellings else ())
     except ValueError:
         raise NotImplementedError from None
     found = [None if out else next(encoded) for out in rejected]

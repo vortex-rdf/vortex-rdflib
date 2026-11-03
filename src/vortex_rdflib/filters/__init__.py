@@ -50,6 +50,7 @@ from typing import Any
 from rdflib.plugins.sparql.evalutils import _ebv as rdflib_ebv
 from rdflib.plugins.sparql.sparql import FrozenBindings
 
+from .. import boundary
 from ..settings import SETTINGS
 from ..terms import TermView, kind_of, parse_spelling
 from . import compiler, exprs, native, values
@@ -260,7 +261,7 @@ def _fast_route(store, fast, views: dict) -> Callable[[tuple], Any]:
             if code < 0:
                 view = views[code] = values.constant_view(store._terms().foreign[code])
             else:
-                spelling = store._dict.decode(code)
+                spelling = boundary.term_dict(store).decode(code)
                 if spelling is None:
                     raise ValueError(f"term code {code} is not in the store dictionary")
                 view = views[code] = parse_spelling(spelling)
@@ -401,7 +402,7 @@ def decode_views(store, codes, views: dict) -> None:
     missing = [code for code in codes if code not in views]
     if not missing:
         return
-    for code, spelling in zip(missing, store._dict.decode_many(missing), strict=True):
+    for code, spelling in zip(missing, boundary.term_dict(store).decode_many(missing), strict=True):
         if spelling is None:
             raise ValueError(f"term code {code} is not in the store dictionary")
         views[code] = parse_spelling(spelling)

@@ -7,8 +7,7 @@ join they make (:func:`_probe_join`), and the existence probes of
 from collections.abc import Iterator, Sequence
 from itertools import islice
 
-from .. import filters, trace
-from ..cancel import cancel_kw, cancel_kw_for
+from .. import boundary, filters, trace
 from ..settings import SETTINGS
 from ..terms import canonical_spelling, unparseable_iri
 from . import matching, tracing
@@ -96,48 +95,37 @@ def _run_probes(store, probes, count: bool) -> list | Iterator:
     ``count_quads_many`` or ``match_codes_many`` call — every probe parsed
     before any runs, running as far ahead on the native runtime as
     :func:`_probe_lookahead` lets them, a file-backed store overlapping their
-    reads — and the rest through plain calls. The query's cancel token is
-    read once: a batch call races it, a plain call races or checks it as
-    :func:`cancel_kw_for` decides, and without a token no call is given a
-    keyword. The matches come from :func:`_probe_matches` under a token or
+    reads — and the rest through plain calls. The native boundary is taken
+    once (:mod:`vortex_rdflib.boundary`), so the query's cancel token is read
+    once: a batch call races it, a plain call races or checks it as the
+    boundary's policy says. The matches come from :func:`_probe_matches`
     when only some probes are batched; otherwise from a generator over the
     plain calls, or from the batch's own native iterator
     (:func:`_batch_answers`).
     """
     if not probes:
         return []
-    native = tracing._native(store)
+    native = boundary.native(store)
     minimum = SETTINGS.memory_scan_batch_min if store.in_memory else SETTINGS.scan_batch_min
     batched = _batched_probes(store, [n3 for n3, _ in probes]) if len(probes) >= minimum else []
-    cancel = cancel_kw()
     if not count:
-        if cancel or 0 < len(batched) < len(probes):
-            return _probe_matches(store, native, probes, batched, cancel)
+        if 0 < len(batched) < len(probes):
+            return _probe_matches(store, native, probes, batched)
         if batched:
             return _batch_answers(store, native, probes)
         return (native.match_codes(*n3, **narrowing) for n3, narrowing in probes)
     if not batched:
-        if not cancel:
-            return [native.count_quads(*n3, **narrowing) for n3, narrowing in probes]
-        return [
-            native.count_quads(
-                *n3, **narrowing, **cancel_kw_for(cancel, store, n3, narrowing.get("limit"))
-            )
-            for n3, narrowing in probes
-        ]
+        return [native.count_quads(*n3, **narrowing) for n3, narrowing in probes]
     answers: list = [None] * len(probes)
     batch = [_batch_probe(*probes[i]) for i in batched]
     lookahead = _probe_lookahead(store, [probes[i][0] for i in batched])
-    counts = native.count_quads_many(batch, lookahead=lookahead, **cancel)
+    counts = native.count_quads_many(batch, lookahead=lookahead)
     for i, answer in zip(batched, counts, strict=True):
         answers[i] = answer
     done = set(batched)
     for i, (n3, narrowing) in enumerate(probes):
         if i not in done:
-            limit = narrowing.get("limit")
-            answers[i] = native.count_quads(
-                *n3, **narrowing, **cancel_kw_for(cancel, store, n3, limit)
-            )
+            answers[i] = native.count_quads(*n3, **narrowing)
     return answers
 
 
@@ -182,17 +170,17 @@ def _batch_answers(store, native, probes) -> Iterator:
             close()
 
 
-def _probe_matches(store, native, probes, batched, cancel: dict) -> Iterator:
+def _probe_matches(store, native, probes, batched) -> Iterator:
     """The code columns of each probe, in order, each made when it is pulled:
     the ``batched`` probes' from the one ``match_codes_many`` call the first
     pull makes, whose probes run, as far ahead as :func:`_probe_lookahead`
     lets them, while the consumer works through the answers before theirs;
-    the others from a ``match_codes`` call at their position. ``cancel`` is
-    the query's cancel keyword (:func:`cancel_kw`): the batch is given it,
-    and a plain call races or checks the token as :func:`cancel_kw_for`
-    decides. A batch that answers fewer probes than it was given raises
-    ``ValueError`` at the first probe left without an answer, and one that
-    answers more, with its last probe. Closing the iterator releases the
+    the others from a ``match_codes`` call at their position. ``native`` is
+    the store's handle through the boundary, which gives the batch the
+    query's cancel token and has a plain call race or check it. A batch that
+    answers fewer probes than it was given raises ``ValueError`` at the
+    first probe left without an answer, and one that answers more, with its
+    last probe. Closing the iterator releases the
     batch's answers, which aborts the probes still in flight."""
     in_batch = set(batched)
     answers = iter(())
@@ -200,16 +188,12 @@ def _probe_matches(store, native, probes, batched, cancel: dict) -> Iterator:
         answers = native.match_codes_many(
             [_batch_probe(*probes[i]) for i in batched],
             lookahead=_probe_lookahead(store, [probes[i][0] for i in batched]),
-            **cancel,
         )
     unanswered = len(batched)
     try:
         for i, (n3, narrowing) in enumerate(probes):
             if i not in in_batch:
-                limit = narrowing.get("limit")
-                yield native.match_codes(
-                    *n3, **narrowing, **cancel_kw_for(cancel, store, n3, limit)
-                )
+                yield native.match_codes(*n3, **narrowing)
                 continue
             try:
                 answer = next(answers)
@@ -402,7 +386,7 @@ def _probe_spellings(store, rows, bound) -> dict:
         for code in distinct
         if code < 0
     }
-    for code, term in zip(codes, store._dict.decode_many(codes), strict=True):
+    for code, term in zip(codes, boundary.term_dict(store).decode_many(codes), strict=True):
         if term is None:
             raise ValueError(f"term code {code} is not in the store dictionary")
         n3_cache[code] = term

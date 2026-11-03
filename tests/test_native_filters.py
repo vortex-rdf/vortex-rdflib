@@ -507,6 +507,7 @@ def test_a_mid_size_code_set_goes_to_the_native_layer_whole(tmp_path, monkeypatc
     out = tmp_path / "s.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
     store = VortexRdflibStore(str(out), in_memory=False)
+    store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     subjects = ", ".join(f"<http://ex.org/s{i}>" for i in range(0, 200, 2))
     query = f"SELECT ?s WHERE {{ ?s <http://ex.org/p> ?o FILTER(?s IN ({subjects})) }}"
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")

@@ -25,8 +25,10 @@ XSD = "http://www.w3.org/2001/XMLSchema#"
 def test_limit_stops_a_single_pattern_match(tmp_path, monkeypatch, capsys, in_memory):
     """A LIMIT over one pattern — with a FILTER the native match decides,
     too — fetches only the rows it reads; an OFFSET reads past them."""
-    graph = Graph(store=VortexRdflibStore(products_file(tmp_path), in_memory=in_memory))
+    store = VortexRdflibStore(products_file(tmp_path), in_memory=in_memory)
+    graph = Graph(store=store)
     register_sparql_pushdown()
+    store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     for query, limit in [
         ("SELECT * WHERE { ?s ?p ?o } LIMIT 5", 5),
@@ -47,9 +49,13 @@ def test_limit_is_not_pushed_where_rows_are_dropped_in_python(tmp_path, monkeypa
     match whole: the LIMIT applies to the rows as before."""
     register_sparql_pushdown()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
-    plain = Graph(store=VortexRdflibStore(products_file(tmp_path)))
-    indexed_path = products_file(tmp_path / "indexed", indexes=["secondary-by-copy"])
-    indexed = Graph(store=VortexRdflibStore(indexed_path))
+    stores = [
+        VortexRdflibStore(products_file(tmp_path)),
+        VortexRdflibStore(products_file(tmp_path / "indexed", indexes=["secondary-by-copy"])),
+    ]
+    for store in stores:
+        store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
+    plain, indexed = (Graph(store=store) for store in stores)
     for graph, query in [
         (plain, 'SELECT ?s WHERE { ?s ?p ?o FILTER(regex(str(?o), "1")) } LIMIT 3'),
         (plain, "SELECT ?s WHERE { ?s ?p ?s } LIMIT 3"),

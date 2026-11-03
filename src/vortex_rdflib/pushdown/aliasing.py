@@ -11,6 +11,7 @@ from collections.abc import Iterator
 import rdflib.term
 from rdflib.term import Literal
 
+from .. import boundary
 from ..terms import CANONICAL_INTEGER, INTEGER_SUFFIX, canonical_spelling
 
 
@@ -49,7 +50,7 @@ def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
         local = [c for c in pending if c >= 0]
         if local:
             cache = terms.decode
-            for code, spelling in _rewritable(local, store._dict.decode_many(local)):
+            for code, spelling in _rewritable(local, boundary.term_dict(store).decode_many(local)):
                 term = cache.get(code)
                 if term is None:
                     term = cache[code] = store._from_n3_safe(spelling)
@@ -136,14 +137,14 @@ def _canonical_twins(store, read: list) -> dict:
         return {}
     spellings = list(wanted.values())
     try:
-        found = store._dict.encode_many(spellings)
+        found = boundary.term_dict(store).encode_many(spellings)
     except ValueError:
         # A spelling the native parser rejects fails the whole batch; alone,
         # it names no term of the file.
         found = []
         for spelling in spellings:
             try:
-                found.append(store._dict.encode(spelling))
+                found.append(boundary.term_dict(store).encode(spelling))
             except ValueError:
                 found.append(None)
     hits = [code for code in found if code is not None]

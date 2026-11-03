@@ -410,9 +410,11 @@ def test_iri_equality_is_a_keep_on_the_match(tmp_path, monkeypatch, capsys):
     """?v IN (<iri>, ...) is the IRIs' codes — one encode_many — riding the
     native match as a keep: no candidate is evaluated and only the matching
     rows leave vortex-rdf."""
-    graph = Graph(store=VortexRdflibStore(products_file(tmp_path), in_memory=True))
+    store = VortexRdflibStore(products_file(tmp_path), in_memory=True)
+    graph = Graph(store=store)
     register_sparql_pushdown()
     spy = filter_spy(graph)
+    store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
     rows = run(
