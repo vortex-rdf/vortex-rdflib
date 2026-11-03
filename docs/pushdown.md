@@ -493,6 +493,39 @@ SELECT ?s ?v WHERE {
 }
 ```
 
+### SPARQL semantics
+
+A conjunct the hook evaluates itself follows SPARQL 1.1 (§17), not rdflib,
+where the two differ. That covers the fast route, the native predicates and
+the folding of constant subexpressions. The generic route is rdflib's own
+evaluator, and keeps rdflib's answers. So does everything rdflib evaluates:
+the hook switched off, a node it hands back, and the expressions listed under
+[What stays with rdflib](#what-stays-with-rdflib). Query constants reach the
+hook as rdflib's parser built them, so a non-canonical number in the query
+text (`"042"^^xsd:integer`) is already `"42"`.
+
+Where rdflib and the specification part ways:
+
+| Expression | rdflib | SPARQL 1.1, and the hook |
+|---|---|---|
+| `A && B` with `A` an error and `B` false | error | false (`E && F = F`) |
+| `&&`, `\|\|` with an unbound variable as an operand | error, before any operand is tested | the truth tables: `T \|\| E = T`, `F && E = F` |
+| `sameTerm`, `IN`, `=` with a comparison's value (`?a < ?b`) | no match | the `xsd:boolean` term `true` or `false` |
+| `A IN (B, …)` | term identity (`1 IN (1.0)` is false); an erring comparison is no match | `A = B \|\| …`: value equality, an error when no comparison holds and one errs; `NOT IN` is its negation |
+| `=`, `!=` between a literal of an unknown datatype, or an ill-typed one, and another literal | false, `!=` true | true for the same term; false when exactly one has a language tag; otherwise an error |
+| `<`, `>`, `<=`, `>=` across kinds: a string and a number, a language-tagged string, an unknown datatype | ordered by datatype IRI | an error |
+| `xsd:dateTime` and `xsd:date` with and without a timezone | compared as written | XML Schema's partial order: within 14 hours the comparison is an error |
+| effective boolean value of NaN, an ill-typed number or an ill-typed boolean (`"TRUE"^^xsd:boolean`) | true, or an error | false |
+| effective boolean value of an unknown datatype, a date or an IRI | rdflib's | an error |
+| `isNumeric` of an ill-typed number | true | false |
+| `sameTerm` and `STR` of a non-canonical literal (`"01"^^xsd:integer`) | rdflib's normalized term (`"1"`) | the term as the data writes it |
+| `REGEX` flags `x` and `q` | ignored | XPath's: `x` drops the pattern's whitespace, `q` matches it literally |
+| a conjunct with no variable (`"5" > 3`) | rdflib folds it | the rules above |
+
+[`tests/test_filter_spec.py`](../tests/test_filter_spec.py) checks each row,
+and the FILTER tests of the W3C SPARQL test suite
+([`tests/data/w3c_filter_cases.json`](../tests/data/w3c_filter_cases.json)).
+
 ### Splitting into conjuncts
 
 [`_solve_filter`](../src/vortex_rdflib/pushdown/blocks.py#L233) calls
@@ -1066,8 +1099,14 @@ field of `vortex_rdflib.settings.SETTINGS`, read when each decision is made.
 
 ## Tests
 
-The tests check that the hook never changes an answer:
+The tests check that the hook never changes an answer, except where rdflib
+and SPARQL 1.1 disagree ([SPARQL semantics](#sparql-semantics)):
 
+- [`tests/test_filter_spec.py`](../tests/test_filter_spec.py) checks those
+  answers: a table of the cases where rdflib and the specification part ways,
+  and the FILTER tests of the W3C SPARQL test suite
+  ([`tests/data/w3c_filter_cases.json`](../tests/data/w3c_filter_cases.json),
+  derived as [`tests/data/W3C-NOTICE.md`](../tests/data/W3C-NOTICE.md) says).
 - [`tests/test_pushdown.py`](../tests/test_pushdown.py) runs every query shape
   twice, with the hook and with rdflib's default evaluator, and compares the
   results. It covers file-backed and in-memory stores, stores with each
