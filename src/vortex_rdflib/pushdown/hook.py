@@ -84,10 +84,7 @@ def _traced_eval(run, ctx, store, part):
     rdflib, cancelled or failed. The trace's lines are flushed once the
     planning is over, so nothing after it is timed."""
     elapsed = trace.stopwatch()
-    if trace.active() is not None:
-        trace.event(
-            "eval_part_start", algebra_node=part.name, enabled_ops=sorted(SETTINGS.enabled_ops)
-        )
+    trace.event("eval_part_start", algebra_node=part.name, enabled_ops=sorted(SETTINGS.enabled_ops))
     try:
         result = run(ctx, store, part)
     except Exception as error:

@@ -14,7 +14,6 @@ from rdflib.plugins.sparql.evalutils import _val
 from rdflib.term import Variable
 
 from .. import boundary, filters, trace
-from ..cancel import check_cancelled
 from ..settings import SETTINGS
 from ..terms import BLANK, IRI
 from . import algebra, aliasing, blocks, matching, relation, solutions
@@ -316,7 +315,6 @@ def _block_nonempty(ctx, store, node: Block) -> bool:
             # Existence needs no rows: a count capped at one, which stops a
             # file-backed scan at its first match.
             narrowing = matching._narrowing(pat.nkeep, limit=1)
-            check_cancelled()
             return boundary.native(store).count_quads(*pat.n3, **narrowing) > 0
     rel = blocks._solve_block(ctx, store, node, blocks._Frame(scope, limit=1))
     # One row is pulled, and the rows are closed after it: a streamed join

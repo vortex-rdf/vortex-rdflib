@@ -104,7 +104,8 @@ typed path per case.
   `rank_codes_complete` and `limit_applied_during_order` of `order_complete`
   (each repeated another). `join_plan_complete` and `left_join_plan_complete`
   report a `keep_scan` strategy, and the latter reports `constant_false` for
-  any right side.
+  any right side. A FILTER applied over the rows of a pattern rdflib solved
+  is traced as `filter_over_rdflib_rows`, naming that node (`algebra_node`).
 - `vortex_rdflib.pushdown.__all__` lists only `register_sparql_pushdown` and
   `unregister_sparql_pushdown`; its modules are internal.
 
