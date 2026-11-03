@@ -77,21 +77,21 @@ class TermView:
 def parse_spelling(spelling: str) -> TermView:
     """Parse a canonical N-Triples spelling into a ``TermView``.
 
-    The closing quote of a literal is found from the end: a plain literal
-    ends with ``"``, a typed one with ``>`` after the last ``"^^<``, a
-    language-tagged one with the tag after the last ``"@`` — a quote inside
-    the lexical form is always escaped, so the last delimiter is the real one.
+    A literal's closing quote is its last ``"`` — a quote inside the lexical
+    form is escaped, and neither a tag nor a datatype IRI holds one — and
+    what follows it is nothing, ``@tag`` or ``^^<iri>``: the split every
+    reader of a spelling makes (:func:`_term_by_constructors`).
     """
     if spelling.startswith('"'):
-        if spelling.endswith('"'):
-            return TermView(LITERAL, unescape(spelling[1:-1]))
-        if spelling.endswith(">"):
-            cut = spelling.rfind('"^^<')
-            if cut > 0:
-                return TermView(LITERAL, unescape(spelling[1:cut]), dt=spelling[cut + 4 : -1])
-        cut = spelling.rfind('"@')
-        if cut > 0:
-            return TermView(LITERAL, unescape(spelling[1:cut]), lang=spelling[cut + 2 :])
+        end = spelling.rfind('"')
+        suffix = spelling[end + 1 :]
+        if end > 0:
+            if not suffix:
+                return TermView(LITERAL, unescape(spelling[1:end]))
+            if suffix.startswith("^^<") and suffix.endswith(">"):
+                return TermView(LITERAL, unescape(spelling[1:end]), dt=suffix[3:-1])
+            if suffix.startswith("@") and len(suffix) > 1:
+                return TermView(LITERAL, unescape(spelling[1:end]), lang=suffix[1:])
         raise ValueError(f"malformed literal spelling: {spelling!r}")
     if spelling.startswith("<") and spelling.endswith(">"):
         return TermView(IRI, spelling[1:-1])
@@ -220,7 +220,8 @@ def _term_by_constructors(value: str) -> Node:
     """The rdflib term for a stored N-Triples spelling, built by rdflib's
     constructors: an IRI, a blank node, or a literal whose lexical form is
     unescaped by the N-Triples rules (:func:`unescape`), so an escaped
-    backslash before ``x41`` decodes to a backslash and ``x41``."""
+    backslash before ``x41`` decodes to a backslash and ``x41``. A literal
+    is split as :func:`parse_spelling` splits it."""
     if len(value) >= 2 and value[0] == "<" and value[-1] == ">":
         return URIRef(value[1:-1])
     if value.startswith("_:"):
@@ -228,7 +229,13 @@ def _term_by_constructors(value: str) -> Node:
     end = value.rfind('"')
     if not value.startswith('"') or end <= 0:
         raise ValueError(f"Could not parse returned RDF term as N-Triples: {value!r}")
-    lexical, suffix = unescape(value[1:end]), value[end + 1 :]
+    return _literal_by_constructors(unescape(value[1:end]), value[end + 1 :], value)
+
+
+def _literal_by_constructors(lexical: str, suffix: str, value: str) -> Literal:
+    """The literal of an unescaped lexical form and the suffix its spelling
+    ``value`` has after the closing quote, built by rdflib's constructors; a
+    suffix no literal has raises ``ValueError``."""
     if not suffix:
         return Literal(lexical)
     if suffix.startswith("@") and len(suffix) > 1:
@@ -278,8 +285,9 @@ def _term_built_directly(value: str) -> Node:
         return term
     elif suffix[0] == "@":
         language = suffix[1:]
-        # Not None: `_term_builder` picks this builder only when rdflib has it.
-        if _is_valid_langtag(language):  # ty: ignore[call-non-callable]
+        # `_term_builder` picks this builder only when rdflib has the check.
+        check = _is_valid_langtag
+        if check is not None and check(language):
             term = _new_str(Literal, lexical)
             term._language = language
             term._datatype = None
@@ -304,14 +312,7 @@ def _term_built_directly(value: str) -> Node:
         term._value = number
         term._ill_typed = False
         return term
-    # The rest of `_term_by_constructors`, on the parts split above.
-    if not suffix:
-        return Literal(lexical)
-    if suffix.startswith("@") and len(suffix) > 1:
-        return Literal(lexical, lang=suffix[1:])
-    if suffix.startswith("^^<") and suffix.endswith(">"):
-        return Literal(lexical, datatype=URIRef(suffix[3:-1]))
-    raise ValueError(f"Could not parse returned RDF term as N-Triples: {value!r}")
+    return _literal_by_constructors(lexical, suffix, value)
 
 
 #: Spellings `_term_builder` builds both ways: each kind
