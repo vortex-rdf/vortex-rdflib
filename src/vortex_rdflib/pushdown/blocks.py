@@ -22,7 +22,7 @@ from .relation import Relation
 
 def _eval_block_node(ctx, store, part):
     node = algebra.block(part)
-    rel = _solve_block(ctx, store, node, _Frame(stream=True))
+    rel = _solve_block(ctx, store, node, _Frame(algebra._active_scope(ctx, store), stream=True))
     return solutions._yield_solutions(ctx, store, rel)
 
 
@@ -45,7 +45,7 @@ class _Frame:
     """What a block is solved under (:func:`_solve_block`).
 
     ``scope`` is the graph every pattern below is matched in
-    (:class:`algebra._GraphScope`); ``None`` means the graph the context has
+    (:class:`algebra._GraphScope`): at the top, the graph the context has
     made active. ``env`` is the set of variables an enclosing lazy join or
     OPTIONAL binds row by row in rdflib's evaluation — here the sides are
     solved independently and joined, which is only exact while nothing
@@ -60,27 +60,17 @@ class _Frame:
     (:func:`planner._join_incremental_bgp`).
     """
 
-    scope: algebra._GraphScope | None = None
+    scope: algebra._GraphScope
     env: frozenset = frozenset()
     pushed: Pushed = NOTHING
     limit: int | None = None
     stream: bool = False
 
-    def inner(self, **changes) -> "_Frame":
-        """The frame of the block a FILTER or a GRAPH holds: this one with
-        ``changes`` — the FILTER's pushed conjuncts and the limit and
-        streaming it lets through, the GRAPH's scope."""
-        return replace(self, **changes)
-
-    def side(self, env=None, pushed=None) -> "_Frame":
+    def side(self, **changes) -> "_Frame":
         """The frame of a group join's side, or of an OPTIONAL's or a
-        MINUS's left side: the same scope, ``env`` and pushed conjuncts but
-        where given, every row read."""
-        return _Frame(
-            self.scope,
-            self.env if env is None else env,
-            self.pushed if pushed is None else pushed,
-        )
+        MINUS's left side: this one with ``changes`` (an ``env``, the
+        ``pushed`` conjuncts), every row read."""
+        return replace(self, limit=None, stream=False, **changes)
 
     def right(self, bound=frozenset()) -> "_Frame":
         """The frame of an OPTIONAL's or a MINUS's right side: nothing
@@ -90,12 +80,9 @@ class _Frame:
         return _Frame(self.scope, self.env | bound)
 
 
-def _solve_block(ctx, store, node: Block, frame: _Frame | None = None) -> Relation:
+def _solve_block(ctx, store, node: Block, frame: _Frame) -> Relation:
     """Solve a block into a relation, by its solver (:data:`_SOLVERS`), under
-    ``frame`` (:class:`_Frame`; by default the active graph, nothing pushed,
-    every row read)."""
-    if frame is None or frame.scope is None:
-        frame = replace(frame or _Frame(), scope=algebra._active_scope(ctx, store))
+    ``frame`` (:class:`_Frame`)."""
     active = trace.active()
     started = trace.stopwatch()
     if active is not None:
@@ -123,7 +110,7 @@ def _solve_graph(ctx, store, node: algebra.Graph, frame: _Frame) -> Relation:
     inner = algebra._graph_scope(ctx, node)
     if inner.var is not None and not node.inner.carries_graph(inner.var):
         raise NotImplementedError
-    return _solve_block(ctx, store, node.inner, frame.inner(scope=inner))
+    return _solve_block(ctx, store, node.inner, replace(frame, scope=inner))
 
 
 def _trace_block(node: Block, rel: Relation, depth: int, elapsed_ns: int) -> None:
@@ -227,7 +214,6 @@ def _solve_filter(ctx, store, node: algebra.Filter, frame: _Frame) -> Relation:
     (:func:`_group_vars`; see :func:`filters.analyze_filter` for the rest of
     its scope)."""
     inner, source, scope, env = node.inner, node.source, frame.scope, frame.env
-    assert scope is not None, "a block's frame has its scope (_solve_block)"
     # The columns of the empty relation a false constant conjunct returns.
     block_vars = algebra._block_vars(ctx, inner, scope)
     plan = filters.analyze_filter(source, algebra._group_vars(ctx, inner), ctx)
@@ -263,7 +249,8 @@ def _solve_filter(ctx, store, node: algebra.Filter, frame: _Frame) -> Relation:
         ctx,
         store,
         inner,
-        frame.inner(
+        replace(
+            frame,
             pushed=pushed,
             limit=None if residual or plan.exists else frame.limit,
             stream=frame.stream and not plan.exists,
@@ -424,7 +411,6 @@ def _solve_join(ctx, store, node: algebra.Join, frame: _Frame) -> Relation:
     join :func:`_plan_side` plans. rdflib deduplicates the right side of a
     non-lazy join."""
     lazy, scope, p2 = node.lazy, frame.scope, node.right
-    assert scope is not None, "a block's frame has its scope (_solve_block)"
     left = _solve_block(ctx, store, node.left, frame.side())
     left_rows = relation._rows_of(left)
     if not left_rows:
@@ -445,8 +431,8 @@ def _solve_join(ctx, store, node: algebra.Join, frame: _Frame) -> Relation:
     else:
         # What the left side applied, every joined row passes.
         pushed = frame.pushed.without(left.applied)
-        env = frame.env | frozenset(algebra._scoped_vars(node.left, scope)) if lazy else None
-        right = _solve_block(ctx, store, p2, frame.side(env, pushed))
+        env = frame.env | frozenset(algebra._scoped_vars(node.left, scope)) if lazy else frame.env
+        right = _solve_block(ctx, store, p2, frame.side(env=env, pushed=pushed))
     right_rows = relation._rows_of(right)
     if not lazy:
         right_rows = list(dict.fromkeys(right_rows))
@@ -467,7 +453,6 @@ def _solve_left_join(ctx, store, node: algebra.LeftJoin, frame: _Frame) -> Relat
     joined as :func:`_plan_side` plans."""
     p1, p2, expr = node.left, node.right, node.source.expr
     scope, env = frame.scope, frame.env
-    assert scope is not None, "a block's frame has its scope (_solve_block)"
     vars1, vars2 = algebra._scoped_vars(p1, scope), algebra._scoped_vars(p2, scope)
     if (
         scope.var is not None
@@ -608,7 +593,6 @@ def _solve_minus(ctx, store, node: algebra.Minus, frame: _Frame) -> Relation:
     right side's own ``?g`` matches any term. The shapes that turn on the
     enclosing row, or on that ``?g``, are left to rdflib."""
     scope, env = frame.scope, frame.env
-    assert scope is not None, "a block's frame has its scope (_solve_block)"
     left_vars, right_vars = (
         algebra._group_vars(ctx, node.left),
         algebra._group_vars(ctx, node.right),
