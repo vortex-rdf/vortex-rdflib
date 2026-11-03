@@ -15,7 +15,7 @@ from .. import boundary
 from ..terms import CANONICAL_INTEGER, INTEGER_SUFFIX, LITERAL, canonical_spelling
 
 
-def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
+def _alias_codes(store, codes, aliases: dict) -> None:
     """Record in ``aliases`` each code of ``codes`` whose decoded term another
     code represents, mapped to that code — rdflib compares decoded terms,
     and two spellings of a typed literal can be one term
@@ -39,6 +39,7 @@ def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
     """
     literal_lo, literal_hi = store._file.kind_ranges.range(LITERAL)
     terms = store._terms()
+    foreign = terms.foreign
     classified = terms.alias_classified
     pending = [
         c

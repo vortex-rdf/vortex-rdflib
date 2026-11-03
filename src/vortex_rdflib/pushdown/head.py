@@ -88,7 +88,7 @@ def _eval_head(ctx, store, part):
         rows=relation._relation_rows(rel),
         columns=len(rel.schema),
         nullable_columns=len(rel.nullable),
-        foreign_terms=len(rel.foreign),
+        foreign_terms=len(store._terms().foreign),
         elapsed_ns=started(),
     )
     if head.order:
@@ -126,7 +126,7 @@ def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
         index = rel.schema.index(var)
         distinct_codes = {row[index] for row in rows}
         key_started = trace.stopwatch()
-        ranks = _rank_codes(store, rel.foreign, distinct_codes)
+        ranks = _rank_codes(store, distinct_codes)
         trace.event(
             "order_key_ranked",
             key_index=key_index,
@@ -160,7 +160,7 @@ def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
     return output
 
 
-def _rank_codes(store, foreign: dict, codes) -> dict:
+def _rank_codes(store, codes) -> dict:
     """Ranks reproducing rdflib's ORDER BY comparison (``_val``): unbound
     first, then blank nodes, IRIs and literals.
 
@@ -206,6 +206,7 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
     hits = sum(code in store._terms().decode for code in local) if traced else 0
     if others:
         cached = store._prime_decode_cache(local)
+        foreign = store._terms().foreign
         keyed = [(_val(cached[code] if code >= 0 else foreign[code]), code) for code in others]
         _rank_keyed(ranks, keyed, rank)
     if traced:
@@ -249,8 +250,8 @@ def _eval_distinct(ctx, store, rel: Relation, head: _Head):
     pv = head.pv or ()
     keys = tuple(v for v in pv if v in rel.schema)
     idx = [rel.schema.index(v) for v in keys]
-    rows = _term_distinct(store, _code_distinct(rel, idx), rel.foreign)
-    return solutions._yield_rows(ctx, store, keys, rows, rel.foreign, pv, head.start, head.stop)
+    rows = _term_distinct(store, _code_distinct(rel, idx))
+    return solutions._yield_rows(ctx, store, keys, rows, pv, head.start, head.stop)
 
 
 def _code_distinct(rel: Relation, idx: list) -> Iterator[tuple]:
@@ -274,7 +275,7 @@ def _code_distinct(rel: Relation, idx: list) -> Iterator[tuple]:
     return rows()
 
 
-def _term_distinct(store, tuples: Iterator[tuple], foreign: dict) -> Iterator[tuple]:
+def _term_distinct(store, tuples: Iterator[tuple]) -> Iterator[tuple]:
     """Drop the code tuples whose decoded terms equal an earlier tuple's."""
     seen: set = set()
     aliases: dict = {}
@@ -283,7 +284,7 @@ def _term_distinct(store, tuples: Iterator[tuple], foreign: dict) -> Iterator[tu
         chunk = list(islice(tuples, size))
         if not chunk:
             return
-        aliasing._alias_codes(store, {c for row in chunk for c in row}, foreign, aliases)
+        aliasing._alias_codes(store, {c for row in chunk for c in row}, aliases)
         for row in chunk:
             key = tuple(aliases.get(c, c) for c in row) if aliases else row
             if key not in seen:

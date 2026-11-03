@@ -241,7 +241,7 @@ def test_alias_classes_are_rdflibs_term_equality(generated_store, caplog, calls)
             batches = [codes]
         aliases: dict = {}
         for batch in batches:
-            pd.aliasing._alias_codes(store, batch, store._terms().foreign, aliases)
+            pd.aliasing._alias_codes(store, batch, aliases)
     finally:
         query_scope.leave(token)
     expected = _partition(codes, lambda c: reference[c] if c >= 0 else foreign[c])
@@ -282,7 +282,7 @@ def test_query_constants_look_up_no_twin(generated_store, monkeypatch):
         codes = [store._foreign_code(term) for term in constants]
         monkeypatch.setattr(store, "_dict", _Lookups(store._dict))
         aliases: dict = {}
-        pd.aliasing._alias_codes(store, codes, store._terms().foreign, aliases)
+        pd.aliasing._alias_codes(store, codes, aliases)
     finally:
         query_scope.leave(token)
     assert len(set(codes)) == 3 and all(code < 0 for code in codes)
@@ -368,7 +368,7 @@ def test_the_alias_pass_builds_only_spellings_rdflib_may_rewrite(tmp_path, monke
     token = query_scope.enter(scope)
     try:
         aliases: dict = {}
-        pd.aliasing._alias_codes(store, codes, {}, aliases)
+        pd.aliasing._alias_codes(store, codes, aliases)
     finally:
         query_scope.leave(token)
     assert sorted(built) == sorted(

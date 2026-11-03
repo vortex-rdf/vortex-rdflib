@@ -3,7 +3,7 @@ streamed pieces — read as rows, and the join kernels over them.
 """
 
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from operator import itemgetter
 
 from vortex_rdf import JoinTooLarge, U64Column
@@ -37,8 +37,9 @@ class Relation:
     ``pieces``: an iterator of column tuples in schema order, a join step
     gathered a piece at a time as it is pulled (:func:`_streamed_step`),
     consumed once. ``None`` in a row is an unbound variable and
-    ``nullable`` lists the variables that may hold it; ``foreign`` maps
-    negative codes to terms outside the dictionary; ``preds`` are row
+    ``nullable`` lists the variables that may hold it; a negative code
+    stands for a term outside the dictionary, which the query's term state
+    holds (``QueryTerms.foreign``); ``preds`` are row
     predicates still to be applied while a columnar or streamed body streams
     (``nrows`` counts a columnar body's rows before them).
 
@@ -54,7 +55,6 @@ class Relation:
     rows: list[tuple] | None
     nrows: int
     nullable: frozenset = frozenset()
-    foreign: dict = field(default_factory=dict)
     preds: tuple[Callable[[tuple], bool], ...] = ()
     pieces: Iterator[tuple] | None = None
     rest: tuple = ()
@@ -70,10 +70,8 @@ class Relation:
 
     def with_rows(self, rows: list) -> "Relation":
         """The relation over ``rows`` instead of its body: the same schema,
-        nullable variables, foreign terms and ``rest``."""
-        return Relation(
-            self.schema, None, rows, len(rows), self.nullable, self.foreign, rest=self.rest
-        )
+        nullable variables and ``rest``."""
+        return Relation(self.schema, None, rows, len(rows), self.nullable, rest=self.rest)
 
     def row_list(self) -> list[tuple]:
         """A columnar or row body's rows, a columnar one zipped in one pass:

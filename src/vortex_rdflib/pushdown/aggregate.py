@@ -141,9 +141,9 @@ def _aggregate_rows(ctx, store, rel: Relation, group_vars, counts, samples, impl
                 codes.update(group.sets[j])
             elif spec.distinct and spec.kind == "rows":
                 codes.update(c for row in group.sets[j] for c in row if c is not None)
-    foreign = rel.foreign
+    foreign = store._terms().foreign
     aliases: dict = {}
-    aliasing._alias_codes(store, codes, foreign, aliases)
+    aliasing._alias_codes(store, codes, aliases)
 
     def distinct_count(values) -> int:
         if not aliases:

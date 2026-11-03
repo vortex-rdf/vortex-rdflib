@@ -206,7 +206,7 @@ def _solve_values(ctx, store, node, var_preds=None) -> Relation:
         for row in rows_in
     ]
     nullable = frozenset(v for i, v in enumerate(schema) if any(row[i] is None for row in rows))
-    return Relation(schema, None, rows, len(rows), nullable, store._terms().foreign)
+    return Relation(schema, None, rows, len(rows), nullable)
 
 
 def _constant_codes(store, terms: list) -> list:
@@ -459,9 +459,7 @@ def _solve_join(ctx, store, node, env, var_preds, scope) -> Relation:
         schema = left.schema + tuple(
             v for v in algebra._block_vars(ctx, node.p2, scope) if v not in left.schema
         )
-        return Relation(
-            schema, None, [], 0, left.nullable | algebra._block_nullable(node.p2), left.foreign
-        )
+        return Relation(schema, None, [], 0, left.nullable | algebra._block_nullable(node.p2))
     right_env = env | frozenset(algebra._scoped_vars(node.p1, scope)) if lazy else env
     p2 = node.p2
     if lazy and p2.name == "BGP" and len(p2.triples) == 1:
@@ -478,7 +476,7 @@ def _solve_join(ctx, store, node, env, var_preds, scope) -> Relation:
                 native_probe_call_count=len(left_rows),
                 output_rows=len(rows),
             )
-            return Relation(schema, None, rows, len(rows), left.nullable, left.foreign)
+            return Relation(schema, None, rows, len(rows), left.nullable)
         trace.event(
             "join_plan_complete",
             strategy="hash",
@@ -495,8 +493,7 @@ def _solve_join(ctx, store, node, env, var_preds, scope) -> Relation:
     shared = [v for v in right.schema if v in left.schema]
     relation._shared_key_ok(left, right, shared)
     schema, rows = relation._join(left.schema, left_rows, right.schema, right_rows)
-    foreign = left.foreign or right.foreign
-    return Relation(schema, None, rows, len(rows), left.nullable | right.nullable, foreign)
+    return Relation(schema, None, rows, len(rows), left.nullable | right.nullable)
 
 
 def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
@@ -546,7 +543,7 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
     extra = tuple(v for v in algebra._block_vars(ctx, p2, scope) if v not in left.schema)
     nullable = left.nullable | algebra._block_nullable(p2) | frozenset(extra)
     if not left_rows:
-        return Relation(left.schema + extra, None, [], 0, nullable, left.foreign)
+        return Relation(left.schema + extra, None, [], 0, nullable)
 
     def condition_preds(schema):
         if condition is None:
@@ -601,7 +598,7 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
                 output_rows=len(rows),
                 elapsed_ns=plan_started(),
             )
-            return Relation(schema, None, rows, len(rows), nullable, left.foreign)
+            return Relation(schema, None, rows, len(rows), nullable)
         trace.event(
             "left_join_plan_complete",
             strategy="hash",
@@ -618,15 +615,14 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
     shared = [v for v in right.schema if v in left.schema]
     relation._shared_key_ok(left, right, shared)
     schema = left.schema + tuple(v for v in right.schema if v not in left.schema)
-    foreign = left.foreign or right.foreign
     preds = condition_preds(schema)
     if preds is None:
         rows = [row + (None,) * (len(schema) - len(left.schema)) for row in left_rows]
-        return Relation(schema, None, rows, len(rows), nullable, foreign)
+        return Relation(schema, None, rows, len(rows), nullable)
     rows = relation._left_join_rows(
         left.schema, left_rows, right.schema, relation._rows_of(right), preds
     )
-    return Relation(schema, None, rows, len(rows), nullable, foreign)
+    return Relation(schema, None, rows, len(rows), nullable)
 
 
 def _solve_minus(ctx, store, node, env, var_preds, scope) -> Relation:

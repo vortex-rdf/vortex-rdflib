@@ -58,10 +58,8 @@ def _yield_solutions(ctx, store, rel: Relation, project=None, start=0, stop=None
     projected and windowed.
     """
     if not rel.rest:
-        return _yield_rows(
-            ctx, store, rel.schema, relation._code_rows(rel), rel.foreign, project, start, stop
-        )
-    rows = _yield_rows(ctx, store, rel.schema, relation._body_rows(rel), rel.foreign, None, 0, None)
+        return _yield_rows(ctx, store, rel.schema, relation._code_rows(rel), project, start, stop)
+    rows = _yield_rows(ctx, store, rel.schema, relation._body_rows(rel), None, 0, None)
     return _project_window(_finish_with_rdflib(ctx, rows, rel.rest), project, start, stop)
 
 
@@ -119,12 +117,13 @@ def _pushed_graph(ctx) -> bool:
     return dataset is not None and ctx.graph is not dataset
 
 
-def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, start, stop):
+def _yield_rows(ctx, store, schema, rows: Iterator[tuple], project, start, stop):
     """Decode code rows over ``schema`` into solutions (see
     ``_yield_solutions``); ``start``/``stop`` slice the rows first. Each
     decode chunk checks the query's cancel token before its rows are pulled
     (:func:`check_cancelled`), so a cancel stops the solutions within one
     chunk."""
+    foreign = store._terms().foreign
     outer = dict(ctx.bindings.items())
     # Normally every solution carries the caller's own context — no per-row
     # scope, unlike rdflib's `evalBGP`. Under a graph rdflib pushed, each row

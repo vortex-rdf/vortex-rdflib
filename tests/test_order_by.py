@@ -108,9 +108,9 @@ def ranked(monkeypatch) -> list:
     calls = []
     rank_codes = pd.head._rank_codes
 
-    def spy(store, foreign, codes):
+    def spy(store, codes):
         calls.append(codes)
-        return rank_codes(store, foreign, codes)
+        return rank_codes(store, codes)
 
     monkeypatch.setattr(pd.head, "_rank_codes", spy)
     return calls
@@ -170,6 +170,6 @@ def test_an_iri_code_without_a_spelling_raises_the_store_error(order_files):
 
     store._dict = _Dict()  # ty: ignore[invalid-assignment]
     with pytest.raises(ValueError) as raised:
-        pd.head._rank_codes(store, {}, iris)
+        pd.head._rank_codes(store, iris)
     assert len(handed) == 2 and set(handed) == iris
     assert str(raised.value) == f"term code {handed[1]} is not in the store dictionary"
