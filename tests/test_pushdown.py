@@ -1166,7 +1166,10 @@ def test_head_intercepts_the_whole_slice_project_chain(graph, monkeypatch):
     never evaluates the Project or the BGP below it itself."""
     heads = []
     original = pd.head._eval_head
-    monkeypatch.setattr(pd.head, "_eval_head", lambda *a: heads.append(a[2].name) or original(*a))
+    for name in ("Project", "Slice", "Distinct", "OrderBy"):
+        monkeypatch.setitem(
+            pd.hook._HANDLERS, name, lambda *a: heads.append(a[2].name) or original(*a)
+        )
     register_sparql_pushdown()
     rows = run(graph, "SELECT ?o WHERE { ?s <http://ex.org/name> ?o } LIMIT 2")
     assert len(rows) == 2
@@ -1485,8 +1488,10 @@ def test_distinct_and_count_are_answered_in_code_space(graph, monkeypatch):
     monkeypatch.setattr(
         pd.head, "_eval_distinct", lambda *a: distincts.append(1) or original_distinct(*a)
     )
-    monkeypatch.setattr(
-        pd.aggregate, "_eval_aggregate", lambda *a: aggregates.append(1) or original_aggregate(*a)
+    monkeypatch.setitem(
+        pd.hook._HANDLERS,
+        "AggregateJoin",
+        lambda *a: aggregates.append(1) or original_aggregate(*a),
     )
     register_sparql_pushdown()
     rows = run(graph, "SELECT DISTINCT ?a WHERE { ?x <http://ex.org/age> ?a }")
@@ -1617,8 +1622,10 @@ def test_left_join_probe_and_hash_paths_are_ours(graph, monkeypatch):
     original_left = pd.blocks._solve_left_join
     original_probe = pd.probes._probe_join
     original_bgp = pd.bgp._solve_bgp
-    monkeypatch.setattr(
-        pd.blocks, "_solve_left_join", lambda *a: left_joins.append(1) or original_left(*a)
+    monkeypatch.setitem(
+        pd.blocks._SOLVERS,
+        pd.algebra.LeftJoin,
+        lambda *a: left_joins.append(1) or original_left(*a),
     )
     monkeypatch.setattr(
         pd.probes, "_probe_join", lambda *a, **k: probes.append(1) or original_probe(*a, **k)
@@ -1640,7 +1647,9 @@ def test_left_join_probe_and_hash_paths_are_ours(graph, monkeypatch):
 def test_minus_is_an_anti_join_in_code_space(graph, monkeypatch):
     calls = []
     original = pd.blocks._solve_minus
-    monkeypatch.setattr(pd.blocks, "_solve_minus", lambda *a: calls.append(1) or original(*a))
+    monkeypatch.setitem(
+        pd.blocks._SOLVERS, pd.algebra.Minus, lambda *a: calls.append(1) or original(*a)
+    )
     register_sparql_pushdown()
     rows = run(
         graph, "SELECT ?x WHERE { ?x <http://ex.org/name> ?n MINUS { ?x <http://ex.org/age> ?a } }"
@@ -1665,7 +1674,7 @@ def test_cheated_scope_falls_back_to_rdflib(graph, monkeypatch):
             left_joins.append("fallback")
             raise
 
-    monkeypatch.setattr(pd.blocks, "_solve_left_join", spy)
+    monkeypatch.setitem(pd.blocks._SOLVERS, pd.algebra.LeftJoin, spy)
     sparql = """SELECT ?x ?a ?y WHERE {
         { VALUES ?a { 42 } }
         { ?x <http://ex.org/name> ?n OPTIONAL { ?y <http://ex.org/age> ?a } } }"""
@@ -1731,7 +1740,9 @@ def test_order_by_is_a_rank_sort_in_code_space(graph, monkeypatch):
 def test_values_is_a_code_space_relation(graph, monkeypatch):
     calls = []
     original = pd.blocks._solve_values
-    monkeypatch.setattr(pd.blocks, "_solve_values", lambda *a: calls.append(1) or original(*a))
+    monkeypatch.setitem(
+        pd.blocks._SOLVERS, pd.algebra.Values, lambda *a: calls.append(1) or original(*a)
+    )
     register_sparql_pushdown()
     rows = run(
         graph,

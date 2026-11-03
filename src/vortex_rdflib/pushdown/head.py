@@ -1,5 +1,7 @@
 """The head above a block — ``Project``, ``Distinct``, ``OrderBy`` and
-``Slice`` — applied to its code-space relation (:func:`_eval_head`).
+``Slice`` — applied to its code-space relation (:func:`_eval_head`), and
+``ASK`` over a block (:func:`_eval_ask`): one pattern counted, or one row
+pulled.
 """
 
 import heapq
@@ -11,16 +13,19 @@ from operator import itemgetter
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.term import Variable
 
-from .. import trace
+from .. import boundary, filters, trace
+from ..cancel import check_cancelled
 from ..settings import SETTINGS
 from ..terms import BLANK, IRI
-from . import algebra, aliasing, blocks, relation, solutions
+from . import algebra, aliasing, blocks, matching, relation, solutions
+from .algebra import Block
+from .matching import Pattern
 from .relation import Relation
 
 
 @dataclass(slots=True)
 class _Head:
-    block: object
+    block: Block
     pv: tuple | None
     start: int
     stop: int | None
@@ -60,8 +65,7 @@ def _plan_head(part) -> _Head:
         node = node.p
     if pv is None and not order:
         raise NotImplementedError
-    algebra._check_block(node)
-    return _Head(node, pv, start, stop, distinct, order)
+    return _Head(algebra.block(node), pv, start, stop, distinct, order)
 
 
 def _eval_head(ctx, store, part):
@@ -288,3 +292,60 @@ def _term_distinct(store, tuples: Iterator[tuple]) -> Iterator[tuple]:
                 seen.add(key)
                 yield row
         size = min(size * 4, SETTINGS.chunk_max)
+
+
+def _eval_ask(ctx, store, part):
+    """``ASK`` over a block: whether it has a solution."""
+    project = part.p
+    if getattr(project, "name", None) != "Project":
+        raise NotImplementedError
+    node = algebra.block(project.p)
+    return {"type_": "ASK", "askAnswer": _block_nonempty(ctx, store, node)}
+
+
+def _block_nonempty(ctx, store, node: Block) -> bool:
+    """Whether a block has a solution: one pattern's count capped at one
+    row (:func:`_single_pattern`), or one row pulled from the solved block."""
+    node, scope = algebra._peel_graph(ctx, node, algebra._active_scope(ctx, store))
+    pat = _single_pattern(ctx, store, node, scope)
+    if pat is not None:
+        if pat.unsatisfiable:
+            return False
+        if not pat.repeats:
+            # Existence needs no rows: a count capped at one, which stops a
+            # file-backed scan at its first match.
+            narrowing = matching._narrowing(pat.nkeep, limit=1)
+            check_cancelled()
+            return boundary.native(store).count_quads(*pat.n3, **narrowing) > 0
+    rel = blocks._solve_block(ctx, store, node, blocks._Frame(scope, limit=1))
+    # One row is pulled, and the rows are closed after it: a streamed join
+    # gathers one piece and releases its feed.
+    rows = relation._code_rows(rel)
+    try:
+        return next(rows, None) is not None
+    finally:
+        close = getattr(rows, "close", None)
+        if close is not None:
+            close()
+
+
+def _single_pattern(ctx, store, node: Block, scope) -> Pattern | None:
+    """``node`` as one triple pattern the native layer answers whole: a
+    ``BGP`` of one pattern, or a ``FILTER`` over one whose conjuncts all push
+    into the native match as keeps. The resolved pattern, ready to count, or
+    ``None``."""
+    var_preds = None
+    if isinstance(node, algebra.Filter):
+        inner = node.inner
+        if not isinstance(inner, algebra.Bgp) or len(inner.triples) != 1:
+            return None
+        plan = filters.analyze_filter(node.source, algebra._block_vars(ctx, inner, scope), ctx)
+        if plan.constant or plan.tuples or plan.exists:
+            return None
+        var_preds, node = plan.per_var, inner
+    elif not isinstance(node, algebra.Bgp) or len(node.triples) != 1:
+        return None
+    pat = matching._pattern_terms(ctx, store, *node.triples[0], scope=scope)
+    if var_preds and matching._push_native_restrictions(store, pat, var_preds):
+        return None  # a conjunct the native match cannot decide
+    return pat

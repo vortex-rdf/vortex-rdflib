@@ -11,7 +11,7 @@ from rdflib.term import Literal, Variable
 from vortex_rdf import U64Column
 
 from ..settings import SETTINGS
-from . import algebra, aliasing, blocks, matching, relation
+from . import algebra, aliasing, blocks, head, matching, relation
 from .algebra import _VAR_LIKE
 from .relation import Relation
 
@@ -28,8 +28,7 @@ def _eval_aggregate(ctx, store, part):
     group = part.p
     if getattr(group, "name", None) != "Group":
         raise NotImplementedError
-    block = group.p
-    algebra._check_block(block)
+    block = algebra.block(group.p)
     block, scope = algebra._peel_graph(ctx, block, algebra._active_scope(ctx, store))
     group_vars = None if group.expr is None else list(group.expr)
     if group_vars is not None and not all(isinstance(v, Variable) for v in group_vars):
@@ -51,7 +50,7 @@ def _eval_aggregate(ctx, store, part):
     # One pattern — under a FILTER the native match decides entirely, or
     # none — no grouping, and every count the rows' count: the row
     # selection's size.
-    pat = blocks._single_pattern(ctx, store, block, scope) if group_vars is None else None
+    pat = head._single_pattern(ctx, store, block, scope) if group_vars is None else None
     if pat is not None and not pat.repeats:
         specs = _count_specs(ctx, {v: i for i, v in enumerate(pat.varpos)}, counts)
         if all(_counts_rows(spec) for spec in specs):

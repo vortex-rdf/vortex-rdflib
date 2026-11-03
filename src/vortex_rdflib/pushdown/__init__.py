@@ -157,12 +157,17 @@ The modules, from the hook down:
 - :mod:`.aliasing` — codes whose terms another code represents;
 - :mod:`.tracing` — the query trace.
 
-Within the package a module calls another's functions through it
+The package exports the two registration functions; the modules are its
+internals. Within the package a module calls another's functions through it
 (``matching._rel_from_pattern``), so a test that patches a function on its
-module reaches every caller.
+module reaches every caller — but for the handlers and the block solvers,
+held in tables (``hook._HANDLERS``, ``blocks._SOLVERS``): a test patches
+their entries.
 """
 
-from . import (
+# The package's modules, loaded with it, so the package's attributes name
+# them (tests reach them as ``pushdown.<module>``); none is exported.
+from . import (  # noqa: F401
     aggregate,
     algebra,
     aliasing,
@@ -179,20 +184,4 @@ from . import (
 )
 from .hook import register_sparql_pushdown, unregister_sparql_pushdown
 
-__all__ = [
-    "aggregate",
-    "algebra",
-    "aliasing",
-    "bgp",
-    "blocks",
-    "head",
-    "hook",
-    "matching",
-    "probes",
-    "register_sparql_pushdown",
-    "relation",
-    "solutions",
-    "streaming",
-    "tracing",
-    "unregister_sparql_pushdown",
-]
+__all__ = ["register_sparql_pushdown", "unregister_sparql_pushdown"]

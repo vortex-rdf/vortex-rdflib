@@ -8,6 +8,7 @@ before it hands a generator back.
 """
 
 import time
+from collections.abc import Callable
 
 from rdflib.plugins.sparql import CUSTOM_EVALS
 from rdflib.plugins.sparql.evaluate import evalPart
@@ -21,23 +22,22 @@ from . import aggregate, blocks, head
 _EVAL_KEY = "vortex_rdflib_bgp"
 
 
-#: The algebra nodes the hook answers: each node's handler, as its module
-#: and name. A handler is looked up when it is called, so one patched on its
-#: module (a test's spy) is the one called.
-_HANDLERS = {
-    "BGP": (blocks, "_eval_block_node"),
-    "Filter": (blocks, "_eval_filter"),
-    "Join": (blocks, "_eval_block_node"),
-    "LeftJoin": (blocks, "_eval_block_node"),
-    "Minus": (blocks, "_eval_block_node"),
-    "ToMultiSet": (blocks, "_eval_block_node"),
-    "Graph": (blocks, "_eval_block_node"),
-    "Project": (head, "_eval_head"),
-    "Slice": (head, "_eval_head"),
-    "Distinct": (head, "_eval_head"),
-    "OrderBy": (head, "_eval_head"),
-    "AggregateJoin": (aggregate, "_eval_aggregate"),
-    "AskQuery": (blocks, "_eval_ask"),
+#: The algebra nodes the hook answers, by rdflib's name, and each one's
+#: handler, called with the context, the store and the node.
+_HANDLERS: dict[str, Callable] = {
+    "BGP": blocks._eval_block_node,
+    "Filter": blocks._eval_filter,
+    "Join": blocks._eval_block_node,
+    "LeftJoin": blocks._eval_block_node,
+    "Minus": blocks._eval_block_node,
+    "ToMultiSet": blocks._eval_block_node,
+    "Graph": blocks._eval_block_node,
+    "Project": head._eval_head,
+    "Slice": head._eval_head,
+    "Distinct": head._eval_head,
+    "OrderBy": head._eval_head,
+    "AggregateJoin": aggregate._eval_aggregate,
+    "AskQuery": head._eval_ask,
 }
 assert _HANDLERS.keys() == settings.ALL_OPS
 
@@ -69,10 +69,9 @@ def _eval_part(ctx, part):
     store = getattr(getattr(ctx, "graph", None), "store", None)
     if not isinstance(store, VortexRdflibStore) or store._dict is None:
         raise NotImplementedError
-    run = getattr(*handler)
     if trace.active() is None:
-        return run(ctx, store, part)
-    return _traced_eval(run, ctx, store, part)
+        return handler(ctx, store, part)
+    return _traced_eval(handler, ctx, store, part)
 
 
 def _traced_eval(run, ctx, store, part):
