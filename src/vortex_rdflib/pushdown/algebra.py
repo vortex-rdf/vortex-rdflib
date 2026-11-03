@@ -220,7 +220,7 @@ def _left_carries_graph(left: Block, right: Block, var) -> bool:
 
 def _merged(first: tuple, second) -> tuple:
     """``first``, then the terms of ``second`` it lacks, in order."""
-    return first + tuple(dict.fromkeys(term for term in second if term not in first))
+    return first + tuple(dict.fromkeys([term for term in second if term not in first]))
 
 
 def block(node) -> Block:
@@ -230,7 +230,9 @@ def block(node) -> Block:
     name = getattr(node, "name", None)
     if name == "BGP":
         triples = tuple(node.triples)
-        found = _merged((), (t for triple in triples for t in triple if isinstance(t, _VAR_LIKE)))
+        found = tuple(
+            dict.fromkeys([t for triple in triples for t in triple if isinstance(t, _VAR_LIKE)])
+        )
         return Bgp(found, found, frozenset(), triples)
     if name == "Filter":
         inner = block(node.p)

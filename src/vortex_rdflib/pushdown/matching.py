@@ -65,8 +65,11 @@ class Pattern:
 
     def __post_init__(self) -> None:
         self.n3 = tuple(self.n3)
-        self.repeats = any(len(pos) > 1 for pos in self.varpos.values())
-        self.positions = tuple(sorted({idx for pos in self.varpos.values() for idx in pos}))
+        # Each position holds one term, so a variable repeats exactly when
+        # the variables hold more positions than there are variables.
+        positions = [idx for pos in self.varpos.values() for idx in pos]
+        self.repeats = len(positions) > len(self.varpos)
+        self.positions = tuple(sorted(positions))
 
     def set_match(self, cols: tuple, nrows: int) -> None:
         """Hold a match: its columns and row count."""
@@ -269,7 +272,8 @@ def _pattern_terms(ctx, store, s, p, o, scope, index: int | None = None) -> Patt
     if scope.var is not None:
         varpos.setdefault(scope.var, []).append(3)
 
-    n3 = (*(store._node_to_n3(v) for v in (rs, rp, ro)), scope.n3)
+    to_n3 = store._node_to_n3
+    n3 = (to_n3(rs), to_n3(rp), to_n3(ro), scope.n3)
     distinct = scope.n3 is None and scope.var is None and store._union_has_repeats()
     pat = Pattern(n3, varpos, unsatisfiable, index=index, distinct=distinct)
     if scope.var is not None:

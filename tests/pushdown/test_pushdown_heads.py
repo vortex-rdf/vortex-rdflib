@@ -99,6 +99,31 @@ def test_ask_over_one_pattern_counts_instead_of_matching(graph):
     assert (native.counts, native.matches) == (2, 0)
 
 
+def test_an_ask_over_one_pattern_plans_without_generator_frames(graph):
+    """The one-pattern ASK, the smallest query the pushdown answers, is
+    mostly fixed cost: its planning builds the block and the pattern without
+    a generator expression, whose every step is a Python frame."""
+    import cProfile
+    import pstats
+
+    from rdflib.plugins.sparql import prepareQuery
+
+    register_sparql_pushdown()
+    query = prepareQuery("ASK { ?s <http://ex.org/knows> ?o }")
+    assert graph.query(query).askAnswer is True
+    profile = cProfile.Profile()
+    profile.enable()
+    answer = graph.query(query).askAnswer
+    profile.disable()
+    assert answer is True
+    generators = [
+        f"{path.split('vortex_rdflib/')[-1]}:{line}"
+        for (path, line, name) in pstats.Stats(profile).stats
+        if "vortex_rdflib" in path and name == "<genexpr>"
+    ]
+    assert generators == []
+
+
 def test_native_none_falls_back_at_call_time(graph):
     """A store whose code path declines (``match_codes`` -> None) makes the
     hook raise while rdflib is still listening, so the default evaluator
