@@ -11,12 +11,12 @@ import pytest
 from rdflib.term import Variable
 from tests.corpus import SPELLINGS
 from tests.oracle import departs, spec_answer
-from tests.support import RecordingTermDict, filter_expr, kind_ranges, typed
+from tests.support import CTX, RecordingTermDict, filter_expr, kind_ranges, typed
 from vortex_rdf import U64Column, serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown, trace
 from vortex_rdflib.filters import native
-from vortex_rdflib.filters.native import NativeShape
+from vortex_rdflib.filters.native import FilterCodes
 from vortex_rdflib.terms import BLANK, IRI, LITERAL, parse_spelling
 
 V = Variable("v")
@@ -75,11 +75,7 @@ EXTRA_SPELLINGS = [
 ALL_SPELLINGS = [s for s in SPELLINGS + EXTRA_SPELLINGS if s is not None]
 
 #: Expressions the mapping must take, each with the predicate it maps to.
-MAPPED: list[tuple[str, tuple]] = [
-    ("isIRI(?v)", ("is_iri", "")),
-    ("isURI(?v)", ("is_iri", "")),
-    ("isBlank(?v)", ("is_blank", "")),
-    ("isLiteral(?v)", ("is_literal", "")),
+MAPPED: list[tuple[str, tuple | native.IriIn]] = [
     ("datatype(?v) = xsd:integer", ("datatype", XSD + "integer")),
     ("xsd:integer = datatype(?v)", ("datatype", XSD + "integer")),
     ("datatype(?v) = xsd:string", ("datatype", XSD + "string")),
@@ -120,55 +116,76 @@ for _constant, _spelled in [
 #: REGEX, CONTAINS, STRSTARTS and STRENDS over ?v or STR(?v), either under
 #: LCASE/UCASE. Only flags i, s and m reach vortex-rdf.
 STRING_MAPPED = [
-    ('regex(?v, "^a")', NativeShape("regex", "^a")),
-    ('regex(?v, "b$")', NativeShape("regex", "b$")),
-    ('regex(?v, "c$", "m")', NativeShape("regex", "c$", "m")),
-    ('regex(?v, "a.b", "s")', NativeShape("regex", "a.b", "s")),
-    ('regex(?v, "^AB", "i")', NativeShape("regex", "^AB", "i")),
-    ('regex(?v, "s", "i")', NativeShape("regex", "s", "i")),
-    ('regex(?v, "ſ", "i")', NativeShape("regex", "ſ", "i")),
-    ('regex(?v, "\\\\w+ \\\\w+")', NativeShape("regex", "\\w+ \\w+")),
-    ('regex(?v, "^[^a-z]")', NativeShape("regex", "^[^a-z]")),
-    ('regex(str(?v), "^ab")', NativeShape("regex", "^ab", as_str=True)),
-    ('regex(str(?v), "^4")', NativeShape("regex", "^4", as_str=True)),
-    ('regex(lcase(?v), "^abc$")', NativeShape("regex", "^abc$", case="lower")),
+    ('regex(?v, "^a")', FilterCodes("regex", "^a")),
+    ('regex(?v, "b$")', FilterCodes("regex", "b$")),
+    ('regex(?v, "c$", "m")', FilterCodes("regex", "c$", "m")),
+    ('regex(?v, "a.b", "s")', FilterCodes("regex", "a.b", "s")),
+    ('regex(?v, "^AB", "i")', FilterCodes("regex", "^AB", "i")),
+    ('regex(?v, "s", "i")', FilterCodes("regex", "s", "i")),
+    ('regex(?v, "ſ", "i")', FilterCodes("regex", "ſ", "i")),
+    ('regex(?v, "\\\\w+ \\\\w+")', FilterCodes("regex", "\\w+ \\w+")),
+    ('regex(?v, "^[^a-z]")', FilterCodes("regex", "^[^a-z]")),
+    ('regex(str(?v), "^ab")', FilterCodes("regex", "^ab", as_str=True)),
+    ('regex(str(?v), "^4")', FilterCodes("regex", "^4", as_str=True)),
+    ('regex(lcase(?v), "^abc$")', FilterCodes("regex", "^abc$", case="lower")),
     (
         'regex(ucase(str(?v)), "STRASSE")',
-        NativeShape("regex", "STRASSE", case="upper", as_str=True),
+        FilterCodes("regex", "STRASSE", case="upper", as_str=True),
     ),
-    ('contains(?v, "b")', NativeShape("contains", '"b"')),
-    ('contains(?v, "b"@en)', NativeShape("contains", '"b"@en')),
-    ('contains(?v, "x"^^xsd:string)', NativeShape("contains", '"x"')),
-    ('contains(str(?v), "+")', NativeShape("contains", '"+"', as_str=True)),
-    ('contains(lcase(?v), "école")', NativeShape("contains", '"école"', case="lower")),
-    ('strstarts(?v, "a")', NativeShape("strstarts", '"a"')),
-    ('strstarts(?v, "a"@en)', NativeShape("strstarts", '"a"@en')),
-    ('strstarts(ucase(?v), "AB")', NativeShape("strstarts", '"AB"', case="upper")),
+    ('contains(?v, "b")', FilterCodes("contains", '"b"')),
+    ('contains(?v, "b"@en)', FilterCodes("contains", '"b"@en')),
+    ('contains(?v, "x"^^xsd:string)', FilterCodes("contains", '"x"')),
+    ('contains(str(?v), "+")', FilterCodes("contains", '"+"', as_str=True)),
+    ('contains(lcase(?v), "école")', FilterCodes("contains", '"école"', case="lower")),
+    ('strstarts(?v, "a")', FilterCodes("strstarts", '"a"')),
+    ('strstarts(?v, "a"@en)', FilterCodes("strstarts", '"a"@en')),
+    ('strstarts(ucase(?v), "AB")', FilterCodes("strstarts", '"AB"', case="upper")),
     (
         'strstarts(lcase(str(?v)), "http")',
-        NativeShape("strstarts", '"http"', case="lower", as_str=True),
+        FilterCodes("strstarts", '"http"', case="lower", as_str=True),
     ),
-    ('strends(?v, "\\n")', NativeShape("strends", '"\\n"')),
-    ('strends(str(?v), ".0")', NativeShape("strends", '".0"', as_str=True)),
-    ('strends(lcase(str(?v)), "e")', NativeShape("strends", '"e"', case="lower", as_str=True)),
+    ('strends(?v, "\\n")', FilterCodes("strends", '"\\n"')),
+    ('strends(str(?v), ".0")', FilterCodes("strends", '".0"', as_str=True)),
+    ('strends(lcase(str(?v)), "e")', FilterCodes("strends", '"e"', case="lower", as_str=True)),
 ]
 MAPPED += STRING_MAPPED
 
 #: IRI equality: true for exactly the listed IRIs, a keep of their codes; an
 #: IRI the dictionary lacks contributes none.
 IRI_MAPPED = [
-    ("?v = <http://ex.org/x>", NativeShape("iri_in", ("<http://ex.org/x>",))),
-    ("<http://ex.org/x> = ?v", NativeShape("iri_in", ("<http://ex.org/x>",))),
-    ("sameTerm(?v, <http://ex.org/x>)", NativeShape("iri_in", ("<http://ex.org/x>",))),
-    ("sameTerm(<urn:x>, ?v)", NativeShape("iri_in", ("<urn:x>",))),
+    ("?v = <http://ex.org/x>", native.IriIn(("<http://ex.org/x>",))),
+    ("<http://ex.org/x> = ?v", native.IriIn(("<http://ex.org/x>",))),
+    ("sameTerm(?v, <http://ex.org/x>)", native.IriIn(("<http://ex.org/x>",))),
+    ("sameTerm(<urn:x>, ?v)", native.IriIn(("<urn:x>",))),
     (
         "?v IN (<http://ex.org/x>, <urn:x>, <http://ex.org/x>)",
-        NativeShape("iri_in", ("<http://ex.org/x>", "<urn:x>")),
+        native.IriIn(("<http://ex.org/x>", "<urn:x>")),
     ),
-    ("?v IN (<http://ex.org/absent>)", NativeShape("iri_in", ("<http://ex.org/absent>",))),
-    ("?v IN ()", NativeShape("iri_in", ())),
+    ("?v IN (<http://ex.org/absent>)", native.IriIn(("<http://ex.org/absent>",))),
+    ("?v IN ()", native.IriIn(())),
 ]
 MAPPED += IRI_MAPPED
+
+#: Tests of a term's kind alone, and the kinds each is true for: decided by
+#: kind, and a keep when those kinds run together.
+KIND_MAPPED: list[tuple[str, set]] = [
+    ("isIRI(?v)", {IRI}),
+    ("isURI(?v)", {IRI}),
+    ("isBlank(?v)", {BLANK}),
+    ("isLiteral(?v)", {LITERAL}),
+    ("isIRI(?v) || isBlank(?v)", {IRI, BLANK}),
+    ("isLiteral(?v) || isBlank(?v)", {LITERAL, BLANK}),
+    ("!isLiteral(?v)", {IRI, BLANK, ""}),
+]
+
+
+def _decide(store, decision, codes) -> tuple[set, list]:
+    """``decision`` over ``codes``: a keep's membership, or vortex-rdf's
+    ``filter_codes``."""
+    if isinstance(decision, (native.IriIn, native.KindRange)):
+        return native.keep_decides(store, decision, codes)
+    return native.evaluate(store, decision, codes)
+
 
 #: Shapes the mapping must leave to the Python routes: the native layer
 #: would answer some of them differently from the specification.
@@ -242,7 +259,26 @@ def spelling_store(tmp_path_factory):
 
 @pytest.mark.parametrize(("sparql_expr", "expected"), MAPPED, ids=[m[0] for m in MAPPED])
 def test_expression_maps_to_its_native_predicate(sparql_expr, expected):
-    assert filters.native.native_shape(filter_expr(sparql_expr), V, {}) == NativeShape(*expected)
+    if not isinstance(expected, native.IriIn):
+        expected = FilterCodes(*expected)
+    assert filters.native.native_shape(filter_expr(sparql_expr), V, {}) == expected
+
+
+@pytest.mark.parametrize(("sparql_expr", "kinds"), KIND_MAPPED, ids=[k[0] for k in KIND_MAPPED])
+def test_a_kind_test_is_decided_by_the_kinds_it_holds_for(spelling_store, sparql_expr, kinds):
+    """A test of the term's kind alone is evaluated once per kind: the kinds
+    it is true for decide every code, as the specification answers, and are
+    a keep on the native match when their codes run together."""
+    conjunct = filters._compile_conjunct(filter_expr(sparql_expr), (V,), {}, CTX)
+    assert conjunct.kinds == kinds
+    assert conjunct.keep == native.kind_range(frozenset(kinds))
+    assert filters.native.native_shape(filter_expr(sparql_expr), V, {}) is None
+    kind_of = spelling_store._file.kind_ranges.kind_of
+    for code in sorted(_all_codes(spelling_store)):
+        stored = spelling_store._dict.decode(code)
+        if departs(sparql_expr, stored):
+            continue
+        assert (kind_of(code) in kinds) == spec_answer(sparql_expr, {"v": stored}), stored
 
 
 @pytest.mark.parametrize("sparql_expr", UNMAPPED)
@@ -263,7 +299,7 @@ def test_native_candidates_follow_the_spec(spelling_store, sparql_expr):
     shape = filters.native.native_shape(expr, V, {})
     assert shape is not None
     codes = _all_codes(spelling_store)
-    passed, undecided = native.evaluate(spelling_store, shape, codes)
+    passed, undecided = _decide(spelling_store, shape, codes)
     undecided = set(undecided)
     assert passed <= codes and undecided <= codes and not passed & undecided
     decided = 0
@@ -290,7 +326,7 @@ def test_wide_integers_are_left_undecided(spelling_store):
         ]
     }
     for kind in ("num_lt", "num_gt", "num_eq"):
-        shape = NativeShape(kind, f'"1e+100"^^<{XSD}double>')
+        shape = FilterCodes(kind, f'"1e+100"^^<{XSD}double>')
         passed, undecided = native.evaluate(spelling_store, shape, wide)
         assert not passed and set(undecided) == wide
 
@@ -303,7 +339,7 @@ def test_a_refused_argument_leaves_every_candidate_to_the_python_routes(
     monkeypatch.setattr(
         spelling_store, "_dict", RecordingTermDict(spelling_store._dict, refuse=True)
     )
-    shape = NativeShape("num_lt", f'"1e400"^^<{XSD}double>')
+    shape = FilterCodes("num_lt", f'"1e400"^^<{XSD}double>')
     passed, undecided = native.evaluate(spelling_store, shape, codes)
     assert not passed
     assert set(undecided) == {code for code in codes if lo <= code < hi}
@@ -322,8 +358,8 @@ def test_only_the_codes_a_predicate_reads_are_sent(spelling_store, monkeypatch):
     recording = RecordingTermDict(spelling_store._dict)
     monkeypatch.setattr(spelling_store, "_dict", recording)
     five = f'"5"^^<{XSD}integer>'
-    passed_ne, _ = native.evaluate(spelling_store, NativeShape("num_ne", five), codes)
-    passed_lt, _ = native.evaluate(spelling_store, NativeShape("num_lt", five), codes)
+    passed_ne, _ = native.evaluate(spelling_store, FilterCodes("num_ne", five), codes)
+    passed_lt, _ = native.evaluate(spelling_store, FilterCodes("num_lt", five), codes)
     assert nonliterals <= passed_ne
     assert not nonliterals & passed_lt
     kinds = [kind for kind, _, _, _ in recording.calls]
@@ -372,7 +408,7 @@ def test_str_of_a_blank_node_is_left_to_the_python_routes(spelling_store, monkey
     recording = RecordingTermDict(spelling_store._dict)
     monkeypatch.setattr(spelling_store, "_dict", recording)
     _, undecided = native.evaluate(
-        spelling_store, NativeShape("str_prefix", "a", as_str=True), codes
+        spelling_store, FilterCodes("str_prefix", "a", as_str=True), codes
     )
     assert blanks <= set(undecided)
     [sent] = recording.sent
@@ -388,29 +424,29 @@ def test_an_argument_vortex_rdf_cannot_take_leaves_every_candidate_undecided(spe
     lo, hi = kind_ranges(spelling_store).range(LITERAL)
     literals = {code for code in codes if lo <= code < hi}
     for shape in (
-        NativeShape("regex", "a|\ud800"),
-        NativeShape("contains", '"\ud800"'),
-        NativeShape("strstarts", '"\ud800"', as_str=True),
+        FilterCodes("regex", "a|\ud800"),
+        FilterCodes("contains", '"\ud800"'),
+        FilterCodes("strstarts", '"\ud800"', as_str=True),
     ):
         passed, undecided = native.evaluate(spelling_store, shape, codes)
         assert not passed and literals <= set(undecided), shape
-    shape = NativeShape("iri_in", ("<http://ex.org/\ud800>",))
-    passed, undecided = native.evaluate(spelling_store, shape, codes)
+    shape = native.IriIn(("<http://ex.org/\ud800>",))
+    passed, undecided = _decide(spelling_store, shape, codes)
     assert not passed and set(undecided) == codes
 
 
 @pytest.mark.parametrize(
     "shape",
     [
-        NativeShape("is_literal", ""),
-        NativeShape("is_iri", ""),
-        NativeShape("is_blank", ""),
-        NativeShape("iri_in", ("<http://ex.org/x>", "<urn:x>")),
-        NativeShape("num_ne", f'"5"^^<{XSD}integer>'),
-        NativeShape("num_lt", f'"5"^^<{XSD}integer>'),
-        NativeShape("str_prefix", "a", as_str=True),
-        NativeShape("regex", "a"),
-        NativeShape("regex", "a|\ud800"),
+        native.KindRange(frozenset({LITERAL})),
+        native.KindRange(frozenset({IRI})),
+        native.KindRange(frozenset({BLANK})),
+        native.IriIn(("<http://ex.org/x>", "<urn:x>")),
+        FilterCodes("num_ne", f'"5"^^<{XSD}integer>'),
+        FilterCodes("num_lt", f'"5"^^<{XSD}integer>'),
+        FilterCodes("str_prefix", "a", as_str=True),
+        FilterCodes("regex", "a"),
+        FilterCodes("regex", "a|\ud800"),
     ],
     ids=[
         "is_literal",
@@ -433,8 +469,8 @@ def test_a_code_that_is_no_term_is_left_undecided_under_every_shape(spelling_sto
     assert dictionary.decode(0) == ""
     not_terms = {0, len(dictionary), len(dictionary) + 7, -1}
     codes = _all_codes(spelling_store)
-    passed, undecided = native.evaluate(spelling_store, shape, codes)
-    passed_with, undecided_with = native.evaluate(spelling_store, shape, codes | not_terms)
+    passed, undecided = _decide(spelling_store, shape, codes)
+    passed_with, undecided_with = _decide(spelling_store, shape, codes | not_terms)
     assert passed_with == passed
     assert sorted(undecided_with) == sorted([*undecided, *not_terms])
 
@@ -446,19 +482,23 @@ def test_ctx_bound_constant_side_is_evaluated_by_rdflib():
 
     expr = filter_expr("?v < ?w + 10")
     shape = filters.native.native_shape(expr, V, {Variable("w"): Literal(5)})
-    assert shape == NativeShape("num_lt", f'"15"^^<{XSD}integer>')
+    assert shape == FilterCodes("num_lt", f'"15"^^<{XSD}integer>')
     # an error on the constant side is no constant
     assert filters.native.native_shape(expr, V, {Variable("w"): Literal("x")}) is None
     assert filters.native.native_shape(expr, V, {}) is None
 
 
-QUERY_CONJUNCTS = [m[0] for m in MAPPED] + [
-    'isIRI(?v) && strstarts(str(?v), "http://ex.org/x")',
-    "datatype(?v) = xsd:integer && ?v < 5 && ?v > -5",
-    'lang(?v) = "en" && langMatches(lang(?v), "en")',
-    "?v < 5 && ?v > 1e100",
-    'regex(?v, "a{2,1}")',
-]
+QUERY_CONJUNCTS = (
+    [m[0] for m in MAPPED]
+    + [k[0] for k in KIND_MAPPED]
+    + [
+        'isIRI(?v) && strstarts(str(?v), "http://ex.org/x")',
+        "datatype(?v) = xsd:integer && ?v < 5 && ?v > -5",
+        'lang(?v) = "en" && langMatches(lang(?v), "en")',
+        "?v < 5 && ?v > 1e100",
+        'regex(?v, "a{2,1}")',
+    ]
+)
 
 
 # rdflib warns each time it builds the matrix's "maybe"^^xsd:boolean, an

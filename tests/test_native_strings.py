@@ -20,7 +20,7 @@ from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 from vortex_rdflib.filters import native
-from vortex_rdflib.filters.native import NativeShape
+from vortex_rdflib.filters.native import FilterCodes
 from vortex_rdflib.settings import SETTINGS
 from vortex_rdflib.terms import LITERAL, canonical_spelling, parse_spelling
 
@@ -164,7 +164,7 @@ def _check_regex(store, codes, spellings, pattern, flags, case, as_str) -> int:
         compiled = re.compile(pattern, _py_flags(flags))
     except re.error:
         return 0  # native_shape never maps a pattern Python cannot compile
-    shape = NativeShape("regex", pattern, flags, case, as_str)
+    shape = FilterCodes("regex", pattern, flags, case, as_str)
     passed, undecided = native.evaluate(store, shape, codes)
     checked = 0
     for code in codes - set(undecided):
@@ -233,6 +233,7 @@ def test_string_functions_follow_the_spec(corpus, sparql_expr):
         # A tagged constant against STR(): an error for every value.
         assert "str(?v)" in sparql_expr and '"@' in sparql_expr
         return
+    assert isinstance(shape, FilterCodes)
     passed, undecided = native.evaluate(store, shape, codes)
     decided = 0
     for code in codes - set(undecided):
@@ -294,7 +295,7 @@ def test_bsbm_literals_agree_with_python_re():
     }
     for word in list(dict.fromkeys(words))[:50]:
         for function, test in tests.items():
-            shape = NativeShape(function, canonical_spelling(Literal(word)))
+            shape = FilterCodes(function, canonical_spelling(Literal(word)))
             passed, undecided = native.evaluate(store, shape, codes)
             decided = 0
             for code in codes - set(undecided):

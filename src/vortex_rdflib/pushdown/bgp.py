@@ -476,8 +476,6 @@ def _specialize_tuple_conjuncts(store, pat: Pattern, rel: Relation, tuples, push
     conjunct)`` each.
     """
     specialized: list = []
-    if not (SETTINGS.fast_filters and SETTINGS.native_filters):
-        return specialized
     single: dict = {}
     for conjunct in tuples:
         if id(conjunct) in pushed.applied:
@@ -497,7 +495,7 @@ def _specialize_tuple_conjuncts(store, pat: Pattern, rel: Relation, tuples, push
             consts[other] = store._decode_term(single[other])
         else:
             proxy = filters.specialize(conjunct, var, consts)
-            if proxy is None or proxy.native is None:
+            if proxy is None:
                 continue
             deferred = pat.deferred
             pat.deferred = {**deferred, var: [*deferred.get(var, ()), proxy]}
@@ -507,7 +505,7 @@ def _specialize_tuple_conjuncts(store, pat: Pattern, rel: Relation, tuples, push
                     "bgp_tuple_specialized",
                     original_pattern_index=pat.index,
                     variable=str(var),
-                    native_predicate=proxy.native.kind,
+                    native_predicate=proxy.native_kind(),
                 )
     return specialized
 

@@ -8,12 +8,13 @@ dictionary, and nothing is remembered between calls. vortex-rdf answers each
 code passed, failed or undecided; the undecided ones go on to the Python
 routes (:func:`filters.evaluate_column`).
 
-Two kinds of shape never reach ``filter_codes``: a kind test (``isIRI``,
-``isBlank``, ``isLiteral``) is its kind's code range, and an IRI equality
-(``?v = <iri>``, ``sameTerm``, ``?v IN (<iri>, ...)``) the codes
-``encode_many`` gives its IRIs. Both are keeps on the native match
-(:func:`keep_of`, :func:`native_restriction`), and both are decided
-here too when a specialized conjunct meets codes directly.
+Two kinds of decision never reach ``filter_codes``: a test of the term's
+kind whose true kinds run together (``isIRI``, ``isIRI(?v) || isBlank(?v)``)
+is one code range (:class:`KindRange`), and an IRI equality (``?v = <iri>``,
+``sameTerm``, ``?v IN (<iri>, ...)``) the codes ``encode_many`` gives its
+IRIs (:class:`IriIn`). Both are keeps on the native match (:func:`keep_of`,
+:func:`native_restriction`), and both are decided here too when a
+specialized conjunct meets codes directly (:func:`keep_decides`).
 
 Each native kind reads some term kinds only, and rdflib's answer for the
 others needs no native call: the literal predicates fail every IRI and blank
@@ -32,6 +33,7 @@ native match takes, :func:`native_restriction`.
 import re
 from bisect import bisect_left
 from collections.abc import Callable, Collection
+from dataclasses import dataclass
 from typing import NamedTuple
 
 from rdflib.plugins.sparql.parserutils import CompValue
@@ -39,21 +41,20 @@ from rdflib.term import Literal, URIRef
 from vortex_rdf import U64Column
 
 from .. import boundary, trace
-from ..settings import SETTINGS
 from ..terms import BLANK, IRI, LITERAL, KindRanges, canonical_spelling
-from . import exprs, values
+from . import values
 from .exprs import VAR_LIKE
 from .values import FLOAT, NUMERIC_TYPES, RDF_NIL
 
 
-class NativeShape(NamedTuple):
-    """A FILTER conjunct as a native predicate of one variable:
-    ``TermDict.filter_codes(kind, arg, codes, flags=, case=, as_str=)``, or a
-    kind test or IRI equality (:data:`KIND_TESTS`, :data:`IRI_IN`)."""
+class FilterCodes(NamedTuple):
+    """A FILTER conjunct as a predicate of one variable that vortex-rdf
+    decides over the codes a query produced:
+    ``TermDict.filter_codes(kind, arg, codes, flags=, case=, as_str=)``."""
 
     kind: str
-    #: A constant's spelling, a pattern, a tag — or, for IRI_IN, the IRIs'.
-    arg: str | tuple[str, ...]
+    #: A constant's spelling, a pattern, a tag, a range.
+    arg: str
     #: REGEX flags: only ``i``, ``s`` and ``m``, which vortex-rdf reads as XPath does.
     flags: str = ""
     #: ``"lower"``/``"upper"`` for a text under ``LCASE``/``UCASE``.
@@ -62,13 +63,36 @@ class NativeShape(NamedTuple):
     as_str: bool = False
 
 
-#: The kind tests, each its kind's code range.
-KIND_TESTS = {"is_literal": LITERAL, "is_iri": IRI, "is_blank": BLANK}
-_KIND_SHAPES = {kind: name for name, kind in KIND_TESTS.items()}
+@dataclass(frozen=True, slots=True)
+class IriIn:
+    """IRI equality as a keep on the native match: true for exactly the IRIs
+    ``spellings`` spell (``?v = <iri>``, ``sameTerm``, ``?v IN (<iri>, ...)``)."""
+
+    spellings: tuple[str, ...]
 
 
-#: IRI equality: true for exactly the IRIs ``NativeShape.arg`` spells.
-IRI_IN = "iri_in"
+@dataclass(frozen=True, slots=True)
+class KindRange:
+    """A test of a term's kind as a keep on the native match: true for the
+    terms of ``kinds``, a run of :data:`KIND_ORDER`, so one code range."""
+
+    kinds: frozenset[str]
+
+
+#: The term kinds in the order their codes run (literals, IRIs, blank nodes:
+#: their spellings start ``"``, ``<``, ``_:``).
+KIND_ORDER = (LITERAL, IRI, BLANK)
+
+
+def kind_range(kinds: frozenset[str]) -> KindRange | None:
+    """The keep a set of term kinds is, when the kinds are a run of
+    :data:`KIND_ORDER`: their codes are one range. ``None`` for kinds that
+    do not run together, for none, and for a set holding ``""`` — the codes
+    of no term (the empty graph name), which no kind's range holds."""
+    if not kinds or "" in kinds:
+        return None
+    positions = sorted(KIND_ORDER.index(kind) for kind in kinds)
+    return KindRange(kinds) if positions[-1] - positions[0] + 1 == len(positions) else None
 
 
 #: The string functions; their text is ``?v`` under rdflib's ``string()``
@@ -76,19 +100,32 @@ IRI_IN = "iri_in"
 STRING_KINDS = frozenset({"regex", "contains", "strstarts", "strends"})
 
 
-def keep_of(store, shape: NativeShape):
-    """The keep ``shape`` is on a native match — its kind's code range for a
-    kind test, the ascending codes of its IRIs for an IRI equality (one
-    ``encode_many``; an IRI the dictionary lacks has no code, as it can match
-    no stored term) — or ``None`` for any other shape. A spelling the native
-    parser refuses raises ``ValueError``."""
-    if shape.kind in KIND_TESTS:
-        return store._file.kind_ranges.range(KIND_TESTS[shape.kind])
-    if shape.kind == IRI_IN:
-        spellings = list(shape.arg)
-        found = boundary.term_dict(store).encode_many(spellings) if spellings else []
-        return U64Column(sorted({code for code in found if code is not None}))
-    return None
+def keep_of(store, keep: IriIn | KindRange):
+    """The keep a native match takes for ``keep``: the code range of its
+    kinds, or the ascending codes of its IRIs (one ``encode_many``; an IRI
+    the dictionary lacks has no code, as it can match no stored term). A
+    spelling the native parser refuses raises ``ValueError``."""
+    if isinstance(keep, KindRange):
+        ranges = store._file.kind_ranges
+        bounds = [ranges.range(kind) for kind in keep.kinds]
+        return min(lo for lo, _ in bounds), max(hi for _, hi in bounds)
+    spellings = list(keep.spellings)
+    found = boundary.term_dict(store).encode_many(spellings) if spellings else []
+    return U64Column(sorted({code for code in found if code is not None}))
+
+
+def keep_decides(store, keep: IriIn | KindRange, codes: Collection[int]) -> tuple[set, list]:
+    """Of ``codes``, the set ``keep`` admits and the codes of no term (the
+    empty graph name, a code past the dictionary's end, a negative one),
+    left undecided for the Python routes; every other code fails. A
+    spelling the native parser refuses leaves every code undecided."""
+    if not codes:
+        return set(), []
+    try:
+        member = keep_member(keep_of(store, keep))
+    except ValueError:
+        return set(), list(codes)
+    return {code for code in codes if member(code)}, _not_terms(codes, store._file.kind_ranges)
 
 
 def _not_terms(codes: Collection[int], ranges: KindRanges) -> list:
@@ -105,7 +142,7 @@ def _not_terms(codes: Collection[int], ranges: KindRanges) -> list:
     return [code for code in codes if not low <= code < high]
 
 
-def evaluate(store, shape: NativeShape, codes: Collection[int]) -> tuple[set, list]:
+def evaluate(store, shape: FilterCodes, codes: Collection[int]) -> tuple[set, list]:
     """Of ``codes`` — a collection of distinct codes of one variable, in any
     order — the set that passes ``shape`` and the codes left undecided, for
     the Python routes; every other code fails. A code that is no term's (the
@@ -113,18 +150,8 @@ def evaluate(store, shape: NativeShape, codes: Collection[int]) -> tuple[set, li
     undecided under every shape."""
     if not codes:
         return set(), []
-    try:
-        keep = keep_of(store, shape)
-    except ValueError:
-        return set(), list(codes)
     ranges = store._file.kind_ranges
     undecided = _not_terms(codes, ranges)
-    if isinstance(keep, tuple):
-        lo, hi = keep
-        return {code for code in codes if lo <= code < hi}, undecided
-    if keep is not None:
-        allowed = set(memoryview(keep).cast("Q").tolist())
-        return {code for code in codes if code in allowed}, undecided
     literal_lo, literal_hi = ranges.range(LITERAL)
     iri_lo, iri_hi = ranges.range(IRI)
     blank_lo, blank_hi = ranges.range(BLANK)
@@ -162,18 +189,10 @@ def evaluate(store, shape: NativeShape, codes: Collection[int]) -> tuple[set, li
             if not inside:
                 return passed, undecided
             column = U64Column(inside)
-    assert isinstance(shape.arg, str)
-    options: dict = {}
-    if shape.flags:
-        options["flags"] = shape.flags
-    if shape.case is not None:
-        options["case"] = shape.case
-    if as_str:
-        options["as_str"] = True
     elapsed = trace.stopwatch()
     try:
         yes, maybe = boundary.term_dict(store).filter_codes(
-            shape.kind, shape.arg, column, **options
+            shape.kind, shape.arg, column, flags=shape.flags, case=shape.case, as_str=as_str
         )
     except ValueError:
         # An argument vortex-rdf refuses (a constant outside its value
@@ -208,7 +227,7 @@ def _codes(store, kind: str, arg: str, column: U64Column) -> U64Column | None:
         return None
 
 
-def _numbers(store, shape: NativeShape, ordered: U64Column) -> set | None:
+def _numbers(store, shape: FilterCodes, ordered: U64Column) -> set | None:
     """Of the codes an ordering shape passed, the set that are numbers, or
     ``None`` when every one is.
 
@@ -217,7 +236,6 @@ def _numbers(store, shape: NativeShape, ordered: U64Column) -> set | None:
     numbers, so a passed code is one when ``num_ne`` or, for ``<=`` and
     ``>=``, ``num_eq`` passes it; the two are disjoint, so their sizes tell
     whether they cover every code without reading one."""
-    assert isinstance(shape.arg, str)
     found = []
     for kind in ("num_ne", "num_eq") if shape.kind in ("num_le", "num_ge") else ("num_ne",):
         column = _codes(store, kind, shape.arg, ordered)
@@ -296,7 +314,7 @@ def _text_shape(node, var) -> tuple[str | None, bool] | None:
     return None
 
 
-def _string_function_shape(expr, var, consts) -> NativeShape | None:
+def _string_function_shape(expr, var, consts) -> FilterCodes | None:
     """CONTAINS, STRSTARTS or STRENDS of ``var``'s text and a string constant.
 
     rdflib's ``_compatibleStrings`` makes a tagged constant demand the text's
@@ -312,10 +330,10 @@ def _string_function_shape(expr, var, consts) -> NativeShape | None:
     if language is not None and (as_str or language != language.lower()):
         return None
     kind = _STRING_FUNCTIONS[expr.name]
-    return NativeShape(kind, canonical_spelling(constant), case=case, as_str=as_str)
+    return FilterCodes(kind, canonical_spelling(constant), case=case, as_str=as_str)
 
 
-def _regex_shape(expr, var, consts) -> NativeShape | None:
+def _regex_shape(expr, var, consts) -> FilterCodes | None:
     """REGEX of ``var``'s text with a pattern and flags read once, as the
     fast route reads them (:func:`values.regex_spec`). A pattern or flags
     every call errs on, a pattern only rdflib can compile, and XPath's ``x``
@@ -332,7 +350,7 @@ def _regex_shape(expr, var, consts) -> NativeShape | None:
     if not isinstance(spec, values.RegexSpec) or "x" in spec.flags or "q" in spec.flags:
         return None
     case, as_str = text
-    return NativeShape("regex", spec.pattern, flags=spec.flags, case=case, as_str=as_str)
+    return FilterCodes("regex", spec.pattern, flags=spec.flags, case=case, as_str=as_str)
 
 
 #: IRIs ``canonical_spelling`` spells as an N-Triples IRIREF.
@@ -348,32 +366,32 @@ def _iri_spelling(node, consts) -> str | None:
     return canonical_spelling(iri)
 
 
-def _iri_equality(left, right, var, consts) -> NativeShape | None:
+def _iri_equality(left, right, var, consts) -> IriIn | None:
     """``var = <iri>`` or ``<iri> = var`` (``=`` and ``sameTerm`` alike): true
     for exactly that IRI — rdflib's ``eq`` and ``==`` are term equality for
     an IRI, and no literal or blank node equals one."""
     for side, other in ((left, right), (right, left)):
         if isinstance(side, VAR_LIKE) and side == var:
             spelling = _iri_spelling(other, consts)
-            return None if spelling is None else NativeShape(IRI_IN, (spelling,))
+            return None if spelling is None else IriIn((spelling,))
     return None
 
 
-def _iri_list(left, right, var, consts) -> NativeShape | None:
+def _iri_list(left, right, var, consts) -> IriIn | None:
     """``var IN (<iri>, ...)``: true for exactly those IRIs. rdflib's parser
     spells an empty list as rdf:nil, which its evaluator reads back as the
     empty list."""
     if not (isinstance(left, VAR_LIKE) and left == var):
         return None
     if not isinstance(right, list):
-        return NativeShape(IRI_IN, ()) if right == RDF_NIL else None
+        return IriIn(()) if right == RDF_NIL else None
     spellings = []
     for node in right:
         spelling = _iri_spelling(node, consts)
         if spelling is None:
             return None
         spellings.append(spelling)
-    return NativeShape(IRI_IN, tuple(dict.fromkeys(spellings)))
+    return IriIn(tuple(dict.fromkeys(spellings)))
 
 
 def _constant_term(node, consts: dict):
@@ -383,26 +401,15 @@ def _constant_term(node, consts: dict):
     return term if isinstance(term, (Literal, URIRef)) else None
 
 
-def native_shape(expr, var, consts: dict) -> NativeShape | None:
-    """:func:`_native_shape`, except that with ``VORTEX_RDF_CODE_PREDICATES=0`` a kind test or an
-    IRI equality is not one: it is decided over decoded values, not as a code range or code set."""
-    shape = _native_shape(expr, var, consts)
-    if (
-        shape is not None
-        and not SETTINGS.code_predicates
-        and (shape.kind in KIND_TESTS or shape.kind == IRI_IN)
-    ):
-        return None
-    return shape
+def native_shape(expr, var, consts: dict) -> IriIn | FilterCodes | None:
+    """The native decision ``expr`` is as a test of ``var`` alone — any other
+    variable seen only through ``consts`` — an IRI equality as a keep on the
+    native match (:class:`IriIn`), a predicate ``filter_codes`` decides
+    (:class:`FilterCodes`), or ``None``. A test of the term's kind is
+    neither: its kinds are read off the compiled predicate
+    (``filters._compile_conjunct``).
 
-
-def _native_shape(expr, var, consts: dict) -> NativeShape | None:
-    """The native predicate (:class:`NativeShape`)
-    that ``expr`` is as a test of ``var`` alone — any other variable seen only
-    through ``consts`` — or ``None``.
-
-    The shapes: ``isIRI``/``isURI``/``isBlank``/``isLiteral`` of ``var``;
-    ``datatype(var) = <iri>`` and ``lang(var) = "tag"`` (either way round);
+    The shapes: ``datatype(var) = <iri>`` and ``lang(var) = "tag"`` (either way round);
     ``langMatches(lang(var), "range")``; ``strstarts(str(var), "prefix")``;
     ``REGEX``, ``CONTAINS``, ``STRSTARTS`` and ``STRENDS`` of ``var`` or
     ``STR(var)``, either under ``LCASE``/``UCASE``, with a constant pattern or
@@ -416,9 +423,6 @@ def _native_shape(expr, var, consts: dict) -> NativeShape | None:
     if not isinstance(expr, CompValue):
         return None
     name = expr.name
-    tested = exprs.KIND_BUILTINS.get(name)
-    if tested is not None:
-        return NativeShape(_KIND_SHAPES[tested], "") if expr.arg == var else None
     if name == "Builtin_LANGMATCHES":
         if not _call_on(expr.arg1, "Builtin_LANG", var):
             return None
@@ -427,11 +431,11 @@ def _native_shape(expr, var, consts: dict) -> NativeShape | None:
         rng = _constant_term(expr.arg2, consts)
         if not _string_constant(rng):
             return None
-        return NativeShape("lang_matches", str(rng)) if _LANG_RANGE.fullmatch(str(rng)) else None
+        return FilterCodes("lang_matches", str(rng)) if _LANG_RANGE.fullmatch(str(rng)) else None
     if name == "Builtin_STRSTARTS" and _call_on(expr.arg1, "Builtin_STR", var):
         prefix = _constant_term(expr.arg2, consts)
         if _string_constant(prefix):
-            return NativeShape("str_prefix", str(prefix), as_str=True)
+            return FilterCodes("str_prefix", str(prefix), as_str=True)
     if name in _STRING_FUNCTIONS:
         return _string_function_shape(expr, var, consts)
     if name == "Builtin_REGEX":
@@ -451,10 +455,10 @@ def _native_shape(expr, var, consts: dict) -> NativeShape | None:
                 datatype = _constant_term(other, consts)
                 if not isinstance(datatype, URIRef):
                     return None
-                return NativeShape("datatype", str(datatype))
+                return FilterCodes("datatype", str(datatype))
             if _call_on(call, "Builtin_LANG", var):
                 tag = _constant_term(other, consts)
-                return NativeShape("lang", str(tag)) if _string_constant(tag) else None
+                return FilterCodes("lang", str(tag)) if _string_constant(tag) else None
         iri = _iri_equality(left, right, var, consts)
         if iri is not None:
             return iri
@@ -477,7 +481,7 @@ def _native_shape(expr, var, consts: dict) -> NativeShape | None:
         or values.numeric_value(values.constant_view(constant)) is None
     ):
         return None
-    return NativeShape(kind, canonical_spelling(constant))
+    return FilterCodes(kind, canonical_spelling(constant))
 
 
 def _sorted_contains(view, code: int) -> bool:
@@ -487,18 +491,16 @@ def _sorted_contains(view, code: int) -> bool:
 
 def native_restriction(store, conjuncts: list) -> tuple:
     """``(keep, residual)`` for one variable's conjuncts. ``keep`` admits
-    exactly the codes passing every conjunct vortex-rdf answers with a keep
-    (:func:`keep_of`) — ``None`` when there is none — and
+    exactly the codes passing every conjunct with a keep
+    (``Conjunct.keep``, :func:`keep_of`) — ``None`` when there is none — and
     ``residual`` are the other conjuncts, evaluated over the codes the query
     produces (:func:`evaluate_column`)."""
-    if not (SETTINGS.fast_filters and SETTINGS.native_filters):
-        return None, conjuncts
     keeps, residual = [], []
     for conjunct in conjuncts:
         keep = None
-        if conjunct.native is not None:
+        if conjunct.keep is not None:
             try:
-                keep = keep_of(store, conjunct.native)
+                keep = keep_of(store, conjunct.keep)
             except ValueError:
                 keep = None  # a constant the native parser refuses
         if keep is None:

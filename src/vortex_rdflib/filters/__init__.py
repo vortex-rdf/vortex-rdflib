@@ -24,18 +24,18 @@ evaluated **per distinct value**, never per row, through two routes:
 error propagates, and an ``UNKNOWN`` operand leaves the answer ``UNKNOWN``
 unless another settles it.
 
-A single-variable conjunct of a shape vortex-rdf evaluates (:func:`native_shape`
-lists them) also carries that predicate (``Conjunct.native``, a
-:class:`.native.NativeShape`). A kind test is its kind's
-code range and an IRI equality its IRIs' codes, which the pushdown turns into
-a ``keep`` on the native match (:func:`native_restriction`), so the rows that
-fail never cross into Python. The one exception is a probed pattern: it
-carries a range into each probe and tests a code set on the rows the probe
-returns.
-Every other native shape is answered by vortex-rdf over the distinct codes a
+How each single-variable conjunct is decided is settled once, when it is
+compiled (:func:`_compile_conjunct`), into typed fields, each ``None`` while
+its switch is off: ``kinds``, the term kinds a test of the variable's kind
+alone is true for, which decides every code without decoding it; ``keep``,
+an IRI equality or kinds whose codes run together, which the pushdown turns
+into a keep on the native match (:func:`.native.native_restriction`), so
+the rows that fail never cross into Python — a probed pattern carries a
+range into each probe and tests a code set on the rows the probe returns;
+and ``codes``, a predicate vortex-rdf answers over the distinct codes a
 query produced (:func:`.native.evaluate`, called from
-:func:`evaluate_column`), never over the whole dictionary, and only the codes
-it leaves undecided go down the two routes above.
+:func:`evaluate_column`), never over the whole dictionary, the codes it
+leaves undecided going down the two routes above.
 
 The modules: :mod:`.exprs` walks expression trees, :mod:`.values` holds
 SPARQL's value semantics over term views, :mod:`.compiler` compiles the fast
@@ -53,21 +53,39 @@ from rdflib.plugins.sparql.sparql import FrozenBindings
 from ..settings import SETTINGS
 from ..terms import TermView, parse_spelling
 from . import compiler, exprs, native, values
-from .native import NativeShape
+from .native import FilterCodes, IriIn, KindRange
 from .values import UNKNOWN
 
 
 @dataclass(slots=True)
 class Conjunct:
+    """A conjunct of a FILTER over the block variables ``vars`` (in order),
+    every other variable it reads fixed to the term ``consts`` gives it, and
+    how it is decided — each set by :func:`_compile_conjunct` alone, ``None``
+    while its switch is off: ``fast``, the fast route
+    (``SETTINGS.fast_filters``); for a single variable, ``kinds``, the term
+    kinds a test of its kind alone is true for (``code_predicates``),
+    ``keep``, a keep on the native match (``native_filters``;
+    ``code_predicates`` too), and ``codes``, a predicate ``filter_codes``
+    decides (``native_filters``)."""
+
     expr: Any
-    vars: tuple  # the block variables it references, in order
+    vars: tuple
     fast: Callable | None  # env -> True | False | UNKNOWN
-    kind_only: bool
     consts: dict = field(default_factory=dict)  # visible ctx-bound vars -> rdflib terms
     ctx: Any = None
-    # The native predicate a single-variable conjunct is (see `native_shape`),
-    # or None.
-    native: NativeShape | None = None
+    kinds: frozenset | None = None
+    keep: IriIn | KindRange | None = None
+    codes: FilterCodes | None = None
+
+    def native_kind(self) -> str | None:
+        """What decides it natively, for the trace: a ``filter_codes``
+        kind, ``iri_in`` or ``kind_range``; ``None`` for nothing."""
+        if self.codes is not None:
+            return self.codes.kind
+        if isinstance(self.keep, IriIn):
+            return "iri_in"
+        return None if self.keep is None else "kind_range"
 
     def generic(self, bound: dict) -> bool:
         """rdflib's own answer for one value assignment (``bound`` maps the
@@ -111,25 +129,35 @@ def analyze_filter(node, block_vars, ctx) -> FilterPlan:
     return analyze_expr(node.expr, block_vars, ctx, visible)
 
 
-def _compile_conjunct(
-    expr, variables: tuple, consts: dict, ctx, native: NativeShape | None
-) -> Conjunct:
+#: A view of each term kind, ``""`` (no term) included, for a predicate
+#: that reads its variable's kind alone.
+_KIND_VIEWS = tuple(TermView(kind, "") for kind in (*native.KIND_ORDER, ""))
+
+
+def _compile_conjunct(expr, variables: tuple, consts: dict, ctx) -> Conjunct:
     """``expr`` as a conjunct of ``variables``, every other variable it reads
-    fixed to the term ``consts`` gives it, or unbound: its fast route compiled
-    over those constants (none when the fast routes are off, a constant has no
-    term view or the expression is outside the whitelist), kind-only when it
-    reads nothing but term kinds. ``native`` is the predicate vortex-rdf
-    decides it by, if any."""
+    fixed to the term ``consts`` gives it, or unbound — the one place that
+    decides, by the switches, how it is answered: its fast route compiled
+    over those constants (none when the fast routes are off, a constant has
+    no term view or the expression is outside the whitelist); for a single
+    variable, the kinds it is true for when it reads the variable's kind
+    alone (evaluated once per kind), and its native decision — a keep (an
+    IRI equality, or kinds that run together) or a ``filter_codes``
+    predicate (:func:`.native.native_shape`)."""
     fast = compiler.compile_fast(expr, variables, consts) if SETTINGS.fast_filters else None
-    return Conjunct(
-        expr,
-        variables,
-        fast,
-        fast is not None and compiler.is_kind_only(expr) and SETTINGS.code_predicates,
-        consts,
-        ctx,
-        native,
-    )
+    kinds = keep = codes = None
+    if len(variables) == 1:
+        if fast is not None and SETTINGS.code_predicates and compiler.is_kind_only(expr):
+            kinds = frozenset(view.kind for view in _KIND_VIEWS if fast((view,)) is True)
+        if SETTINGS.fast_filters and SETTINGS.native_filters:
+            shape = native.native_shape(expr, variables[0], consts)
+            if isinstance(shape, FilterCodes):
+                codes = shape
+            elif shape is not None:
+                keep = shape if SETTINGS.code_predicates else None
+            elif kinds is not None:
+                keep = native.kind_range(kinds)
+    return Conjunct(expr, variables, fast, consts, ctx, kinds, keep, codes)
 
 
 def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
@@ -153,10 +181,7 @@ def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
         referenced = exprs.expr_vars(expr)
         variables = tuple(v for v in referenced if v in block_set)
         consts = {v: visible[v] for v in referenced if v in visible and v not in block_set}
-        predicate = None
-        if len(variables) == 1 and SETTINGS.fast_filters and SETTINGS.native_filters:
-            predicate = native.native_shape(expr, variables[0], consts)
-        conjunct = _compile_conjunct(expr, variables, consts, ctx, predicate)
+        conjunct = _compile_conjunct(expr, variables, consts, ctx)
         if shape is not None:
             plan.exists.append(ExistsConjunct(conjunct, *shape))
         elif not variables:
@@ -170,15 +195,12 @@ def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
 
 def specialize(conjunct: Conjunct, var, consts: dict) -> Conjunct | None:
     """``conjunct`` as a test of ``var`` alone, its other variables fixed to
-    the terms ``consts`` gives them: a single-variable conjunct carrying the
-    native shape that makes it (:func:`native_shape`), its fast route compiled
-    over those constants — or ``None`` when it has no native shape that way.
-    Its generic route is rdflib's evaluator over the same constants, so every
-    value it decides is rdflib's answer."""
-    shape = native.native_shape(conjunct.expr, var, consts)
-    if shape is None:
-        return None
-    return _compile_conjunct(conjunct.expr, (var,), consts, conjunct.ctx, shape)
+    the terms ``consts`` gives them, compiled as any conjunct is
+    (:func:`_compile_conjunct`) — or ``None`` when vortex-rdf decides it no
+    way (no keep, no ``filter_codes`` predicate). Its generic route is
+    rdflib's evaluator over the same constants."""
+    special = _compile_conjunct(conjunct.expr, (var,), consts, conjunct.ctx)
+    return special if special.keep is not None or special.codes is not None else None
 
 
 def evaluate_constant(conjunct: Conjunct) -> bool:
@@ -193,10 +215,11 @@ def evaluate_constant(conjunct: Conjunct) -> bool:
 def evaluate_column(store, conjuncts: list, codes) -> set:
     """The subset of ``codes`` (distinct codes of one variable) passing every
     conjunct — ``codes`` itself when it is a set and no conjunct runs.
-    Kind-only predicates never decode; a conjunct with a native shape is
-    answered by vortex-rdf over the codes still in play
-    (:func:`evaluate`), and only the codes it leaves undecided go
-    on; the others decode the surviving codes once, in one batch, and parse
+    A conjunct of term kinds decides each code by its kind, none decoded; one
+    with a keep or a ``filter_codes`` predicate is answered by vortex-rdf
+    over the codes still in play (:func:`.native.keep_decides`,
+    :func:`.native.evaluate`), only the codes it leaves undecided going on;
+    the others decode the surviving codes once, in one batch, and parse
     their spellings."""
     remaining = codes if isinstance(codes, set) else set(codes)
     views: dict = {}
@@ -207,20 +230,18 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
         passed: set = set()
         unknown: list = []
         pending = remaining
-        if conjunct.native is not None and not conjunct.kind_only and SETTINGS.native_filters:
-            passed, pending = native.evaluate(store, conjunct.native, remaining)
+        if conjunct.kinds is not None:
+            kind_of, kinds = store._file.kind_ranges.kind_of, conjunct.kinds
+            passed = {code for code in remaining if kind_of(code) in kinds}
+            pending = ()
+        elif conjunct.keep is not None:
+            passed, pending = native.keep_decides(store, conjunct.keep, remaining)
+        elif conjunct.codes is not None:
+            passed, pending = native.evaluate(store, conjunct.codes, remaining)
         if not pending:
             pass
         elif fast is None:
             unknown = list(pending)
-        elif conjunct.kind_only:
-            kind_of = store._file.kind_ranges.kind_of
-            for code in pending:
-                r = fast((TermView(kind_of(code), None),))
-                if r is True:
-                    passed.add(code)
-                elif r is UNKNOWN:
-                    unknown.append(code)
         else:
             decode_views(store, pending, views)
             for code in pending:
@@ -335,7 +356,7 @@ def solution_filter(store, node, ctx) -> Callable[[Any], bool]:
             tests.append(lambda bound, expr=conjunct_expr: rdflib_ebv(expr, bound))
             continue
         referenced = tuple(exprs.expr_vars(conjunct_expr))
-        conjunct = _compile_conjunct(conjunct_expr, referenced, {}, ctx, None)
+        conjunct = _compile_conjunct(conjunct_expr, referenced, {}, ctx)
         if not referenced:
             passes = evaluate_constant(conjunct)
             tests.append(lambda bound, passes=passes: passes)

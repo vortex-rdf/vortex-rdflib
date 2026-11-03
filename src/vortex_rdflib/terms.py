@@ -43,17 +43,16 @@ def unescape(raw: str) -> str:
 class TermView:
     """A parsed spelling.
 
-    ``kind`` is one of ``LITERAL``, ``IRI``, ``BLANK``. For a literal ``lex``
-    is the unescaped lexical form, ``dt`` the datatype IRI (``None`` for
-    plain and language-tagged literals) and ``lang`` the language tag; for
-    an IRI ``lex`` is the IRI, for a blank node the label. A kind-only view
-    (``lex`` None) is enough for the predicates that never look at the
-    spelling.
+    ``kind`` is one of ``LITERAL``, ``IRI``, ``BLANK`` — or ``""`` for no
+    term, in the views a test of a term's kind alone is asked about. For a
+    literal ``lex`` is the unescaped lexical form, ``dt`` the datatype IRI
+    (``None`` for plain and language-tagged literals) and ``lang`` the
+    language tag; for an IRI ``lex`` is the IRI, for a blank node the label.
     """
 
     __slots__ = ("kind", "lex", "dt", "lang")
 
-    def __init__(self, kind: str, lex: str | None, dt: str | None = None, lang: str | None = None):
+    def __init__(self, kind: str, lex: str, dt: str | None = None, lang: str | None = None):
         self.kind = kind
         self.lex = lex
         self.dt = dt

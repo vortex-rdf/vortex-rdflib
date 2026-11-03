@@ -17,6 +17,7 @@ from tests.support import (
     captured_trace,
     filter_expr,
     filter_spy,
+    kind_ranges,
     native_call_events,
     native_spy,
     predicate_calls,
@@ -30,7 +31,7 @@ from vortex_rdf import U64Column, serialize_rdf
 import vortex_rdflib.pushdown as pd
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
-from vortex_rdflib.terms import parse_spelling
+from vortex_rdflib.terms import BLANK, IRI, parse_spelling
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 PRICE = "<http://ex.org/price>"
@@ -64,7 +65,8 @@ def test_a_single_pattern_filter_is_evaluated_over_its_matched_codes(tmp_path, i
     query = f"SELECT ?s ?v WHERE {{ ?s {PRICE} ?v FILTER(?v < 300) }}"
     assert len(run(graph, query)) == _under(300)
     [(kind, arg, options, codes)] = predicate_calls(spy)
-    assert (kind, arg, options) == ("num_lt", f'"300"^^<{XSD}integer>', {})
+    assert (kind, arg) == ("num_lt", f'"300"^^<{XSD}integer>')
+    assert options == {"flags": "", "case": None, "as_str": False}
     assert codes == expected  # the 200 distinct prices, nothing dictionary-wide
     # The checks around it read the same codes or fewer.
     assert [call[0] for call in spy.calls] == ["datatype", "num_lt", "num_ne"]
@@ -302,9 +304,10 @@ def test_a_specialized_conjunct_compiles_as_analyze_expr_does():
     [analyzed] = filters.analyze_expr(expr, [V], CTX, {W: five}).per_var[V]
     assert proxy is not None and proxy.fast is not None and analyzed.fast is not None
     assert proxy.vars == analyzed.vars == (V,)
-    assert (proxy.native, proxy.kind_only, proxy.consts) == (
-        analyzed.native,
-        analyzed.kind_only,
+    assert (proxy.keep, proxy.codes, proxy.kinds, proxy.consts) == (
+        analyzed.keep,
+        analyzed.codes,
+        analyzed.kinds,
         analyzed.consts,
     )
     for spelling in (
@@ -517,3 +520,49 @@ def test_a_context_bound_operand_takes_the_fast_route(tmp_path, monkeypatch, cap
     [record] = [e for e in events if e["event"] == "bgp_restriction_complete"]
     assert record["native_predicate_count"] == 1
     assert (record["fast_predicate_count"], record["generic_only_predicate_count"]) == (1, 0)
+
+
+_KIND_LINES = [
+    f"<http://ex.org/s{i}> <http://ex.org/p> {obj} .\n"
+    for i, obj in enumerate(
+        ['"a"', '"b"@en', "<http://ex.org/o>", "_:b1", f'"1"^^<{XSD}integer>', "<http://ex.org/q>"]
+    )
+]
+
+
+def _kind_query(tmp_path, monkeypatch, capsys, test: str):
+    """Both answers to a kind test of ``?o`` and the pushdown's trace."""
+    store = VortexRdflibStore(store_file(tmp_path, _KIND_LINES), in_memory=True)
+    graph = Graph(store=store)
+    register_sparql_pushdown()
+    store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    query = f"SELECT ?s WHERE {{ ?s <http://ex.org/p> ?o FILTER({test}) }}"
+    answers = both_ways(graph, query)
+    return store, answers, captured_trace(capsys)
+
+
+def test_a_kind_union_gets_one_range_keep(tmp_path, monkeypatch, capsys):
+    """``isIRI(?o) || isBlank(?o)`` holds for two kinds whose codes run
+    together: one code range, a keep on the native match, so the literals'
+    rows never leave vortex-rdf."""
+    store, (with_pushdown, without_pushdown), events = _kind_query(
+        tmp_path, monkeypatch, capsys, "isIRI(?o) || isBlank(?o)"
+    )
+    assert with_pushdown == without_pushdown and len(with_pushdown) == 3
+    [pushed] = [e for e in events if e["event"] == "bgp_native_restriction"]
+    ranges = kind_ranges(store)
+    assert pushed["keep"] == {"2": {"range": [ranges.range(IRI)[0], ranges.range(BLANK)[1]]}}
+
+
+def test_kinds_that_are_no_range_are_decided_by_kind(tmp_path, monkeypatch, capsys):
+    """``isLiteral(?o) || isBlank(?o)`` holds for kinds whose codes do not
+    run together: no keep, each code decided by its kind alone."""
+    _, (with_pushdown, without_pushdown), events = _kind_query(
+        tmp_path, monkeypatch, capsys, "isLiteral(?o) || isBlank(?o)"
+    )
+    assert with_pushdown == without_pushdown and len(with_pushdown) == 4
+    assert not [e for e in events if e["event"] == "bgp_native_restriction"]
+    [record] = [e for e in events if e["event"] == "bgp_restriction_complete"]
+    assert (record["kind_only_predicate_count"], record["native_predicate_count"]) == (1, 0)

@@ -310,9 +310,7 @@ def test_fast_reject_predicate_keeps_a_row_the_filter_keeps_over_an_unbound_vari
     dictionary = store._dict
     assert dictionary is not None  # the code path is active
     expr = filter_expr("!bound(?w) || ?v < ?w")
-    conjunct = filters.Conjunct(
-        expr, (V, W), filters.compiler.compile_fast(expr, (V, W), {}), False
-    )
+    conjunct = filters.Conjunct(expr, (V, W), filters.compiler.compile_fast(expr, (V, W), {}))
     keep = filters.tuple_fast_reject_predicate(store, conjunct, [0, 1])
     assert keep((dictionary.encode(five), None)) is True
 

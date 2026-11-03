@@ -23,13 +23,15 @@ def _probe_pattern(probe) -> list:
 
 def _restriction_counts(conjuncts) -> dict:
     """The trace fields that say how a variable's conjuncts are decided: how
-    many there are, and how many have a native predicate (sent to vortex-rdf),
-    a fast route, a fast route over term kinds only, or rdflib's evaluator
-    alone."""
+    many there are, and how many vortex-rdf decides (a keep or a
+    ``filter_codes`` predicate), have a fast route, are decided by term kinds
+    alone, or by rdflib's evaluator alone."""
     return {
         "predicate_count": len(conjuncts),
-        "native_predicate_count": sum(c.native is not None and not c.kind_only for c in conjuncts),
+        "native_predicate_count": sum(
+            c.kinds is None and (c.keep is not None or c.codes is not None) for c in conjuncts
+        ),
         "fast_predicate_count": sum(c.fast is not None for c in conjuncts),
-        "kind_only_predicate_count": sum(c.kind_only for c in conjuncts),
+        "kind_only_predicate_count": sum(c.kinds is not None for c in conjuncts),
         "generic_only_predicate_count": sum(c.fast is None for c in conjuncts),
     }
