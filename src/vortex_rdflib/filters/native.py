@@ -337,11 +337,7 @@ def _regex_shape(expr, var, consts) -> FilterCodes | None:
     text = _text_shape(expr.text, var)
     if text is None:
         return None
-    pattern = values.fold(expr.pattern, consts)
-    flags = None if expr.flags is None else values.fold(expr.flags, consts)
-    if pattern is None or (expr.flags is not None and flags is None):
-        return None
-    spec = values.regex_spec(pattern, flags)
+    spec = values.regex_spec(expr, consts)
     if not isinstance(spec, values.RegexSpec) or "x" in spec.flags or "q" in spec.flags:
         return None
     case, as_str = text

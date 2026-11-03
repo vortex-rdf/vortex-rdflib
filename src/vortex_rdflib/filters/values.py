@@ -631,7 +631,7 @@ _REGEX_FLAGS = {"i": re.IGNORECASE, "s": re.DOTALL, "m": re.MULTILINE, "x": 0, "
 
 #: What ``re.compile`` raises for a pattern it cannot compile: a syntax error,
 #: a repetition count past its limit, nesting past the recursion limit.
-COMPILE_ERRORS = (re.error, OverflowError, RecursionError)
+_COMPILE_ERRORS = (re.error, OverflowError, RecursionError)
 
 
 #: XPath escapes Python's ``re`` lacks: Unicode categories and blocks
@@ -652,37 +652,35 @@ class RegexSpec(NamedTuple):
     regex: re.Pattern
 
 
-def regex_spec(pattern, flags):
-    """REGEX's pattern and flags — rdflib terms, ``flags`` ``None`` when
-    absent — as XPath's ``fn:matches`` reads them (§17.4.3.14): a
-    :class:`RegexSpec`; ``ERROR`` when they make every call an error — the
-    pattern or the flags no simple literal, a flag not XPath's, a pattern
-    XPath rejects; ``None`` for a pattern XPath accepts and ``re`` cannot
-    compile (:data:`COMPILE_ERRORS`), which only rdflib's evaluator can try.
-    The fast route and the native recognizer read a REGEX through it."""
+def regex_spec(node, consts: dict):
+    """A REGEX node's pattern and flags, when neither reads a block variable
+    (:func:`fold`, with ``consts``), as XPath's ``fn:matches`` reads them
+    (§17.4.3.14): a :class:`RegexSpec`; ``ERROR`` when they make every call
+    an error — the pattern or the flags no simple literal, a flag not
+    XPath's, a pattern XPath rejects; ``None`` for a pattern or flags read
+    per row, or a pattern XPath accepts and ``re`` cannot compile
+    (:data:`_COMPILE_ERRORS`), which only rdflib's evaluator can try. The
+    fast route and the native recognizer read a REGEX through it."""
+    pattern = fold(node.pattern, consts)
+    flags = None if node.flags is None else fold(node.flags, consts)
+    if pattern is None or (node.flags is not None and flags is None):
+        return None
     if not _simple_term(pattern) or (flags is not None and not _simple_term(flags)):
         return ERROR
-    checked = regex_flags(str(flags) if flags is not None else None)
-    if checked is ERROR:
+    flags = "" if flags is None else str(flags)
+    if not all(flag in _REGEX_FLAGS for flag in flags):
         return ERROR
     try:
-        regex = compile_regex(str(pattern), checked)
-    except COMPILE_ERRORS:
+        regex = _compile(str(pattern), flags)
+    except _COMPILE_ERRORS:
         return None
     if regex is ERROR:
         return ERROR
-    return RegexSpec(str(pattern), checked, regex)
+    return RegexSpec(str(pattern), flags, regex)
 
 
 def _simple_term(term) -> bool:
     return isinstance(term, Literal) and simple_literal(constant_view(term))
-
-
-def regex_flags(flags: str | None):
-    """A REGEX flags string checked against XPath's (``s m i x q``), or
-    ``ERROR`` when it holds any other character."""
-    flags = "" if flags is None else flags
-    return flags if all(flag in _REGEX_FLAGS for flag in flags) else ERROR
 
 
 def _xpath_pattern(pattern: str, flags: str) -> str:
@@ -709,19 +707,16 @@ def _xpath_pattern(pattern: str, flags: str) -> str:
     return "".join(out)
 
 
-def compile_regex(pattern: str, flags: str | None):
-    """A REGEX pattern and its flags compiled as XPath reads them, or
-    ``ERROR`` for invalid flags or a pattern XPath rejects too (§17.4.3.14:
-    an invalid pattern is an error). With ``q`` the pattern is matched
+def _compile(pattern: str, flags: str):
+    """A REGEX pattern compiled as XPath reads it with ``flags`` (XPath's,
+    checked), or ``ERROR`` for a pattern XPath rejects too (§17.4.3.14: an
+    invalid pattern is an error). With ``q`` the pattern is matched
     literally, and only ``i`` still applies.
 
     A pattern XPath accepts but ``re`` cannot compile — an XPath-only escape
     (``\\p{Lu}``), a repetition count past ``re``'s limit, nesting past the
-    recursion limit — raises what ``re`` raised (:data:`COMPILE_ERRORS`): it
-    cannot be evaluated here."""
-    flags = regex_flags(flags)
-    if flags is ERROR:
-        return ERROR
+    recursion limit — raises what ``re`` raised (:data:`_COMPILE_ERRORS`):
+    it cannot be evaluated here."""
     compile_flags = 0
     if "q" in flags:
         source = re.escape(pattern)

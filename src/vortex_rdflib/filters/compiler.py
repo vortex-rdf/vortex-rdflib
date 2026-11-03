@@ -385,11 +385,7 @@ def _compile_regex(node, slots, consts):
     flags every call errs on make it an error; a pattern ``re`` cannot
     compile, or one read per row, leaves the conjunct to rdflib's
     evaluator."""
-    pattern = values.fold(node.pattern, consts)
-    flags = None if node.flags is None else values.fold(node.flags, consts)
-    if pattern is None or (node.flags is not None and flags is None):
-        raise _NotFast
-    spec = values.regex_spec(pattern, flags)
+    spec = values.regex_spec(node, consts)
     if spec is None:
         raise _NotFast
     if spec is ERROR:
