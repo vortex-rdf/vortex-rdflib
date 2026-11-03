@@ -6,7 +6,7 @@ streamed (:mod:`.streaming`) — and their trace events.
 """
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 
@@ -391,22 +391,22 @@ def _join_incremental_bgp(
     put_back: list[Pattern] = []
     while remaining and rel.nrows:
         running = rel.nrows
-        connected = (pat for pat in remaining if any(v in rel.schema for v in pat.varpos))
-        if put_back:
-            pat = next(
-                (
-                    pat
-                    for pat in connected
-                    if all(pat is not back for back in put_back) and _fits(rel, pat, memo, store)
-                ),
-                None,
-            )
-            if pat is None:
-                break
-        else:
-            pat = next(connected, remaining[0])
-        position = next(i for i, other in enumerate(remaining) if other is pat)
-        del remaining[position]
+        # The first pattern sharing a variable with the relation — after a
+        # step over the budget, the first of the others that provably fits —
+        # and with none sharing one, the first: a cross product. A pattern
+        # leaves ``remaining`` only once its step completes.
+        pat = next(
+            (
+                pat
+                for pat in remaining
+                if pat not in put_back
+                and any(v in rel.schema for v in pat.varpos)
+                and (not put_back or _fits(rel, pat, memo))
+            ),
+            None if put_back else remaining[0],
+        )
+        if pat is None:
+            break
         shared = [v for v in pat.varpos if v in rel.schema]
         elapsed = trace.stopwatch()
         count_limit = None
@@ -424,21 +424,21 @@ def _join_incremental_bgp(
         specialized = _specialize_tuple_conjuncts(store, work, rel, tuples) if tuples else ()
         step = _JoinStep(execution_index, work, running, pat.estimate, count_limit, len(shared))
         joined = None
-        for tier in _tiers(store, rel, work, shared, last=not remaining):
-            joined = _TIER_STEPS[tier](store, rel, work, memo, step, stats)
+        for tier in _tiers(store, rel, work, shared, last=len(remaining) == 1):
+            joined = tier(store, rel, work, memo, step, stats)
             if joined is not None:
                 break
         if joined is None:
-            # Over the budget every way it joins: back where it was planned,
+            # Over the budget every way it joins: left where it was planned,
             # as it was — its match left in the memo, and the tuple
             # conjuncts the step specialized onto its copy still pending.
-            remaining.insert(position, pat)
             put_back.append(pat)
             continue
+        remaining.remove(pat)
         rel = joined
         # The step completed: the tuple conjuncts it specialized are applied.
         if specialized:
-            applied.update(conjunct for conjunct, _, _ in specialized)
+            applied.update(specialized)
             tuples = tuple(c for c in tuples if c not in applied)
         _trace_join_step(step, rel, put_back, elapsed())
         put_back.clear()
@@ -487,8 +487,7 @@ def _specialize_tuple_conjuncts(store, pat: Pattern, rel: Relation, tuples) -> l
     step's copy, so a step that goes back over the budget leaves the
     pattern without them.
 
-    Returns what it specialized, ``(conjunct, variable, per-variable
-    conjunct)`` each.
+    Returns the conjuncts it specialized.
     """
     specialized: list = []
     single: dict = {}
@@ -512,7 +511,7 @@ def _specialize_tuple_conjuncts(store, pat: Pattern, rel: Relation, tuples) -> l
                 continue
             deferred = pat.deferred
             pat.deferred = {**deferred, var: [*deferred.get(var, ()), proxy]}
-            specialized.append((conjunct, var, proxy))
+            specialized.append(conjunct)
             if trace.active() is not None:
                 trace.event(
                     "bgp_tuple_specialized",
@@ -603,7 +602,7 @@ def _prune_early(store, rel: Relation, pending, remaining, views) -> tuple[Relat
     return Relation.from_rows(rel.schema, kept), tuple(waiting)
 
 
-def _fits(rel: Relation, pat: Pattern, memo: dict, store) -> bool:
+def _fits(rel: Relation, pat: Pattern, memo: dict) -> bool:
     """Whether joining ``pat`` into the relation — a columnar or row body —
     provably stays within ``SETTINGS.pair_budget``, from what is held
     already: no pattern is counted or matched here.
@@ -670,7 +669,7 @@ def probe_budget() -> int:
     return SETTINGS.pair_budget // 4
 
 
-def _tiers(store, rel: Relation, work: Pattern, shared: list, last: bool) -> tuple[str, ...]:
+def _tiers(store, rel: Relation, work: Pattern, shared: list, last: bool) -> tuple[Callable, ...]:
     """The strategies a join step tries, in order, until one joins within
     the budget: the step rule's (:func:`step_rule`), a probe step's
     followed by a keep-scan. The last step sharing one variable streams
@@ -680,21 +679,21 @@ def _tiers(store, rel: Relation, work: Pattern, shared: list, last: bool) -> tup
     streams = last and len(shared) == 1
     rule = step_rule(store, rel.nrows, work, shared)
     if rule == "probe":
-        tiers: tuple[str, ...] = ("probe", "keep_scan")
+        tiers: tuple[Callable, ...] = (_probe_step, _keep_scan_step)
     elif rule == "keep_scan":
-        tiers = ("keep_scan",)
+        tiers = (_keep_scan_step,)
     elif streams and streaming._read_in_chunks(work, rel.nrows):
-        return ("stream",)
+        return (_stream_step,)
     else:
-        tiers = ("hash",)
-    return (*tiers, "stream") if streams else tiers
+        tiers = (_hash_step,)
+    return (*tiers, _stream_step) if streams else tiers
 
 
 def _probe_step(store, rel: Relation, work: Pattern, memo, step, stats) -> Relation | None:
     """Join ``work`` per row of the relation by its probes
     (:func:`probes._probe_join`); ``None`` once their rows pass
     :func:`probe_budget`, with the probes sent counted."""
-    step.strategy, step.source, step.probe_calls = "probe", "probed", step.running
+    step.strategy, step.probe_calls = "probe", step.running
     clock = trace.stopwatch()
     try:
         schema, rows = probes._probe_join(
@@ -718,7 +717,7 @@ def _keep_scan_step(store, rel: Relation, work: Pattern, memo, step, stats) -> R
     """Join ``work`` by one match narrowed to the relation's codes
     (:func:`_keep_scan`), hash-joined; ``None`` when the match or the join
     passes the budget."""
-    step.strategy, step.source = "keep_scan", "matched"
+    step.strategy = "keep_scan"
     calls, native_ns, fits = _keep_scan(store, work, rel)
     stats.initial_calls += calls
     stats.native_ns += native_ns
@@ -734,7 +733,6 @@ def _keep_scan_step(store, rel: Relation, work: Pattern, memo, step, stats) -> R
 def _hash_step(store, rel: Relation, work: Pattern, memo, step, stats) -> Relation | None:
     """Match ``work`` whole, through the memo, and hash-join it; ``None``
     when the join passes the budget."""
-    step.source = "matched"
     calls, native_ns = matching._match_resolved_pattern(store, work, memo)
     stats.initial_calls += calls
     stats.native_ns += native_ns
@@ -754,29 +752,18 @@ def _stream_step(store, rel: Relation, work: Pattern, memo, step, stats) -> Rela
     (:func:`streaming._chunkable`)."""
     if work.cols is None and not streaming._chunkable(work):
         return None
-    first = step.source is None
+    first = step.strategy is None  # no other strategy of the step read it
     step.strategy = "stream"
     schema, pieces = streaming._streamed_step(store, rel, work, memo)
     if work.cols is None:
-        step.feed, step.source = "chunks", "chunked"
-        step.match_rows = step.restricted_rows = None
+        step.feed = "chunks"
         stats.initial_calls += 1
     else:
         step.feed = "slices"
         if first:
             # The memo held the pattern's match: it was read whole.
-            step.source = "matched"
             step.match_rows = step.restricted_rows = work.nrows
     return Relation(schema, None, None, 0, pieces=pieces)
-
-
-#: Each strategy a join step may try (:func:`_tiers`), by name.
-_TIER_STEPS = {
-    "probe": _probe_step,
-    "keep_scan": _keep_scan_step,
-    "hash": _hash_step,
-    "stream": _stream_step,
-}
 
 
 def _hash_join_step(rel: Relation, right: Relation, step) -> Relation | None:
@@ -829,10 +816,10 @@ class _JoinStep:
     the relation of ``running`` rows (step ``execution_index`` of the plan),
     the count it was planned with (``estimate``, counted at the step up to
     ``count_limit`` when it was not planned), the variables it shares, and
-    what the step did — its ``strategy`` and where its rows came from
-    (``source``), each set by the strategy that tries it (:func:`_tiers`),
-    how a streamed step is fed, its pairs, its pattern's rows before and
-    after their restrictions, and its probes."""
+    what the step did — its ``strategy``, set by each strategy it tries
+    (:func:`_tiers`), how a streamed step is fed, its pairs, its pattern's
+    rows before and after their restrictions, and its probes. Where its
+    rows came from follows (:func:`_trace_join_step`)."""
 
     execution_index: int
     pat: Pattern
@@ -841,7 +828,6 @@ class _JoinStep:
     count_limit: int | None
     shared_count: int
     strategy: str | None = None
-    source: str | None = None
     feed: str | None = None
     pair_count: int | None = None
     match_rows: int | None = None
@@ -852,9 +838,15 @@ class _JoinStep:
 
 def _trace_join_step(step: _JoinStep, rel: Relation, put_back: list, elapsed_ns: int) -> None:
     """Trace a completed join step as ``bgp_join_step_complete``: the step,
-    the patterns it was reordered around, and the relation it made."""
+    the patterns it was reordered around, and the relation it made. Its
+    rows came from its probes, from chunks of its pattern, or from its
+    pattern's match."""
     if trace.active() is None:
         return
+    if step.strategy == "probe":
+        source = "probed"
+    else:
+        source = "chunked" if step.feed == "chunks" else "matched"
     trace.event(
         "bgp_join_step_complete",
         execution_index=step.execution_index,
@@ -862,14 +854,14 @@ def _trace_join_step(step: _JoinStep, rel: Relation, put_back: list, elapsed_ns:
         strategy=step.strategy,
         feed=step.feed,
         reordered_around=[back.index for back in put_back] or None,
-        cardinality_source=step.source,
+        cardinality_source=source,
         input_rows=step.running,
         estimated_rows=step.estimate,
         estimate_limit=step.count_limit,
         pair_count=step.pair_count,
         pattern_match_rows=step.match_rows,
         pattern_restricted_rows=step.restricted_rows,
-        native_initial_match_count=int(step.source != "probed"),
+        native_initial_match_count=int(source != "probed"),
         native_probe_call_count=step.probe_calls,
         native_probe_ns=step.probe_ns,
         output_rows=None if rel.pieces is not None else rel.nrows,

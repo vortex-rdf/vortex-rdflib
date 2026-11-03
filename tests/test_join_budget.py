@@ -937,9 +937,9 @@ def test_tier2_does_not_trust_a_capped_estimate(graph, monkeypatch):
     assert (linked.estimate, linked.estimate_capped) == (101, True)
     monkeypatch.setattr(SETTINGS, "pair_budget", 202)
     relation = pd.relation.Relation.from_rows((x,), [(1,), (2,)])
-    assert not pd.bgp._fits(relation, linked, {}, graph.store)
+    assert not pd.bgp._fits(relation, linked, {})
     linked.estimate_capped = False
-    assert pd.bgp._fits(relation, linked, {}, graph.store)
+    assert pd.bgp._fits(relation, linked, {})
 
 
 def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
@@ -959,13 +959,13 @@ def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
     assert columnar.nrows == 120
     bodies = [columnar, pd.relation.Relation.from_rows((s, x), pd.relation._cols_to_rows(cols))]
     monkeypatch.setattr(SETTINGS, "pair_budget", 5)
-    assert [pd.bgp._fits(body, pat, memo, graph.store) for body in bodies] == [True] * 2
-    assert not pd.bgp._fits(columnar, pat, {}, graph.store)
+    assert [pd.bgp._fits(body, pat, memo) for body in bodies] == [True] * 2
+    assert not pd.bgp._fits(columnar, pat, {})
     monkeypatch.setattr(SETTINGS, "probe_fanout", 2)
-    assert not pd.bgp._fits(columnar, pat, memo, graph.store)
+    assert not pd.bgp._fits(columnar, pat, memo)
     monkeypatch.setattr(SETTINGS, "probe_fanout", 100)
     monkeypatch.setattr(SETTINGS, "pair_budget", 4)
-    assert [pd.bgp._fits(body, pat, memo, graph.store) for body in bodies] == [False] * 2
+    assert [pd.bgp._fits(body, pat, memo) for body in bodies] == [False] * 2
 
 
 @pytest.mark.parametrize("budget", [119, 60])
@@ -1514,3 +1514,33 @@ def test_probe_batches_name_their_lookahead(file_graph, monkeypatch):
             if name.endswith("_many")
         ]
         assert batches == expected, sparql
+
+
+#: The module's join queries, swept by
+#: ``test_a_step_s_source_follows_its_strategy_and_feed``.
+_SWEPT = (
+    STAR, CHAIN, FAN, TWIN, LOOP, WIDE, FANNED, ONE_KEY, SELF_LOOP,
+    REORDER, SCANNED, OWNED, ANCHORED_SCAN, KEYED_TWICE, LOOPED,
+)  # fmt: skip
+
+
+def test_a_step_s_source_follows_its_strategy_and_feed(graph, monkeypatch, capsys):
+    """Every traced join step says where its rows came from by its strategy
+    and feed alone — its probes for a probe step, chunks of its pattern for
+    a stream fed by them, its pattern's match otherwise — and made an
+    initial match exactly when it did not probe; over budgets that reach
+    every kind of step."""
+    seen = set()
+    for budget in (SETTINGS.pair_budget, 40, 0):
+        monkeypatch.setattr(SETTINGS, "pair_budget", budget)
+        for sparql in _SWEPT:
+            _, events = _traced_both_ways(graph, monkeypatch, capsys, sparql)
+            for step in _fields(events, "bgp_join_step_complete"):
+                if step["strategy"] == "probe":
+                    source = "probed"
+                else:
+                    source = "chunked" if step["feed"] == "chunks" else "matched"
+                assert step["cardinality_source"] == source, (budget, sparql, step)
+                assert step["native_initial_match_count"] == int(source != "probed")
+                seen.add(source)
+    assert seen == {"probed", "chunked", "matched"}
