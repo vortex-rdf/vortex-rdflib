@@ -511,3 +511,33 @@ def test_impure_function_inside_exists_is_seen():
     )
     expr = query.algebra.p.p.expr
     assert exprs.is_impure(expr)
+
+
+#: Two dateTimes without a timezone: one within 14 hours of the instant
+#: 2020-01-01T00:00:00Z, one two days after it.
+_LOCAL_TIMES = (
+    f'<{EX}near> <{EX}t> "2020-01-01T00:00:00"^^<{XSD}dateTime> .\n'
+    f'<{EX}far> <{EX}t> "2020-01-03T00:00:00"^^<{XSD}dateTime> .\n'
+)
+
+
+@pytest.mark.parametrize("op", ["=", "!=", "<", ">"])
+def test_a_local_time_near_a_timezoned_one_is_incomparable(stores, op):
+    """A dateTime without a timezone and one with a timezone are ordered by
+    XML Schema's partial order: within 14 hours of each other neither is
+    less, equal or greater, so every comparison is an error — the answer the
+    W3C suite's open-world date-1 and date-2 give for dates (rdflib's
+    evaluator compares them; Oxigraph answers ``!=`` true). Two days apart
+    they are ordered on the time line, where rdflib's evaluator orders them
+    wrongly."""
+    from tests.support import both_ways
+
+    query = (
+        PREFIXES
+        + f'SELECT ?s WHERE {{ ?s ex:t ?d FILTER(?d {op} "2020-01-01T00:00:00Z"^^xsd:dateTime) }}'
+    )
+    dataset = Dataset(store=stores(_LOCAL_TIMES))
+    with_pushdown, _ = both_ways(dataset, query)
+    near, far = (URIRef(f"{EX}near"),), (URIRef(f"{EX}far"),)
+    assert near not in with_pushdown
+    assert (far in with_pushdown) == (op in ("!=", ">"))

@@ -55,7 +55,9 @@ typed path per case.
 - Python 3.11 is no longer supported: `requires-python = ">=3.12"`, tested on
   3.12 to 3.15.
 - A FILTER the pushdown evaluates follows SPARQL 1.1 where rdflib's evaluator
-  does not, so some answers change:
+  does not — the FILTER over a block it hands back to rdflib (a join over the
+  pair budget) included, so an answer does not depend on the join's size — and
+  some answers change:
   - errors through the operators: `T || E` is true, `F && E` and `E && F` are
     false, `!` of an error is an error;
   - `IN` is `=` over its list (an error when nothing matches and a comparison
@@ -66,7 +68,9 @@ typed path per case.
   - orderings within one value space only: NaN orders against nothing, an
     ill-typed literal (in the data, or a constant such as `"300"^^xsd:byte`)
     has no value, `xsd:dateTime` and `xsd:date` follow XML Schema's partial
-    order;
+    order (a value without a timezone and one with it, within 14 hours, are
+    neither equal nor unequal, as the W3C suite's open-world date tests
+    expect);
   - effective boolean value: NaN and ill-typed numbers and booleans are false;
     unknown datatypes, dates and IRIs are errors;
   - `isNumeric` of an ill-typed literal is false; `sameTerm` and `STR` read a

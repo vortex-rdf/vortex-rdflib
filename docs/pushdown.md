@@ -559,7 +559,7 @@ Where rdflib and the specification part ways:
 | `STR` of a blank node | its label | an error |
 | `REGEX` with an invalid pattern (`"("`, `"a{2,1}"`) | the query raises | an error, so no row passes, under `!` either |
 | `REGEX` with a language-tagged pattern or flags (`"a"@en`) | its lexical form | an error: both are simple literals |
-| `xsd:dateTime` and `xsd:date` with and without a timezone | compared as written | XML Schema's partial order: within 14 hours the comparison is an error |
+| `xsd:dateTime` and `xsd:date` with and without a timezone | compared as written (`"2020-01-03T00:00:00"` is less than `"2020-01-01T00:00:00Z"`) | XML Schema's partial order: within 14 hours the comparison is an error, as the W3C suite's open-world date-1 and date-2 expect; further apart, ordered on the time line |
 | effective boolean value of NaN, an ill-typed number or an ill-typed boolean (`"TRUE"^^xsd:boolean`) | true, or an error | false |
 | effective boolean value of an unknown datatype, a date or an IRI | rdflib's | an error |
 | `isNumeric` of an ill-typed number | true | false |
