@@ -5,8 +5,8 @@ graphs that hold it."""
 import pytest
 from rdflib import Dataset, Graph, Literal, URIRef
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, ConjunctiveGraph
+from tests.conftest import GRAPH_1, GRAPH_2, LAYOUTS
 
-from conftest import GRAPH_1, GRAPH_2, LAYOUTS
 from vortex_rdflib import VortexRdflibStore
 
 FOAF_NAME = URIRef("http://xmlns.com/foaf/0.1/name")

@@ -1265,7 +1265,7 @@ and SPARQL 1.1 disagree ([SPARQL semantics](#sparql-semantics)):
   0.14 surface: the batch calls' answer iterators with `lookahead` and
   `cancel`, `JoinTooLarge`, `groups` and `gather`, chunks and `slice`, and
   the `take` and `run_starts` that keep the union default graph a set.
-- [`tests/test_join_budget.py`](../tests/test_join_budget.py) checks the pair
+- [`tests/joins/`](../tests/joins/conftest.py) checks the pair
   budget and what it sets off: the product bound and the native count, the
   three tiers (streamed pieces, a pattern joined first, rdflib finishing the
   rest, and the hand-back where it cannot), keep-scans, the probe tally and the

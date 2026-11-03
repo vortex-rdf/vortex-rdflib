@@ -13,11 +13,11 @@ from rdflib import BNode, Dataset, Graph, Literal, URIRef
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID
 from rdflib.plugins.parsers import ntriples
 from rdflib.term import Node
+from tests.conftest import GRAPH_2, LAYOUTS
 from tests.support import both_ways, counting_term_dict, file_codes, native_spy
 from vortex_rdf import U64Column, serialize_rdf
 
 import vortex_rdflib.terms as terms_mod
-from conftest import GRAPH_2, LAYOUTS
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
 from vortex_rdflib.terms import escape, parse_spelling
