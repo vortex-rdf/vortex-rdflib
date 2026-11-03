@@ -69,13 +69,9 @@ def _environment_reader() -> Callable[[str], str | None]:
     decodevalue = getattr(environ, "decodevalue", None)
     if not isinstance(data, dict) or encodekey is None or decodevalue is None:
         return environ.get
-    keys: dict[str, object] = {}
 
     def read(name: str) -> str | None:
-        key = keys.get(name)
-        if key is None:
-            key = keys[name] = encodekey(name)
-        raw = data.get(key)
+        raw = data.get(encodekey(name))
         return None if raw is None else decodevalue(raw)
 
     return read
