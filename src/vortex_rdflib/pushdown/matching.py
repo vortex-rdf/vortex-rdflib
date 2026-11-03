@@ -4,71 +4,76 @@ and matched natively, restricted by the conjuncts that are not keeps, and
 read as a relation.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from rdflib.term import BNode, Literal, URIRef, Variable
 from vortex_rdf import U64Column
 
-from .. import ablation, filters, union
-from ..cancel import CANCEL_TOKEN, cancel_kw_for
-from ..terms import unparseable_iri
-from . import relation, tracing
+from .. import boundary, filters, trace, union
+from ..settings import SETTINGS
+from ..terms import is_range, unparseable_iri
+from . import relation
 from .algebra import _VAR_LIKE
 from .relation import Relation
-from .tracing import _TRACE
 
 
 @dataclass(slots=True, eq=False)
 class Pattern:
     """One triple pattern of a block, resolved against the context
-    (:func:`_pattern_terms`), and what planning learns about it.
+    (:func:`_pattern_terms`), and what planning and matching learn about it.
 
-    ``n3`` is the quad pattern the native layer matches: each position's
-    N-Triples spelling, ``None`` where it is open; the fourth is the graph.
-    ``varpos`` maps each variable-like term to the position(s) it takes.
+    Its resolution is fixed when it is made. ``n3`` is the quad pattern the
+    native layer matches: each position's N-Triples spelling, ``None`` where
+    it is open; the fourth is the graph. ``varpos`` maps each variable-like
+    term to the position(s) it takes, ``positions`` lists those positions in
+    order, and ``repeats`` says some variable takes two (``?x :p ?x``, which
+    a match tests row by row, :func:`_materialize`). ``index`` is its place
+    in the BGP, ``None`` outside one. ``distinct`` says it is matched in the
+    union over every graph of a store where some triple is in several, so
+    its match is made a set of triples (:func:`union.distinct_rows`).
     ``unsatisfiable`` says no quad can match (a literal in subject or
     predicate position, an IRI the parser rejects, a keep left empty).
-    ``index`` is its place in the BGP, ``None`` outside one. ``nkeep``
-    narrows its native match per position (a code range, or an ascending
-    code column). ``distinct`` says it is matched in the union over every
-    graph of a store where some triple is in several, so its match is made a
-    set of triples (:func:`union.distinct_rows`). ``deferred`` maps variables
-    to the conjuncts still to be evaluated over the codes the pattern brings.
-    Both mappings are replaced when they change, never mutated
-    (:func:`_set_native_keep`), so a keep taken before stays whole and a copy
-    (:meth:`copy`) shares them safely.
 
-    Planning sets ``estimate`` (its count, ``None`` while uncounted; a lower
-    bound when ``estimate_capped``) or marks it ``probe`` (left uncounted
-    next to a small pattern, :func:`_count_patterns`). A match sets ``cols``
-    (the raw code columns, ``None`` at a position nothing reads; none for an
-    unsatisfiable pattern) and ``nrows`` (:meth:`set_match`); ``matched``
-    says whether it holds one.
-    ``match_rows`` and ``probe_rows`` are for the trace: the rows of its match
-    before its restrictions, and the rows its probes kept after theirs.
+    ``nkeep`` narrows its native match per position (a code range, or an
+    ascending code column); ``deferred`` maps variables to the conjuncts
+    still to be evaluated over the codes the pattern brings. Both mappings
+    are replaced when they change, never mutated (:func:`_set_native_keep`),
+    so a keep taken before stays whole and a copy (:meth:`copy`) shares them
+    safely.
+
+    Planning sets ``estimate``: its count, ``None`` while uncounted, a lower
+    bound when ``estimate_capped``. A match sets ``cols`` — the raw code
+    columns, ``None`` at a position nothing reads; ``None`` while unread —
+    and ``nrows`` (:meth:`set_match`).
 
     Identity is the pattern's: two patterns that read alike are still two.
     """
 
-    n3: list
+    n3: tuple
     varpos: dict
     unsatisfiable: bool = False
     index: int | None = None
-    nkeep: dict | None = None
     distinct: bool = False
-    deferred: dict | None = None
+    nkeep: dict = field(default_factory=dict)
+    deferred: dict = field(default_factory=dict)
     estimate: int | None = None
     estimate_capped: bool = False
-    probe: bool = False
-    matched: bool = False
-    cols: tuple = ()
+    cols: tuple | None = None
     nrows: int = 0
-    match_rows: int | None = None
-    probe_rows: int | None = None
+    repeats: bool = field(init=False)
+    positions: tuple = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.n3 = tuple(self.n3)
+        # Each position holds one term, so a variable repeats exactly when
+        # the variables hold more positions than there are variables.
+        positions = [idx for pos in self.varpos.values() for idx in pos]
+        self.repeats = len(positions) > len(self.varpos)
+        self.positions = tuple(sorted(positions))
 
     def set_match(self, cols: tuple, nrows: int) -> None:
         """Hold a match: its columns and row count."""
-        self.cols, self.nrows, self.matched = cols, nrows, True
+        self.cols, self.nrows = cols, nrows
 
     def copy(self) -> "Pattern":
         """A copy for a join step to work on. The mappings a step changes
@@ -78,7 +83,7 @@ class Pattern:
 
     def clear_match(self) -> None:
         """Let go of the match: the pattern is unread again."""
-        self.cols, self.nrows, self.matched, self.match_rows = (), 0, False, None
+        self.cols, self.nrows = None, 0
 
 
 def _pattern_static_rank(pat: Pattern) -> tuple:
@@ -91,62 +96,66 @@ def _pattern_static_rank(pat: Pattern) -> tuple:
 
 
 def _pattern_key(pat: Pattern) -> tuple:
-    """What a pattern's native count and match are memoized by: the resolved
-    quad pattern and its native keep (two triples resolving to the same quad
-    share both only when they are narrowed alike, and a distinct match only
-    with another). A code column stands in the key itself, compared by
-    identity: the key holds it, so no later column can take its place while
-    the memo keeps the entry."""
+    """What a pattern's native match is memoized by: the resolved quad
+    pattern and its native keep (two triples resolving to the same quad
+    share a match only when they are narrowed alike; the patterns of one
+    block share one scope, so a distinct match only ever meets another). A
+    code column stands in the key itself, compared by identity: the key
+    holds it, so no later column can take its place while the memo keeps
+    the entry."""
     nkeep = pat.nkeep
     if not nkeep:
-        return (*pat.n3, "distinct") if pat.distinct else tuple(pat.n3)
+        return pat.n3
     narrowing = tuple(
         sorted(
-            (position, ("range", *keep) if isinstance(keep, tuple) else ("codes", keep))
+            (position, ("range", *keep) if is_range(keep) else ("codes", keep))
             for position, keep in nkeep.items()
         )
     )
-    return (*pat.n3, narrowing, *(("distinct",) if pat.distinct else ()))
+    return (*pat.n3, narrowing)
 
 
-def _count_pattern(
-    store, pat: Pattern, counts: dict, exact: bool = False, limit: int | None = None
-) -> int:
-    """The number of quads a resolved pattern selects, from ``count_quads``
-    — the row selection's size, a fraction of a match's cost, and no
-    columns. Memoized across the patterns of one block, like the matches.
-    Zero for an unsatisfiable pattern.
+def _count_pattern(store, pat: Pattern, counts: dict, limit: int | None = None) -> int:
+    """A planning count: the number of quads a resolved pattern selects,
+    from ``count_quads`` — the row selection's size, a fraction of a match's
+    cost, and no columns — memoized in ``counts`` across the patterns of one
+    block. Zero for an unsatisfiable pattern.
 
-    A planning count (the default) reads the quad pattern alone: narrowing
-    it by the pattern's native keep costs the native layer a pass over the
-    selected rows, more than an estimate is worth, and it decides nothing a
-    narrowed match would not repair. An ``exact`` count — an answer, or a
-    size a join decision hinges on — narrows by the keep. With ``limit`` the
-    count stops there: an answer that reaches it is a lower bound, which is
-    never memoized as the count. A count already memoized is returned whole.
-    A planning count of a ``distinct`` pattern counts its quads, a bound on
-    its triples; its exact count is its match's, made distinct.
+    It reads the quad pattern alone: narrowing it by the pattern's native
+    keep costs the native layer a pass over the selected rows, more than an
+    estimate is worth, and it decides nothing a narrowed match would not
+    repair; a ``distinct`` pattern's quads bound its triples. With ``limit``
+    the count stops there: an answer that reaches it is a lower bound, which
+    is never memoized as the count. An answer is :func:`_exact_count`'s.
+
+    With ``SETTINGS.count_order`` off (``VORTEX_RDF_COUNT_ORDER=0``) nothing
+    is counted: the answer is the pattern's static estimate.
     """
     if pat.unsatisfiable:
         return 0
-    if exact and pat.distinct:
-        token = CANCEL_TOKEN.get()
-        cancel = {} if token is None else cancel_kw_for({"cancel": token}, store, pat.n3)
-        cols = tracing._native(store).match_codes(*pat.n3, **_narrowing(pat.nkeep), **cancel)
-        if cols is None:
-            raise NotImplementedError
-        n = len(union.distinct_rows(cols)[0])
-        return n if limit is None else min(n, limit)
-    nkeep = pat.nkeep if exact else None
-    key = _pattern_key(pat) if nkeep else tuple(pat.n3)
+    if not SETTINGS.count_order:
+        return _static_estimate(pat)
+    key = pat.n3
     n = counts.get(key)
     if n is None:
-        token = CANCEL_TOKEN.get()
-        cancel = {} if token is None else cancel_kw_for({"cancel": token}, store, pat.n3, limit)
-        n = tracing._native(store).count_quads(*pat.n3, **_narrowing(nkeep, limit), **cancel)
+        n = boundary.native(store).count_quads(*pat.n3, **_narrowing(None, limit))
         if limit is None or n < limit:
             counts[key] = n
     return n
+
+
+def _exact_count(store, pat: Pattern) -> int:
+    """The rows a resolved pattern's match holds, as an answer: its quads
+    narrowed by its native keep (``count_quads``, no columns), or a
+    ``distinct`` pattern's match made a set (:func:`_match_resolved_pattern`,
+    which leaves the pattern holding it). Zero for an unsatisfiable
+    pattern."""
+    if pat.unsatisfiable:
+        return 0
+    if pat.distinct:
+        _match_resolved_pattern(store, pat)
+        return pat.nrows
+    return boundary.native(store).count_quads(*pat.n3, **_narrowing(pat.nkeep))
 
 
 def _static_estimate(pat: Pattern) -> int:
@@ -154,14 +163,6 @@ def _static_estimate(pat: Pattern) -> int:
     in place of a native count — fewer rows for more bound positions, and never few enough that a
     connected step matches rather than probes (rdflib's nested loop)."""
     return 1 << (62 - 8 * sum(value is not None for value in pat.n3))
-
-
-def _planning_count(store, pat: Pattern, counts: dict, limit: int | None = None) -> int:
-    """:func:`_count_pattern` for a planning decision, or the static estimate when counts do not
-    plan."""
-    if not ablation.COUNT_ORDER:
-        return 0 if pat.unsatisfiable else _static_estimate(pat)
-    return _count_pattern(store, pat, counts, limit=limit)
 
 
 def _narrowing(keep=None, limit=None) -> dict:
@@ -184,14 +185,15 @@ def _match_resolved_pattern(store, pat: Pattern, memo=None, limit=None) -> tuple
     match, in base order — the order an unlimited match returns them where
     no index serves it (see :func:`_limit_reaches_match`); a limited match
     neither reads nor fills the memo. A ``distinct`` pattern's match is made a
-    set of triples, unless the limit cut it: a match that reaches its limit
-    keeps its rows, so a caller testing it against the limit still can.
+    set of triples, unless the limit cut it: a cut match keeps its rows, so
+    its caller can tell it was cut by its ``limit`` rows (:func:`_keep_scan`
+    drops one).
 
     Only the columns are shared through the memo, as read-only views;
     ``varpos`` stays per pattern, since two triples matching the same rows
     still bind different variables.
     """
-    then = tracing._stopwatch()
+    then = trace.stopwatch()
     if pat.unsatisfiable:
         pat.set_match((), 0)
         return 0, 0
@@ -200,16 +202,15 @@ def _match_resolved_pattern(store, pat: Pattern, memo=None, limit=None) -> tuple
     cols = memo.get(key) if memo is not None and limit is None else None
     calls = 0
     if cols is None:
-        native = tracing._native(store)
-        token = CANCEL_TOKEN.get()
-        cancel = {} if token is None else cancel_kw_for({"cancel": token}, store, pat.n3, limit)
+        native = boundary.native(store)
         if nkeep or limit is not None:
-            cols = native.match_codes(*pat.n3, **_narrowing(nkeep, limit), **cancel)
+            cols = native.match_codes(*pat.n3, **_narrowing(nkeep, limit))
         else:
-            cols = native.match_codes(*pat.n3, **cancel)
+            cols = native.match_codes(*pat.n3)
         if cols is None:
             raise NotImplementedError
-        if pat.distinct and (limit is None or len(cols[0]) < limit):
+        cut = limit is not None and len(cols[0]) >= limit
+        if pat.distinct and not cut:
             cols = union.distinct_rows(cols)
         if memo is not None and limit is None:
             memo[key] = cols
@@ -230,15 +231,10 @@ def _limit_reaches_match(store, pat: Pattern, residual) -> bool:
     pattern's rows are its match's made a set, so a limit on the match would
     cut short the rows it keeps.
     """
-    return (
-        not residual
-        and not pat.distinct
-        and not store._indexes
-        and all(len(positions) == 1 for positions in pat.varpos.values())
-    )
+    return not residual and not pat.distinct and not store._opened().indexes and not pat.repeats
 
 
-def _pattern_terms(ctx, store, s, p, o, scope) -> Pattern:
+def _pattern_terms(ctx, store, s, p, o, scope, index: int | None = None) -> Pattern:
     """Resolve one triple pattern against the context, without matching:
     the :class:`Pattern` of its positions as N-Triples strings (``None``
     where variable), the position(s) each variable-like term occupies, and
@@ -276,13 +272,30 @@ def _pattern_terms(ctx, store, s, p, o, scope) -> Pattern:
     if scope.var is not None:
         varpos.setdefault(scope.var, []).append(3)
 
-    n3 = [store._node_to_n3(v) for v in (rs, rp, ro)]
-    n3.append(scope.n3)
-    pat = Pattern(n3, varpos, unsatisfiable)
-    pat.distinct = scope.n3 is None and scope.var is None and store._union_has_repeats()
+    to_n3 = store._node_to_n3
+    n3 = (to_n3(rs), to_n3(rp), to_n3(ro), scope.n3)
+    distinct = scope.n3 is None and scope.var is None and store._union_has_repeats()
+    pat = Pattern(n3, varpos, unsatisfiable, index=index, distinct=distinct)
     if scope.var is not None:
         _exclude_default_graph(store, pat)
     return pat
+
+
+def resolve(ctx, store, triple, scope, var_preds=None, index: int | None = None) -> Pattern:
+    """``triple`` resolved (:func:`_pattern_terms`), with the conjuncts of
+    ``var_preds`` over its variables (:func:`restrict`)."""
+    pat = _pattern_terms(ctx, store, *triple, scope=scope, index=index)
+    if var_preds:
+        restrict(store, pat, var_preds)
+    return pat
+
+
+def restrict(store, pat: Pattern, var_preds) -> None:
+    """Give a resolved pattern the conjuncts of ``var_preds`` over its
+    variables: those vortex-rdf answers with a keep pushed into its native
+    match (:func:`_push_native_restrictions`), the others deferred to the
+    codes it brings (``Pattern.deferred``)."""
+    pat.deferred = _push_native_restrictions(store, pat, var_preds)
 
 
 def _exclude_default_graph(store, pat: Pattern) -> None:
@@ -296,23 +309,54 @@ def _exclude_default_graph(store, pat: Pattern) -> None:
     counts apply. A file with no default-graph rows has no such code and
     needs no restriction at all.
     """
-    default = store._default_graph_code()
+    default = store._opened().codes.default_graph_code
     if default is None:
         return
     if default != 0:
         raise NotImplementedError  # not a dictionary in byte order
-    _set_native_keep(pat, 3, (1, len(store._dict)))
+    _set_native_keep(pat, 3, (1, len(store._opened().codes.term_dict)))
 
 
 def _set_native_keep(pat: Pattern, position: int, keep) -> None:
     """Narrow the pattern's native match at ``position`` by ``keep`` (a code
     range or an ascending code column), on top of any keep already there.
     The pattern gets a new keep mapping, so one taken before stays whole."""
-    nkeep = dict(pat.nkeep or {})
+    nkeep = dict(pat.nkeep)
     if position in nkeep:
         keep = filters.native.intersect_keeps([nkeep[position], keep])
     nkeep[position] = keep
     pat.nkeep = nkeep
+
+
+def _keep_only(pat: Pattern, var, codes) -> None:
+    """Narrow the pattern's native match to ``codes``, ascending dictionary
+    codes, at every position ``var`` takes (:func:`_set_native_keep`)."""
+    keep = U64Column(codes)
+    for position in pat.varpos[var]:
+        _set_native_keep(pat, position, keep)
+
+
+def narrow_to(pat: Pattern, rel: Relation) -> None:
+    """Narrow ``pat``'s native match, at every position of a variable the
+    relation binds, to the dictionary codes it binds that variable to —
+    a keep-scan's narrowing, for a BGP step and a block's side alike. A
+    columnar body's codes are the dictionary's, read natively; a row body
+    may hold a query constant outside the dictionary (a negative code), which
+    joins nothing and is left out, and a variable bound to no dictionary
+    code makes the pattern unsatisfiable."""
+    for var in pat.varpos:
+        if var not in rel.schema:
+            continue
+        index = rel.schema.index(var)
+        if rel.cols is not None:
+            codes = sorted(relation._distinct_codes(rel.cols[index]))
+        else:
+            assert rel.rows is not None, "a keep-scan narrows to a held body"
+            codes = sorted(code for code in {row[index] for row in rel.rows} if code >= 0)
+        if not codes:
+            pat.unsatisfiable = True
+            return
+        _keep_only(pat, var, codes)
 
 
 def _push_native_restrictions(store, pat: Pattern, var_preds) -> dict:
@@ -337,18 +381,18 @@ def _push_native_restrictions(store, pat: Pattern, var_preds) -> dict:
         if keep is not None:
             for position in positions:
                 _set_native_keep(pat, position, keep)
-            if _TRACE.get() is not None:
-                tracing._trace_event(
+            if trace.active() is not None:
+                trace.event(
                     "bgp_native_restriction",
                     original_pattern_index=pat.index,
                     variable=str(var),
                     pushed_predicate_count=len(conjuncts) - len(rest),
                     residual_predicate_count=len(rest),
-                    keep=tracing._keep_summary({positions[0]: keep}),
+                    keep=trace.keep_summary({positions[0]: keep}),
                 )
         if rest:
             residual[var] = rest
-    if any(not isinstance(k, tuple) and not len(k) for k in (pat.nkeep or {}).values()):
+    if any(not is_range(k) and not len(k) for k in pat.nkeep.values()):
         pat.unsatisfiable = True
     return residual
 
@@ -361,16 +405,18 @@ def _restrict_pattern(store, pat: Pattern, var_preds) -> None:
     its real size is what a join sees."""
     if pat.nrows == 0:
         return
-    traced = _TRACE.get() is not None
+    traced = trace.active() is not None
     keep: dict = {}
     input_rows = pat.nrows
     records = []
+    cols = pat.cols
+    assert cols is not None, "a pattern is restricted once matched"
     for var, positions in pat.varpos.items():
         conjuncts = var_preds.get(var)
         if not conjuncts:
             continue
-        elapsed = tracing._stopwatch()
-        values = set(relation._distinct_codes(pat.cols[positions[0]]))
+        elapsed = trace.stopwatch()
+        values = set(relation._distinct_codes(cols[positions[0]]))
         distinct_binding_count = len(values)
         allowed = filters.evaluate_column(store, conjuncts, values)
         if len(allowed) < distinct_binding_count:
@@ -380,7 +426,7 @@ def _restrict_pattern(store, pat: Pattern, var_preds) -> None:
                 {
                     "variable": str(var),
                     "mode": "match",
-                    **tracing._restriction_counts(conjuncts),
+                    **filters.restriction_counts(conjuncts),
                     "distinct_binding_count": distinct_binding_count,
                     "allowed_binding_count": len(allowed),
                     "elapsed_ns": elapsed(),
@@ -389,7 +435,7 @@ def _restrict_pattern(store, pat: Pattern, var_preds) -> None:
     if keep:
         _compact_pattern(pat, keep)
     for record in records:
-        tracing._trace_event(
+        trace.event(
             "bgp_restriction_complete",
             original_pattern_index=pat.index,
             input_rows=input_rows,
@@ -408,10 +454,12 @@ def _compact_pattern(pat: Pattern, keep: dict[Variable, set[int]]) -> None:
     at its first position, as ``_materialize`` reads it. The columns of
     constant positions are dropped (``None``): nothing reads them."""
     varpos = pat.varpos
-    positions = sorted({idx for pos in varpos.values() for idx in pos})
+    positions = pat.positions
     if not positions:
         return
-    columns = {idx: relation._native_column(pat.cols[idx]) for idx in positions}
+    matched = pat.cols
+    assert matched is not None, "a pattern is compacted once matched"
+    columns = {idx: relation._native_column(matched[idx]) for idx in positions}
     for var, allowed in keep.items():
         if not allowed:
             columns = {idx: U64Column([]) for idx in positions}
@@ -423,6 +471,24 @@ def _compact_pattern(pat: Pattern, keep: dict[Variable, set[int]]) -> None:
     pat.nrows = len(columns[positions[0]])
 
 
+def restricted(store, pat: Pattern, bound, stats=None) -> Relation:
+    """A matched pattern as the relation it joins with: its deferred
+    per-variable restrictions applied over the variables not in ``bound`` —
+    the relation it is about to join, which restricted its own — compacting
+    it natively to the rows that pass (:func:`_restrict_pattern`), so its
+    real size, not the match's, is what the join sees. Their time is booked
+    on ``stats`` (``restriction_ns``) when given."""
+    clock = trace.stopwatch()
+    pending, pat.deferred = pat.deferred, {}
+    if pending:
+        pending = {v: conjuncts for v, conjuncts in pending.items() if v not in bound}
+    if pending:
+        _restrict_pattern(store, pat, pending)
+    if stats is not None:
+        stats.restriction_ns += clock()
+    return _rel_from_pattern(pat)
+
+
 def _rel_from_pattern(pat: Pattern) -> Relation:
     """A matched pattern as a relation — columnar when it can be.
 
@@ -431,10 +497,12 @@ def _rel_from_pattern(pat: Pattern) -> Relation:
     ground patterns go through ``_materialize`` instead.
     """
     varpos = pat.varpos
-    if pat.nrows == 0 or not varpos or any(len(pos) > 1 for pos in varpos.values()):
+    if pat.nrows == 0 or not varpos or pat.repeats:
         return Relation.from_rows(*_materialize(pat))
     schema = tuple(varpos)
-    cols = tuple(memoryview(pat.cols[pos[0]]).cast("Q") for pos in varpos.values())
+    matched = pat.cols
+    assert matched is not None, "a pattern becomes a relation once matched"
+    cols = tuple(memoryview(matched[pos[0]]).cast("Q") for pos in varpos.values())
     return Relation(schema, cols, None, pat.nrows)
 
 
@@ -454,8 +522,9 @@ def _materialize(pat: Pattern):
         # non-matching ground pattern still eliminates all solutions.
         return (), [()] * pat.nrows
 
-    needed = sorted({idx for pos in varpos.values() for idx in pos})
-    views = {idx: memoryview(pat.cols[idx]).cast("Q").tolist() for idx in needed}
+    matched = pat.cols
+    assert matched is not None, "a pattern is materialized once matched"
+    views = {idx: memoryview(matched[idx]).cast("Q").tolist() for idx in pat.positions}
     eq_checks = [(pos[0], later) for pos in varpos.values() for later in pos[1:]]
     if eq_checks:
         keep = [

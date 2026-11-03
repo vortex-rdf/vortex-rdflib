@@ -3,9 +3,10 @@
 usage: python -m bench.bsbm.record_native <store.vortex> (--file|--in-memory)
            <warmup.json> <measured.json> <trace.jsonl>
 
-vortex-rdflib talks to vortex-rdf through the store (``store._native``) and its
-term dictionary (``store._dict``). Both are wrapped in recording proxies once
-the warm-up has run; every measured call on them is written with its
+vortex-rdflib talks to vortex-rdf through the open file's handle
+(``OpenFile.native``) and its term dictionary (``OpenFile.codes.term_dict``).
+Both are wrapped in recording proxies once the warm-up has run; every
+measured call on them is written with its
 arguments, so ``replay_native`` re-issues the same native work against another
 vortex-rdf build, separating native time from Python time.
 
@@ -99,10 +100,10 @@ def record(
     for q in warmup:
         run(q["text"])
     sink = _Sink()
-    store._store()  # the lazy open, if any, happens before the proxies go in
-    store._native = _Recorder(store._native, "store", sink)  # ty: ignore[invalid-assignment]
-    if store._dict is not None:
-        store._dict = _Recorder(store._dict, "dict", sink)  # ty: ignore[invalid-assignment]
+    opened = store._opened()  # the lazy open, if any, happens before the proxies go in
+    opened.native = _Recorder(opened.native, "store", sink)  # ty: ignore[invalid-assignment]
+    if opened.codes is not None:
+        opened.codes.term_dict = _Recorder(opened.codes.term_dict, "dict", sink)
     total = raised = 0
     with open(out_path, "w", encoding="utf-8") as out:
         header = {

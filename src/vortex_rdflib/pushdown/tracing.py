@@ -1,340 +1,196 @@
-"""The query trace (``VORTEX_RDF_TRACE_QUERY=1``): one JSON line per planning
-step, held until the planning it describes is over and printed to stderr
-prefixed ``VORTEX_RDF_QUERY_TRACE``.
+"""The trace events of a BGP's plan (:mod:`vortex_rdflib.trace`): its
+patterns, its join steps, the steps over the pair budget and the plan, from
+what solving it did (:class:`_BgpStats`) and what each step did
+(:class:`_JoinStep`)."""
 
-The trace is current through a context variable; :func:`_trace_event` and
-:func:`_stopwatch` cost nothing without one. While a query is traced, its
-native calls go through :class:`_TracedNative` (:func:`_native`), so each is
-an event too.
-"""
+from dataclasses import dataclass
 
-import abc
-import json
-import sys
-import time
-from collections.abc import Callable
-from contextvars import ContextVar
-from dataclasses import dataclass, field
-
-from ..filters import native
-
-_TRACE_PREFIX = "VORTEX_RDF_QUERY_TRACE "
-
-
-_TRACE_SCHEMA = "vortex-rdf-query-trace-v1"
+from .. import trace
+from . import relation
+from .matching import Pattern
+from .relation import Relation
 
 
 @dataclass(slots=True)
-class _QueryTrace:
-    query_id: str | None
-    sequence: int = 0
-    depth: int = 0
-    # Lines wait here until flush(), which runs once the planning (or the
-    # iteration) they describe is over, so a slow stderr never lands in the
-    # timed windows the events report.
-    pending: list = field(default_factory=list)
+class _BgpStats:
+    """What solving a BGP did, for its trace events: the native calls it
+    made — the patterns' matches (``initial_calls``) and the probes
+    (``probe_calls``) — and the planning counts (``estimate_calls``, made
+    for a BGP of several patterns only), the native calls' time, the
+    restrictions' and the joins'."""
 
-    def emit(self, event: str, **fields) -> None:
-        self.sequence += 1
-        payload = {
-            "schema": _TRACE_SCHEMA,
-            "event": event,
-            "sequence": self.sequence,
-            "query_id": self.query_id,
-            **fields,
-        }
-        try:
-            line = json.dumps(payload, separators=(",", ":"), allow_nan=False)
-        except (TypeError, ValueError):
-            _TRACE.set(None)
-            return
-        self.pending.append(_TRACE_PREFIX + line)
-
-    def flush(self) -> None:
-        if not self.pending:
-            return
-        lines, self.pending = self.pending, []
-        try:
-            print("\n".join(lines), file=sys.stderr, flush=True)
-        except OSError:
-            _TRACE.set(None)
+    initial_calls: int = 0
+    probe_calls: int = 0
+    estimate_calls: int = 0
+    native_ns: int = 0
+    restriction_ns: int = 0
+    join_ns: int = 0
 
 
-_TRACE: ContextVar[_QueryTrace | None] = ContextVar("vortex_rdf_query_trace", default=None)
+def _trace_pattern_start(ctx, index: int, triple) -> dict | None:
+    """Trace a BGP pattern's start as ``bgp_pattern_start``, with its shape
+    in the context; returns the shape, for :func:`_trace_pattern_complete`
+    (``None`` when the query is not traced)."""
+    if trace.active() is None:
+        return None
+    resolved = [ctx[term] for term in triple]
+    bound = [value is not None for value in resolved]
+    variables = [term for term, value in zip(triple, resolved, strict=True) if value is None]
+    shape = {
+        "bound_subject": bound[0],
+        "bound_predicate": bound[1],
+        "bound_object": bound[2],
+        "variable_count": len(set(variables)),
+        "repeated_variable_count": len(variables) - len(set(variables)),
+        "pattern_shape": "".join("B" if item else "V" for item in bound),
+    }
+    trace.event("bgp_pattern_start", original_pattern_index=index, **shape)
+    return shape
 
 
-def _trace_event(event: str, **fields) -> None:
-    trace = _TRACE.get()
-    if trace is not None:
-        trace.emit(event, **fields)
-
-
-def _no_time() -> int:
-    return 0
-
-
-def _stopwatch() -> Callable[[], int]:
-    """A clock for a trace field: called, the nanoseconds since this call
-    while the query is traced; ``0``, and no clock read, otherwise."""
-    if _TRACE.get() is None:
-        return _no_time
-    started = time.perf_counter_ns()
-    return lambda: time.perf_counter_ns() - started
-
-
-def _trace_native_filter(
-    kind: str, sent: int, passed: int, undecided: int, elapsed_ns: int
+def _trace_pattern_complete(
+    index: int, shape: dict | None, matched_rows: int | None, native_ns: int
 ) -> None:
-    """One ``TermDict.filter_codes`` call (:func:`native.evaluate`) as a
-    trace event."""
-    _trace_event(
-        "native_filter_complete",
-        kind=kind,
-        candidate_codes=sent,
-        passed_codes=passed,
-        undecided_codes=undecided,
+    """Trace a BGP pattern as ``bgp_pattern_complete``: matched now, with
+    its rows and match time, or left unmatched for the planner (``None``)."""
+    if shape is None:
+        return
+    trace.event(
+        "bgp_pattern_complete",
+        original_pattern_index=index,
+        cardinality_source="unmatched" if matched_rows is None else "matched",
+        native_call_count=int(matched_rows is not None),
+        matched_rows=matched_rows,
+        native_match_ns=native_ns,
+        restriction_ns=0,
+        relation_extend_ns=0,
+        other_ns=0,
+        elapsed_ns=native_ns,
+        timing_reconciled=True,
+        **shape,
+    )
+
+
+def _trace_bgp_complete(pattern_count: int, rel: Relation, stats: _BgpStats, elapsed: int) -> None:
+    """Trace a solved BGP as ``bgp_complete``: its relation, its native
+    calls, and its time split into the native calls', the restrictions',
+    the joins' and the rest, which add up to the whole."""
+    if trace.active() is None:
+        return
+    known = stats.native_ns + stats.restriction_ns + stats.join_ns
+    other_ns = max(0, elapsed - known)
+    # Only a BGP of several patterns is planned, and counted to plan it.
+    planned = {"estimate_calls": stats.estimate_calls} if pattern_count > 1 else {}
+    trace.event(
+        "bgp_complete",
+        pattern_count=pattern_count,
+        output_rows=relation._relation_rows(rel),
+        output_columns=len(rel.schema),
+        native_call_count=stats.initial_calls + stats.probe_calls,
+        native_initial_match_count=stats.initial_calls,
+        native_probe_call_count=stats.probe_calls,
+        **planned,
+        native_match_ns=stats.native_ns,
+        restriction_ns=stats.restriction_ns,
+        join_ns=stats.join_ns,
+        other_ns=other_ns,
+        elapsed_ns=known + other_ns,
+        timing_reconciled=True,
+    )
+
+
+@dataclass(slots=True)
+class _JoinStep:
+    """One step of a BGP's join, for its trace events: ``pat`` joined into
+    the relation of ``running`` rows (step ``execution_index`` of the plan),
+    the count it was planned with (``estimate``, counted at the step up to
+    ``count_limit`` when it was not planned), the variables it shares, and
+    what the step did — its ``strategy``, set by each strategy it tries
+    (:func:`_tiers`), how a streamed step is fed, its pairs, its pattern's
+    rows before and after their restrictions, and its probes. Where its
+    rows came from follows (:func:`_trace_join_step`)."""
+
+    execution_index: int
+    pat: Pattern
+    running: int
+    estimate: int
+    count_limit: int | None
+    shared_count: int
+    strategy: str | None = None
+    feed: str | None = None
+    pair_count: int | None = None
+    match_rows: int | None = None
+    restricted_rows: int | None = None
+    probe_calls: int = 0
+    probe_ns: int = 0
+
+
+def _trace_join_step(step: _JoinStep, rel: Relation, put_back: list, elapsed_ns: int) -> None:
+    """Trace a completed join step as ``bgp_join_step_complete``: the step,
+    the patterns it was reordered around, and the relation it made. Its
+    rows came from its probes, from chunks of its pattern, or from its
+    pattern's match."""
+    if trace.active() is None:
+        return
+    if step.strategy == "probe":
+        source = "probed"
+    else:
+        source = "chunked" if step.feed == "chunks" else "matched"
+    trace.event(
+        "bgp_join_step_complete",
+        execution_index=step.execution_index,
+        original_pattern_index=step.pat.index,
+        strategy=step.strategy,
+        feed=step.feed,
+        reordered_around=[back.index for back in put_back] or None,
+        cardinality_source=source,
+        input_rows=step.running,
+        estimated_rows=step.estimate,
+        estimate_limit=step.count_limit,
+        pair_count=step.pair_count,
+        pattern_match_rows=step.match_rows,
+        pattern_restricted_rows=step.restricted_rows,
+        native_initial_match_count=int(source != "probed"),
+        native_probe_call_count=step.probe_calls,
+        native_probe_ns=step.probe_ns,
+        output_rows=None if rel.pieces is not None else rel.nrows,
+        output_columns=len(rel.schema),
+        shared_variable_count=step.shared_count,
         elapsed_ns=elapsed_ns,
     )
 
 
-native.TRACE = _trace_native_filter
+def _trace_over_budget(step: _JoinStep, pairs: int | None) -> None:
+    """Trace a join step over ``SETTINGS.pair_budget`` as ``bgp_over_budget``:
+    its place in the plan, its strategy, its pair count (``None`` where it
+    stopped on its rows), the relation's rows and the pattern's count."""
+    trace.event(
+        "bgp_over_budget",
+        execution_index=step.execution_index,
+        original_pattern_index=step.pat.index,
+        strategy=step.strategy,
+        pair_count=pairs,
+        input_rows=step.running,
+        estimated_rows=step.estimate,
+    )
 
 
-def _keep_summary(keep) -> dict | None:
-    """A native keep as JSON: per position, a code range or a set's size."""
-    if not keep:
-        return None
-    return {
-        str(position): ({"range": list(spec)} if isinstance(spec, tuple) else {"codes": len(spec)})
-        for position, spec in keep.items()
-    }
-
-
-def _probe_pattern(probe) -> list:
-    """The ``(s, p, o, g)`` of a batch probe, tuple or dict."""
-    if isinstance(probe, dict):
-        return [probe.get(key) for key in ("s", "p", "o", "g")]
-    return list(probe)
-
-
-class _TracedIterator(abc.ABC):
-    """A native iterator with its pulls traced. Each ``__next__`` is exactly
-    one timed pull of the native iterator, so nothing is pulled ahead of the
-    caller; the rows of what was pulled are summed, and the iterator's event
-    is emitted once, when it is exhausted or closed. Closing drops the native
-    iterator, which aborts the work it still has in flight. The time reported
-    is the native layer's: the call that made the iterator and every pull."""
-
-    __slots__ = ("_inner", "_pulls", "_rows", "_elapsed_ns", "_emitted")
-
-    def __init__(self, inner, elapsed_ns: int):
-        self._inner = inner
-        self._pulls = 0
-        self._rows = 0
-        self._elapsed_ns = elapsed_ns
-        self._emitted = False
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        inner = self._inner
-        if inner is None:
-            raise StopIteration
-        started = time.perf_counter_ns()
-        try:
-            item = next(inner)
-        except StopIteration:
-            self._elapsed_ns += time.perf_counter_ns() - started
-            self.close()
-            raise
-        self._elapsed_ns += time.perf_counter_ns() - started
-        self._pulls += 1
-        self._rows += 0 if item is None else len(item[0])
-        return item
-
-    def close(self) -> None:
-        """Drop the native iterator and emit the event, if it was not yet."""
-        self._inner = None
-        if not self._emitted:
-            self._emitted = True
-            self._emit()
-
-    @abc.abstractmethod
-    def _emit(self) -> None:
-        """Emit the iterator's trace event."""
-
-
-class _TracedAnswers(_TracedIterator):
-    """The answers of a traced ``match_codes_many``; its length is the number
-    of probes. Its event is ``native_batch_complete``."""
-
-    __slots__ = ("_probe_count", "_first_pattern")
-
-    def __init__(self, inner, probes, elapsed_ns: int):
-        super().__init__(inner, elapsed_ns)
-        self._probe_count = len(probes)
-        self._first_pattern = _probe_pattern(probes[0]) if probes else None
-
-    def __len__(self) -> int:
-        return self._probe_count
-
-    def _emit(self) -> None:
-        _trace_event(
-            "native_batch_complete",
-            operation="match_codes_many",
-            probe_count=self._probe_count,
-            first_pattern=self._first_pattern,
-            returned_rows=self._rows,
-            elapsed_ns=self._elapsed_ns,
-        )
-
-
-class _TracedChunks(_TracedIterator):
-    """The chunks of a traced ``match_code_chunks``. Its event is
-    ``native_chunks_complete``."""
-
-    __slots__ = ("_pattern", "_keep", "_columns")
-
-    def __init__(self, inner, pattern, options: dict, elapsed_ns: int):
-        super().__init__(inner, elapsed_ns)
-        self._pattern = list(pattern)
-        self._keep = _keep_summary(options.get("keep"))
-        self._columns = list(options.get("columns", ("s", "p", "o", "g")))
-
-    def _emit(self) -> None:
-        _trace_event(
-            "native_chunks_complete",
-            operation="match_code_chunks",
-            pattern=self._pattern,
-            keep=self._keep,
-            columns=self._columns,
-            chunks=self._pulls,
-            returned_rows=self._rows,
-            elapsed_ns=self._elapsed_ns,
-        )
-
-
-class _TracedNative:
-    """The native store with every call recorded as an event: a single call
-    as ``native_call_complete`` (its operation, pattern, narrowing, rows
-    returned and elapsed time), a batch of counts as ``native_batch_complete``
-    (its operation, probe count, total rows and elapsed time). A batch of
-    matches and a chunked match return the traced iterators
-    :class:`_TracedAnswers` and :class:`_TracedChunks`, which emit their
-    events as they end. The keywords of a call (``keep``, ``limit``,
-    ``offset``, ``cancel``, ``lookahead``, ...) pass to the native call.
-    Handed out by :func:`_native` while a query is traced, so each native
-    call the pushdown makes is an event, the per-row probes included."""
-
-    __slots__ = ("_inner",)
-
-    def __init__(self, inner):
-        self._inner = inner
-
-    def count_quads(self, *pattern, **options):
-        started = time.perf_counter_ns()
-        result = self._inner.count_quads(*pattern, **options)
-        elapsed = time.perf_counter_ns() - started
-        _trace_event(
-            "native_call_complete",
-            operation="count_quads",
-            pattern=list(pattern),
-            keep=_keep_summary(options.get("keep")),
-            limit=options.get("limit"),
-            returned_rows=result,
-            elapsed_ns=elapsed,
-        )
-        return result
-
-    def match_codes(self, *pattern, **options):
-        started = time.perf_counter_ns()
-        result = self._inner.match_codes(*pattern, **options)
-        elapsed = time.perf_counter_ns() - started
-        _trace_event(
-            "native_call_complete",
-            operation="match_codes",
-            pattern=list(pattern),
-            keep=_keep_summary(options.get("keep")),
-            limit=options.get("limit"),
-            returned_rows=None if result is None else len(result[0]),
-            elapsed_ns=elapsed,
-        )
-        return result
-
-    def count_quads_many(self, probes, **options):
-        started = time.perf_counter_ns()
-        result = self._inner.count_quads_many(probes, **options)
-        elapsed = time.perf_counter_ns() - started
-        _trace_event(
-            "native_batch_complete",
-            operation="count_quads_many",
-            probe_count=len(probes),
-            first_pattern=_probe_pattern(probes[0]) if probes else None,
-            returned_rows=sum(result),
-            elapsed_ns=elapsed,
-        )
-        return result
-
-    def match_codes_many(self, probes, **options):
-        started = time.perf_counter_ns()
-        answers = self._inner.match_codes_many(probes, **options)
-        return _TracedAnswers(answers, probes, time.perf_counter_ns() - started)
-
-    def match_code_chunks(self, *pattern, **options):
-        started = time.perf_counter_ns()
-        chunks = self._inner.match_code_chunks(*pattern, **options)
-        if chunks is None:
-            return None
-        return _TracedChunks(chunks, pattern, options, time.perf_counter_ns() - started)
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-
-def _native(store):
-    """The store's native handle, traced while the query is."""
-    native = store._store()
-    return native if _TRACE.get() is None else _TracedNative(native)
-
-
-def _trace_generator(iterator, trace: _QueryTrace, token):
-    _TRACE.reset(token)
-    started = time.perf_counter_ns()
-    rows = 0
-    try:
-        while True:
-            inner_token = _TRACE.set(trace)
-            try:
-                item = next(iterator)
-            except StopIteration:
-                return
-            finally:
-                _TRACE.reset(inner_token)
-            rows += 1
-            yield item
-    finally:
-        inner_token = _TRACE.set(trace)
-        try:
-            _trace_event(
-                "query_iterator_complete",
-                rows_yielded=rows,
-                elapsed_ns=time.perf_counter_ns() - started,
-            )
-            trace.flush()
-        finally:
-            _TRACE.reset(inner_token)
-
-
-def _restriction_counts(conjuncts) -> dict:
-    """The trace fields that say how a variable's conjuncts are decided: how
-    many there are, and how many have a native predicate (sent to vortex-rdf),
-    a fast route, a fast route over term kinds only, or rdflib's evaluator
-    alone."""
-    return {
-        "predicate_count": len(conjuncts),
-        "native_predicate_count": sum(c.native is not None and not c.kind_only for c in conjuncts),
-        "fast_predicate_count": sum(c.fast is not None for c in conjuncts),
-        "kind_only_predicate_count": sum(c.kind_only for c in conjuncts),
-        "generic_only_predicate_count": sum(c.fast is None for c in conjuncts),
-    }
+def _trace_plan_complete(
+    pattern_count: int, order: list, seed: Pattern | None, stats: _BgpStats, rest: list
+) -> None:
+    """Trace a BGP's plan as ``bgp_plan_complete``: the order its patterns
+    joined in, its seed (``None`` when a count emptied it first), its native
+    calls and the patterns left to rdflib (``rest``, by index)."""
+    if trace.active() is None:
+        return
+    trace.event(
+        "bgp_plan_complete",
+        pattern_count=pattern_count,
+        execution_order=order,
+        seed_pattern_index=None if seed is None else seed.index,
+        seed_selection="empty_count" if seed is None else "smallest_count",
+        estimate_calls=stats.estimate_calls,
+        native_initial_match_count=stats.initial_calls,
+        native_probe_call_count=stats.probe_calls,
+        rest_pattern_indices=rest or None,
+    )

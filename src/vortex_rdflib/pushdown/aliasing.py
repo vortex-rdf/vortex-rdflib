@@ -11,10 +11,11 @@ from collections.abc import Iterator
 import rdflib.term
 from rdflib.term import Literal
 
-from ..terms import CANONICAL_INTEGER, INTEGER_SUFFIX, canonical_spelling
+from .. import boundary
+from ..terms import CANONICAL_INTEGER, INTEGER_SUFFIX, LITERAL, canonical_spelling
 
 
-def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
+def _alias_codes(store, codes, aliases: dict) -> None:
     """Record in ``aliases`` each code of ``codes`` whose decoded term another
     code represents, mapped to that code — rdflib compares decoded terms,
     and two spellings of a typed literal can be one term
@@ -36,20 +37,21 @@ def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
     negative (`_constant_codes`), so no twin is looked up for it. For most
     stores no code aliases another and ``aliases`` stays empty.
     """
-    literal_lo, iri_lo, _ = store._term_kind_bounds()
+    literal_lo, literal_hi = store._opened().codes.kind_ranges.range(LITERAL)
     terms = store._terms()
+    foreign = terms.foreign
     classified = terms.alias_classified
     pending = [
         c
         for c in codes
-        if c is not None and (c < 0 or literal_lo <= c < iri_lo) and c not in classified
+        if c is not None and (c < 0 or literal_lo <= c < literal_hi) and c not in classified
     ]
     if pending:
         typed = []
         local = [c for c in pending if c >= 0]
         if local:
             cache = terms.decode
-            for code, spelling in _rewritable(local, store._dict.decode_many(local)):
+            for code, spelling in _rewritable(local, store._opened().codes.spellings(local)):
                 term = cache.get(code)
                 if term is None:
                     term = cache[code] = store._from_n3_safe(spelling)
@@ -100,16 +102,12 @@ def _rewritable(codes, spellings) -> Iterator[tuple[int, str]]:
     mapping = _toPythonMapping
     if mapping is None:
         for code, spelling in zip(codes, spellings, strict=True):
-            if spelling is None:
-                raise ValueError(f"term code {code} is not in the store dictionary")
             if spelling.endswith(">"):
                 yield code, spelling
         return
     canonical = _CANONICAL_INTEGER_SPELLING.fullmatch
     converted = None
     for code, spelling in zip(codes, spellings, strict=True):
-        if spelling is None:
-            raise ValueError(f"term code {code} is not in the store dictionary")
         if not spelling.endswith(">") or canonical(spelling) is not None:
             continue
         if converted is None:
@@ -124,8 +122,9 @@ def _rewritable(codes, spellings) -> Iterator[tuple[int, str]]:
 def _canonical_twins(store, read: list) -> dict:
     """The code of each term's canonical spelling, for the ``(term,
     spelling)`` pairs of ``read`` whose term was read from another spelling
-    and whose canonical spelling the dictionary holds: one ``encode_many``
-    call, and the codes it finds decoded to confirm the term."""
+    and whose canonical spelling the dictionary holds: one lookup
+    (:func:`~vortex_rdflib.boundary.codes_of`), and the codes it finds
+    decoded to confirm the term."""
     wanted: dict = {}
     for term, spelling in read:
         if term not in wanted:
@@ -134,18 +133,7 @@ def _canonical_twins(store, read: list) -> dict:
                 wanted[term] = canonical
     if not wanted:
         return {}
-    spellings = list(wanted.values())
-    try:
-        found = store._dict.encode_many(spellings)
-    except ValueError:
-        # A spelling the native parser rejects fails the whole batch; alone,
-        # it names no term of the file.
-        found = []
-        for spelling in spellings:
-            try:
-                found.append(store._dict.encode(spelling))
-            except ValueError:
-                found.append(None)
+    found = boundary.codes_of(store, list(wanted.values()))
     hits = [code for code in found if code is not None]
     if not hits:
         return {}

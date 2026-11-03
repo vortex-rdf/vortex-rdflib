@@ -514,11 +514,11 @@ jobs:
   deploy:
 """
 DOWNLOADS = """\
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: history-record
           path: {folder}/records
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: history-record-bsbm
           path: {folder}/records-bsbm"""

@@ -15,10 +15,13 @@ from tests.support import (
     W,
     both_ways,
     captured_trace,
+    file_codes,
     filter_expr,
     filter_spy,
+    kind_ranges,
     native_call_events,
     native_spy,
+    predicate_calls,
     products_file,
     run,
     store_file,
@@ -29,7 +32,7 @@ from vortex_rdf import U64Column, serialize_rdf
 import vortex_rdflib.pushdown as pd
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 from vortex_rdflib.settings import SETTINGS
-from vortex_rdflib.terms import parse_spelling
+from vortex_rdflib.terms import BLANK, IRI, parse_spelling
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 PRICE = "<http://ex.org/price>"
@@ -42,12 +45,12 @@ S, X, Y, G = (Variable(name) for name in "sxyg")
 
 
 def _price_code(store, i: int) -> int:
-    return store._dict.encode(f'"{(i * 37) % 1000}"^^<{XSD}integer>')
+    return file_codes(store).term_dict.encode(f'"{(i * 37) % 1000}"^^<{XSD}integer>')
 
 
 def _price_match(store):
     """The four code columns of every price quad."""
-    return store._store().match_codes(None, PRICE, None, None)
+    return store._opened().native.match_codes(None, PRICE, None, None)
 
 
 def _under(limit: int) -> int:
@@ -62,9 +65,13 @@ def test_a_single_pattern_filter_is_evaluated_over_its_matched_codes(tmp_path, i
     spy = filter_spy(graph)
     query = f"SELECT ?s ?v WHERE {{ ?s {PRICE} ?v FILTER(?v < 300) }}"
     assert len(run(graph, query)) == _under(300)
-    [(kind, arg, options, codes)] = spy.calls
-    assert (kind, arg, options) == ("num_lt", f'"300"^^<{XSD}integer>', {})
+    [(kind, arg, options, codes)] = predicate_calls(spy)
+    assert (kind, arg) == ("num_lt", f'"300"^^<{XSD}integer>')
+    assert options == {"flags": "", "case": None, "as_str": False}
     assert codes == expected  # the 200 distinct prices, nothing dictionary-wide
+    # The checks around it read the same codes or fewer.
+    assert [call[0] for call in spy.calls] == ["datatype", "num_lt", "num_ne"]
+    assert all(set(call[3]) <= set(expected) for call in spy.calls)
     with_pushdown, without_pushdown = both_ways(graph, query)
     assert with_pushdown == without_pushdown
 
@@ -83,7 +90,7 @@ def test_a_join_step_evaluates_the_codes_it_binds(tmp_path, monkeypatch, fanout)
         ?s <http://ex.org/type> <http://ex.org/Product> .
         ?s {PRICE} ?v FILTER(?v < 300) }}"""
     assert len(run(graph, query)) == _under(300)
-    [(kind, _, _, codes)] = spy.calls
+    [(kind, _, _, codes)] = predicate_calls(spy)
     assert kind == "num_lt" and codes == expected
 
 
@@ -97,9 +104,9 @@ def test_a_probe_join_evaluates_only_the_codes_its_probes_reached(tmp_path, monk
         VALUES ?s {{ <http://ex.org/p1> <http://ex.org/p2> <http://ex.org/p3> }}
         ?s {PRICE} ?v FILTER(?v < 300) }}"""
     rows = run(graph, query)
-    [(_, _, _, codes)] = spy.calls
+    [(_, _, _, codes)] = predicate_calls(spy)
     assert codes == sorted(_price_code(store, i) for i in (1, 2, 3))
-    store._dict = spy._inner
+    file_codes(store).term_dict = spy._inner
     with_pushdown, without_pushdown = both_ways(graph, query)
     assert rows == with_pushdown == without_pushdown
 
@@ -116,8 +123,8 @@ def test_undecided_codes_take_the_python_routes(tmp_path):
             super().filter_codes(kind, arg, codes, **options)
             return U64Column([]), codes
 
-    spy = _Undecided(store._dict)
-    store._dict = spy  # ty: ignore[invalid-assignment]
+    spy = _Undecided(file_codes(store).term_dict)
+    file_codes(store).term_dict = spy
     for query in (
         f"SELECT ?s WHERE {{ ?s {PRICE} ?v FILTER(?v < 300) }}",
         'SELECT ?s WHERE { ?s <http://ex.org/label> ?l FILTER(langMatches(lang(?l), "en")) }',
@@ -186,7 +193,7 @@ def test_count_over_a_candidate_filter_matches_once(tmp_path):
         ?s {PRICE} ?v FILTER(?v < 300 && datatype(?v) = xsd:integer) }}"""
     assert run(graph, count) == [(Literal(_under(300)),)]
     assert native.names().count("match_codes") == 1
-    first, second = filtered.calls
+    first, second = predicate_calls(filtered)
     assert (first[0], second[0]) == ("num_lt", "datatype")
     assert len(first[3]) == 200 and len(second[3]) == _under(300)
 
@@ -220,7 +227,7 @@ def test_band_around_an_anchor_is_evaluated_over_the_price_codes(
     assert sorted(rows) == expected
     specialized = [e for e in trace if e["event"] == "bgp_tuple_specialized"]
     assert sorted(e["native_predicate"] for e in specialized) == ["num_gt", "num_lt"]
-    assert sorted(call[0] for call in spy.calls) == ["num_gt", "num_lt"]
+    assert sorted(call[0] for call in predicate_calls(spy)) == ["num_gt", "num_lt"]
     assert all(len(call[3]) <= 200 for call in spy.calls)
     restriction = next(
         e for e in trace if e["event"] == "bgp_restriction_complete" and e["variable"] == "v"
@@ -228,9 +235,33 @@ def test_band_around_an_anchor_is_evaluated_over_the_price_codes(
     assert (restriction["input_rows"], restriction["output_rows"]) == (200, len(expected))
     assert built == []
     monkeypatch.delenv("VORTEX_RDF_TRACE_QUERY")
-    store._dict = spy._inner
+    file_codes(store).term_dict = spy._inner
     with_pushdown, without_pushdown = both_ways(graph, BAND)
     assert with_pushdown == without_pushdown
+
+
+#: BAND with a group joined in beside its pattern pair: the band is
+#: specialized inside the left side of the join.
+BAND_JOINED = f"""SELECT ?s ?v ?t WHERE {{
+    {{ <http://ex.org/p0> {PRICE} ?ref . ?s {PRICE} ?v }}
+    {{ ?s <http://ex.org/type> ?t }}
+    FILTER(?v < ?ref + 100 && ?v > ?ref - 100) }}"""
+
+
+def test_a_band_applied_in_one_side_of_a_join_is_not_evaluated_again(tmp_path, monkeypatch):
+    """The band specialized inside the left side of a group join holds for
+    every row the join makes: the join reports it applied, so the FILTER
+    above the join builds no predicate for it."""
+    graph = Graph(store=VortexRdflibStore(products_file(tmp_path), in_memory=True))
+    built = []
+    original = filters.tuple_predicate
+    monkeypatch.setattr(
+        filters, "tuple_predicate", lambda *a, **k: built.append(a[1]) or original(*a, **k)
+    )
+    with_pushdown, without_pushdown = both_ways(graph, BAND_JOINED)
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == sum((i * 37) % 1000 < 100 for i in range(200))
+    assert built == []
 
 
 def test_iri_equality_between_two_variables_is_evaluated_over_the_codes_it_reaches(
@@ -298,9 +329,9 @@ def test_a_specialized_conjunct_compiles_as_analyze_expr_does():
     [analyzed] = filters.analyze_expr(expr, [V], CTX, {W: five}).per_var[V]
     assert proxy is not None and proxy.fast is not None and analyzed.fast is not None
     assert proxy.vars == analyzed.vars == (V,)
-    assert (proxy.native, proxy.kind_only, proxy.consts) == (
-        analyzed.native,
-        analyzed.kind_only,
+    assert (proxy.keep, proxy.decision, proxy.consts) == (
+        analyzed.keep,
+        analyzed.decision,
         analyzed.consts,
     )
     for spelling in (
@@ -357,7 +388,7 @@ def test_compacting_a_match_keeps_the_allowed_rows_in_match_order(varpos, keep, 
     kept variable's first position is allowed, in match order; the columns of
     constant positions are dropped, and the match's own columns are untouched."""
     columns = tuple(U64Column(column) for column in MATCH)
-    pat = pd.matching.Pattern([None] * 4, varpos)
+    pat = pd.matching.Pattern((None,) * 4, varpos)
     pat.set_match(columns, len(MATCH[0]))
     kept = [
         i
@@ -366,7 +397,7 @@ def test_compacting_a_match_keeps_the_allowed_rows_in_match_order(varpos, keep, 
     ]
     assert kept == remaining
     pd.matching._compact_pattern(pat, keep)
-    assert pat.nrows == len(kept)
+    assert pat.nrows == len(kept) and pat.cols is not None
     read = {idx for positions in varpos.values() for idx in positions}
     for idx in range(4):
         if idx in read:
@@ -387,13 +418,13 @@ def test_restricting_a_match_compacts_it_to_the_rows_that_pass(tmp_path, limit, 
     columns = _price_match(store)
     subjects, prices = (memoryview(columns[i]).cast("Q").tolist() for i in (0, 2))
     passing = {_price_code(store, i) for i in range(200) if (i * 37) % 1000 < limit}
-    pat = pd.matching.Pattern([None] * 4, {S: [0], V: [2]}, index=0)
+    pat = pd.matching.Pattern((None,) * 4, {S: [0], V: [2]}, index=0)
     pat.set_match(columns, len(subjects))
     [conjunct] = filters.analyze_expr(filter_expr(f"?v < {limit}"), [V], CTX, {}).per_var[V]
     pd.matching._restrict_pattern(store, pat, {V: [conjunct]})
     rows = [i for i, price in enumerate(prices) if price in passing]
     assert 0 < len(rows) and (len(rows) < len(subjects)) == compacted
-    assert pat.nrows == len(rows)
+    assert pat.nrows == len(rows) and pat.cols is not None
     assert memoryview(pat.cols[0]).cast("Q").tolist() == [subjects[i] for i in rows]
     assert memoryview(pat.cols[2]).cast("Q").tolist() == [prices[i] for i in rows]
     if compacted:
@@ -406,9 +437,11 @@ def test_iri_equality_is_a_keep_on_the_match(tmp_path, monkeypatch, capsys):
     """?v IN (<iri>, ...) is the IRIs' codes — one encode_many — riding the
     native match as a keep: no candidate is evaluated and only the matching
     rows leave vortex-rdf."""
-    graph = Graph(store=VortexRdflibStore(products_file(tmp_path), in_memory=True))
+    store = VortexRdflibStore(products_file(tmp_path), in_memory=True)
+    graph = Graph(store=store)
     register_sparql_pushdown()
     spy = filter_spy(graph)
+    store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
     rows = run(
@@ -469,7 +502,7 @@ def test_values_only_rdflib_answers_are_decoded_in_one_batch(tmp_path, monkeypat
     graph = Graph(store=VortexRdflibStore(products_file(tmp_path), in_memory=True))
     monkeypatch.setattr(SETTINGS, "fast_filters", False)
     register_sparql_pushdown()
-    inner = graph.store._dict  # ty: ignore[unresolved-attribute]
+    inner = file_codes(graph.store).term_dict
     calls: list[str] = []
 
     class _Calls:
@@ -486,8 +519,74 @@ def test_values_only_rdflib_answers_are_decoded_in_one_batch(tmp_path, monkeypat
 
     # The file's one-time bookkeeping is not a query's cost.
     graph.store._union_has_repeats()  # ty: ignore[unresolved-attribute]
-    graph.store._dict = _Calls()  # ty: ignore[unresolved-attribute]
+    file_codes(graph.store).term_dict = _Calls()
     query = "SELECT ?s WHERE { ?s <http://ex.org/label> ?l FILTER(strlen(?l) > 10) }"
     assert len(run(graph, query)) == sum(1 for i in range(200) if len(f"product {i}") > 10)
     assert "decode" not in calls
     assert "decode_many" in calls
+
+
+def test_a_context_bound_operand_takes_the_fast_route(tmp_path, monkeypatch, capsys):
+    """An operand that reads only context-bound variables is evaluated once,
+    for the fast route as for the native one: ``?v < ?w * 2`` with ``?w``
+    bound compiles to a fast predicate over the codes vortex-rdf leaves,
+    where rdflib's evaluator took them before."""
+    store = VortexRdflibStore(products_file(tmp_path), in_memory=True)
+    graph = Graph(store=store)
+    register_sparql_pushdown()
+    store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
+    query = "SELECT ?s WHERE { ?s <http://ex.org/price> ?v FILTER(?v < ?w * 2) }"
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    rows = list(graph.query(query, initBindings={"w": Literal(50)}))
+    events = captured_trace(capsys)
+    assert len(rows) == sum((i * 37) % 1000 < 100 for i in range(200))
+    [record] = [e for e in events if e["event"] == "bgp_restriction_complete"]
+    assert record["native_predicate_count"] == 1
+    assert (record["fast_predicate_count"], record["generic_only_predicate_count"]) == (1, 0)
+
+
+_KIND_LINES = [
+    f"<http://ex.org/s{i}> <http://ex.org/p> {obj} .\n"
+    for i, obj in enumerate(
+        ['"a"', '"b"@en', "<http://ex.org/o>", "_:b1", f'"1"^^<{XSD}integer>', "<http://ex.org/q>"]
+    )
+]
+
+
+def _kind_query(tmp_path, monkeypatch, capsys, test: str):
+    """Both answers to a kind test of ``?o`` and the pushdown's trace."""
+    store = VortexRdflibStore(store_file(tmp_path, _KIND_LINES), in_memory=True)
+    graph = Graph(store=store)
+    register_sparql_pushdown()
+    store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    query = f"SELECT ?s WHERE {{ ?s <http://ex.org/p> ?o FILTER({test}) }}"
+    answers = both_ways(graph, query)
+    return store, answers, captured_trace(capsys)
+
+
+def test_a_kind_union_gets_one_range_keep(tmp_path, monkeypatch, capsys):
+    """``isIRI(?o) || isBlank(?o)`` holds for two kinds whose codes run
+    together: one code range, a keep on the native match, so the literals'
+    rows never leave vortex-rdf."""
+    store, (with_pushdown, without_pushdown), events = _kind_query(
+        tmp_path, monkeypatch, capsys, "isIRI(?o) || isBlank(?o)"
+    )
+    assert with_pushdown == without_pushdown and len(with_pushdown) == 3
+    [pushed] = [e for e in events if e["event"] == "bgp_native_restriction"]
+    ranges = kind_ranges(store)
+    assert pushed["keep"] == {"2": {"range": [ranges.range(IRI)[0], ranges.range(BLANK)[1]]}}
+
+
+def test_kinds_that_are_no_range_are_decided_by_kind(tmp_path, monkeypatch, capsys):
+    """``isLiteral(?o) || isBlank(?o)`` holds for kinds whose codes do not
+    run together: no keep, each code decided by its kind alone."""
+    _, (with_pushdown, without_pushdown), events = _kind_query(
+        tmp_path, monkeypatch, capsys, "isLiteral(?o) || isBlank(?o)"
+    )
+    assert with_pushdown == without_pushdown and len(with_pushdown) == 4
+    assert not [e for e in events if e["event"] == "bgp_native_restriction"]
+    [record] = [e for e in events if e["event"] == "bgp_restriction_complete"]
+    assert (record["kind_only_predicate_count"], record["native_predicate_count"]) == (1, 0)

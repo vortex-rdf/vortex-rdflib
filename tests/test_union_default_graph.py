@@ -96,7 +96,7 @@ def test_the_union_holds_each_triple_once(
 
 
 def quads_in(path) -> int:
-    return len(VortexRdflibStore(str(path))._store())
+    return len(VortexRdflibStore(str(path))._opened().native)
 
 
 def test_a_store_of_one_graph_pays_nothing_for_the_union(tmp_path):
@@ -153,7 +153,7 @@ def test_the_check_reads_the_files_codes_with_the_code_path_off(tmp_path, monkey
     repeats a triple is read from them all the same."""
     monkeypatch.setenv("VORTEX_RDF_DISABLE_CODE_PATH", "1")
     store = _partitioned_store(tmp_path)
-    assert store._dict is None
+    assert store._opened().codes is None
     assert not store._union_has_repeats()
     assert len(store) == 5
 

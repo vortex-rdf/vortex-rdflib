@@ -1,15 +1,15 @@
 [build-system]
-requires = ["uv_build>=0.12.20,<0.13.0"]
+requires = ["uv_build>=0.13.6,<0.14.0"]
 build-backend = "uv_build"
 
 [project]
 name = "vortex-rdflib"
-version = "0.4.0"
+version = "0.5.0"
 description = "rdflib Store implementation for Vortex-RDF, a columnar zero-copy RDF store"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 authors = [
   { name = "Julián Rojas", email = "julianandres.rojasmelendez@ugent.be" },
 ]
@@ -20,10 +20,10 @@ classifiers = [
   "Intended Audience :: Science/Research",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
   "Topic :: Database",
   "Topic :: Scientific/Engineering :: Information Analysis",
   "Typing :: Typed",
@@ -40,11 +40,16 @@ dependencies = [
 # than the bench group so `uv sync` alone can run the instrumented suite —
 # the bench group is for the comparative dashboard's third-party contenders,
 # which the CodSpeed run deliberately does not need.
+#
+# pyoxigraph is the tests' reference for SPARQL 1.1 (tests/oracle.py): an engine
+# that passes the W3C SPARQL test suite, against which the FILTER routes'
+# answers are checked.
 dev = [
-    "pytest>=9.1",
+    "pyoxigraph>=0.5",
+    "pytest>=9.2",
     "pytest-codspeed>=5",
-    "ruff>=0.16.9",
-    "ty>=0.0.84",
+    "ruff>=0.17.3",
+    "ty>=0.0.95",
 ]
 # Comparative benchmark contenders (bench/): oxrdflib serves Oxigraph through
 # rdflib, and pyoxigraph is measured directly as well.
@@ -73,6 +78,10 @@ pythonpath = ["."]
 filterwarnings = [
   "ignore:Dataset.default_context is deprecated:DeprecationWarning",
   "ignore:Dataset.contexts is deprecated:DeprecationWarning",
+  # pytest 9.2 asks every module attribute for `_mock_name` while it collects
+  # fixtures, and rdflib's closed namespaces (`XSD`) warn about any name they
+  # do not define.
+  "ignore:Code. _mock_name is not defined in namespace:UserWarning",
 ]
 
 [tool.ruff]

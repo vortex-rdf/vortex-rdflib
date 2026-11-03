@@ -24,7 +24,7 @@ structure and queried.
 pip install vortex-rdflib
 ```
 
-Python 3.11+. The `vortex-rdf` dependency ships prebuilt wheels for Linux
+Python 3.12+ (tested on 3.12–3.15). The `vortex-rdf` dependency ships prebuilt wheels for Linux
 (x86_64, aarch64), macOS (x86_64, arm64) and Windows (x64); on other
 platforms it builds from source.
 
@@ -72,7 +72,9 @@ for row in dataset.query("""
 A plain `Graph(store=VortexRdflibStore(path))` — as in the example above — is
 the view over the **whole file**, every graph included. Like the union
 default graph of a `Dataset`, it is a set of triples — a triple in two graphs
-is yielded once, with both graphs as its contexts. A match over every graph
+is yielded once, with both graphs as its contexts. Triples are the file's own:
+two spellings rdflib reads as one value, such as `"042"^^xsd:integer` and
+`"42"^^xsd:integer`, are two triples, as `len()` and SPARQL count them. A match over every graph
 returns a triple's quads next to each other (every sort order a store holds
 ends in the graph), so the store keeps one row of each run as it streams them
 (`vortex_rdflib.union`). A file where no triple is in two graphs — a file of
@@ -193,6 +195,17 @@ columns. How each pushdown works, and where in the code it runs, is described
 in [docs/pushdown.md](docs/pushdown.md); the switches to disable or narrow it
 are in the table below.
 
+**FILTER semantics.** Where rdflib's evaluator and SPARQL 1.1 disagree —
+ill-typed literals, NaN, comparisons across types, `IN`, errors through `&&`
+and `||`, numeric type promotion, language-tag case — a FILTER the pushdown
+evaluates gives the specification's answer, over the terms as the data writes
+them. rdflib's semantics remain where rdflib evaluates: with the pushdown off,
+for a node the pushdown hands back (other than a FILTER over its rows), for a
+FILTER expression outside the shapes the pushdown compiles, and for comparisons
+of the XML Schema types SPARQL 1.1 leaves to the implementation (`xsd:time`,
+the durations, `xsd:gYear`, …). [docs/pushdown.md](docs/pushdown.md#sparql-semantics)
+lists every case.
+
 **File-backed vs in-memory.** The default open is file-backed: vortex-rdf
 memory-maps the `.vortex` file, so a query reads only the parts of the file it
 touches. What stays in RAM is the operating system's page cache plus a bounded
@@ -239,17 +252,29 @@ budget works is described in [docs/pushdown.md](docs/pushdown.md#the-pair-budget
 
 ## Environment variables
 
+Every switch is read when a store is constructed (the pushdown's also when it
+is registered), never on import. An on/off switch takes `1`, `true`, `yes` or
+`on`, and `0`, `false`, `no` or `off`, in any case; a size takes an integer. A
+value it refuses raises `ValueError`, naming the variable.
+
 | Variable | Effect |
 | --- | --- |
 | `VORTEX_RDF_IN_MEMORY=1` | Load stores into memory instead of memory-mapping the file |
 | `VORTEX_RDF_DISABLE_CODE_PATH=1` | Force the N-Triples string path instead of `u64` codes |
 | `VORTEX_RDF_DISABLE_PUSHDOWN=1` | Keep rdflib's default evaluator for every operator (see [docs/pushdown.md](docs/pushdown.md)) |
-| `VORTEX_RDF_PUSHDOWN_OPS=<list>` | Only push down the listed algebra nodes (`bgp` = basic graph patterns only) |
-| `VORTEX_RDF_FILTER_FAST=0` | Evaluate every FILTER value through rdflib's expression evaluator (still once per distinct value) |
+| `VORTEX_RDF_PUSHDOWN_OPS=<list>` | Only push down the listed algebra nodes (`BGP,Filter,Project,...`; `bgp` = basic graph patterns only) |
+| `VORTEX_RDF_FILTER_FAST=0` | Evaluate every FILTER value through rdflib's expression evaluator (still once per distinct value), with rdflib's semantics |
 | `VORTEX_RDF_NATIVE_FILTERS=0` | Evaluate no FILTER conjunct inside vortex-rdf (no `filter_codes` calls, no kind-test or IRI-equality keeps on the scans): every value goes through the Python routes |
 | `VORTEX_RDF_PAIR_BUDGET=<n>` | The most row pairs one join step of a basic graph pattern builds at once: an integer of at least 0, 16,777,216 by default. A step over it is streamed, reordered around or left to rdflib (see [docs/pushdown.md](docs/pushdown.md#the-pair-budget)) |
+| `VORTEX_RDF_CODE_PREDICATES=0` | Ablation: answer kind tests and IRI equality through decoded values, not as code ranges and code sets |
+| `VORTEX_RDF_COUNT_ORDER=0` | Ablation: order a pattern's joins by their bound positions, with no native counts, and probe every connected step |
+| `VORTEX_RDF_DECODE_EACH_STEP=1` | Ablation: decode a join's codes to spellings and encode them again after every step |
+| `VORTEX_RDF_DECODE_CHUNK=<n>` | Ablation: decode rows `n` at a time (by default 64, growing to 4,096) |
+| `VORTEX_RDF_PROBE_BATCH=<n>` | Ablation: `n` probes per batch call (4,096 by default), and every probe step batched |
+| `VORTEX_RDF_COUNTERS=1` | Count every native call, row returned, decode and encode (`vortex_rdflib.counters.snapshot()`) |
 | `VORTEX_RDF_TRACE_TRIPLES=1` | Print every `triples()` pattern (debugging) |
-| `VORTEX_RDF_TRACE_QUERY=1` | Print the pushdown's query plan as JSON lines on stderr — counts, matches, probes, restrictions, joins, mid-join FILTER prunes and every native call, with row counts and timings (debugging; `VORTEX_RDF_TRACE_QUERY_ID` labels the lines) |
+| `VORTEX_RDF_TRACE_QUERY=1` | Print the pushdown's query plan as JSON lines on stderr — counts, matches, probes, restrictions, joins, mid-join FILTER prunes and every native call, with row counts and timings (debugging; read on each query) |
+| `VORTEX_RDF_TRACE_QUERY_ID=<id>` | The `query_id` the trace's lines carry |
 
 ## Benchmarks
 
