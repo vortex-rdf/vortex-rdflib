@@ -1053,8 +1053,9 @@ def test_tier3_projects_and_windows(graph, monkeypatch, capsys):
 
 
 #: Nodes above a BGP whose last patterns rdflib finishes (tier 3), by id: the
-#: query, the node it hands back, how its answer is compared, and whether it
-#: runs over the named graphs. Each keeps the relation from going straight
+#: query, the node it hands back (a FILTER's pattern, whose rows the hook
+#: still filters), how its answer is compared, and whether it runs over the
+#: named graphs. Each keeps the relation from going straight
 #: to the emitter, or the remaining patterns from being rdflib's alone to
 #: evaluate: a conjunct pushed into them or over a variable only they bind,
 #: a GRAPH scope other than the active graph, an OPTIONAL, an ORDER BY.
@@ -1101,8 +1102,9 @@ def test_tier3_keeps_the_answer(
 ):
     """Where rdflib's evaluation of the remaining patterns would not be the
     block's, the node above the BGP goes back to rdflib, which offers the BGP
-    alone in the scope it sets, and there rdflib finishes the rest per row.
-    The answer is rdflib's."""
+    alone in the scope it sets, and there rdflib finishes the rest per row —
+    under a FILTER, the hook hands rdflib the FILTER's pattern and filters the
+    rows itself. The answer is rdflib's."""
     sparql, node, runner, named = TIER3_ABOVE[shape]
     if named:
         store = VortexRdflibStore(str(tier_quads_vortex), in_memory=in_memory)
@@ -1115,7 +1117,10 @@ def test_tier3_keeps_the_answer(
     )
     assert with_pushdown == without_pushdown
     assert with_pushdown
-    assert node in [event["algebra_node"] for event in _fields(events, "eval_part_fallback")]
+    if node == "Filter":
+        assert _fields(events, "filter_over_rdflib_rows")
+    else:
+        assert node in [event["algebra_node"] for event in _fields(events, "eval_part_fallback")]
     assert [1, 2] in _plans(events)
 
 
@@ -1339,8 +1344,9 @@ def test_an_over_budget_keep_scan_with_a_deferred_restriction_goes_back(graph, m
     """A FILTER over `?f` alone restricts the keep-scanned pattern over its
     whole match, which chunks do not carry: come back full at a budget of
     10, the last step goes back, and with the conjunct pushed into the block
-    the FILTER goes back to rdflib too. rdflib offers the block alone, whose
-    keep-scan, full again, streams from chunks."""
+    the FILTER's pattern goes back to rdflib, the hook filtering its rows.
+    rdflib offers the block alone, whose keep-scan, full again, streams from
+    chunks."""
     monkeypatch.setattr(SETTINGS, "pair_budget", 10)
     sparql = (
         _PREFIX + "SELECT ?k ?f ?p WHERE { :c0 :has ?k . ?f ?p ?k "
@@ -1352,7 +1358,7 @@ def test_an_over_budget_keep_scan_with_a_deferred_restriction_goes_back(graph, m
     assert with_pushdown == without_pushdown
     assert len(with_pushdown) == 9
     assert {over["strategy"] for over in _fields(events, "bgp_over_budget")} == {"keep_scan"}
-    assert "Filter" in [event["algebra_node"] for event in _fields(events, "eval_part_fallback")]
+    assert _fields(events, "filter_over_rdflib_rows")
     assert [step["feed"] for step in _streams(events)] == ["chunks"]
 
 

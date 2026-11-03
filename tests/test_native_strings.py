@@ -12,9 +12,10 @@ import re
 import signal
 
 import pytest
-from rdflib import Graph, Literal
+from rdflib import Graph, Literal, URIRef
 from rdflib.term import Variable
-from tests.support import both_ways, filter_expr, outcome, rdflib_answer
+from tests.oracle import departs, spec_answer
+from tests.support import both_ways, filter_expr, outcome, run
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
@@ -222,19 +223,24 @@ STRING_EXPRESSIONS = [
 
 
 @pytest.mark.parametrize("sparql_expr", STRING_EXPRESSIONS)
-def test_string_functions_agree_with_rdflib(corpus, sparql_expr):
+def test_string_functions_follow_the_spec(corpus, sparql_expr):
+    """Each code vortex-rdf decides gets SPARQL 1.1's answer (Oxigraph's,
+    :mod:`tests.oracle`)."""
     store, codes = corpus
     expr = filter_expr(sparql_expr)
     shape = filters.native.native_shape(expr, V, {})
     if shape is None:
-        # A tagged constant against STR(): an error for every value in rdflib.
+        # A tagged constant against STR(): an error for every value.
         assert "str(?v)" in sparql_expr and '"@' in sparql_expr
         return
     passed, undecided = native.evaluate(store, shape, codes)
     decided = 0
     for code in codes - set(undecided):
         stored = store._dict.decode(code)
-        assert (code in passed) == rdflib_answer(expr, stored), (sparql_expr, stored)
+        if departs(sparql_expr, stored):
+            continue
+        expected = spec_answer(sparql_expr, {"v": stored})
+        assert (code in passed) == expected, (sparql_expr, stored)
         decided += 1
     assert decided > 0, sparql_expr
 
@@ -302,8 +308,10 @@ def test_bsbm_literals_agree_with_python_re():
 
 def test_stored_language_tags_are_lower_case(tmp_path):
     """The dictionary stores every language tag lower-cased, which the string
-    shapes rely on: the pushdown and rdflib's evaluator over the store both
-    read `"x"@EN-GB` back as `"x"@en-gb`."""
+    shapes rely on: the pushdown reads `"x"@EN-GB` back as `"x"@en-gb`, and a
+    tag in any case matches it, as RDF 1.1 compares tags case-insensitively
+    (rdflib's evaluator compares them as written, so it drops the row for
+    `"x"@EN-GB`)."""
     nt = tmp_path / "tags.nt"
     nt.write_text('<http://ex.org/s> <http://ex.org/p> "x"@EN-GB .\n', encoding="utf-8")
     out = tmp_path / "tags.vortex"
@@ -321,8 +329,7 @@ def test_stored_language_tags_are_lower_case(tmp_path):
         'langMatches(lang(?o), "EN")',
     ):
         query = f"SELECT ?s WHERE {{ ?s <http://ex.org/p> ?o FILTER({condition}) }}"
-        with_pushdown, without_pushdown = both_ways(graph, query)
-        assert with_pushdown == without_pushdown, condition
+        assert run(graph, query) == [(URIRef("http://ex.org/s"),)], condition
 
 
 #: Patterns Python's `re` refuses with an exception other than `re.error`: a

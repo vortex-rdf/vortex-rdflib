@@ -9,18 +9,20 @@ any join), or several (applied on the joined rows). Either way a conjunct is
 evaluated **per distinct value**, never per row, through two routes:
 
 - **fast**: a whitelist of expression shapes compiled to a predicate over the
-  parsed spelling (:class:`~vortex_rdflib.terms.TermView`). Every leaf mirrors
-  the exact rdflib code path (``operators.py``, ``Literal.__gt__``/``eq``)
-  and answers ``True``, ``False``, ``ERROR`` (rdflib would raise, which a
-  filter turns into false) or ``UNKNOWN`` — the value is outside the domain
-  the fast path reproduces exactly (an ill-typed number, a datatype rdflib
-  orders by its own rules, ...) and is deferred, alone, to
+  parsed spelling (:class:`~vortex_rdflib.terms.TermView`). Every leaf
+  answers as SPARQL 1.1 does (:mod:`.values`; ``docs/pushdown.md``, "SPARQL
+  semantics"): ``True``, ``False``, ``ERROR`` (a type error, which a filter
+  turns into false) or ``UNKNOWN`` — a comparison of values of an XML Schema
+  type SPARQL 1.1 leaves to the implementation, deferred, alone, to
 - **generic**: rdflib's own evaluator (``_ebv``) on a ``FrozenBindings`` with
-  the value decoded to an rdflib term. Semantics-exact by construction, at
-  rdflib's per-evaluation cost, but paid once per distinct value.
+  the value decoded to an rdflib term, at rdflib's per-evaluation cost, but
+  paid once per distinct value. It answers as rdflib does, and takes every
+  conjunct outside the whitelist.
 
-``UNKNOWN`` is sticky through ``&&``/``||``/``!`` except where rdflib itself
-short-circuits first (``false && ?`` is false, ``true || ?`` is true).
+``&&`` and ``||`` follow SPARQL's truth tables (§17.2): ``false && E`` and
+``E && false`` are false, ``true || E`` and ``E || true`` are true, any other
+error propagates, and an ``UNKNOWN`` operand leaves the answer ``UNKNOWN``
+unless another settles it.
 
 A single-variable conjunct of a shape vortex-rdf evaluates (:func:`native_shape`
 lists them) also carries that predicate (``Conjunct.native``, a
@@ -36,7 +38,7 @@ query produced (:func:`.native.evaluate`, called from
 it leaves undecided go down the two routes above.
 
 The modules: :mod:`.exprs` walks expression trees, :mod:`.values` holds
-rdflib's value semantics over term views, :mod:`.compiler` compiles the fast
+SPARQL's value semantics over term views, :mod:`.compiler` compiles the fast
 route, :mod:`.native` recognizes and decides the native shapes; this module
 splits a FILTER into conjuncts and evaluates them.
 """
@@ -51,8 +53,7 @@ from rdflib.plugins.sparql.sparql import FrozenBindings
 from .. import ablation
 from ..settings import SETTINGS
 from ..terms import TermView, kind_of, parse_spelling
-from . import compiler, exprs, native
-from .compiler import _NotFast
+from . import compiler, exprs, native, values
 from .native import NativeShape
 from .values import UNKNOWN
 
@@ -123,8 +124,8 @@ def _compile_conjunct(
     fast = None
     if SETTINGS.fast_filters:
         try:
-            const_views = {v: compiler.view_of_node(term) for v, term in consts.items()}
-        except _NotFast:
+            const_views = {v: values.constant_view(term) for v, term in consts.items()}
+        except TypeError:  # a constant that is no RDF term
             const_views = None
         if const_views is not None:
             fast = compiler.compile_fast(expr, variables, const_views)
@@ -258,7 +259,7 @@ def _fast_route(store, fast, views: dict) -> Callable[[tuple], Any]:
         view = views.get(code)
         if view is None:
             if code < 0:
-                view = views[code] = compiler.view_of_node(store._terms().foreign[code])
+                view = views[code] = values.constant_view(store._terms().foreign[code])
             else:
                 spelling = store._dict.decode(code)
                 if spelling is None:
@@ -306,8 +307,7 @@ def tuple_predicate(
 def constant_predicate(conjunct: Conjunct) -> Callable[[Any], bool]:
     """A single-variable conjunct as a test of a query constant (a VALUES
     table's term, as rdflib binds it), memoized per term: the fast route over
-    the constant's view, rdflib's evaluator where that is unknown, a number
-    the fast route refuses included (see :func:`_constant_view`)."""
+    the constant's view, rdflib's evaluator where that is unknown."""
     memo: dict = {}
     fast = conjunct.fast
     var = conjunct.vars[0]
@@ -317,15 +317,59 @@ def constant_predicate(conjunct: Conjunct) -> Callable[[Any], bool]:
         if r is None:
             r = UNKNOWN
             if fast is not None:
-                view = compiler._constant_view(term)
-                if view is not UNKNOWN:
-                    r = fast((view,))
+                r = fast((values.constant_view(term),))
             if r is UNKNOWN:
                 r = conjunct.generic({var: term})
             memo[term] = r
         return r is True
 
     return predicate
+
+
+def solution_filter(store, node, ctx) -> Callable[[Any], bool]:
+    """A ``Filter`` node's expression as a test of rdflib's own solutions —
+    the rows of a pattern the pushdown handed back to rdflib — answered as
+    the pushdown answers it, so the FILTER does not depend on which route
+    solved its pattern.
+
+    Each term goes back to the code it was decoded from
+    (:meth:`~vortex_rdflib.query_scope.QueryTerms.code_of`; a query constant
+    or a term of no code gets a negative one), and each conjunct is a
+    :func:`tuple_predicate` over those codes, memoized per distinct tuple. A
+    conjunct holding an EXISTS is rdflib's, over the whole solution, as
+    rdflib's ``evalFilter`` binds it. An expression the pushdown hands back
+    whole (a random or fresh-node call) raises ``NotImplementedError``."""
+    variables = tuple(dict.fromkeys(exprs.expr_vars(node.expr)))
+    position = {var: i for i, var in enumerate(variables)}
+    views: dict = {}
+    tests: list[Callable[[tuple, Any], bool]] = []
+    for conjunct_expr in exprs._flatten_and(node.expr, []):
+        if exprs._is_impure(conjunct_expr):
+            raise NotImplementedError
+        if exprs.has_exists(conjunct_expr):
+            tests.append(lambda row, bound, expr=conjunct_expr: rdflib_ebv(expr, bound))
+            continue
+        referenced = tuple(dict.fromkeys(exprs.expr_vars(conjunct_expr)))
+        conjunct = _compile_conjunct(conjunct_expr, referenced, {}, ctx, None)
+        if not referenced:
+            passes = evaluate_constant(conjunct)
+            tests.append(lambda row, bound, passes=passes: passes)
+            continue
+        predicate = tuple_predicate(store, conjunct, [position[v] for v in referenced], views)
+        tests.append(lambda row, bound, predicate=predicate: predicate(row))
+    terms = store._terms()
+    isolated = not getattr(node, "no_isolated_scope", False)
+
+    def code(term) -> int:
+        found = terms.code_of(term)
+        return store._foreign_code(term) if found is None else found
+
+    def keep(solution) -> bool:
+        bound = solution.forget(ctx, _except=node._vars) if isolated else solution
+        row = tuple(None if (term := bound.get(var)) is None else code(term) for var in variables)
+        return all(test(row, bound) for test in tests)
+
+    return keep
 
 
 def tuple_fast_reject_predicate(

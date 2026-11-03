@@ -4,6 +4,8 @@ OPTIONAL, a MINUS, a VALUES table, a GRAPH — and the block and ASK
 handlers.
 """
 
+from rdflib.plugins.sparql.evaluate import evalPart
+
 from .. import filters
 from ..cancel import check_cancelled
 from ..settings import SETTINGS
@@ -17,6 +19,20 @@ from .tracing import _TRACE
 def _eval_block_node(ctx, store, part):
     algebra._check_block(part)
     return solutions._yield_solutions(ctx, store, _solve_block(ctx, store, part, stream=True))
+
+
+def _eval_filter(ctx, store, part):
+    """A ``Filter`` node: the pushdown's block, or — when the block goes back
+    to rdflib (a join step over the pair budget, a shape the pushdown does not
+    take) — rdflib's solutions of the node's pattern, kept by the pushdown's
+    own FILTER (:func:`filters.solution_filter`), so the answer does not
+    depend on which route solved the pattern."""
+    try:
+        return _eval_block_node(ctx, store, part)
+    except NotImplementedError:
+        keep = filters.solution_filter(store, part, ctx)
+    tracing._trace_event("filter_over_rdflib_rows", algebra_node=part.p.name)
+    return (solution for solution in evalPart(ctx, part.p) if keep(solution))
 
 
 def _eval_ask(ctx, store, part):

@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 import pytest
+from tests.corpus import QUERIES, RDFLIB_DIVERGES
 
 from vortex_rdflib import ablation
 
@@ -123,9 +124,18 @@ def baseline(store):
     "settings", SETTINGS, ids=lambda s: ",".join(f"{k}={v}" for k, v in s.items())
 )
 def test_switch_changes_no_answer(store, baseline, settings):
+    """With the pushdown off, rdflib's evaluator answers every query, so the
+    queries on which it breaks SPARQL 1.1 (``RDFLIB_DIVERGES``, whose
+    answers ``test_pushdown`` checks) are the ones it may answer differently."""
     answers = _answers(store, settings)
     assert len(answers) == len(baseline)
-    wrong = [i for i, (a, b) in enumerate(zip(answers, baseline, strict=True)) if a != b]
+    rdflib_answers = settings.get("VORTEX_RDF_DISABLE_PUSHDOWN") == "1"
+    queries = QUERIES * 2  # file-backed, then in memory
+    wrong = [
+        i
+        for i, (a, b) in enumerate(zip(answers, baseline, strict=True))
+        if a != b and not (rdflib_answers and " ".join(queries[i].split()) in RDFLIB_DIVERGES)
+    ]
     assert not wrong, f"{len(wrong)} queries answer differently, first: {wrong[:5]}"
 
 

@@ -42,9 +42,9 @@ from vortex_rdf import U64Column
 from .. import ablation
 from ..settings import SETTINGS
 from ..terms import BLANK, IRI, LITERAL, canonical_spelling
-from . import compiler, exprs, values
+from . import exprs, values
 from .exprs import _VAR_LIKE
-from .values import _COMPILE_ERRORS, _RDF_NIL, _XSD_STRING, NUMERIC_TYPES
+from .values import _FLOAT, _RDF_NIL, _XSD_STRING, ERROR, NUMERIC_TYPES
 
 
 class NativeShape(NamedTuple):
@@ -55,7 +55,7 @@ class NativeShape(NamedTuple):
     kind: str
     #: A constant's spelling, a pattern, a tag — or, for IRI_IN, the IRIs'.
     arg: str | tuple[str, ...]
-    #: REGEX flags, only those rdflib maps (``i``, ``s``, ``m``).
+    #: REGEX flags: only ``i``, ``s`` and ``m``, which vortex-rdf reads as XPath does.
     flags: str = ""
     #: ``"lower"``/``"upper"`` for a text under ``LCASE``/``UCASE``.
     case: str | None = None
@@ -147,13 +147,28 @@ def evaluate(store, shape: NativeShape, codes: Collection[int]) -> tuple[set, li
         )
     else:
         if shape.kind == "num_ne":
-            # rdflib's != is true for an IRI or a blank node against a number.
+            # An IRI or a blank node is no literal, so != a number (§17.4.1.7).
             passed.update(
                 code for code in codes if iri_lo <= code < iri_hi or blank_lo <= code < blank_hi
             )
         inside = sorted(code for code in codes if literal_lo <= code < literal_hi)
     if not inside:
         return passed, undecided
+    column = U64Column(inside)
+    if shape.kind in NUMERIC_KINDS:
+        # vortex-rdf compares an xsd:float as a double, where XPath rounds it
+        # to single precision: those go to the Python routes.
+        floats = _codes(store, "datatype", _FLOAT, column)
+        if floats is None:
+            undecided.extend(inside)
+            return passed, undecided
+        if len(floats):
+            diverted = set(memoryview(floats).cast("Q").tolist())
+            undecided.extend(diverted)
+            inside = [code for code in inside if code not in diverted]
+            if not inside:
+                return passed, undecided
+            column = U64Column(inside)
     assert isinstance(shape.arg, str)
     options: dict = {}
     if shape.flags:
@@ -164,17 +179,53 @@ def evaluate(store, shape: NativeShape, codes: Collection[int]) -> tuple[set, li
         options["as_str"] = True
     started = time.perf_counter_ns()
     try:
-        yes, maybe = store._dict.filter_codes(shape.kind, shape.arg, U64Column(inside), **options)
+        yes, maybe = store._dict.filter_codes(shape.kind, shape.arg, column, **options)
     except ValueError:
         # An argument vortex-rdf refuses (a constant outside its value
         # model): every candidate goes to the Python routes.
         undecided.extend(inside)
         return passed, undecided
-    passed.update(memoryview(yes).cast("Q").tolist())
+    yes_codes = memoryview(yes).cast("Q").tolist()
     undecided.extend(memoryview(maybe).cast("Q").tolist())
+    if shape.kind in ORDER_KINDS and yes_codes:
+        numbers = _numbers(store, shape, yes)
+        if numbers is not None:
+            undecided.extend(code for code in yes_codes if code not in numbers)
+            yes_codes = [code for code in yes_codes if code in numbers]
+    passed.update(yes_codes)
     if TRACE is not None:
         TRACE(shape.kind, len(inside), len(yes), len(maybe), time.perf_counter_ns() - started)
     return passed, undecided
+
+
+def _codes(store, kind: str, arg: str, column: U64Column) -> U64Column | None:
+    """The codes of ``column`` that ``kind`` passes, or ``None`` when
+    vortex-rdf refuses the argument."""
+    try:
+        return store._dict.filter_codes(kind, arg, column)[0]
+    except ValueError:
+        return None
+
+
+def _numbers(store, shape: NativeShape, ordered: U64Column) -> set | None:
+    """Of the codes an ordering shape passed, the set that are numbers, or
+    ``None`` when every one is.
+
+    vortex-rdf orders any literal against a number by datatype IRI, where
+    SPARQL errs unless both are numbers (§17.3). ``num_ne`` passes only
+    numbers, so a passed code is one when ``num_ne`` or, for ``<=`` and
+    ``>=``, ``num_eq`` passes it; the two are disjoint, so their sizes tell
+    whether they cover every code without reading one."""
+    assert isinstance(shape.arg, str)
+    found = []
+    for kind in ("num_ne", "num_eq") if shape.kind in ("num_le", "num_ge") else ("num_ne",):
+        column = _codes(store, kind, shape.arg, ordered)
+        if column is None:
+            return set()
+        found.append(column)
+    if sum(len(column) for column in found) == len(ordered):
+        return None
+    return {code for column in found for code in memoryview(column).cast("Q").tolist()}
 
 
 #: The relational operators as native numeric predicates, and the operator
@@ -192,8 +243,13 @@ _NUM_KINDS = {
 _SWAPPED = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "=": "=", "!=": "!="}
 
 
-#: Language ranges on which the native basic filtering (RFC 4647 §3.3.1) and
-#: rdflib's `_lang_range_check` agree: `*`, or ASCII alphanumeric subtags.
+#: The numeric comparisons, and those of them that order.
+NUMERIC_KINDS = frozenset(_NUM_KINDS.values())
+ORDER_KINDS = frozenset({"num_lt", "num_le", "num_gt", "num_ge"})
+
+
+#: Language ranges the native basic filtering (RFC 4647 §3.3.1) decides as
+#: SPARQL's langMatches does: `*`, or ASCII alphanumeric subtags.
 _LANG_RANGE = re.compile(r"\*|[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 
 
@@ -264,10 +320,9 @@ def _string_function_shape(expr, var, consts) -> NativeShape | None:
 def _regex_shape(expr, var, consts) -> NativeShape | None:
     """REGEX of ``var``'s text with a constant string pattern and flags.
 
-    rdflib compiles the pattern with Python's ``re`` and raises for every
-    string text when that fails, so such a pattern stays with rdflib. Only
-    the flags rdflib maps (``i``, ``s``, ``m``) are kept; it ignores the
-    rest."""
+    A pattern or flags the fast route reads as an error (an invalid pattern,
+    a flag outside XPath's), and XPath's ``x`` and ``q``, which vortex-rdf
+    does not read, stay with the Python routes."""
     text = _text_shape(expr.text, var)
     pattern = _constant_term(expr.pattern, consts)
     flags = None if expr.flags is None else _constant_term(expr.flags, consts)
@@ -275,13 +330,16 @@ def _regex_shape(expr, var, consts) -> NativeShape | None:
         return None
     if expr.flags is not None and not _string_literal(flags):
         return None
-    kept, compile_flags = values._regex_flags(flags)
+    checked = values.regex_flags(None if flags is None else str(flags))
+    if checked is ERROR or "x" in checked or "q" in checked:
+        return None
     try:
-        re.compile(str(pattern), compile_flags)
-    except _COMPILE_ERRORS:
+        if values.compile_regex(str(pattern), checked) is ERROR:
+            return None
+    except values.COMPILE_ERRORS:
         return None
     case, as_str = text
-    return NativeShape("regex", str(pattern), flags=kept, case=case, as_str=as_str)
+    return NativeShape("regex", str(pattern), flags=checked, case=case, as_str=as_str)
 
 
 #: IRIs ``canonical_spelling`` spells as an N-Triples IRIREF.
@@ -387,10 +445,10 @@ def _native_shape(expr, var, consts: dict) -> NativeShape | None:
     if name == "Builtin_LANGMATCHES":
         if not _call_on(expr.arg1, "Builtin_LANG", var):
             return None
-        # rdflib's `string()` admits a language-tagged range: its lexical
-        # form is the range either way.
+        # A range is a simple literal (§17.4.3.12); any other is an error
+        # for every value, which the Python routes answer.
         rng = _constant_term(expr.arg2, consts)
-        if not _string_literal(rng):
+        if not _string_constant(rng):
             return None
         return NativeShape("lang_matches", str(rng)) if _LANG_RANGE.fullmatch(str(rng)) else None
     if name == "Builtin_STRSTARTS" and _call_on(expr.arg1, "Builtin_STR", var):
@@ -433,13 +491,13 @@ def _native_shape(expr, var, consts: dict) -> NativeShape | None:
         kind = _NUM_KINDS[_SWAPPED[op]]
     else:
         return None
-    # A constant inside the value model both sides share — rdflib compares a
-    # typed query constant by its value even out of its type's bounds (see
-    # `_constant_view`), which the native layer refuses to.
+    # A well-typed number, but no xsd:float: vortex-rdf compares one as a
+    # double, where XPath rounds it to single precision first.
     if (
         not isinstance(constant, Literal)
         or str(constant.datatype) not in NUMERIC_TYPES
-        or values.numeric_value(compiler.view_of_node(constant)) is None
+        or str(constant.datatype) == _FLOAT
+        or values.numeric_value(values.constant_view(constant)) is None
     ):
         return None
     return NativeShape(kind, canonical_spelling(constant))

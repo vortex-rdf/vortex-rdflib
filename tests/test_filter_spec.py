@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import pytest
 from rdflib import BNode, Dataset, Literal, URIRef
+from rdflib.util import from_n3
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore
@@ -65,6 +66,40 @@ EBV = "".join(
         ("empty", '""'),
         ("iri", f"<{EX}i>"),
     )
+)
+
+
+def _terms(**terms) -> str:
+    """One ``ex:p`` statement per subject name and object spelling."""
+    return "".join(f"<{EX}{name}> <{EX}p> {term} .\n" for name, term in terms.items())
+
+
+#: One subject per numeric type, and one per operand arithmetic refuses.
+ARITH = _terms(
+    i5=f'"5"^^<{XSD}integer>',
+    d5=f'"5"^^<{XSD}decimal>',
+    f5=f'"5"^^<{XSD}float>',
+    e5=f'"5"^^<{XSD}double>',
+    b7=f'"7"^^<{XSD}byte>',
+    nan=f'"NaN"^^<{XSD}double>',
+    space=f'" 7"^^<{XSD}integer>',
+    big=f'"300"^^<{XSD}byte>',
+    str='"5"',
+    date=f'"2020-01-01"^^<{XSD}date>',
+    iri=f"<{EX}x>",
+)
+
+#: xsd:float values whose single precision shows: 0.1 is not the double 0.1,
+#: 16777217 rounds to 16777216, and 3.4028235E38 rounds to the largest float.
+FLOATS = _terms(
+    f01=f'"0.1"^^<{XSD}float>',
+    e01=f'"0.1"^^<{XSD}double>',
+    f2p24=f'"16777217"^^<{XSD}float>',
+    max=f'"3.4028235E38"^^<{XSD}float>',
+    # Just above the midpoint 1 + 2**-24 of the floats 1 and 1 + 2**-23: its
+    # nearest double is that midpoint, which rounds to even (1); the float
+    # nearest the number itself is 1 + 2**-23.
+    above=f'"1.000000059604644775390625000001"^^<{XSD}float>',
 )
 
 
@@ -119,6 +154,14 @@ SPEC_CASES: list[SpecCase] = [
         "eq-bool",
         NUMBERS,
         "SELECT ?s WHERE { ?s ex:p ?o FILTER((?o < 5) = true) }",
+        _s(0, 1, 2, 3, 4),
+    ),
+    SpecCase(
+        "builtins-of-bool",
+        NUMBERS,
+        "SELECT ?s WHERE { ?s ex:p ?o FILTER(datatype(?o < 5) = xsd:boolean "
+        '&& str(?o < 5) = "true" && isLiteral(?o < 5) && lang(?o < 5) = "" '
+        "&& !isNumeric(?o < 5) && !isIRI(?o < 5)) }",
         _s(0, 1, 2, 3, 4),
     ),
     # IN is `=` over the list (§17.4.1.9): value equality, and an error when
@@ -244,6 +287,121 @@ SPEC_CASES: list[SpecCase] = [
         'SELECT ?s WHERE { ?s ex:p ?o FILTER("5" > 3) }',
         [],
     ),
+    # A typed constant is read as written, so an ill-typed one has no value
+    # either (rdflib's parser leaves it unflagged and compares the number).
+    SpecCase(
+        "illtyped-constant",
+        NUMBERS,
+        'SELECT ?s WHERE { ?s ex:p ?o FILTER(?o < "300"^^xsd:byte) }',
+        [],
+    ),
+    # xsd:integer is unbounded; a type derived from it is its own datatype, so
+    # "5"^^xsd:int is not the term 5 (XML Schema §3.3.13; §17.4.1.8).
+    SpecCase(
+        "integer-unbounded",
+        _terms(big=f'"99999999999999999999"^^<{XSD}integer>'),
+        "SELECT ?s WHERE { ?s ex:p ?o FILTER(?o > 9223372036854775807) }",
+        _subjects("big"),
+    ),
+    SpecCase(
+        "derived-datatype",
+        _terms(int=f'"5"^^<{XSD}int>', integer=f'"5"^^<{XSD}integer>'),
+        "SELECT ?s WHERE { ?s ex:p ?o FILTER(datatype(?o) = xsd:int) }",
+        _subjects("int"),
+    ),
+    SpecCase(
+        "derived-sameterm",
+        _terms(int=f'"5"^^<{XSD}int>', integer=f'"5"^^<{XSD}integer>'),
+        "SELECT ?s WHERE { ?s ex:p ?o FILTER(sameTerm(?o, 5)) }",
+        _subjects("integer"),
+    ),
+    # NaN compares false, not in error, so `!` turns it true (XPath
+    # op:numeric-less-than).
+    SpecCase(
+        "nan-not-lt",
+        EBV,
+        "SELECT ?s WHERE { ?s ex:q ?v FILTER(!(?v < 5)) }",
+        _subjects("nan"),
+    ),
+    # An invalid pattern is an error (§17.4.3.14, XPath FORX0002): `!` of it
+    # is an error too, so neither keeps a row.
+    SpecCase(
+        "regex-invalid",
+        f'<{EX}a> <{EX}p> "abc" .\n',
+        'SELECT ?s WHERE { ?s ex:p ?o FILTER(regex(?o, "(") || !regex(?o, "a{2,1}")) }',
+        [],
+    ),
+    # `+` and `-` take numbers (§17.3): XPath promotes both operands to the
+    # wider of integer < decimal < float < double (F&O §B.1), and anything
+    # else — an ill-typed number, a string, a date, an IRI — is a type error.
+    SpecCase(
+        "arith-promotion",
+        ARITH,
+        "SELECT ?s WHERE { ?s ex:p ?o FILTER(?o + 1 IN (6, 8)) }",
+        _subjects("i5", "d5", "f5", "e5", "b7"),
+    ),
+    SpecCase(
+        "arith-type",
+        ARITH,
+        "SELECT ?s WHERE { ?s ex:p ?o FILTER(datatype(?o + 1.0) = xsd:decimal) }",
+        _subjects("i5", "d5", "b7"),
+    ),
+    SpecCase(
+        "arith-operands",
+        ARITH,
+        "SELECT ?s WHERE { ?s ex:p ?o FILTER(?o + 1 > 3) }",
+        _subjects("i5", "d5", "f5", "e5", "b7"),
+    ),
+    SpecCase(
+        "arith-ebv",
+        ARITH,
+        "SELECT ?s WHERE { ?s ex:p ?o FILTER(?o - 5) }",
+        _subjects("b7"),
+    ),
+    # A decimal or an integer meets an xsd:float as the nearest float, and an
+    # xsd:float meets an xsd:double as the double it is (F&O §B.1).
+    SpecCase(
+        "float-decimal-eq",
+        FLOATS,
+        "SELECT ?s WHERE { ?s ex:p ?o FILTER(?o = 0.1) }",
+        _subjects("f01", "e01"),
+    ),
+    SpecCase(
+        "float-double-eq",
+        FLOATS,
+        'SELECT ?s WHERE { ?s ex:p ?o FILTER(?o = "0.1"^^xsd:double) }',
+        _subjects("e01"),
+    ),
+    SpecCase(
+        "float-integer-eq",
+        FLOATS,
+        "SELECT ?s WHERE { ?s ex:p ?o FILTER(?o = 16777217) }",
+        _subjects("f2p24"),
+    ),
+    SpecCase(
+        "float-rounding",
+        FLOATS,
+        "SELECT ?s WHERE { ?s ex:p ?o FILTER(?o > 1 && ?o < 2) }",
+        _subjects("above"),
+    ),
+    SpecCase(
+        "float-rounding-promoted",
+        FLOATS,
+        'SELECT ?s WHERE { ?s ex:p ?o FILTER(?o = "1.00000011920928955078125"^^xsd:float) }',
+        _subjects("above"),
+    ),
+    SpecCase(
+        "decimal-rounding-promoted",
+        FLOATS,
+        "SELECT ?s WHERE { ?s ex:p ?o FILTER(?o = 1.000000059604644775390625000001) }",
+        _subjects("above"),
+    ),
+    SpecCase(
+        "float-max",
+        FLOATS,
+        'SELECT ?s WHERE { ?s ex:p ?o FILTER(?o > 1e38 && ?o < "INF"^^xsd:double) }',
+        _subjects("max"),
+    ),
 ]
 
 
@@ -258,6 +416,15 @@ def _spelling(term) -> str | None:
         if term.datatype == XSD_STRING:
             return Literal(str(term)).n3()
     return term.n3()
+
+
+def _as_returned(spelling: str | None) -> str | None:
+    """An expected term's spelling as the store returns that term: built by
+    rdflib, which normalizes a literal's lexical form (``"01"^^xsd:integer``
+    comes back as ``"1"``)."""
+    if spelling is None or spelling == "_:b":
+        return spelling
+    return _spelling(from_n3(spelling))
 
 
 class _Stores:
@@ -279,71 +446,12 @@ class _Stores:
         return store
 
 
-#: The answers the pushdown gets wrong before the fixes that follow this table.
-_NOT_YET = frozenset(
-    {
-        "and-error-first",
-        "constant-comparison",
-        "ebv",
-        "ebv-not",
-        "illtyped-data-ne",
-        "illtyped-data-not-gt",
-        "in-bool",
-        "in-numeric-value",
-        "isnumeric-illtyped",
-        "lang-lt",
-        "not-in-unknown-type",
-        "number-lt-string",
-        "sameTerm-bool",
-        "sameterm-noncanonical",
-        "str-noncanonical",
-        "string-gt-number",
-        "expr-builtin/sameTerm-eq",
-        "expr-builtin/sameTerm-not-eq",
-        "expr-builtin/sameTerm-simple",
-        "expr-builtin/str-1",
-        "expr-builtin/str-2",
-        "expr-equals/Equality with dateTime",
-        "expr-ops/DateTime Greater-than",
-        "expr-ops/DateTime Greater-than or equals",
-        "expr-ops/DateTime Less-than",
-        "expr-ops/DateTime Less-than or equals",
-        "open-world/date-1",
-        "open-world/date-3",
-        "open-world/open-cmp-01",
-        "open-world/open-cmp-02",
-        "open-world/open-eq-04",
-        "open-world/open-eq-08",
-        "open-world/open-eq-10",
-        "open-world/open-eq-11",
-        "open-world/open-eq-12",
-        "regex/REGEX with the ignore spacing (x) option",
-        "regex/REGEX with the ignore spacing (x) option with class expression",
-        "regex/REGEX with the iq option",
-        "regex/REGEX with the q option",
-    }
-)
-
-
-def _cases(cases, name_of):
-    return [
-        pytest.param(
-            case,
-            id=name_of(case),
-            marks=pytest.mark.xfail(strict=True, reason="fixed in Task 3")
-            if name_of(case) in _NOT_YET
-            else (),
-        )
-        for case in cases
-    ]
-
-
 @pytest.fixture(scope="module")
 def stores(tmp_path_factory) -> _Stores:
     return _Stores(tmp_path_factory.mktemp("filter-spec"))
 
 
-@pytest.mark.parametrize("case", _cases(SPEC_CASES, lambda case: case.name))
+@pytest.mark.parametrize("case", SPEC_CASES, ids=lambda case: case.name)
 def test_filter_follows_the_spec(stores, case):
     dataset = Dataset(store=stores(case.data))
     result = dataset.query(PREFIXES + case.query)
@@ -356,7 +464,7 @@ W3C_CASES = json.loads(
 )
 
 
-@pytest.mark.parametrize("case", _cases(W3C_CASES, lambda case: case["name"]))
+@pytest.mark.parametrize("case", W3C_CASES, ids=lambda case: case["name"])
 def test_w3c_filter_case(stores, case):
     dataset = Dataset(store=stores(case["data"]))
     result = dataset.query(case["query"], base=case["base"])
@@ -368,5 +476,7 @@ def test_w3c_filter_case(stores, case):
         tuple(sorted((str(v), _spelling(row[v])) for v in result.vars if row[v] is not None))
         for row in result
     )
-    want = Counter({tuple(tuple(pair) for pair in row): n for row, n in expected["rows"]})
+    want = Counter()
+    for row, n in expected["rows"]:
+        want[tuple(sorted((var, _as_returned(spelling)) for var, spelling in row))] += n
     assert got == want

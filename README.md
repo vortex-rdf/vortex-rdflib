@@ -193,6 +193,17 @@ columns. How each pushdown works, and where in the code it runs, is described
 in [docs/pushdown.md](docs/pushdown.md); the switches to disable or narrow it
 are in the table below.
 
+**FILTER semantics.** Where rdflib's evaluator and SPARQL 1.1 disagree —
+ill-typed literals, NaN, comparisons across types, `IN`, errors through `&&`
+and `||`, numeric type promotion, language-tag case — a FILTER the pushdown
+evaluates gives the specification's answer, over the terms as the data writes
+them. rdflib's semantics remain where rdflib evaluates: with the pushdown off,
+for a node the pushdown hands back (other than a FILTER over its rows), for a
+FILTER expression outside the shapes the pushdown compiles, and for comparisons
+of the XML Schema types SPARQL 1.1 leaves to the implementation (`xsd:time`,
+the durations, `xsd:gYear`, …). [docs/pushdown.md](docs/pushdown.md#sparql-semantics)
+lists every case.
+
 **File-backed vs in-memory.** The default open is file-backed: vortex-rdf
 memory-maps the `.vortex` file, so a query reads only the parts of the file it
 touches. What stays in RAM is the operating system's page cache plus a bounded
@@ -245,7 +256,7 @@ budget works is described in [docs/pushdown.md](docs/pushdown.md#the-pair-budget
 | `VORTEX_RDF_DISABLE_CODE_PATH=1` | Force the N-Triples string path instead of `u64` codes |
 | `VORTEX_RDF_DISABLE_PUSHDOWN=1` | Keep rdflib's default evaluator for every operator (see [docs/pushdown.md](docs/pushdown.md)) |
 | `VORTEX_RDF_PUSHDOWN_OPS=<list>` | Only push down the listed algebra nodes (`bgp` = basic graph patterns only) |
-| `VORTEX_RDF_FILTER_FAST=0` | Evaluate every FILTER value through rdflib's expression evaluator (still once per distinct value) |
+| `VORTEX_RDF_FILTER_FAST=0` | Evaluate every FILTER value through rdflib's expression evaluator (still once per distinct value), with rdflib's semantics |
 | `VORTEX_RDF_NATIVE_FILTERS=0` | Evaluate no FILTER conjunct inside vortex-rdf (no `filter_codes` calls, no kind-test or IRI-equality keeps on the scans): every value goes through the Python routes |
 | `VORTEX_RDF_PAIR_BUDGET=<n>` | The most row pairs one join step of a basic graph pattern builds at once: an integer of at least 0, 16,777,216 by default. A step over it is streamed, reordered around or left to rdflib (see [docs/pushdown.md](docs/pushdown.md#the-pair-budget)) |
 | `VORTEX_RDF_TRACE_TRIPLES=1` | Print every `triples()` pattern (debugging) |

@@ -19,6 +19,7 @@ from tests.support import (
     filter_spy,
     native_call_events,
     native_spy,
+    predicate_calls,
     products_file,
     run,
     store_file,
@@ -62,9 +63,12 @@ def test_a_single_pattern_filter_is_evaluated_over_its_matched_codes(tmp_path, i
     spy = filter_spy(graph)
     query = f"SELECT ?s ?v WHERE {{ ?s {PRICE} ?v FILTER(?v < 300) }}"
     assert len(run(graph, query)) == _under(300)
-    [(kind, arg, options, codes)] = spy.calls
+    [(kind, arg, options, codes)] = predicate_calls(spy)
     assert (kind, arg, options) == ("num_lt", f'"300"^^<{XSD}integer>', {})
     assert codes == expected  # the 200 distinct prices, nothing dictionary-wide
+    # The checks around it read the same codes or fewer.
+    assert [call[0] for call in spy.calls] == ["datatype", "num_lt", "num_ne"]
+    assert all(set(call[3]) <= set(expected) for call in spy.calls)
     with_pushdown, without_pushdown = both_ways(graph, query)
     assert with_pushdown == without_pushdown
 
@@ -83,7 +87,7 @@ def test_a_join_step_evaluates_the_codes_it_binds(tmp_path, monkeypatch, fanout)
         ?s <http://ex.org/type> <http://ex.org/Product> .
         ?s {PRICE} ?v FILTER(?v < 300) }}"""
     assert len(run(graph, query)) == _under(300)
-    [(kind, _, _, codes)] = spy.calls
+    [(kind, _, _, codes)] = predicate_calls(spy)
     assert kind == "num_lt" and codes == expected
 
 
@@ -97,7 +101,7 @@ def test_a_probe_join_evaluates_only_the_codes_its_probes_reached(tmp_path, monk
         VALUES ?s {{ <http://ex.org/p1> <http://ex.org/p2> <http://ex.org/p3> }}
         ?s {PRICE} ?v FILTER(?v < 300) }}"""
     rows = run(graph, query)
-    [(_, _, _, codes)] = spy.calls
+    [(_, _, _, codes)] = predicate_calls(spy)
     assert codes == sorted(_price_code(store, i) for i in (1, 2, 3))
     store._dict = spy._inner
     with_pushdown, without_pushdown = both_ways(graph, query)
@@ -186,7 +190,7 @@ def test_count_over_a_candidate_filter_matches_once(tmp_path):
         ?s {PRICE} ?v FILTER(?v < 300 && datatype(?v) = xsd:integer) }}"""
     assert run(graph, count) == [(Literal(_under(300)),)]
     assert native.names().count("match_codes") == 1
-    first, second = filtered.calls
+    first, second = predicate_calls(filtered)
     assert (first[0], second[0]) == ("num_lt", "datatype")
     assert len(first[3]) == 200 and len(second[3]) == _under(300)
 
@@ -220,7 +224,7 @@ def test_band_around_an_anchor_is_evaluated_over_the_price_codes(
     assert sorted(rows) == expected
     specialized = [e for e in trace if e["event"] == "bgp_tuple_specialized"]
     assert sorted(e["native_predicate"] for e in specialized) == ["num_gt", "num_lt"]
-    assert sorted(call[0] for call in spy.calls) == ["num_gt", "num_lt"]
+    assert sorted(call[0] for call in predicate_calls(spy)) == ["num_gt", "num_lt"]
     assert all(len(call[3]) <= 200 for call in spy.calls)
     restriction = next(
         e for e in trace if e["event"] == "bgp_restriction_complete" and e["variable"] == "v"

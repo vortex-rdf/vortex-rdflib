@@ -865,6 +865,16 @@ REENTRY_SHAPES = [
 # ahead of a pattern, which leaves the variable to the table. Over a UNION or
 # an OPTIONAL rdflib applies the FILTER, and an UNDEF leaves it to the
 # residual.
+#: rdflib compares this VALUES constant as the number 300, but a byte is at
+#: most 127: "300"^^xsd:byte is ill-typed, so `>` is a type error on it and
+#: SPARQL 1.1 keeps no row (§17.3; docs/pushdown.md).
+OUT_OF_RANGE = """SELECT * WHERE { VALUES ?n { "300"^^<http://www.w3.org/2001/XMLSchema#byte> 1 }
+    FILTER (?n > 5) }"""
+
+#: The VALUES shapes rdflib answers against the specification, and the
+#: specification's answer.
+SPEC_ANSWERS: dict[str, list] = {OUT_OF_RANGE: []}
+
 VALUES_SHAPES = [
     pytest.param('SELECT * WHERE { VALUES ?o { "y1" "a" } FILTER (?o = "a") }', id="values-eq"),
     pytest.param(
@@ -965,11 +975,7 @@ VALUES_SHAPES = [
     pytest.param("SELECT * WHERE { VALUES ?n { 1 5 } FILTER (?n < 3) }", id="values-number-lt"),
     # rdflib compares the query's "300"^^xsd:byte by its value, a data
     # literal out of its type's range not at all.
-    pytest.param(
-        """SELECT * WHERE { VALUES ?n { "300"^^<http://www.w3.org/2001/XMLSchema#byte> 1 }
-            FILTER (?n > 5) }""",
-        id="values-out-of-range-gt",
-    ),
+    pytest.param(OUT_OF_RANGE, id="values-out-of-range-gt"),
     pytest.param(
         """SELECT * WHERE { ?s ex:p ?o2 { VALUES ?o { "y1" "a" } FILTER (?o != "zz") }
             FILTER (?o = "a") }""",
@@ -1174,7 +1180,7 @@ def test_an_exists_re_entered_with_a_row_sees_only_its_filters_bindings(dataset,
 @pytest.mark.parametrize("sparql", VALUES_SHAPES)
 def test_a_filter_on_a_values_variable_answers_as_rdflib_does(dataset, sparql):
     with_pushdown, without_pushdown = both_ways(dataset, PREFIX + sparql)
-    assert with_pushdown == without_pushdown
+    assert with_pushdown == SPEC_ANSWERS.get(sparql, without_pushdown)
 
 
 _BY_ID = {param.id: param for param in SHAPES + GROUP_SHAPES + REENTRY_SHAPES + VALUES_SHAPES}

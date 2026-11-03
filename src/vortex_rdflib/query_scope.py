@@ -15,6 +15,7 @@ is produced or the result is closed. A call outside any query (rdflib's
 ``Store.triples()`` API, ``len()``) gets fresh state for that call alone.
 """
 
+import itertools
 from collections.abc import Callable
 from contextvars import ContextVar, Token
 
@@ -31,7 +32,9 @@ class QueryTerms:
     the codes whose term another code represents; ``foreign`` and
     ``foreign_codes`` map the negative codes of query constants the
     dictionary lacks to their terms and back; ``blank_graphs`` says, per
-    blank-node spelling, whether the file holds a graph by that name.
+    blank-node spelling, whether the file holds a graph by that name;
+    ``codes_by_id`` indexes ``decode`` by term identity for :meth:`code_of`,
+    built the first time it is asked.
     """
 
     __slots__ = (
@@ -42,6 +45,8 @@ class QueryTerms:
         "foreign",
         "foreign_codes",
         "blank_graphs",
+        "codes_by_id",
+        "indexed",
     )
 
     def __init__(self) -> None:
@@ -52,6 +57,25 @@ class QueryTerms:
         self.foreign: dict[int, Node] = {}
         self.foreign_codes: dict[Node, int] = {}
         self.blank_graphs: dict[str, bool] = {}
+        self.codes_by_id: dict[int, int] | None = None
+        self.indexed = 0
+
+    def code_of(self, term: Node) -> int | None:
+        """The code ``term`` was decoded from in this query — that very
+        object, as rdflib's own evaluation passes it on from
+        ``Store.triples()`` — or ``None``. Equal terms of different codes
+        ("042" and "42" both read 42) stay apart. The query's terms are
+        alive while it runs, so no identity is reused; the index takes in
+        the codes decoded since it last looked, the newest last."""
+        by_id = self.codes_by_id
+        if by_id is None:
+            by_id = self.codes_by_id = {}
+        added = len(self.decode) - self.indexed
+        if added:
+            for code, node in itertools.islice(reversed(self.decode.items()), added):
+                by_id[id(node)] = code
+            self.indexed = len(self.decode)
+        return by_id.get(id(term))
 
 
 class QueryScope:

@@ -25,7 +25,7 @@ _EVAL_KEY = "vortex_rdflib_bgp"
 #: module (a test's spy) is the one called.
 _HANDLERS = {
     "BGP": (blocks, "_eval_block_node"),
-    "Filter": (blocks, "_eval_block_node"),
+    "Filter": (blocks, "_eval_filter"),
     "Join": (blocks, "_eval_block_node"),
     "LeftJoin": (blocks, "_eval_block_node"),
     "Minus": (blocks, "_eval_block_node"),

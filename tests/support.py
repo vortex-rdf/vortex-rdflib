@@ -1,19 +1,18 @@
 """What the test modules share: running a query both ways, reading the
 query trace, spies over the native store and its dictionary, building
-small stores, and FILTER expressions with rdflib's own answer for them."""
+small stores, and FILTER expressions as rdflib's parser builds them."""
 
 import json
 import weakref
 
 from rdflib import Graph, Variable
 from rdflib.plugins.sparql.algebra import translateQuery
-from rdflib.plugins.sparql.evalutils import _ebv
 from rdflib.plugins.sparql.parser import parseQuery
-from rdflib.plugins.sparql.sparql import FrozenBindings, QueryContext
+from rdflib.plugins.sparql.sparql import QueryContext
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
+from vortex_rdflib import register_sparql_pushdown, unregister_sparql_pushdown
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 
@@ -272,17 +271,6 @@ def filter_expr(sparql_expr: str):
 CTX = QueryContext(graph=Graph(), initBindings={})
 
 
-RAISES = "rdflib raises"
-
-
-def rdflib_answer(expr, spelling):
-    bindings = {} if spelling is None else {V: VortexRdflibStore._from_n3_safe(spelling)}
-    try:
-        return _ebv(expr, FrozenBindings(CTX, bindings))
-    except Exception:  # noqa: BLE001 - rdflib's own bugs (e.g. NaN vs Decimal) are the oracle
-        return RAISES
-
-
 class RecordingTermDict:
     """A TermDict that records every filter_codes call as ``(kind, arg,
     options, candidate codes)`` (or refuses every argument, with
@@ -316,6 +304,24 @@ def outcome(graph, sparql):
         return run(graph, sparql)
     except Exception as error:  # noqa: BLE001 - the exception is the answer
         return type(error)
+
+
+def predicate_calls(spy: RecordingTermDict) -> list[tuple]:
+    """The ``filter_codes`` calls that evaluate a predicate, without the two
+    checks a numeric one makes around its call (``filters.native.evaluate``):
+    the lookup of the xsd:float codes before it, which go to the Python routes,
+    and, after an ordering, ``num_ne`` (and ``num_eq``) over the codes it
+    passed, which keep only the numbers."""
+    calls: list[tuple] = []
+    for call in spy.calls:
+        kind, arg = call[0], call[1]
+        if kind == "datatype" and arg == XSD + "float":
+            continue
+        ordering = calls and calls[-1][0] in ("num_lt", "num_le", "num_gt", "num_ge")
+        if ordering and kind in ("num_ne", "num_eq") and arg == calls[-1][1]:
+            continue
+        calls.append(call)
+    return calls
 
 
 def filter_spy(graph) -> RecordingTermDict:

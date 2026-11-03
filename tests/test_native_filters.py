@@ -1,23 +1,24 @@
-"""The native term predicates (``TermDict.filter_codes``) must agree with
-rdflib's own evaluator wherever they give a definite answer: a FILTER
-conjunct mapped to one (``filters.native.native_shape``) is answered by vortex-rdf
-over the codes a query produced (``native.evaluate``), so a
-disagreement would be a wrong answer, not a slow one. The matrix of
-spellings is the fast route's (``test_filters``) plus the shapes the native
-value model treats specially: decimals against doubles, integers past 2^53,
-64-bit bounds, language subtags."""
+"""The native term predicates (``TermDict.filter_codes``) must give SPARQL
+1.1's answer wherever they give a definite one: a FILTER conjunct mapped to
+one (``filters.native.native_shape``) is answered by vortex-rdf over the codes
+a query produced (``native.evaluate``), so a disagreement would be a wrong
+answer, not a slow one. The answers are Oxigraph's (:mod:`tests.oracle`); the
+matrix of spellings is the fast route's (``test_filters``) plus the shapes the
+native value model treats specially: decimals against doubles, integers past
+2^53, 64-bit bounds, language subtags."""
 
 import pytest
 from rdflib.term import Variable
 from tests.corpus import SPELLINGS
-from tests.support import RecordingTermDict, filter_expr, outcome, rdflib_answer, typed
-from vortex_rdf import serialize_rdf
+from tests.oracle import departs, spec_answer
+from tests.support import RecordingTermDict, filter_expr, typed
+from vortex_rdf import U64Column, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 from vortex_rdflib.filters import native
 from vortex_rdflib.filters.native import NativeShape
-from vortex_rdflib.terms import BLANK, IRI, LITERAL
+from vortex_rdflib.terms import BLANK, IRI, LITERAL, parse_spelling
 
 V = Variable("v")
 XSD = "http://www.w3.org/2001/XMLSchema#"
@@ -92,7 +93,6 @@ MAPPED: list[tuple[str, tuple]] = [
     ('langMatches(lang(?v), "EN")', ("lang_matches", "EN")),
     ('langMatches(lang(?v), "*")', ("lang_matches", "*")),
     ('langMatches(lang(?v), "en-US")', ("lang_matches", "en-US")),
-    ('langMatches(lang(?v), "de-CH"@fr)', ("lang_matches", "de-CH")),
     ('strstarts(str(?v), "http")', ("str_prefix", "http")),
     ('strstarts(str(?v), "http://ex.org/x")', ("str_prefix", "http://ex.org/x")),
     ('strstarts(str(?v), "a")', ("str_prefix", "a")),
@@ -111,7 +111,6 @@ for _constant, _spelled in [
     ("-1", f'"-1"^^<{XSD}integer>'),
     ("1e100", f'"1e+100"^^<{XSD}double>'),
     ('"5"^^xsd:int', f'"5"^^<{XSD}int>'),
-    ('"5"^^xsd:float', f'"5"^^<{XSD}float>'),
     ('"5"^^xsd:long', f'"5"^^<{XSD}long>'),
 ]:
     MAPPED.append((f"?v < {_constant}", ("num_lt", _spelled)))
@@ -120,7 +119,7 @@ for _constant, _spelled in [
 
 #: The string functions, each with the native shape it maps to:
 #: REGEX, CONTAINS, STRSTARTS and STRENDS over ?v or STR(?v), either under
-#: LCASE/UCASE. Only the flags rdflib maps (i, s, m) reach vortex-rdf.
+#: LCASE/UCASE. Only flags i, s and m reach vortex-rdf.
 STRING_MAPPED = [
     ('regex(?v, "^a")', NativeShape("regex", "^a")),
     ('regex(?v, "b$")', NativeShape("regex", "b$")),
@@ -130,7 +129,6 @@ STRING_MAPPED = [
     ('regex(?v, "s", "i")', NativeShape("regex", "s", "i")),
     ('regex(?v, "ſ", "i")', NativeShape("regex", "ſ", "i")),
     ('regex(?v, "\\\\w+ \\\\w+")', NativeShape("regex", "\\w+ \\w+")),
-    ('regex(?v, "^[a-c]{2}", "xq")', NativeShape("regex", "^[a-c]{2}")),
     ('regex(?v, "^[^a-z]")', NativeShape("regex", "^[^a-z]")),
     ('regex(str(?v), "^ab")', NativeShape("regex", "^ab", as_str=True)),
     ('regex(str(?v), "^4")', NativeShape("regex", "^4", as_str=True)),
@@ -174,18 +172,19 @@ IRI_MAPPED = [
 MAPPED += IRI_MAPPED
 
 #: Shapes the mapping must leave to the Python routes: the native layer
-#: would answer some of them differently from rdflib.
+#: would answer some of them differently from the specification.
 UNMAPPED = [
-    # rdflib's langMatches splits the range on "-" and lets "*" match any
-    # subtag; the native basic filtering does not.
+    # ranges the native basic filtering leaves undecided: a "*" subtag,
+    # padding, the empty range
     'langMatches(lang(?v), "*-US")',
     'langMatches(lang(?v), "en-*")',
     'langMatches(lang(?v), " en")',
     'langMatches(lang(?v), "")',
-    # a language-tagged prefix makes strstarts an error for every value
+    # a language-tagged range or prefix is an error for every value
+    'langMatches(lang(?v), "de-CH"@fr)',
     'strstarts(str(?v), "a"@en)',
     'lang(?v) = "en"@fr',
-    # constants rdflib compares by its own rules
+    # constants that are no well-typed number, and shapes no native kind is
     '?v < "abc"^^xsd:integer',
     '?v < "300"^^xsd:byte',
     '?v < "5"',
@@ -194,13 +193,19 @@ UNMAPPED = [
     "datatype(?v) != xsd:integer",
     "?v + 1 > 3",
     "!isIRI(?v)",
-    # rdflib compares language tags as written and the dictionary stores
-    # them lower-cased: an upper-case tag stays with the Python routes
+    # an xsd:float constant: vortex-rdf compares it as a double, where XPath
+    # rounds it to single precision
+    '?v < "5"^^xsd:float',
+    '"5"^^xsd:float = ?v',
+    # vortex-rdf compares a constant's language tag as written, SPARQL
+    # case-insensitively: an upper-case tag stays with the Python routes
     'contains(?v, "a"@EN)',
     # STR() drops the tag, so a tagged constant is an error for every value
     'contains(str(?v), "a"@en)',
-    # a pattern Python cannot compile: rdflib raises, so must the query
+    # an invalid pattern, an error for every value
     'regex(?v, "a{2,1}")',
+    # flags x and q change how the pattern reads; vortex-rdf ignores them
+    'regex(?v, "^[a-c]{2}", "xq")',
     # not a constant pattern, or flags that are not a string
     "regex(?v, str(?v))",
     'regex(?v, "a", 1)',
@@ -208,13 +213,19 @@ UNMAPPED = [
     'strstarts(lcase(lcase(?v)), "a")',
     'contains(str(lcase(?v)), "a")',
     'contains(substr(?v, 1), "a")',
-    # IRI equality only: a literal constant compares by rdflib's term rules
+    # IRI equality only: a literal constant compares by value (RDFterm-equal)
     '?v IN (<http://ex.org/x>, "x")',
     'sameTerm(?v, "x")',
     "?v != <http://ex.org/x>",
     "?v NOT IN (<http://ex.org/x>)",
     "?v = ?v",
 ]
+
+
+def _subject(index: int, spelling: str) -> str:
+    """The subject of the spelling store's statement whose object is
+    ``spelling``: the term itself for an IRI or a blank node."""
+    return spelling if spelling.startswith(("<", "_:")) else f"<http://ex.org/s{index}>"
 
 
 @pytest.fixture(scope="module")
@@ -224,8 +235,7 @@ def spelling_store(tmp_path_factory):
     nt = directory / "spellings.nt"
     with open(nt, "w", encoding="utf-8") as f:
         for i, spelling in enumerate(ALL_SPELLINGS):
-            subject = spelling if spelling.startswith(("<", "_:")) else f"<http://ex.org/s{i}>"
-            f.write(f"{subject} <http://ex.org/p> {spelling} .\n")
+            f.write(f"{_subject(i, spelling)} <http://ex.org/p> {spelling} .\n")
     out = directory / "spellings.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
     return VortexRdflibStore(str(out), in_memory=True)
@@ -245,11 +255,10 @@ def _all_codes(store) -> set:
     return {store._dict.encode(spelling) for spelling in ALL_SPELLINGS}
 
 
-@pytest.mark.filterwarnings("ignore:Parsing weird boolean:UserWarning")
 @pytest.mark.parametrize("sparql_expr", [m[0] for m in MAPPED])
-def test_native_candidates_agree_with_rdflib(spelling_store, sparql_expr):
+def test_native_candidates_follow_the_spec(spelling_store, sparql_expr):
     """Every spelling of the matrix at once, as one query's candidate codes:
-    each code vortex-rdf decides gets rdflib's answer; the codes it leaves
+    each code vortex-rdf decides gets SPARQL 1.1's answer; the codes it leaves
     undecided go to the Python routes."""
     expr = filter_expr(sparql_expr)
     shape = filters.native.native_shape(expr, V, {})
@@ -260,9 +269,12 @@ def test_native_candidates_agree_with_rdflib(spelling_store, sparql_expr):
     assert passed <= codes and undecided <= codes and not passed & undecided
     decided = 0
     for code in sorted(codes - undecided):
-        decided += 1
         stored = spelling_store._dict.decode(code)
-        assert (code in passed) == rdflib_answer(expr, stored), (sparql_expr, stored)
+        if departs(sparql_expr, stored):
+            continue
+        decided += 1
+        expected = spec_answer(sparql_expr, {"v": stored})
+        assert (code in passed) == expected, (sparql_expr, stored)
     assert decided > 0, sparql_expr
 
 
@@ -300,9 +312,10 @@ def test_a_refused_argument_leaves_every_candidate_to_the_python_routes(
 
 def test_only_the_codes_a_predicate_reads_are_sent(spelling_store, monkeypatch):
     """vortex-rdf fails every code in neither answer set, so the codes outside
-    a predicate's domain are decided here by rdflib's rule and never sent —
-    `!=` passes every IRI and blank node, `<` fails them — and what is sent is
-    sorted and unique, as filter_codes requires."""
+    a predicate's domain are decided here — `!=` passes every IRI and blank
+    node, `<` fails them — and only literals are sent, sorted and unique, as
+    filter_codes requires: the xsd:float codes looked up first, and an
+    ordering's passed codes checked for numbers after."""
     codes = _all_codes(spelling_store)
     lo, hi = spelling_store._kind_ranges()[LITERAL]
     nonliterals = {code for code in codes if not lo <= code < hi}
@@ -314,10 +327,39 @@ def test_only_the_codes_a_predicate_reads_are_sent(spelling_store, monkeypatch):
     passed_lt, _ = native.evaluate(spelling_store, NativeShape("num_lt", five), codes)
     assert nonliterals <= passed_ne
     assert not nonliterals & passed_lt
-    assert len(recording.sent) == 2
+    kinds = [kind for kind, _, _, _ in recording.calls]
+    assert kinds == ["datatype", "num_ne", "datatype", "num_lt", "num_ne"]
     for sent in recording.sent:
         assert sent == sorted(set(sent))
         assert not set(sent) & nonliterals
+
+
+@pytest.mark.parametrize(
+    "constant",
+    [
+        f'"5"^^<{XSD}integer>',
+        f'"0"^^<{XSD}integer>',
+        f'"-1"^^<{XSD}integer>',
+        f'"4.5"^^<{XSD}decimal>',
+        f'"1e+100"^^<{XSD}double>',
+    ],
+)
+def test_num_eq_and_num_ne_pass_only_numbers(spelling_store, constant):
+    """The contract an ordering's check for numbers relies on
+    (``native._numbers``): every code ``num_eq`` or ``num_ne`` passes is a
+    well-typed number."""
+    codes = sorted(code for code in _all_codes(spelling_store) if _is_literal(spelling_store, code))
+    for kind in ("num_eq", "num_ne"):
+        passed, _ = spelling_store._dict.filter_codes(kind, constant, U64Column(codes))
+        for code in memoryview(passed).cast("Q").tolist():
+            stored = spelling_store._dict.decode(code)
+            number = filters.values.numeric_operand(parse_spelling(stored))
+            assert number is not None, (kind, stored)
+
+
+def _is_literal(store, code: int) -> bool:
+    lo, hi = store._kind_ranges()[LITERAL]
+    return lo <= code < hi
 
 
 def test_str_of_a_blank_node_is_left_to_the_python_routes(spelling_store, monkeypatch):
@@ -418,19 +460,16 @@ QUERY_CONJUNCTS = [m[0] for m in MAPPED] + [
 ]
 
 
+# rdflib warns each time it builds the matrix's "maybe"^^xsd:boolean, an
+# ill-typed literal kept on purpose, for a row it returns.
 @pytest.mark.filterwarnings("ignore:Parsing weird boolean:UserWarning")
-# rdflib's own Literal comparator, on the default-evaluator side, for the
-# exotic datatypes of the matrix.
-@pytest.mark.filterwarnings("ignore:NotImplemented should not be used:DeprecationWarning")
 @pytest.mark.parametrize("in_memory", [True, False], ids=["mem", "file"])
 @pytest.mark.parametrize("sparql_expr", QUERY_CONJUNCTS)
-def test_pushed_filter_query_equals_default_evaluator(spelling_store, in_memory, sparql_expr):
-    """End to end: the FILTER, pushed into the native match as a keep, gives
-    rdflib's answer — with the undecided values resolved on the Python
-    routes."""
+def test_pushed_filter_query_follows_the_spec(spelling_store, in_memory, sparql_expr):
+    """End to end: the FILTER, pushed into the native match as a keep, keeps
+    the subjects whose object SPARQL 1.1 keeps — with the undecided values
+    resolved on the Python routes."""
     from rdflib import Graph
-
-    from test_pushdown import both_ways
 
     graph = Graph(store=VortexRdflibStore(spelling_store.path, in_memory=in_memory))
     query = (
@@ -439,8 +478,15 @@ def test_pushed_filter_query_equals_default_evaluator(spelling_store, in_memory,
         f"SELECT ?s ?v WHERE {{ ?s <http://ex.org/p> ?v FILTER({sparql_expr}) }}"
     )
     register_sparql_pushdown()
-    with_pushdown, without_pushdown = both_ways(graph, query, runner=outcome)
-    assert with_pushdown == without_pushdown
+    skipped, expected = set(), set()
+    for i, spelling in enumerate(ALL_SPELLINGS):
+        subject = _subject(i, spelling)
+        if departs(sparql_expr, spelling):
+            skipped.add(subject)
+        elif spec_answer(sparql_expr, {"v": spelling}):
+            expected.add(subject)
+    kept = {row[0].n3() for row in graph.query(query)}
+    assert kept - skipped == expected
 
 
 def test_a_mid_size_code_set_goes_to_the_native_layer_whole(tmp_path, monkeypatch, capsys):

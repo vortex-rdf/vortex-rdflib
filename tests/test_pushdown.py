@@ -1,6 +1,8 @@
 """The pushdown must be observationally identical to rdflib's default
 evaluator — every query shape is run both ways and compared exactly, on a
-file-backed and on an in-memory store."""
+file-backed and on an in-memory store — except where rdflib breaks SPARQL 1.1
+on a FILTER, where the pushdown gives the specification's answer
+(``tests/corpus.py``, ``RDFLIB_DIVERGES``)."""
 
 import contextlib
 import io
@@ -20,6 +22,8 @@ from tests.corpus import (
     PROBE_MULTIPLICITY,
     PROBE_QUADS,
     QUERIES,
+    RDFLIB_DIVERGES,
+    spec_corrected,
 )
 from tests.support import (
     both_ways,
@@ -142,11 +146,14 @@ class Forcing:
     lookup), and the runs of its equivalence matrix — each a corpus
     (:data:`_CORPORA`) over the views it names (``graph-file`` and
     ``graph-mem`` over the triples, ``dataset-*`` over the quads, as a
-    union-default ``Dataset``)."""
+    union-default ``Dataset``). Where the path leaves every FILTER to
+    rdflib's evaluator (``rdflib_filters``), rdflib's semantics apply, so its
+    answer is the expected one even where it breaks SPARQL 1.1."""
 
     settings: dict
     runs: tuple
     point: bool | None = None
+    rdflib_filters: bool = False
 
 
 _GRAPH = ("graph-file", "graph-mem")
@@ -168,13 +175,13 @@ FORCINGS = {
     # Only basic graph patterns solved here (VORTEX_RDF_PUSHDOWN_OPS=bgp):
     # every head is rdflib's own operator, and rdflib evaluates a `Graph`
     # node itself, pushing each block down under a constant scope.
-    "bgp_only": Forcing({"enabled_ops": frozenset({"BGP"})}, _FILE_AND_GRAPHS),
+    "bgp_only": Forcing({"enabled_ops": frozenset({"BGP"})}, _FILE_AND_GRAPHS, rdflib_filters=True),
     # The native term predicates off: every conjunct they would decide runs
     # on the Python fast route.
     "python_filters": Forcing({"native_filters": False}, _FILE),
     # VORTEX_RDF_FILTER_FAST=0: every FILTER value through rdflib's own
     # evaluator, once per distinct value.
-    "generic_filters": Forcing({"fast_filters": False}, _FILE_AND_GRAPHS),
+    "generic_filters": Forcing({"fast_filters": False}, _FILE_AND_GRAPHS, rdflib_filters=True),
     # Every probe a scan, through the batch calls in batches of three, a lone
     # probe included; a BGP step keep-scans instead.
     "batched_scans": Forcing(
@@ -249,7 +256,10 @@ def test_answers_equal_the_default_evaluator(
     _force(FORCINGS[forcing], monkeypatch)
     _, runner = _CORPORA[corpus]
     with_pushdown, without_pushdown = both_ways(target, sparql, runner)
-    assert with_pushdown == without_pushdown
+    if FORCINGS[forcing].rdflib_filters:
+        assert with_pushdown == without_pushdown
+    else:
+        assert with_pushdown == spec_corrected(sparql, without_pushdown)
 
 
 #: The forced paths a trace shows taken, by id: the forcing, and the test
@@ -304,7 +314,7 @@ def test_store_variants_equal_default_evaluator(variant_graph, sparql):
     """The same shapes over a file-backed dictionary and over the secondary
     indexes."""
     with_pushdown, without_pushdown = both_ways(variant_graph, sparql)
-    assert with_pushdown == without_pushdown
+    assert with_pushdown == spec_corrected(sparql, without_pushdown)
 
 
 @pytest.mark.parametrize("sparql", GRAPH_QUERIES)
@@ -313,7 +323,13 @@ def test_graph_pattern_over_a_file_backed_dictionary(dict_vortex_quads, sparql):
     assert store._dict is not None and store._dict.file_backed
     dataset = Dataset(store=store, default_union=True)
     with_pushdown, without_pushdown = both_ways(dataset, sparql)
-    assert with_pushdown == without_pushdown
+    assert with_pushdown == spec_corrected(sparql, without_pushdown)
+
+
+def test_every_divergence_is_a_corpus_query():
+    """The corrections apply to the queries they were written for."""
+    corpus = {" ".join(sparql.split()) for sparql in QUERIES + ORDER_QUERIES + GRAPH_QUERIES}
+    assert set(RDFLIB_DIVERGES) <= corpus
 
 
 def test_solutions_do_not_share_a_context_under_a_pushed_graph(dataset, monkeypatch):
@@ -1331,9 +1347,10 @@ def test_filter_is_pushed_into_the_pattern_scan(graph, monkeypatch):
     assert restrictions and not generic_calls
 
 
-def test_values_outside_the_fast_domain_take_the_generic_route(graph, monkeypatch):
-    """``str(?a)`` of a numeric literal is rdflib's normalized lexical form:
-    the fast route defers those values, one call per distinct value."""
+def test_str_of_a_number_is_answered_by_the_fast_route(graph, monkeypatch):
+    """``str(?a)`` of a numeric literal is its lexical form as written: the
+    fast route answers every value itself, so dave's "042" is no "42", and no
+    value goes to rdflib's evaluator."""
     generic_calls = []
     original_generic = filters.Conjunct.generic
     monkeypatch.setattr(
@@ -1343,8 +1360,29 @@ def test_values_outside_the_fast_domain_take_the_generic_route(graph, monkeypatc
     )
     register_sparql_pushdown()
     rows = run(graph, 'SELECT ?x WHERE { ?x <http://ex.org/age> ?a FILTER(str(?a) = "42") }')
-    assert {row[0] for row in rows} == {URIRef("http://ex.org/bob"), URIRef("http://ex.org/dave")}
-    assert len(generic_calls) == 5  # one per distinct age code, never per row
+    assert {row[0] for row in rows} == {URIRef("http://ex.org/bob")}
+    assert generic_calls == []
+
+
+def test_a_filter_over_a_block_rdflib_solves_answers_as_the_pushdown(graph, monkeypatch, capsys):
+    """A join over the pair budget sends its block back to rdflib, which
+    solves the pattern; the FILTER above it is still the pushdown's, over the
+    stored terms, so the answer does not depend on how large the join got:
+    erin's ill-typed age orders against nothing (§17.3)."""
+    sparql = (
+        "SELECT ?a ?b WHERE { ?x <http://ex.org/age> ?a . ?y <http://ex.org/age> ?b "
+        "FILTER(?a < ?b) }"
+    )
+    register_sparql_pushdown()
+    expected = run(graph, sparql)
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    assert run(graph, sparql) == expected
+    events = [e["event"] for e in trace_events(capsys.readouterr().err)]
+    assert "bgp_over_budget" in events and "filter_over_rdflib_rows" in events
+    integer = URIRef("http://www.w3.org/2001/XMLSchema#integer")
+    assert not any(Literal("abc", datatype=integer) in row for row in expected)
 
 
 def test_init_bindings_are_visible_to_filters(graph):
