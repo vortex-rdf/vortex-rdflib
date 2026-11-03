@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.4.0...v0.5.0) - 2026-11-02
+## [0.5.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.4.0...v0.5.0) - 2026-11-03
 
 Requires vortex-rdf 0.14 (`vortex-rdf>=0.14.0,<0.15`, up from 0.13.1), and the
 union default graph is a set of triples. A plain `Graph` over the store, and a
@@ -27,6 +27,23 @@ calls, rows, decodes and page faults a run makes. Inside, the pushdown and the
 FILTER code are packages of one module per concern, and the settings and the
 cancellation have modules of their own.
 
+Python 3.12 to 3.15 are supported; 3.11 is dropped. A FILTER the pushdown
+evaluates gives SPARQL 1.1's answer where rdflib's evaluator differs — errors
+through `||` and `&&`, `IN`, comparisons across types and of ill-typed literals,
+NaN, numeric promotion, language-tag case, `REGEX` flags and patterns — checked
+against Oxigraph; rdflib's semantics remain wherever rdflib evaluates
+([docs/pushdown.md](docs/pushdown.md#sparql-semantics) lists every case). An
+`OPTIONAL`, a nested group join and an `EXISTS` plan a one-pattern right side
+as a BGP's join step does: probed per row only where each probe is a point
+lookup, matched once narrowed to the left side's codes where each would scan
+the store; an `OPTIONAL` whose condition no row can pass leaves its right side
+unread. A query is one trace, whose events are built only when tracing is on,
+and the FILTER applied over rows rdflib produced keeps nothing per row. Inside,
+the switches are one settings object read when a store is constructed, every
+native call goes through one boundary, an open file's state is one record, and
+the join planner, the FILTER model, `COUNT` and the block solvers take one
+typed path per case.
+
 ### Breaking changes
 
 - vortex-rdf 0.13 is no longer supported: the dependency is
@@ -35,6 +52,57 @@ cancellation have modules of their own.
   one triple of the union in `triples()`, `len()` and every query over it. Code
   that counted it once per graph through the union counts it per graph with
   `GRAPH ?g` or `quads()`.
+- Python 3.11 is no longer supported: `requires-python = ">=3.12"`, tested on
+  3.12 to 3.15.
+- A FILTER the pushdown evaluates follows SPARQL 1.1 where rdflib's evaluator
+  does not, so some answers change:
+  - errors through the operators: `T || E` is true, `F && E` and `E && F` are
+    false, `!` of an error is an error;
+  - `IN` is `=` over its list (an error when nothing matches and a comparison
+    errs), `NOT IN` its negation;
+  - RDF-term equality: a literal of an unknown or ill-typed datatype equals
+    only itself, is unequal to a language-tagged literal, and is otherwise an
+    error;
+  - orderings within one value space only: NaN orders against nothing, an
+    ill-typed literal (in the data, or a constant such as `"300"^^xsd:byte`)
+    has no value, `xsd:dateTime` and `xsd:date` follow XML Schema's partial
+    order;
+  - effective boolean value: NaN and ill-typed numbers and booleans are false;
+    unknown datatypes, dates and IRIs are errors;
+  - `isNumeric` of an ill-typed literal is false; `sameTerm` and `STR` read a
+    term as the data writes it (`"042"^^xsd:integer`); `STR` of a blank node
+    is an error;
+  - `+` and `-` over XPath's numeric tower, exact for decimals, `xsd:float` at
+    single precision; any other operand is an error;
+  - the string functions compare language tags case-insensitively;
+    `langMatches` takes a simple-literal range;
+  - `REGEX` reads XPath's flags (`s m i x q`); an invalid pattern, and a
+    language-tagged pattern or flags, is an error;
+  - impure functions (`RAND()`, `BNODE()`, ...) inside an `EXISTS` body are
+    seen: the FILTER goes to rdflib and is drawn per row.
+- `VortexRdflibStore` takes `(configuration, identifier, path, *, in_memory)`
+  and raises `TypeError` on any other argument, so a typo such as
+  `in_memroy=True` no longer opens the file another way. The unused `layout`
+  and `backend` parameters are removed; `store.layout` still reads the open
+  file's layout.
+- Every `VORTEX_RDF_*` switch is parsed one way: an on/off switch takes
+  `1/true/yes/on` or `0/false/no/off` in any case (only `1` and `0` worked for
+  some), a size is a positive integer, and anything else raises a `ValueError`
+  naming the variable — when a store is constructed or the pushdown
+  registered, not on import. `VORTEX_RDF_TRACE_TRIPLES` is read when a store
+  is constructed. `ablation.flag`, `ablation.positive_int`, the ablation
+  constants, `counters.ON` and `settings.trace_triples()` are gone: the fields
+  of `settings.SETTINGS` replace them.
+- The query trace (`VORTEX_RDF_TRACE_QUERY=1`) is one trace per query, kept on
+  the query's scope: a `UNION`'s branches no longer restart its numbering, and
+  a result never read no longer traces later queries. The `order_start` and
+  `order_key_ranked` events are gone, as are the `input_codes` field of
+  `rank_codes_complete` and `limit_applied_during_order` of `order_complete`
+  (each repeated another). `join_plan_complete` and `left_join_plan_complete`
+  report a `keep_scan` strategy, and the latter reports `constant_false` for
+  any right side.
+- `vortex_rdflib.pushdown.__all__` lists only `register_sparql_pushdown` and
+  `unregister_sparql_pushdown`; its modules are internal.
 
 ### Added
 
@@ -58,6 +126,22 @@ cancellation have modules of their own.
 - One module per concern (pushdown) ([`5494f18`](https://github.com/vortex-rdf/vortex-rdflib/commit/5494f1829223c91f58bc8ab4cb95c7bd46eca93b) by @claude)
 - A package, and one home for the native shapes (filters) ([`2020e33`](https://github.com/vortex-rdf/vortex-rdflib/commit/2020e33844c5509df50ece0fe3852516cd57dcb8) by @claude)
 - Drop repeats only where a triple is in two graphs (union) ([`7623786`](https://github.com/vortex-rdf/vortex-rdflib/commit/76237865497d884ab2969d5f299876e684fb0073) by @claude)
+- Every switch in SETTINGS, one parser per kind (settings) ([`0993fc4`](https://github.com/vortex-rdf/vortex-rdflib/commit/0993fc4141aed37f6fa18f0a61374202af4f8506) by @claude)
+- One native boundary for cancellation, tracing and counters ([`a966aa5`](https://github.com/vortex-rdf/vortex-rdflib/commit/a966aa5e85f845222e641e91dcb8730265f9631e) by @claude)
+- Per-file state in one record; unknown keywords raise (store) ([`f6b28ea`](https://github.com/vortex-rdf/vortex-rdflib/commit/f6b28eac978cb21e26b1bceeea3e7a720171e879) by @claude)
+- Read the switches once per store (settings) ([`3343807`](https://github.com/vortex-rdf/vortex-rdflib/commit/3343807ba659805b89fc713251c89149682a34e1) by @claude)
+- Read the switches without a memo (settings) ([`e9ba9f1`](https://github.com/vortex-rdf/vortex-rdflib/commit/e9ba9f15b988d6fa8b7ce36e16d53838c4a39dcc) by @claude)
+- One strategy per join tier, one hash-join kernel (planner) ([`1f254f7`](https://github.com/vortex-rdf/vortex-rdflib/commit/1f254f795eef7a8409806dab2ff9f48a4b45a37b) by @claude)
+- One way to split a literal's spelling (terms) ([`5224e4d`](https://github.com/vortex-rdf/vortex-rdflib/commit/5224e4d9d045810429c3135143ce9143ec21d0e9) by @claude)
+- Typed native decisions; kind tests decided per kind (filters) ([`57f391e`](https://github.com/vortex-rdf/vortex-rdflib/commit/57f391ec2958eb85cf3de524cfccf8ba6e81f0c0) by @claude)
+- Walk an expression off one stack (filters) ([`bcb1afa`](https://github.com/vortex-rdf/vortex-rdflib/commit/bcb1afa61402492e65d6d1ef7cf74289d71675c5) by @claude)
+- One place for the query's foreign terms (pushdown) ([`8b11e5a`](https://github.com/vortex-rdf/vortex-rdflib/commit/8b11e5a6b900faac030414abeed49f447efdbf71) by @claude)
+- One plan for a one-pattern right side (pushdown) ([`b4de4f5`](https://github.com/vortex-rdf/vortex-rdflib/commit/b4de4f5d3b20b9fcb6064cb6f934f832a503ab91) by @claude)
+- Build trace payloads only when the query is traced (trace) ([`df2f97c`](https://github.com/vortex-rdf/vortex-rdflib/commit/df2f97c740ff4ba319d5b91e18346a022f1ef9ff) by @claude)
+- Three COUNT cases, resolved once (aggregate) ([`451af27`](https://github.com/vortex-rdf/vortex-rdflib/commit/451af278d32034a858badab6332347b41ea9d53b) by @claude)
+- A frozen frame and pushed conjuncts, applied on the relation (pushdown) ([`baccfa2`](https://github.com/vortex-rdf/vortex-rdflib/commit/baccfa2bf4ed9f1713cf8dbbcc438ab770c95bd4) by @claude)
+- Typed blocks, a solver per kind, handlers as functions (pushdown) ([`21e8f2e`](https://github.com/vortex-rdf/vortex-rdflib/commit/21e8f2e55da081571f7efcf9e73a1635a99299b1) by @claude)
+- Read a VALUES table in one pass (algebra) ([`bf03d3e`](https://github.com/vortex-rdf/vortex-rdflib/commit/bf03d3ed8fe71b5876debf3b5e892b6ff67c749f) by @claude)
 
 ### Fixed
 
@@ -65,6 +149,12 @@ cancellation have modules of their own.
 - Wrap() keeps the native types; ty-clean ablation test (counters) ([`ec67338`](https://github.com/vortex-rdf/vortex-rdflib/commit/ec67338f8f6a547d62c72dd8fcad338be6fef31c) by @fothot2)
 - Import resource only where it exists (not on Windows) (counters) ([`c531eb7`](https://github.com/vortex-rdf/vortex-rdflib/commit/c531eb7d4643e42ab76fba5e14f21f094a95aadf) by @fothot2)
 - The union default graph is a set of triples ([`33bde65`](https://github.com/vortex-rdf/vortex-rdflib/commit/33bde65b0c0fdf602008b83cb3e3bbccbecc1e50) by @fothot2)
+- Follow SPARQL 1.1 where rdflib does not (filters) ([`d40c233`](https://github.com/vortex-rdf/vortex-rdflib/commit/d40c233e9a39007cc5eb6772bfd62c3b0e126f8e) by @claude)
+- See impure functions inside EXISTS bodies (filters) ([`780ec63`](https://github.com/vortex-rdf/vortex-rdflib/commit/780ec631eac76378b77615c71b6f19b6dbe67983) by @claude)
+- One trace per query, kept on its scope (trace) ([`77d19ba`](https://github.com/vortex-rdf/vortex-rdflib/commit/77d19bab0a75afed6e222e26a660a5774abdb9cc) by @claude)
+- Resolve the graph once, and merge the union by code (store) ([`e7bda4b`](https://github.com/vortex-rdf/vortex-rdflib/commit/e7bda4b45341783c6d64431ec38861322fb049fc) by @claude)
+- The FILTER over rdflib's rows keeps nothing per row (filters) ([`ab41173`](https://github.com/vortex-rdf/vortex-rdflib/commit/ab411738a64d80fe2178122024ef1903898adf67) by @claude)
+- One constant evaluator and one REGEX check for both routes (filters) ([`e4d9153`](https://github.com/vortex-rdf/vortex-rdflib/commit/e4d91534052ec72adf6c7199f518b1d1f6229897) by @claude)
 
 ## [0.4.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.3.0...v0.4.0) - 2026-10-24
 
