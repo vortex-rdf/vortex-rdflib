@@ -181,13 +181,6 @@ class VortexRdflibStore(Store):
         size = sum(len(cols[0]) for cols in union.distinct_chunks(chunks))
         return UnionFacts(has_repeats=size != quads, size=size)
 
-    def _union_view(self, context) -> bool:
-        """Whether ``context`` selects the union over every graph."""
-        try:
-            return self._graph_n3(context) is None
-        except _NoGraph:
-            return False
-
     def _graph_n3(self, context) -> str | None:
         """The native graph spelling a context selects, ``None`` for the union.
 
@@ -307,15 +300,19 @@ class VortexRdflibStore(Store):
         """
         if self.path is None:
             return
-        rows = self._quad_rows(triple_pattern, context)
-        if self._union_view(context) and self._union_has_repeats():
+        try:
+            g_n3 = self._graph_n3(context)
+        except _NoGraph:
+            return
+        rows = self._quad_rows(triple_pattern, g_n3)
+        if g_n3 is None and self._union_has_repeats():
             rows = union.one_per_triple(rows)
         yield from rows
 
-    def _quad_rows(self, triple_pattern, context=None):
+    def _quad_rows(self, triple_pattern, g_n3: str | None):
         """``((s, p, o), contexts)`` for each quad a pattern matches in the
-        graph ``context`` selects, a triple several graphs hold once per graph
-        under the union. The store streams the quads it holds rather than
+        graph named ``g_n3`` (``None``: every graph), a triple several graphs
+        hold once per graph under the union. The store streams the quads it holds rather than
         building the RDF merge of the union, which would mean a set the size
         of the result. A pattern of more than ``SETTINGS.triples_chunk_rows`` rows is
         read from the native layer in chunks of at most that many rows
@@ -329,10 +326,11 @@ class VortexRdflibStore(Store):
         that call — a scan of a file-backed store — and checks it before the
         call otherwise, every pull of a chunk races it, and a read through
         the string fallback, which takes no token, checks it before the call.
-        """
-        if self.path is None:
-            return
 
+        Each term it yields is one object per code (per spelling, on the
+        string fallback) for the whole call: the union's rows of one triple
+        are told apart by identity (:func:`union.one_per_triple`).
+        """
         s, p, o = triple_pattern
 
         # RDFLib can propagate an object binding into subject or predicate
@@ -349,10 +347,6 @@ class VortexRdflibStore(Store):
         s_n3 = self._node_to_n3(s)
         p_n3 = self._node_to_n3(p)
         o_n3 = self._node_to_n3(o)
-        try:
-            g_n3 = self._graph_n3(context)
-        except _NoGraph:
-            return
         # One named graph: every matched row is in it, so the contexts are one
         # tuple and the graph column is never read. The tuple is taken once
         # the match has a row, which proves the file holds the graph; a name
@@ -377,29 +371,18 @@ class VortexRdflibStore(Store):
         term_dict = boundary.term_dict(self)
         pattern = (s_n3, p_n3, o_n3, g_n3)
 
-        # Fully-ground pattern: no term needs materializing. In one graph it
-        # is an existence check — counting from the row selection preserves
-        # multiplicity (the quad repeated in the graph) by yielding once per
-        # match. Under the union only the graph column is read: one row per
-        # graph holding the triple, each with that graph's context.
+        # Fully-ground pattern: no term needs materializing. A store's quads
+        # are unique, so in one graph the triple is there or not: one count.
+        # Under the union it is one row, with the context of each graph that
+        # holds it (only the graph column is read).
         if s_n3 is not None and p_n3 is not None and o_n3 is not None:
             triple = (s, p, o)
-            if g_n3 is not None:
-                count = native.count_quads(*pattern)
-                if count:
-                    fixed = self._context_tuple(opened, g_n3)
-                    for _ in range(count):
-                        yield triple, fixed
-                return
-            if term_dict is not None:
-                cols = native.match_codes(s_n3, p_n3, o_n3, None)
-                if cols is not None:
-                    for code in memoryview(cols[3]).cast("Q").tolist():
-                        yield triple, self._context_of_code(opened, code)
-                    return
-            *_, graphs = native.match_columns(s_n3, p_n3, o_n3, None)
-            for g_raw in graphs:
-                yield triple, self._context_tuple(opened, g_raw)
+            if g_n3 is None:
+                graphs = self._distinct_graphs(s_n3, p_n3, o_n3)
+                if graphs:
+                    yield triple, tuple(graphs)
+            elif native.count_quads(*pattern):
+                yield triple, self._context_tuple(opened, g_n3)
             return
 
         matches = None
@@ -628,9 +611,9 @@ class VortexRdflibStore(Store):
         """Triples in ``context``: the quads of its graph, or the distinct
         triples of the union view, as ``triples()`` yields them — the store's
         quads when no triple is in two graphs, else the union's size
-        :meth:`_read_union` counted, or, in a layout without codes, a count
-        of the union's rows, read once. A context that names no graph the
-        file can hold has none.
+        :meth:`_read_union` counted, or, in a layout without codes, the count
+        :meth:`_union_size_by_spelling` makes, read once. A context that names
+        no graph the file can hold has none.
         """
         if self.path is None:
             return 0
@@ -643,10 +626,25 @@ class VortexRdflibStore(Store):
             if not facts.has_repeats:
                 return len(self._store())
             if facts.size is None:
-                size = sum(1 for _ in self.triples((None, None, None)))
+                size = self._union_size_by_spelling()
                 facts = self._opened().union = UnionFacts(has_repeats=True, size=size)
             return facts.size
         return boundary.native(self).count_quads(None, None, None, g_n3)
+
+    def _union_size_by_spelling(self) -> int:
+        """The union's distinct triples, in a layout without codes: one match
+        of every quad, as spellings, whose rows of one triple are adjacent
+        (every sort order a store holds ends in the graph), counted by runs
+        of equal ``(s, p, o)`` spellings — no term is built."""
+        subjects, predicates, objects, _ = boundary.native(self).match_columns(
+            None, None, None, None
+        )
+        size, last = 0, None
+        for key in zip(subjects, predicates, objects, strict=True):
+            if key != last:
+                size += 1
+                last = key
+        return size
 
     def add(self, triple, context=None, quoted=False):
         raise NotImplementedError("VortexRdflibStore is read-only")

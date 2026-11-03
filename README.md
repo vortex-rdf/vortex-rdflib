@@ -72,7 +72,9 @@ for row in dataset.query("""
 A plain `Graph(store=VortexRdflibStore(path))` — as in the example above — is
 the view over the **whole file**, every graph included. Like the union
 default graph of a `Dataset`, it is a set of triples — a triple in two graphs
-is yielded once, with both graphs as its contexts. A match over every graph
+is yielded once, with both graphs as its contexts. Triples are the file's own:
+two spellings rdflib reads as one value, such as `"042"^^xsd:integer` and
+`"42"^^xsd:integer`, are two triples, as `len()` and SPARQL count them. A match over every graph
 returns a triple's quads next to each other (every sort order a store holds
 ends in the graph), so the store keeps one row of each run as it streams them
 (`vortex_rdflib.union`). A file where no triple is in two graphs — a file of

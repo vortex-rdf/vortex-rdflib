@@ -48,12 +48,22 @@ def distinct_chunks(chunks: Iterable[tuple], key=TRIPLE) -> Iterator[tuple]:
 
 
 def one_per_triple(rows: Iterable[tuple]) -> Iterator[tuple]:
-    """``(triple, contexts)`` rows whose equal triples are adjacent, as one row
-    per triple carrying the contexts of all its rows — what an rdflib store's
-    ``triples()`` yields for the union."""
+    """``(triple, contexts)`` rows whose rows of one triple are adjacent, as
+    one row per triple carrying the contexts of all its rows — what an rdflib
+    store's ``triples()`` yields for the union.
+
+    Rows are of one triple when their terms are the same objects. The store
+    hands out one term object per code — per spelling, on a layout without
+    codes — for the length of a ``triples()`` call
+    (``VortexRdflibStore._quad_rows``), so this is the triple of codes the
+    union is a set of, as ``len()`` and the pushdown count it: two codes
+    rdflib reads as equal terms (``"042"^^xsd:integer`` and
+    ``"42"^^xsd:integer``) stay two triples."""
     triple, first, merged = None, (), None
+    s = p = o = None
     for row_triple, row_contexts in rows:
-        if row_triple == triple:
+        rs, rp, ro = row_triple
+        if ro is o and rp is p and rs is s:
             if merged is None:
                 merged = list(first)
             merged.extend(row_contexts)
@@ -61,6 +71,7 @@ def one_per_triple(rows: Iterable[tuple]) -> Iterator[tuple]:
         if triple is not None:
             yield triple, first if merged is None else tuple(merged)
         triple, first, merged = row_triple, row_contexts, None
+        s, p, o = rs, rp, ro
     if triple is not None:
         yield triple, first if merged is None else tuple(merged)
 
