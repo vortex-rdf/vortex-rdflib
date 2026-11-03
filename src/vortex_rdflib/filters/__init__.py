@@ -51,8 +51,8 @@ from rdflib.plugins.sparql.evalutils import _ebv as rdflib_ebv
 from rdflib.plugins.sparql.sparql import FrozenBindings
 
 from ..settings import SETTINGS
-from ..terms import TermView, parse_spelling
-from . import compiler, exprs, native, values
+from ..terms import TermView, parse_spelling, view_of
+from . import compiler, exprs, native, values  # noqa: F401 - filters.values is public
 from .native import FilterCodes, IriIn, KindRange
 from .values import UNKNOWN
 
@@ -266,17 +266,17 @@ def _fast_route(store, fast, views: dict) -> Callable[[tuple], Any]:
     ``views``, a dictionary code decoded and a negative (query-constant) one
     taken from the query's foreign terms; an unbound ``None`` stays unbound."""
 
-    def view_of(code):
+    def view_at(code):
         view = views.get(code)
         if view is None:
             if code < 0:
-                view = views[code] = values.constant_view(store._terms().foreign[code])
+                view = views[code] = view_of(store._terms().foreign[code])
             else:
                 view = views[code] = parse_spelling(store._spelling(code))
         return view
 
     def answer(key: tuple):
-        return fast(tuple(None if code is None else view_of(code) for code in key))
+        return fast(tuple(None if code is None else view_at(code) for code in key))
 
     return answer
 
@@ -325,7 +325,7 @@ def constant_predicate(conjunct: Conjunct) -> Callable[[Any], bool]:
         if r is None:
             r = UNKNOWN
             if fast is not None:
-                r = fast((values.constant_view(term),))
+                r = fast((view_of(term),))
             if r is UNKNOWN:
                 r = conjunct.generic({var: term})
             memo[term] = r
@@ -341,7 +341,7 @@ def solution_filter(store, node, ctx) -> Callable[[Any], bool]:
     route solved its pattern.
 
     Each solution is tested from its own terms, each read as a data term is
-    (:func:`values.constant_view`): nothing is kept per solution, so the
+    (:func:`~vortex_rdflib.terms.view_of`): nothing is kept per solution, so the
     query's memory does not grow with the rows it filters. A typed literal
     rdflib normalized as it was decoded (``"042"^^xsd:integer`` reads
     ``"42"``) is read as rdflib wrote it. A conjunct holding an EXISTS is
@@ -381,7 +381,7 @@ def _solution_test(conjunct: Conjunct, variables: tuple) -> Callable[[Any], bool
         terms = [bound.get(var) for var in variables]
         r = UNKNOWN
         if fast is not None:
-            r = fast(tuple(None if t is None else values.constant_view(t) for t in terms))
+            r = fast(tuple(None if t is None else view_of(t) for t in terms))
         if r is UNKNOWN:
             r = conjunct.generic(
                 {var: t for var, t in zip(variables, terms, strict=True) if t is not None}

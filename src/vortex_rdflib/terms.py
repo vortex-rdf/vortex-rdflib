@@ -145,6 +145,25 @@ def canonical_spelling(node) -> str:
     raise TypeError(f"not an RDF term: {node!r}")
 
 
+def view_of(node) -> TermView:
+    """An rdflib term as the term view its stored spelling parses to
+    (``parse_spelling(canonical_spelling(node))``, built directly): a
+    literal's lexical form as rdflib left it, well-typed or not, its
+    language tag lowercased, ``xsd:string`` dropped."""
+    if isinstance(node, URIRef):
+        return TermView(IRI, str(node))
+    if isinstance(node, BNode):
+        return TermView(BLANK, str(node))
+    if isinstance(node, Literal):
+        if node.language:
+            return TermView(LITERAL, str(node), lang=node.language.lower())
+        datatype = node.datatype
+        if datatype is None or str(datatype) == _XSD_STRING:
+            return TermView(LITERAL, str(node))
+        return TermView(LITERAL, str(node), dt=str(datatype))
+    raise TypeError(f"not an RDF term: {node!r}")
+
+
 #: The form of every IRI vortex-rdf parses: a scheme, then none of the
 #: characters no IRI holds.
 _IRI_FORM = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*:[^\x00-\x20<>"{}|^`\\]*')

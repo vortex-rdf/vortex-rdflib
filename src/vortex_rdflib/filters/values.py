@@ -22,7 +22,7 @@ from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.plugins.sparql.sparql import SPARQLError
 from rdflib.term import Literal, URIRef
 
-from ..terms import LITERAL, TermView, canonical_spelling, parse_spelling
+from ..terms import LITERAL, TermView, view_of
 from .exprs import VAR_LIKE, expr_vars
 
 
@@ -458,12 +458,6 @@ def literal_value(view: TermView):
     return None
 
 
-def constant_view(node) -> TermView:
-    """A query constant (an rdflib term) as a term view, read as a data term
-    is: its lexical form as rdflib's parser left it, well-typed or not."""
-    return parse_spelling(canonical_spelling(node))
-
-
 def string_like(view) -> bool:
     """A string literal SPARQL's string functions accept: simple, xsd:string
     or language-tagged."""
@@ -665,7 +659,8 @@ def regex_spec(node, consts: dict):
     flags = None if node.flags is None else fold(node.flags, consts)
     if pattern is None or (node.flags is not None and flags is None):
         return None
-    if not _simple_term(pattern) or (flags is not None and not _simple_term(flags)):
+    operands = (pattern,) if flags is None else (pattern, flags)
+    if not all(isinstance(term, Literal) and simple_literal(view_of(term)) for term in operands):
         return ERROR
     flags = "" if flags is None else str(flags)
     if not all(flag in _REGEX_FLAGS for flag in flags):
@@ -677,10 +672,6 @@ def regex_spec(node, consts: dict):
     if regex is ERROR:
         return ERROR
     return RegexSpec(str(pattern), flags, regex)
-
-
-def _simple_term(term) -> bool:
-    return isinstance(term, Literal) and simple_literal(constant_view(term))
 
 
 def _xpath_pattern(pattern: str, flags: str) -> str:

@@ -41,7 +41,15 @@ from rdflib.term import Literal, URIRef
 from vortex_rdf import U64Column
 
 from .. import boundary, trace
-from ..terms import BLANK, IRI, LITERAL, KindRanges, canonical_spelling, unparseable_iri
+from ..terms import (
+    BLANK,
+    IRI,
+    LITERAL,
+    KindRanges,
+    canonical_spelling,
+    unparseable_iri,
+    view_of,
+)
 from . import values
 from .exprs import VAR_LIKE
 from .values import FLOAT, NUMERIC_TYPES, RDF_NIL
@@ -272,17 +280,6 @@ def _call_on(node, name: str, var) -> bool:
     return isinstance(node, CompValue) and node.name == name and node.arg == var
 
 
-def _string_literal(term) -> bool:
-    """A string literal SPARQL's string functions take (:func:`values.string_like`)."""
-    return term is not None and values.string_like(values.constant_view(term))
-
-
-def _string_constant(term) -> bool:
-    """A simple literal: what the native string predicates take as their
-    argument (:func:`values.simple_literal`)."""
-    return term is not None and values.simple_literal(values.constant_view(term))
-
-
 #: The string functions with a native kind, by rdflib's builtin name.
 _STRING_FUNCTIONS = {
     "Builtin_CONTAINS": "contains",
@@ -318,7 +315,7 @@ def _string_function_shape(expr, var, consts) -> FilterCodes | None:
     never matches either. Both stay with the Python routes."""
     text = _text_shape(expr.arg1, var)
     constant = _constant_term(expr.arg2, consts)
-    if text is None or not _string_literal(constant):
+    if text is None or constant is None or not values.string_like(view_of(constant)):
         return None
     case, as_str = text
     language = constant.language
@@ -417,12 +414,12 @@ def native_shape(expr, var, consts: dict) -> IriIn | FilterCodes | None:
         # A range is a simple literal (§17.4.3.12); any other is an error
         # for every value, which the Python routes answer.
         rng = _constant_term(expr.arg2, consts)
-        if not _string_constant(rng):
+        if rng is None or not values.simple_literal(view_of(rng)):
             return None
         return FilterCodes("lang_matches", str(rng)) if _LANG_RANGE.fullmatch(str(rng)) else None
     if name == "Builtin_STRSTARTS" and _call_on(expr.arg1, "Builtin_STR", var):
         prefix = _constant_term(expr.arg2, consts)
-        if _string_constant(prefix):
+        if prefix is not None and values.simple_literal(view_of(prefix)):
             return FilterCodes("str_prefix", str(prefix), as_str=True)
     if name in _STRING_FUNCTIONS:
         return _string_function_shape(expr, var, consts)
@@ -446,7 +443,9 @@ def native_shape(expr, var, consts: dict) -> IriIn | FilterCodes | None:
                 return FilterCodes("datatype", str(datatype))
             if _call_on(call, "Builtin_LANG", var):
                 tag = _constant_term(other, consts)
-                return FilterCodes("lang", str(tag)) if _string_constant(tag) else None
+                if tag is None or not values.simple_literal(view_of(tag)):
+                    return None
+                return FilterCodes("lang", str(tag))
         iri = _iri_equality(left, right, var, consts)
         if iri is not None:
             return iri
@@ -466,7 +465,7 @@ def native_shape(expr, var, consts: dict) -> IriIn | FilterCodes | None:
         not isinstance(constant, Literal)
         or str(constant.datatype) not in NUMERIC_TYPES
         or str(constant.datatype) == FLOAT
-        or values.numeric_value(values.constant_view(constant)) is None
+        or values.numeric_value(view_of(constant)) is None
     ):
         return None
     return FilterCodes(kind, canonical_spelling(constant))

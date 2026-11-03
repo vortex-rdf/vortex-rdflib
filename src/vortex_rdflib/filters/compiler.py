@@ -10,7 +10,7 @@ from collections.abc import Callable
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import Literal, URIRef
 
-from ..terms import BLANK, IRI, LITERAL, TermView
+from ..terms import BLANK, IRI, LITERAL, TermView, view_of
 from . import exprs, values
 from .exprs import VAR_LIKE
 from .values import (
@@ -20,7 +20,6 @@ from .values import (
     UNKNOWN,
     XSD_BOOLEAN,
     XSD_STRING,
-    constant_view,
 )
 
 _KIND_LEAVES = frozenset({*exprs.KIND_BUILTINS, "Builtin_BOUND"})
@@ -52,7 +51,7 @@ def _view(term):
     """A context-bound term's view; a value no view holds leaves the
     conjunct to rdflib's evaluator."""
     try:
-        return constant_view(term)
+        return view_of(term)
     except TypeError as error:
         raise _NotFast from error
 
@@ -64,7 +63,7 @@ def _folded(node, consts: dict):
     value = values.fold(node, consts)
     if value is None:
         raise _NotFast
-    return value if value is ERROR else constant_view(value)
+    return value if value is ERROR else view_of(value)
 
 
 def _compile(node, slots: dict, consts: dict):
@@ -81,7 +80,7 @@ def _compile(node, slots: dict, consts: dict):
         term = consts.get(node)
         return _const(None if term is None else _view(term))
     if isinstance(node, (Literal, URIRef)):
-        return _const(constant_view(node))
+        return _const(view_of(node))
     if not isinstance(node, CompValue):
         raise _NotFast
     if not any(v in slots for v in exprs.expr_vars(node)):
