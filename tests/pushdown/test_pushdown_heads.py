@@ -104,7 +104,7 @@ def test_an_ask_over_one_pattern_plans_without_generator_frames(graph):
     mostly fixed cost: its planning builds the block and the pattern without
     a generator expression, whose every step is a Python frame."""
     import cProfile
-    import pstats
+    from types import CodeType
 
     from rdflib.plugins.sparql import prepareQuery
 
@@ -117,9 +117,11 @@ def test_an_ask_over_one_pattern_plans_without_generator_frames(graph):
     profile.disable()
     assert answer is True
     generators = [
-        f"{path.split('vortex_rdflib/')[-1]}:{line}"
-        for (path, line, name) in pstats.Stats(profile).stats
-        if "vortex_rdflib" in path and name == "<genexpr>"
+        f"{entry.code.co_filename.split('vortex_rdflib/')[-1]}:{entry.code.co_firstlineno}"
+        for entry in profile.getstats()
+        if isinstance(entry.code, CodeType)
+        and "vortex_rdflib" in entry.code.co_filename
+        and entry.code.co_name == "<genexpr>"
     ]
     assert generators == []
 
