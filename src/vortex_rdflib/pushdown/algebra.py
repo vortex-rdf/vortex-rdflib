@@ -179,10 +179,10 @@ class Minus(Block):
 
 @dataclass(frozen=True, slots=True, eq=False)
 class Values(Block):
-    """An inline VALUES table: its ``rows``, a dict of each row's bound
-    variables."""
+    """An inline VALUES table: its ``rows``, each a tuple of its terms in
+    ``vars`` order, ``None`` for an UNDEF."""
 
-    rows: list
+    rows: tuple
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -248,29 +248,32 @@ def block(node) -> Block:
         nullable |= frozenset(right.vars) - frozenset(left.bound_vars)
         return LeftJoin(node, mentioned, bound, nullable, left, right)
     if name == "ToMultiSet" and getattr(node.p, "name", None) == "values":
-        rows = node.p.res
-        found, undef = _values_vars(rows)
-        return Values(node, found, found, frozenset(undef), rows)
+        found, rows, nullable = _values_table(node.p.res)
+        return Values(node, found, found, nullable, rows)
     raise NotImplementedError
 
 
-def _values_vars(rows) -> tuple[tuple, set]:
-    """A VALUES table's variables, in first-seen order, and those some row
-    leaves unbound: ``UNDEF`` there — rdflib's plain string, where a bound
-    value is a term — or no entry at all. One pass, read once per table."""
+def _values_table(rows) -> tuple[tuple, tuple, frozenset]:
+    """A VALUES table as ``(variables, rows, nullable)``: its variables, in
+    first-seen order; each row a tuple of its terms in that order
+    (:func:`_cell`); and the variables some row leaves unbound."""
     found: dict = {}
-    undef: set = set()
     for row in rows:
-        for var, value in row.items():
+        for var in row:
             if var not in found:
                 found[var] = None
-            if value.__class__ is str and value == "UNDEF":
-                undef.add(var)
-    width = len(found)
-    for row in rows:
-        if len(row) < width:
-            undef.update(var for var in found if var not in row)
-    return tuple(found), undef
+    variables = tuple(found)
+    table = tuple([tuple([_cell(row.get(var)) for var in variables]) for row in rows])
+    nullable = frozenset(
+        [var for i, var in enumerate(variables) if any([row[i] is None for row in table])]
+    )
+    return variables, table, nullable
+
+
+def _cell(value):
+    """A VALUES row's term for a variable: ``None`` for ``UNDEF`` — rdflib's
+    plain string, where a bound value is a term — or for no entry at all."""
+    return None if value.__class__ is str and value == "UNDEF" else value
 
 
 def _scoped_vars(node: Block, scope: _GraphScope) -> tuple:

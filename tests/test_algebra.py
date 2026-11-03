@@ -4,7 +4,7 @@ kind mentions, binds and may leave unbound, whether its rows carry a
 
 import pytest
 from rdflib.plugins.sparql import prepareQuery
-from rdflib.term import Variable
+from rdflib.term import Literal, Variable
 
 import vortex_rdflib.pushdown as pd
 from vortex_rdflib import settings
@@ -104,3 +104,13 @@ def test_every_kind_of_block_has_a_solver():
 
 def test_the_package_exports_the_registration_functions():
     assert pd.__all__ == ["register_sparql_pushdown", "unregister_sparql_pushdown"]
+
+
+def test_values_rows_are_tuples_in_variable_order():
+    """A VALUES table's rows are tuples of its terms in ``vars`` order, an
+    UNDEF unbound (``None``)."""
+    node = _where("SELECT * { VALUES (?a ?b) { (1 2) (3 UNDEF) } }")
+    assert isinstance(node, pd.algebra.Values)
+    assert node.vars == (A, B)
+    assert node.rows == ((Literal(1), Literal(2)), (Literal(3), None))
+    assert node.nullable == {B}

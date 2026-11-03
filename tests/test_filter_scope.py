@@ -1075,6 +1075,24 @@ VALUES_SHAPES = [
     ),
 ]
 
+#: VALUES rows with an UNDEF beside a term the dictionary lacks: joined with a
+#: BGP, under an OPTIONAL, and filtered.
+VALUES_UNDEF_SHAPES = [
+    pytest.param(
+        'SELECT * WHERE { VALUES (?s ?o) { (ex:nowhere UNDEF) (UNDEF "a") } ?s ex:p ?o }',
+        id="values-undef-unknown-join",
+    ),
+    pytest.param(
+        "SELECT * WHERE { VALUES (?s ?x) { (ex:nowhere 1) (UNDEF 2) } OPTIONAL { ?s ex:p ?o } }",
+        id="values-undef-unknown-optional",
+    ),
+    pytest.param(
+        """SELECT * WHERE { VALUES (?s ?o) { (ex:nowhere UNDEF) (UNDEF "a") }
+        ?s ex:p ?o FILTER (?o != "b") }""",
+        id="values-undef-unknown-filter",
+    ),
+]
+
 
 @pytest.fixture(scope="module")
 def quad_files(tmp_path_factory):
@@ -1181,6 +1199,12 @@ def test_an_exists_re_entered_with_a_row_sees_only_its_filters_bindings(dataset,
 def test_a_filter_on_a_values_variable_answers_as_rdflib_does(dataset, sparql):
     with_pushdown, without_pushdown = both_ways(dataset, PREFIX + sparql)
     assert with_pushdown == SPEC_ANSWERS.get(sparql, without_pushdown)
+
+
+@pytest.mark.parametrize("sparql", VALUES_UNDEF_SHAPES)
+def test_values_undef_and_unknown_terms_through_joins(dataset, sparql):
+    with_pushdown, without_pushdown = both_ways(dataset, PREFIX + sparql)
+    assert with_pushdown == without_pushdown
 
 
 _BY_ID = {param.id: param for param in SHAPES + GROUP_SHAPES + REENTRY_SHAPES + VALUES_SHAPES}

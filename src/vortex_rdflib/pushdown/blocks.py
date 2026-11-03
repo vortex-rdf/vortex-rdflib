@@ -139,24 +139,25 @@ def _solve_values(ctx, store, node: algebra.Values, frame: _Frame) -> Relation:
     the table's own
     terms (:func:`filters.constant_predicate`)."""
     variables, per_var = node.vars, frame.pushed.per_var
-    schema = tuple(v for v in variables if ctx[v] is None)
-    bound = {v: ctx[v] for v in variables if ctx[v] is not None}
+    positions = [i for i, v in enumerate(variables) if ctx[v] is None]
+    bound = [(i, ctx[v]) for i, v in enumerate(variables) if ctx[v] is not None]
     rows_in = [
         row
         for row in node.rows
-        if not any(row.get(v, "UNDEF") != "UNDEF" and row[v] != term for v, term in bound.items())
+        if not any(row[i] is not None and row[i] != term for i, term in bound)
     ]
-    terms = list(
-        dict.fromkeys(row[v] for row in rows_in for v in schema if row.get(v, "UNDEF") != "UNDEF")
-    )
+    terms = list(dict.fromkeys(row[i] for row in rows_in for i in positions if row[i] is not None))
     codes = dict(zip(terms, _constant_codes(store, terms), strict=True))
     if per_var:
-        tests = [(v, filters.constant_predicate(c)) for v in schema for c in per_var.get(v, ())]
-        rows_in = [row for row in rows_in if all(test(row[v]) for v, test in tests)]
-    rows = [
-        tuple(None if row.get(v, "UNDEF") == "UNDEF" else codes[row[v]] for v in schema)
-        for row in rows_in
-    ]
+        # The conjuncts pushed down name variables bound in every row.
+        tests = [
+            (i, filters.constant_predicate(c))
+            for i in positions
+            for c in per_var.get(variables[i], ())
+        ]
+        rows_in = [row for row in rows_in if all(test(row[i]) for i, test in tests)]
+    rows = [tuple(None if row[i] is None else codes[row[i]] for i in positions) for row in rows_in]
+    schema = tuple(variables[i] for i in positions)
     nullable = frozenset(v for i, v in enumerate(schema) if any(row[i] is None for row in rows))
     return Relation(schema, None, rows, len(rows), nullable)
 
