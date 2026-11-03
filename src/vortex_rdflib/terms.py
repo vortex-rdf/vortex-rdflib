@@ -226,6 +226,13 @@ class KindRanges:
         return ""
 
 
+def is_range(keep) -> bool:
+    """Whether a native keep — what narrows a native match at one position —
+    is a code range, ``(lo, hi)`` half-open (a kind's, :class:`KindRanges`),
+    rather than a column of ascending codes."""
+    return isinstance(keep, tuple)
+
+
 #: xsd:integer, and its suffix after a literal's closing quote.
 XSD_INTEGER = URIRef("http://www.w3.org/2001/XMLSchema#integer")
 INTEGER_SUFFIX = f"^^<{XSD_INTEGER}>"

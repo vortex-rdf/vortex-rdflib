@@ -49,7 +49,7 @@ class Relation:
     schema lacks the variables only those patterns bind. Such a relation
     goes to :func:`_yield_solutions` alone.
 
-    ``applied`` holds the ids of the FILTER conjuncts every row passes: the
+    ``applied`` holds the FILTER conjuncts every row passes: the
     tuple conjuncts a BGP turned into restrictions of its patterns
     (:func:`_specialize_tuple_conjuncts`), reported up through the joins,
     so the FILTER that pushed them evaluates them no more.

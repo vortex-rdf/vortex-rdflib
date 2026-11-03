@@ -269,7 +269,7 @@ def _solve_filter(ctx, store, node: algebra.Filter, frame: _Frame) -> Relation:
             stream=frame.stream and not plan.exists,
         ),
     )
-    residual = [conjunct for conjunct in residual if id(conjunct) not in rel.applied]
+    residual = [conjunct for conjunct in residual if conjunct not in rel.applied]
     if residual:
         if rel.rest and any(v not in rel.schema for c in residual for v in c.vars):
             raise NotImplementedError

@@ -9,12 +9,14 @@ code passed, failed or undecided; the undecided ones go on to the Python
 routes (:func:`filters.evaluate_column`).
 
 Two kinds of decision never reach ``filter_codes``: a test of the term's
-kind whose true kinds run together (``isIRI``, ``isIRI(?v) || isBlank(?v)``)
-is one code range (:class:`KindRange`), and an IRI equality (``?v = <iri>``,
-``sameTerm``, ``?v IN (<iri>, ...)``) the codes ``encode_many`` gives its
-IRIs (:class:`IriIn`). Both are keeps on the native match (:func:`keep_of`,
-:func:`native_restriction`), and both are decided here too when a
-specialized conjunct meets codes directly (:func:`keep_decides`).
+kind alone is decided by the kinds it holds for (:class:`Kinds`), each code
+by its kind's range, and an IRI equality (``?v = <iri>``, ``sameTerm``,
+``?v IN (<iri>, ...)``) by the codes the dictionary gives its IRIs
+(:class:`IriIn`). Both are keeps on the native match too — kinds whose
+codes run together are one code range — (:func:`keep_of`,
+:func:`native_restriction`). A conjunct's decision splits the codes a query
+produced into those it passes and those it leaves undecided
+(``split``).
 
 Each native kind reads some term kinds only, and rdflib's answer for the
 others needs no native call: the literal predicates fail every IRI and blank
@@ -34,7 +36,7 @@ import re
 from bisect import bisect_left
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import Literal, URIRef
@@ -47,6 +49,7 @@ from ..terms import (
     LITERAL,
     KindRanges,
     canonical_spelling,
+    is_range,
     unparseable_iri,
     view_of,
 )
@@ -70,21 +73,25 @@ class FilterCodes(NamedTuple):
     #: The text is ``STR(?v)`` rather than ``?v`` itself.
     as_str: bool = False
 
+    def split(self, store, codes: Collection[int]) -> tuple[set, list]:
+        """The codes it passes and the codes it leaves undecided
+        (:func:`evaluate`)."""
+        return evaluate(store, self, codes)
+
 
 @dataclass(frozen=True, slots=True)
 class IriIn:
-    """IRI equality as a keep on the native match: true for exactly the IRIs
+    """IRI equality, a keep on the native match: true for exactly the IRIs
     ``spellings`` spell (``?v = <iri>``, ``sameTerm``, ``?v IN (<iri>, ...)``)."""
 
     spellings: tuple[str, ...]
+    #: Its name in the query trace.
+    kind: ClassVar[str] = "iri_in"
 
-
-@dataclass(frozen=True, slots=True)
-class KindRange:
-    """A test of a term's kind as a keep on the native match: true for the
-    terms of ``kinds``, a run of :data:`KIND_ORDER`, so one code range."""
-
-    kinds: frozenset[str]
+    def split(self, store, codes: Collection[int]) -> tuple[set, list]:
+        """The codes it passes and the codes it leaves undecided
+        (:func:`keep_decides`)."""
+        return keep_decides(store, self, codes)
 
 
 #: The term kinds in the order their codes run (literals, IRIs, blank nodes:
@@ -92,15 +99,32 @@ class KindRange:
 KIND_ORDER = (LITERAL, IRI, BLANK)
 
 
-def kind_range(kinds: frozenset[str]) -> KindRange | None:
-    """The keep a set of term kinds is, when the kinds are a run of
-    :data:`KIND_ORDER`: their codes are one range. ``None`` for kinds that
-    do not run together, for none, and for a set holding ``""`` — the codes
-    of no term (the empty graph name), which no kind's range holds."""
-    if not kinds or "" in kinds:
-        return None
-    positions = sorted(KIND_ORDER.index(kind) for kind in kinds)
-    return KindRange(kinds) if positions[-1] - positions[0] + 1 == len(positions) else None
+@dataclass(frozen=True, slots=True)
+class Kinds:
+    """A test of a term's kind alone, decided by the kinds it holds for —
+    ``""`` among them when it holds for no term, the codes in no kind's
+    range (the empty graph name) — each code by the range it falls in, none
+    decoded."""
+
+    kinds: frozenset[str]
+    #: Its name in the query trace, as a keep.
+    kind: ClassVar[str] = "kind_range"
+
+    @property
+    def one_range(self) -> bool:
+        """Whether the kinds are a run of :data:`KIND_ORDER`, so their codes
+        are one range: a keep on the native match. Not for kinds apart, for
+        none, or with ``""`` among them — the codes of no term, which no
+        kind's range holds."""
+        if not self.kinds or "" in self.kinds:
+            return False
+        positions = sorted(KIND_ORDER.index(kind) for kind in self.kinds)
+        return positions[-1] - positions[0] + 1 == len(positions)
+
+    def split(self, store, codes: Collection[int]) -> tuple[set, list]:
+        """The codes of its kinds; none is left undecided."""
+        kind_of = store._file.kind_ranges.kind_of
+        return {code for code in codes if kind_of(code) in self.kinds}, []
 
 
 #: The string functions; their text is ``?v`` under rdflib's ``string()``
@@ -108,12 +132,12 @@ def kind_range(kinds: frozenset[str]) -> KindRange | None:
 STRING_KINDS = frozenset({"regex", "contains", "strstarts", "strends"})
 
 
-def keep_of(store, keep: IriIn | KindRange):
+def keep_of(store, keep: IriIn | Kinds):
     """The keep a native match takes for ``keep``: the code range of its
-    kinds, or the ascending codes of its IRIs (:func:`boundary.codes_of`; an
-    IRI the dictionary lacks or the native parser refuses has no code, as it
-    can match no stored term)."""
-    if isinstance(keep, KindRange):
+    kinds (:attr:`Kinds.one_range`), or the ascending codes of its IRIs
+    (:func:`boundary.codes_of`; an IRI the dictionary lacks or the native
+    parser refuses has no code, as it can match no stored term)."""
+    if isinstance(keep, Kinds):
         ranges = store._file.kind_ranges
         bounds = [ranges.range(kind) for kind in keep.kinds]
         return min(lo for lo, _ in bounds), max(hi for _, hi in bounds)
@@ -121,7 +145,7 @@ def keep_of(store, keep: IriIn | KindRange):
     return U64Column(sorted({code for code in found if code is not None}))
 
 
-def keep_decides(store, keep: IriIn | KindRange, codes: Collection[int]) -> tuple[set, list]:
+def keep_decides(store, keep: IriIn, codes: Collection[int]) -> tuple[set, list]:
     """Of ``codes``, the set ``keep`` admits and the codes of no term (the
     empty graph name, a code past the dictionary's end, a negative one),
     left undecided for the Python routes; every other code fails."""
@@ -495,8 +519,8 @@ def intersect_keeps(keeps: list):
     """The intersection of native keeps: ranges intersect as ranges, code
     columns (ascending, unique) through the native merge join, and a range
     over a column slices it."""
-    ranges = [keep for keep in keeps if isinstance(keep, tuple)]
-    columns = sorted((keep for keep in keeps if not isinstance(keep, tuple)), key=len)
+    ranges = [keep for keep in keeps if is_range(keep)]
+    columns = sorted((keep for keep in keeps if not is_range(keep)), key=len)
     if ranges:
         lo = max(lo for lo, _ in ranges)
         hi = max(lo, min(hi for _, hi in ranges))
@@ -519,7 +543,7 @@ def intersect_keeps(keeps: list):
 def keep_member(keep) -> Callable[[int], bool]:
     """A native keep as a test of one code, for rows that did not come
     through a keep-narrowed native match."""
-    if isinstance(keep, tuple):
+    if is_range(keep):
         lo, hi = keep
         return lambda code: lo <= code < hi
     view = memoryview(keep).cast("Q")

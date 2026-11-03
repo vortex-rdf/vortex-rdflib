@@ -11,7 +11,7 @@ from vortex_rdf import U64Column
 
 from .. import boundary, filters, trace, union
 from ..settings import SETTINGS
-from ..terms import unparseable_iri
+from ..terms import is_range, unparseable_iri
 from . import relation, tracing
 from .algebra import _VAR_LIKE
 from .relation import Relation
@@ -105,7 +105,7 @@ def _pattern_key(pat: Pattern) -> tuple:
         return pat.n3
     narrowing = tuple(
         sorted(
-            (position, ("range", *keep) if isinstance(keep, tuple) else ("codes", keep))
+            (position, ("range", *keep) if is_range(keep) else ("codes", keep))
             for position, keep in nkeep.items()
         )
     )
@@ -351,7 +351,7 @@ def _push_native_restrictions(store, pat: Pattern, var_preds) -> dict:
                 )
         if rest:
             residual[var] = rest
-    if any(not isinstance(k, tuple) and not len(k) for k in pat.nkeep.values()):
+    if any(not is_range(k) and not len(k) for k in pat.nkeep.values()):
         pat.unsatisfiable = True
     return residual
 
@@ -385,7 +385,7 @@ def _restrict_pattern(store, pat: Pattern, var_preds) -> None:
                 {
                     "variable": str(var),
                     "mode": "match",
-                    **tracing._restriction_counts(conjuncts),
+                    **filters.restriction_counts(conjuncts),
                     "distinct_binding_count": distinct_binding_count,
                     "allowed_binding_count": len(allowed),
                     "elapsed_ns": elapsed(),

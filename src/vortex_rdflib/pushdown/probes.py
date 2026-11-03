@@ -9,8 +9,8 @@ from itertools import islice
 
 from .. import boundary, filters, trace, union
 from ..settings import SETTINGS
-from ..terms import canonical_spelling, unparseable_iri
-from . import matching, tracing
+from ..terms import canonical_spelling, is_range, unparseable_iri
+from . import matching
 from .matching import Pattern
 
 
@@ -289,7 +289,7 @@ def _probe_join(
     probe_keep, tests = {}, []
     for position, spec in pat.nkeep.items():
         if position in needed:
-            if isinstance(spec, tuple):
+            if is_range(spec):
                 probe_keep[position] = spec
             else:
                 tests.append((position, filters.native.keep_member(spec)))
@@ -364,7 +364,7 @@ def _probe_join(
                 mode="probe",
                 input_rows=restriction_input_rows,
                 output_rows=len(out),
-                **tracing._restriction_counts(conjuncts),
+                **filters.restriction_counts(conjuncts),
                 distinct_binding_count=len(values),
                 allowed_binding_count=len(allowed),
                 elapsed_ns=elapsed_ns,

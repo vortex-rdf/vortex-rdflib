@@ -42,11 +42,11 @@ class _Pushed:
     views: dict | None = None
 
     def without(self, applied: frozenset) -> "_Pushed":
-        """These conjuncts but the tuple conjuncts ``applied`` names (by
-        id): another block of the group has applied them already."""
+        """These conjuncts but the tuple conjuncts ``applied`` holds: another
+        block of the group has applied them already."""
         if not applied or not self.tuples:
             return self
-        return replace(self, tuples=tuple(c for c in self.tuples if id(c) not in applied))
+        return replace(self, tuples=tuple(c for c in self.tuples if c not in applied))
 
 
 #: No conjunct pushed.
@@ -350,7 +350,7 @@ def _join_incremental_bgp(
     tuples, views = pushed.tuples, pushed.views
     # The ids of the tuple conjuncts a completed step specialized: every row
     # the BGP yields passes them (``Relation.applied``).
-    applied: set[int] = set()
+    applied: set[filters.Conjunct] = set()
 
     clock = trace.stopwatch()
     if any(pat.unsatisfiable for pat in patterns):
@@ -460,8 +460,8 @@ def _join_incremental_bgp(
         rel = joined
         # The step completed: the tuple conjuncts it specialized are applied.
         if specialized:
-            applied.update(id(conjunct) for conjunct, _, _ in specialized)
-            tuples = tuple(c for c in tuples if id(c) not in applied)
+            applied.update(conjunct for conjunct, _, _ in specialized)
+            tuples = tuple(c for c in tuples if c not in applied)
         _trace_join_step(step, rel, put_back, elapsed())
         put_back.clear()
         order.append(pat.index)
@@ -540,7 +540,7 @@ def _specialize_tuple_conjuncts(store, pat: Pattern, rel: Relation, tuples) -> l
                     "bgp_tuple_specialized",
                     original_pattern_index=pat.index,
                     variable=str(var),
-                    native_predicate=proxy.native_kind(),
+                    native_predicate=None if proxy.decision is None else proxy.decision.kind,
                 )
     return specialized
 

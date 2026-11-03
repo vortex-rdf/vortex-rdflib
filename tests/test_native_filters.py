@@ -13,7 +13,7 @@ import pytest
 from rdflib.term import Variable
 from tests.corpus import SPELLINGS
 from tests.oracle import departs, spec_answer
-from tests.support import CTX, RecordingTermDict, filter_expr, kind_ranges, typed
+from tests.support import CTX, RecordingTermDict, W, filter_expr, kind_ranges, typed
 from vortex_rdf import U64Column, serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown, trace
@@ -182,11 +182,17 @@ KIND_MAPPED: list[tuple[str, set]] = [
 
 
 def _decide(store, decision, codes) -> tuple[set, list]:
-    """``decision`` over ``codes``: a keep's membership, or vortex-rdf's
-    ``filter_codes``."""
-    if isinstance(decision, (native.IriIn, native.KindRange)):
-        return native.keep_decides(store, decision, codes)
-    return native.evaluate(store, decision, codes)
+    """``decision`` over ``codes``: the codes it passes and the codes it
+    leaves undecided."""
+    return decision.split(store, codes)
+
+
+def _one_range(kinds) -> bool:
+    """Whether ``kinds`` are a run of the kinds' code order, no ``""``."""
+    if not kinds or "" in kinds:
+        return False
+    positions = sorted(native.KIND_ORDER.index(kind) for kind in kinds)
+    return positions[-1] - positions[0] + 1 == len(positions)
 
 
 #: Shapes the mapping must leave to the Python routes: the native layer
@@ -272,8 +278,8 @@ def test_a_kind_test_is_decided_by_the_kinds_it_holds_for(spelling_store, sparql
     it is true for decide every code, as the specification answers, and are
     a keep on the native match when their codes run together."""
     conjunct = filters._compile_conjunct(filter_expr(sparql_expr), (V,), {}, CTX)
-    assert conjunct.kinds == kinds
-    assert conjunct.keep == native.kind_range(frozenset(kinds))
+    assert conjunct.decision == native.Kinds(frozenset(kinds))
+    assert conjunct.keep is (conjunct.decision if _one_range(kinds) else None)
     assert filters.native.native_shape(filter_expr(sparql_expr), V, {}) is None
     kind_of = spelling_store._file.kind_ranges.kind_of
     for code in sorted(_all_codes(spelling_store)):
@@ -281,6 +287,30 @@ def test_a_kind_test_is_decided_by_the_kinds_it_holds_for(spelling_store, sparql
         if departs(sparql_expr, stored):
             continue
         assert (kind_of(code) in kinds) == spec_answer(sparql_expr, {"v": stored}), stored
+
+
+def test_a_conjunct_is_hashable_by_identity():
+    """Two conjuncts of one expression are two conjuncts: a relation names
+    the ones every row passes (``Relation.applied``) by identity."""
+    expr = filter_expr("?v < ?w")
+    a = filters._compile_conjunct(expr, (V, W), {}, CTX)
+    b = filters._compile_conjunct(expr, (V, W), {}, CTX)
+    assert len({a, b}) == 2 and a in {a} and b not in {a}
+
+
+def test_a_kind_decision_is_one_range_keep(spelling_store):
+    """A test of the term's kind alone is decided by the kinds it holds for;
+    kinds whose codes run together are also its keep on the native match,
+    one code range, and kinds apart are none."""
+    conjunct = filters._compile_conjunct(filter_expr("isIRI(?v) || isBlank(?v)"), (V,), {}, CTX)
+    assert conjunct.decision == native.Kinds(frozenset({IRI, BLANK}))
+    assert conjunct.keep is conjunct.decision
+    ranges = kind_ranges(spelling_store)
+    keep = native.keep_of(spelling_store, conjunct.keep)
+    assert native.is_range(keep) and keep == (ranges.range(IRI)[0], ranges.range(BLANK)[1])
+    apart = filters._compile_conjunct(filter_expr("isLiteral(?v) || isBlank(?v)"), (V,), {}, CTX)
+    assert apart.decision == native.Kinds(frozenset({LITERAL, BLANK}))
+    assert apart.keep is None
 
 
 @pytest.mark.parametrize("sparql_expr", UNMAPPED)
@@ -492,9 +522,6 @@ def test_an_iri_the_parser_refuses_names_no_term(spelling_store, refused):
 @pytest.mark.parametrize(
     "shape",
     [
-        native.KindRange(frozenset({LITERAL})),
-        native.KindRange(frozenset({IRI})),
-        native.KindRange(frozenset({BLANK})),
         native.IriIn(("<http://ex.org/x>", "<urn:x>")),
         FilterCodes("num_ne", f'"5"^^<{XSD}integer>'),
         FilterCodes("num_lt", f'"5"^^<{XSD}integer>'),
@@ -503,9 +530,6 @@ def test_an_iri_the_parser_refuses_names_no_term(spelling_store, refused):
         FilterCodes("regex", "a|\ud800"),
     ],
     ids=[
-        "is_literal",
-        "is_iri",
-        "is_blank",
         "iri_in",
         "num_ne",
         "num_lt",
@@ -518,7 +542,8 @@ def test_a_code_that_is_no_term_is_left_undecided_under_every_shape(spelling_sto
     """The empty graph name (code 0), a code past the dictionary's end and a
     negative code lie in none of the kinds' ranges: whatever the shape, they
     go to the Python routes, which fail on them, and the verdicts on the
-    terms are what they are without them."""
+    terms are what they are without them. (A test of the term's kind alone
+    decides them itself, by whether it holds for no term: ``native.Kinds``.)"""
     dictionary = spelling_store._dict
     assert dictionary.decode(0) == ""
     not_terms = {0, len(dictionary), len(dictionary) + 7, -1}

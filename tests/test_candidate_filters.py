@@ -328,10 +328,9 @@ def test_a_specialized_conjunct_compiles_as_analyze_expr_does():
     [analyzed] = filters.analyze_expr(expr, [V], CTX, {W: five}).per_var[V]
     assert proxy is not None and proxy.fast is not None and analyzed.fast is not None
     assert proxy.vars == analyzed.vars == (V,)
-    assert (proxy.keep, proxy.codes, proxy.kinds, proxy.consts) == (
+    assert (proxy.keep, proxy.decision, proxy.consts) == (
         analyzed.keep,
-        analyzed.codes,
-        analyzed.kinds,
+        analyzed.decision,
         analyzed.consts,
     )
     for spelling in (

@@ -43,7 +43,7 @@ route, :mod:`.native` recognizes and decides the native shapes; this module
 splits a FILTER into conjuncts and evaluates them.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -53,39 +53,49 @@ from rdflib.plugins.sparql.sparql import FrozenBindings
 from ..settings import SETTINGS
 from ..terms import TermView, parse_spelling, view_of
 from . import compiler, exprs, native, values  # noqa: F401 - filters.values is public
-from .native import FilterCodes, IriIn, KindRange
+from .native import FilterCodes, IriIn, Kinds
 from .values import UNKNOWN
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class Conjunct:
     """A conjunct of a FILTER over the block variables ``vars`` (in order),
     every other variable it reads fixed to the term ``consts`` gives it, and
     how it is decided — each set by :func:`_compile_conjunct` alone, ``None``
     while its switch is off: ``fast``, the fast route
-    (``SETTINGS.fast_filters``); for a single variable, ``kinds``, the term
-    kinds a test of its kind alone is true for (``code_predicates``),
-    ``keep``, a keep on the native match (``native_filters``;
-    ``code_predicates`` too), and ``codes``, a predicate ``filter_codes``
-    decides (``native_filters``)."""
+    (``SETTINGS.fast_filters``), and for a single variable its
+    ``decision`` over the codes a query produced — the term kinds a test of
+    its kind alone holds for (``code_predicates``), an IRI equality
+    (``native_filters`` and ``code_predicates``) or a predicate
+    ``filter_codes`` decides (``native_filters``) — and ``keep``, the one of
+    those a native match takes too (``native_filters``). Two conjuncts are
+    two, however alike: a relation names the ones it applied by identity."""
 
     expr: Any
     vars: tuple
     fast: Callable | None  # env -> True | False | UNKNOWN
     consts: dict = field(default_factory=dict)  # visible ctx-bound vars -> rdflib terms
     ctx: Any = None
-    kinds: frozenset | None = None
-    keep: IriIn | KindRange | None = None
-    codes: FilterCodes | None = None
+    decision: Kinds | IriIn | FilterCodes | None = None
+    keep: Kinds | IriIn | None = None
 
-    def native_kind(self) -> str | None:
-        """What decides it natively, for the trace: a ``filter_codes``
-        kind, ``iri_in`` or ``kind_range``; ``None`` for nothing."""
-        if self.codes is not None:
-            return self.codes.kind
-        if isinstance(self.keep, IriIn):
-            return "iri_in"
-        return None if self.keep is None else "kind_range"
+    def decide(self, views: tuple | None, key: Sequence, decode: Callable | None = None) -> bool:
+        """Its answer for one assignment of its variables, ``key`` (their
+        values in order, ``None`` unbound — terms, or codes ``decode`` turns
+        into terms): its fast route over their term views ``views``
+        (``None`` while that route is off), rdflib's evaluator where the
+        route is off or leaves it undecided."""
+        fast = self.fast
+        r = UNKNOWN if views is None or fast is None else fast(views)
+        if r is UNKNOWN:
+            r = self.generic(
+                {
+                    var: value if decode is None else decode(value)
+                    for var, value in zip(self.vars, key, strict=True)
+                    if value is not None
+                }
+            )
+        return r is True
 
     def generic(self, bound: dict) -> bool:
         """rdflib's own answer for one value assignment (``bound`` maps the
@@ -145,19 +155,19 @@ def _compile_conjunct(expr, variables: tuple, consts: dict, ctx) -> Conjunct:
     IRI equality, or kinds that run together) or a ``filter_codes``
     predicate (:func:`.native.native_shape`)."""
     fast = compiler.compile_fast(expr, variables, consts) if SETTINGS.fast_filters else None
-    kinds = keep = codes = None
+    decision = keep = None
     if len(variables) == 1:
         if fast is not None and SETTINGS.code_predicates and compiler.is_kind_only(expr):
-            kinds = frozenset(view.kind for view in _KIND_VIEWS if fast((view,)) is True)
-        if SETTINGS.fast_filters and SETTINGS.native_filters:
+            decision = Kinds(frozenset(view.kind for view in _KIND_VIEWS if fast((view,)) is True))
+            if SETTINGS.native_filters and decision.one_range:
+                keep = decision
+        elif SETTINGS.fast_filters and SETTINGS.native_filters:
             shape = native.native_shape(expr, variables[0], consts)
             if isinstance(shape, FilterCodes):
-                codes = shape
-            elif shape is not None:
-                keep = shape if SETTINGS.code_predicates else None
-            elif kinds is not None:
-                keep = native.kind_range(kinds)
-    return Conjunct(expr, variables, fast, consts, ctx, kinds, keep, codes)
+                decision = shape
+            elif shape is not None and SETTINGS.code_predicates:
+                decision = keep = shape
+    return Conjunct(expr, variables, fast, consts, ctx, decision, keep)
 
 
 def analyze_expr(expr, block_vars, ctx, visible: dict) -> FilterPlan:
@@ -200,27 +210,24 @@ def specialize(conjunct: Conjunct, var, consts: dict) -> Conjunct | None:
     way (no keep, no ``filter_codes`` predicate). Its generic route is
     rdflib's evaluator over the same constants."""
     special = _compile_conjunct(conjunct.expr, (var,), consts, conjunct.ctx)
-    return special if special.keep is not None or special.codes is not None else None
+    if special.keep is not None or isinstance(special.decision, FilterCodes):
+        return special
+    return None
 
 
 def evaluate_constant(conjunct: Conjunct) -> bool:
     """A conjunct without block variables, evaluated once."""
-    if conjunct.fast is not None:
-        r = conjunct.fast(())
-        if r is not UNKNOWN:
-            return r
-    return conjunct.generic({})
+    return conjunct.decide(None if conjunct.fast is None else (), ())
 
 
 def evaluate_column(store, conjuncts: list, codes) -> set:
     """The subset of ``codes`` (distinct codes of one variable) passing every
     conjunct — ``codes`` itself when it is a set and no conjunct runs.
-    A conjunct of term kinds decides each code by its kind, none decoded; one
-    with a keep or a ``filter_codes`` predicate is answered by vortex-rdf
-    over the codes still in play (:func:`.native.keep_decides`,
-    :func:`.native.evaluate`), only the codes it leaves undecided going on;
-    the others decode the surviving codes once, in one batch, and parse
-    their spellings."""
+    A conjunct's decision splits the codes still in play (term kinds decide
+    each code by its kind, none decoded; an IRI equality or a
+    ``filter_codes`` predicate is answered by vortex-rdf), only the codes it
+    leaves undecided going on; the others decode the surviving codes once,
+    in one batch, and parse their spellings."""
     remaining = codes if isinstance(codes, set) else set(codes)
     views: dict = {}
     for conjunct in conjuncts:
@@ -230,19 +237,11 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
         passed: set = set()
         unknown: list = []
         pending = remaining
-        if conjunct.kinds is not None:
-            kind_of, kinds = store._file.kind_ranges.kind_of, conjunct.kinds
-            passed = {code for code in remaining if kind_of(code) in kinds}
-            pending = ()
-        elif conjunct.keep is not None:
-            passed, pending = native.keep_decides(store, conjunct.keep, remaining)
-        elif conjunct.codes is not None:
-            passed, pending = native.evaluate(store, conjunct.codes, remaining)
-        if not pending:
-            pass
-        elif fast is None:
+        if conjunct.decision is not None:
+            passed, pending = conjunct.decision.split(store, remaining)
+        if fast is None:
             unknown = list(pending)
-        else:
+        elif pending:
             decode_views(store, pending, views)
             for code in pending:
                 r = fast((views[code],))
@@ -261,10 +260,11 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
     return remaining
 
 
-def _fast_route(store, fast, views: dict) -> Callable[[tuple], Any]:
-    """``fast`` over a code tuple: each code parsed into a view once, through
-    ``views``, a dictionary code decoded and a negative (query-constant) one
-    taken from the query's foreign terms; an unbound ``None`` stays unbound."""
+def _code_views(store, views: dict) -> Callable[[tuple], tuple]:
+    """The term views of a code tuple, for a fast route: each code parsed
+    into a view once, through ``views``, a dictionary code decoded and a
+    negative (query-constant) one taken from the query's foreign terms; an
+    unbound ``None`` stays unbound."""
 
     def view_at(code):
         view = views.get(code)
@@ -275,10 +275,10 @@ def _fast_route(store, fast, views: dict) -> Callable[[tuple], Any]:
                 view = views[code] = parse_spelling(store._spelling(code))
         return view
 
-    def answer(key: tuple):
-        return fast(tuple(None if code is None else view_at(code) for code in key))
+    def views_of(key: tuple) -> tuple:
+        return tuple(None if code is None else view_at(code) for code in key)
 
-    return answer
+    return views_of
 
 
 def tuple_predicate(
@@ -288,26 +288,19 @@ def tuple_predicate(
     distinct code tuple; ``positions`` are the variables' row indexes and
     ``shared_views`` a parsed-term cache shared with the caller."""
     memo: dict = {}
-    fast = conjunct.fast
-    views = {} if shared_views is None else shared_views
-    answer = None if fast is None else _fast_route(store, fast, views)
-    variables = conjunct.vars
+    views_of = None
+    if conjunct.fast is not None:
+        views_of = _code_views(store, {} if shared_views is None else shared_views)
+    decode = store._decode_term
 
     def predicate(row) -> bool:
         key = tuple(row[i] for i in positions)
         r = memo.get(key)
         if r is None:
-            r = UNKNOWN if answer is None else answer(key)
-            if r is UNKNOWN:
-                r = conjunct.generic(
-                    {
-                        v: store._decode_term(c)
-                        for v, c in zip(variables, key, strict=True)
-                        if c is not None
-                    }
-                )
-            memo[key] = r
-        return r is True
+            r = memo[key] = conjunct.decide(
+                None if views_of is None else views_of(key), key, decode
+            )
+        return r
 
     return predicate
 
@@ -318,18 +311,12 @@ def constant_predicate(conjunct: Conjunct) -> Callable[[Any], bool]:
     the constant's view, rdflib's evaluator where that is unknown."""
     memo: dict = {}
     fast = conjunct.fast
-    var = conjunct.vars[0]
 
     def predicate(term) -> bool:
         r = memo.get(term)
         if r is None:
-            r = UNKNOWN
-            if fast is not None:
-                r = fast((view_of(term),))
-            if r is UNKNOWN:
-                r = conjunct.generic({var: term})
-            memo[term] = r
-        return r is True
+            r = memo[term] = conjunct.decide(None if fast is None else (view_of(term),), (term,))
+        return r
 
     return predicate
 
@@ -379,14 +366,10 @@ def _solution_test(conjunct: Conjunct, variables: tuple) -> Callable[[Any], bool
 
     def test(bound) -> bool:
         terms = [bound.get(var) for var in variables]
-        r = UNKNOWN
+        views = None
         if fast is not None:
-            r = fast(tuple(None if t is None else view_of(t) for t in terms))
-        if r is UNKNOWN:
-            r = conjunct.generic(
-                {var: t for var, t in zip(variables, terms, strict=True) if t is not None}
-            )
-        return r is True
+            views = tuple(None if t is None else view_of(t) for t in terms)
+        return conjunct.decide(views, terms)
 
     return test
 
@@ -403,16 +386,32 @@ def tuple_fast_reject_predicate(
     if fast is None:
         raise ValueError("tuple_fast_reject_predicate requires a fast conjunct")
     memo: dict = {}
-    answer = _fast_route(store, fast, {} if shared_views is None else shared_views)
+    views_of = _code_views(store, {} if shared_views is None else shared_views)
 
     def predicate(row) -> bool:
         key = tuple(row[index] for index in positions)
         result = memo.get(key)
         if result is None:
-            result = memo[key] = answer(key)
+            result = memo[key] = fast(views_of(key))
         return result is not False
 
     return predicate
+
+
+def restriction_counts(conjuncts) -> dict:
+    """The trace fields that say how a variable's conjuncts are decided: how
+    many there are, and how many vortex-rdf decides (an IRI equality or a
+    ``filter_codes`` predicate), have a fast route, are decided by term kinds
+    alone, or by rdflib's evaluator alone."""
+    return {
+        "predicate_count": len(conjuncts),
+        "native_predicate_count": sum(
+            isinstance(c.decision, (IriIn, FilterCodes)) for c in conjuncts
+        ),
+        "fast_predicate_count": sum(c.fast is not None for c in conjuncts),
+        "kind_only_predicate_count": sum(isinstance(c.decision, Kinds) for c in conjuncts),
+        "generic_only_predicate_count": sum(c.fast is None for c in conjuncts),
+    }
 
 
 def decode_views(store, codes, views: dict) -> None:

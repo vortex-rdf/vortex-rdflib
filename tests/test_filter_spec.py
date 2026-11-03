@@ -20,6 +20,7 @@ from rdflib.util import from_n3
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore
+from vortex_rdflib.settings import SETTINGS
 
 EX = "http://ex.org/"
 XSD = "http://www.w3.org/2001/XMLSchema#"
@@ -472,6 +473,16 @@ def test_filter_follows_the_spec(stores, case):
     result = dataset.query(PREFIXES + case.query)
     rows = [tuple(_spelling(row[v]) for v in result.vars) for row in result]
     assert sorted(rows, key=str) == sorted(case.expected, key=str)
+
+
+@pytest.mark.parametrize("switch", ["native_filters", "code_predicates"])
+@pytest.mark.parametrize("case", SPEC_CASES, ids=lambda case: case.name)
+def test_the_filter_switches_change_no_answer(stores, case, switch, monkeypatch):
+    """With vortex-rdf's decisions off (``VORTEX_RDF_NATIVE_FILTERS=0``) or
+    the code predicates off (``VORTEX_RDF_CODE_PREDICATES=0``) every FILTER
+    still answers as the specification does."""
+    monkeypatch.setattr(SETTINGS, switch, False)
+    test_filter_follows_the_spec(stores, case)
 
 
 W3C_CASES = json.loads(
