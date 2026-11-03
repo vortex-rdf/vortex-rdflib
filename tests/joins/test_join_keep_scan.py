@@ -23,7 +23,7 @@ from tests.join_corpus import (
     _streams,
     _traced_both_ways,
 )
-from tests.support import both_ways, native_spy, run, trace_events
+from tests.support import both_ways, file_codes, native_spy, run, trace_events
 from vortex_rdf import U64Column
 
 import vortex_rdflib.pushdown as pd
@@ -150,6 +150,86 @@ def test_a_keep_scan_reads_a_relation_of_rows(graph, monkeypatch, capsys):
     names = ("strategy", "input_rows", "output_rows")
     steps = [tuple(step[n] for n in names) for step in _fields(events, "bgp_join_step_complete")]
     assert steps == [("probe", 1, 2), ("keep_scan", 2, 2)]
+
+
+#: A lazy join whose left side is a VALUES table of a term the dictionary
+#: lacks and the key `k0`: `?x ?p ?k` binds only its object, so a probe per
+#: key would scan the file, and the right side is keep-scanned.
+VALUES_UNKNOWN = _PREFIX + "SELECT ?k ?x ?p WHERE { { VALUES ?k { :unknown :k0 } } { ?x ?p ?k } }"
+#: An OPTIONAL over the anchor's two keys whose right side binds only its
+#: object: keep-scanned.
+OPTIONAL_SCANNED = _PREFIX + "SELECT ?k ?x ?p WHERE { :a0 :r ?k OPTIONAL { ?x ?p ?k } }"
+#: A lazy join whose left side binds the right side's subject: probed.
+LAZY_PROBED = _PREFIX + 'SELECT ?s ?k WHERE { { ?s :anchor "yes" } { ?s :r ?k } }'
+
+#: Per shape: the keys its keep-scan narrows to (none where it probes), and
+#: its native calls in order, each with the keywords it passed — the calls
+#: each made before BGP steps and block joins shared one step ladder.
+NARROWED_SHAPES = {
+    "bgp-after-a-probe": (
+        ANCHORED_SCAN,
+        ["k0", "k1"],
+        [
+            ("count_quads_many", []),
+            ("match_codes", []),
+            ("match_codes", []),
+            ("match_codes", ["keep"]),
+        ],
+    ),
+    "lazy-join-over-values": (
+        VALUES_UNKNOWN,
+        ["k0"],
+        [("count_quads", ["limit"]), ("match_codes", ["keep"])],
+    ),
+    "optional": (
+        OPTIONAL_SCANNED,
+        ["k0", "k1"],
+        [("match_codes", []), ("count_quads", ["limit"]), ("match_codes", ["keep"])],
+    ),
+    "lazy-join-probe": (
+        LAZY_PROBED,
+        [],
+        [("match_codes", []), ("count_quads", ["limit"]), ("match_codes", [])],
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", list(NARROWED_SHAPES))
+def test_a_keep_scan_through_a_relation_of_rows_leaves_out_foreign_codes(
+    joins_vortex, monkeypatch, shape
+):
+    """A BGP step after a probe step, an OPTIONAL and a lazy join keep-scan
+    through a relation of rows (``matching.narrow_to``): the native keep holds
+    the dictionary codes of the rows' keys and never a negative one — a
+    VALUES term the dictionary lacks reaches the narrowing and joins
+    nothing — and each shape makes the native calls it made before, in
+    order. The answers are rdflib's."""
+    sparql, keys, calls = NARROWED_SHAPES[shape]
+    graph = Graph(store=VortexRdflibStore(str(joins_vortex), in_memory=False))
+    narrowed = []
+    narrow_to = pd.matching.narrow_to
+
+    def watched(pat, rel):
+        narrowed.append(rel)
+        return narrow_to(pat, rel)
+
+    monkeypatch.setattr(pd.matching, "narrow_to", watched)
+    spy = native_spy(graph)
+    register_sparql_pushdown()
+    rows = run(graph, sparql)
+    assert [(name, sorted(kwargs)) for name, kwargs in spy.calls] == calls
+    keeps = [kwargs["keep"] for _, kwargs in spy.calls if kwargs.get("keep")]
+    term_dict = file_codes(graph.store).term_dict
+    codes = sorted(term_dict.encode(f"<{EX}{key}>") for key in keys)
+    assert [memoryview(keep[2]).cast("Q").tolist() for keep in keeps] == ([codes] if keys else [])
+    assert [rel.cols is None for rel in narrowed] == ([True] if keys else [])
+    foreign = [code for rel in narrowed for row in rel.rows for code in row if code < 0]
+    assert bool(foreign) is (shape == "lazy-join-over-values")
+    unregister_sparql_pushdown()
+    try:
+        assert rows == run(graph, sparql)
+    finally:
+        register_sparql_pushdown()
 
 
 def test_a_keep_scan_over_budget_by_its_pairs_streams_its_match(graph, monkeypatch, capsys):
