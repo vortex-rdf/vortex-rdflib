@@ -124,9 +124,14 @@ def _count_pattern(store, pat: Pattern, counts: dict, limit: int | None = None) 
     repair; a ``distinct`` pattern's quads bound its triples. With ``limit``
     the count stops there: an answer that reaches it is a lower bound, which
     is never memoized as the count. An answer is :func:`_exact_count`'s.
+
+    With ``SETTINGS.count_order`` off (``VORTEX_RDF_COUNT_ORDER=0``) nothing
+    is counted: the answer is the pattern's static estimate.
     """
     if pat.unsatisfiable:
         return 0
+    if not SETTINGS.count_order:
+        return _static_estimate(pat)
     key = pat.n3
     n = counts.get(key)
     if n is None:
@@ -155,14 +160,6 @@ def _static_estimate(pat: Pattern) -> int:
     in place of a native count — fewer rows for more bound positions, and never few enough that a
     connected step matches rather than probes (rdflib's nested loop)."""
     return 1 << (62 - 8 * sum(value is not None for value in pat.n3))
-
-
-def _planning_count(store, pat: Pattern, counts: dict, limit: int | None = None) -> int:
-    """:func:`_count_pattern` for a planning decision, or the static estimate when counts do not
-    plan."""
-    if not SETTINGS.count_order:
-        return 0 if pat.unsatisfiable else _static_estimate(pat)
-    return _count_pattern(store, pat, counts, limit=limit)
 
 
 def _narrowing(keep=None, limit=None) -> dict:
@@ -280,6 +277,23 @@ def _pattern_terms(ctx, store, s, p, o, scope, index: int | None = None) -> Patt
     return pat
 
 
+def resolve(ctx, store, triple, scope, var_preds=None, index: int | None = None) -> Pattern:
+    """``triple`` resolved (:func:`_pattern_terms`), with the conjuncts of
+    ``var_preds`` over its variables (:func:`restrict`)."""
+    pat = _pattern_terms(ctx, store, *triple, scope=scope, index=index)
+    if var_preds:
+        restrict(store, pat, var_preds)
+    return pat
+
+
+def restrict(store, pat: Pattern, var_preds) -> None:
+    """Give a resolved pattern the conjuncts of ``var_preds`` over its
+    variables: those vortex-rdf answers with a keep pushed into its native
+    match (:func:`_push_native_restrictions`), the others deferred to the
+    codes it brings (``Pattern.deferred``)."""
+    pat.deferred = _push_native_restrictions(store, pat, var_preds)
+
+
 def _exclude_default_graph(store, pat: Pattern) -> None:
     """Drop the default graph's rows from a pattern a ``GRAPH ?g`` scopes,
     inside its native match.
@@ -316,6 +330,29 @@ def _keep_only(pat: Pattern, var, codes) -> None:
     keep = U64Column(codes)
     for position in pat.varpos[var]:
         _set_native_keep(pat, position, keep)
+
+
+def narrow_to(pat: Pattern, rel: Relation) -> None:
+    """Narrow ``pat``'s native match, at every position of a variable the
+    relation binds, to the dictionary codes it binds that variable to —
+    a keep-scan's narrowing, for a BGP step and a block's side alike. A
+    columnar body's codes are the dictionary's, read natively; a row body
+    may hold a query constant outside the dictionary (a negative code), which
+    joins nothing and is left out, and a variable bound to no dictionary
+    code makes the pattern unsatisfiable."""
+    for var in pat.varpos:
+        if var not in rel.schema:
+            continue
+        index = rel.schema.index(var)
+        if rel.cols is not None:
+            codes = sorted(relation._distinct_codes(rel.cols[index]))
+        else:
+            assert rel.rows is not None, "a keep-scan narrows to a held body"
+            codes = sorted(code for code in {row[index] for row in rel.rows} if code >= 0)
+        if not codes:
+            pat.unsatisfiable = True
+            return
+        _keep_only(pat, var, codes)
 
 
 def _push_native_restrictions(store, pat: Pattern, var_preds) -> dict:
@@ -428,6 +465,24 @@ def _compact_pattern(pat: Pattern, keep: dict[Variable, set[int]]) -> None:
             columns = {idx: column.take(rows) for idx, column in columns.items()}
     pat.cols = tuple(columns.get(idx) for idx in range(4))
     pat.nrows = len(columns[positions[0]])
+
+
+def restricted(store, pat: Pattern, bound, stats=None) -> Relation:
+    """A matched pattern as the relation it joins with: its deferred
+    per-variable restrictions applied over the variables not in ``bound`` —
+    the relation it is about to join, which restricted its own — compacting
+    it natively to the rows that pass (:func:`_restrict_pattern`), so its
+    real size, not the match's, is what the join sees. Their time is booked
+    on ``stats`` (``restriction_ns``) when given."""
+    clock = trace.stopwatch()
+    pending, pat.deferred = pat.deferred, {}
+    if pending:
+        pending = {v: conjuncts for v, conjuncts in pending.items() if v not in bound}
+    if pending:
+        _restrict_pattern(store, pat, pending)
+    if stats is not None:
+        stats.restriction_ns += clock()
+    return _rel_from_pattern(pat)
 
 
 def _rel_from_pattern(pat: Pattern) -> Relation:

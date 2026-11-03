@@ -106,20 +106,15 @@ def _solve_pattern(ctx, store, triple, scope, var_preds, limit) -> tuple[Relatio
     """A BGP of one pattern: its native match, restricted by the conjuncts
     the match does not take, as a relation."""
     shape = _trace_pattern_start(ctx, 0, triple)
-    pat = matching._pattern_terms(ctx, store, *triple, scope=scope, index=0)
-    residual = matching._push_native_restrictions(store, pat, var_preds) if var_preds else {}
-    if not matching._limit_reaches_match(store, pat, residual):
+    pat = matching.resolve(ctx, store, triple, scope, var_preds, index=0)
+    if not matching._limit_reaches_match(store, pat, pat.deferred):
         limit = None
     stats = _BgpStats()
     stats.initial_calls, stats.native_ns = matching._match_resolved_pattern(store, pat, limit=limit)
     _trace_pattern_complete(0, shape, pat.nrows, stats.native_ns)
     clock = trace.stopwatch()
-    if residual:
-        matching._restrict_pattern(store, pat, residual)
-    stats.restriction_ns = clock()
-    clock = trace.stopwatch()
-    rel = matching._rel_from_pattern(pat)
-    stats.join_ns = clock()
+    rel = matching.restricted(store, pat, (), stats)
+    stats.join_ns = max(0, clock() - stats.restriction_ns)
     return rel, stats
 
 
@@ -131,17 +126,9 @@ def _solve_patterns(
     are native keeps into its match; the other conjuncts of its variables
     are deferred to the codes it brings."""
     patterns = []
-    var_preds = pushed.per_var
     for index, triple in enumerate(triples):
         shape = _trace_pattern_start(ctx, index, triple)
-        pat = matching._pattern_terms(ctx, store, *triple, scope=scope, index=index)
-        if var_preds:
-            pending = {v: var_preds[v] for v in pat.varpos if v in var_preds}
-            if pending:
-                pending = matching._push_native_restrictions(store, pat, pending)
-            if pending:
-                pat.deferred = pending
-        patterns.append(pat)
+        patterns.append(matching.resolve(ctx, store, triple, scope, pushed.per_var, index=index))
         _trace_pattern_complete(index, shape, None, 0)
     stats = _BgpStats()
     clock = trace.stopwatch()
@@ -240,17 +227,15 @@ def _count_patterns(store, patterns, counts: dict) -> int:
     one ``count_quads_many`` batch that runs them concurrently, one GIL
     release for all — after the point counts (``OpenFile.point_lookup``: those
     the native layer answers without a scan), any of which may still end the
-    block first. Returns the counts made."""
-    if not SETTINGS.count_order:  # VORTEX_RDF_COUNT_ORDER=0: static estimates, no native counts
-        for pat in patterns:
-            pat.estimate = 0 if pat.unsatisfiable else matching._static_estimate(pat)
-        return 0
+    block first. With ``SETTINGS.count_order`` off every count is a static
+    estimate (:func:`matching._count_pattern`), and none is batched. Returns
+    the counts made."""
     before = len(counts)
     ordered = sorted(patterns, key=matching._pattern_static_rank)
     in_memory = store._opened().in_memory
     minimum = SETTINGS.memory_scan_batch_min if in_memory else SETTINGS.scan_batch_min
     scans: list = []
-    if len(patterns) >= minimum:
+    if SETTINGS.count_order and len(patterns) >= minimum:
         scans = [
             pat
             for pat in ordered
@@ -385,12 +370,9 @@ def _join_incremental_bgp(
     calls, native_ns = matching._match_resolved_pattern(store, seed, memo)
     stats.initial_calls += calls
     stats.native_ns += native_ns
-    clock = trace.stopwatch()
-    _materialize_eager_restrictions(store, seed, ())
-    stats.restriction_ns += clock()
     # The relation so far: a columnar or row body, then — after a streamed
     # last step — its pieces.
-    rel = matching._rel_from_pattern(seed)
+    rel = matching.restricted(store, seed, (), stats)
     order = [seed.index]
     trace.event(
         "bgp_seed_complete",
@@ -430,14 +412,9 @@ def _join_incremental_bgp(
         count_limit = None
         if pat.estimate is None:
             # Next to a pattern of at most SETTINGS.probe_fanout rows, so not
-            # counted when planned: counted here, only as far as the
-            # probe-or-match decision needs; a capped answer means probe. The
-            # count is the pattern's, kept whether or not the step completes.
-            count_limit = running * SETTINGS.probe_fanout + 1
+            # counted when planned: counted here.
             clock = trace.stopwatch()
-            pat.estimate = matching._count_pattern(store, pat, counts, limit=count_limit)
-            # An answer at the cap is a lower bound of the count (_fits).
-            pat.estimate_capped = pat.estimate >= count_limit
+            count_limit = count_at_step(store, pat, running, counts)
             stats.native_ns += clock()
             stats.estimate_calls += 1
         # The step works on a copy and keeps it only once it completes: a
@@ -657,7 +634,20 @@ def _fits(rel: Relation, pat: Pattern, memo: dict, store) -> bool:
     return key.join_count(match[pat.varpos[var][0]]) <= SETTINGS.pair_budget
 
 
-def _step_rule(store, running: int, pat: Pattern, shared: Sequence) -> str:
+def count_at_step(store, pat: Pattern, running: int, counts: dict) -> int:
+    """Count ``pat`` at the step that joins it to a relation of ``running``
+    rows — a pattern the plan left uncounted, or a block's one-pattern side
+    — only as far as the probe-or-match decision (:func:`step_rule`) needs:
+    up to ``running * SETTINGS.probe_fanout + 1``, an answer at that cap a
+    lower bound (``estimate_capped``, :func:`_fits`). The count is the
+    pattern's, kept whether or not the step completes. Returns the cap."""
+    count_limit = running * SETTINGS.probe_fanout + 1
+    pat.estimate = matching._count_pattern(store, pat, counts, limit=count_limit)
+    pat.estimate_capped = pat.estimate >= count_limit
+    return count_limit
+
+
+def step_rule(store, running: int, pat: Pattern, shared: Sequence) -> str:
     """How a counted pattern joins a relation of ``running`` rows on its
     ``shared`` variables: per row of the relation when the relation is at
     least ``SETTINGS.probe_fanout`` times smaller than the pattern's count —
@@ -665,7 +655,7 @@ def _step_rule(store, running: int, pat: Pattern, shared: Sequence) -> str:
     (:meth:`OpenFile.point_lookup`), else ``"keep_scan"``, one match narrowed
     to the relation's codes rather than a scan per row — and ``"hash"``, its
     match hash-joined, otherwise. A probe step stops at
-    :func:`_probe_budget` rows."""
+    :func:`probe_budget` rows."""
     estimate = pat.estimate
     assert estimate is not None, "a step counts its pattern before it plans the join"
     if shared and running * SETTINGS.probe_fanout < estimate:
@@ -674,7 +664,7 @@ def _step_rule(store, running: int, pat: Pattern, shared: Sequence) -> str:
     return "hash"
 
 
-def _probe_budget() -> int:
+def probe_budget() -> int:
     """The rows a probe step makes before it is planned again as a
     keep-scan: a quarter of ``SETTINGS.pair_budget``."""
     return SETTINGS.pair_budget // 4
@@ -682,13 +672,13 @@ def _probe_budget() -> int:
 
 def _tiers(store, rel: Relation, work: Pattern, shared: list, last: bool) -> tuple[str, ...]:
     """The strategies a join step tries, in order, until one joins within
-    the budget: the step rule's (:func:`_step_rule`), a probe step's
+    the budget: the step rule's (:func:`step_rule`), a probe step's
     followed by a keep-scan. The last step sharing one variable streams
     (tier 1, :func:`_stream_step`): from the start when its pattern is too
     large to read whole (:func:`streaming._read_in_chunks`), else once the
     others are over the budget."""
     streams = last and len(shared) == 1
-    rule = _step_rule(store, rel.nrows, work, shared)
+    rule = step_rule(store, rel.nrows, work, shared)
     if rule == "probe":
         tiers: tuple[str, ...] = ("probe", "keep_scan")
     elif rule == "keep_scan":
@@ -703,12 +693,12 @@ def _tiers(store, rel: Relation, work: Pattern, shared: list, last: bool) -> tup
 def _probe_step(store, rel: Relation, work: Pattern, memo, step, stats) -> Relation | None:
     """Join ``work`` per row of the relation by its probes
     (:func:`probes._probe_join`); ``None`` once their rows pass
-    :func:`_probe_budget`, with the probes sent counted."""
+    :func:`probe_budget`, with the probes sent counted."""
     step.strategy, step.source, step.probe_calls = "probe", "probed", step.running
     clock = trace.stopwatch()
     try:
         schema, rows = probes._probe_join(
-            store, rel.schema, rel.row_list(), work, max_rows=_probe_budget()
+            store, rel.schema, rel.row_list(), work, max_rows=probe_budget()
         )
     except probes.RowsOverBudget as over:
         # Only the probes sent before the tally passed count.
@@ -735,7 +725,10 @@ def _keep_scan_step(store, rel: Relation, work: Pattern, memo, step, stats) -> R
     if not fits:
         _trace_over_budget(step, None)
         return None
-    return _hash_join_step(rel, _restricted(store, rel, work, step, stats), step)
+    step.match_rows = work.nrows
+    right = matching.restricted(store, work, rel.schema, stats)
+    step.restricted_rows = work.nrows
+    return _hash_join_step(rel, right, step)
 
 
 def _hash_step(store, rel: Relation, work: Pattern, memo, step, stats) -> Relation | None:
@@ -745,7 +738,9 @@ def _hash_step(store, rel: Relation, work: Pattern, memo, step, stats) -> Relati
     calls, native_ns = matching._match_resolved_pattern(store, work, memo)
     stats.initial_calls += calls
     stats.native_ns += native_ns
-    right = _restricted(store, rel, work, step, stats)
+    step.match_rows = work.nrows
+    right = matching.restricted(store, work, rel.schema, stats)
+    step.restricted_rows = work.nrows
     step.strategy = relation._hash_kind(rel, right)
     return _hash_join_step(rel, right, step)
 
@@ -784,18 +779,6 @@ _TIER_STEPS = {
 }
 
 
-def _restricted(store, rel: Relation, work: Pattern, step, stats) -> Relation:
-    """A matched pattern as the relation a hash join takes: its deferred
-    restrictions applied over the variables the relation does not bind
-    (:func:`_materialize_eager_restrictions`), its rows before and after
-    them noted on the step."""
-    clock = trace.stopwatch()
-    step.match_rows = _materialize_eager_restrictions(store, work, rel.schema)
-    stats.restriction_ns += clock()
-    step.restricted_rows = work.nrows
-    return matching._rel_from_pattern(work)
-
-
 def _hash_join_step(rel: Relation, right: Relation, step) -> Relation | None:
     """The hash join of a step (:func:`relation._hash_join`); ``None`` past
     the budget, its pairs traced."""
@@ -816,9 +799,9 @@ def _keep_scan(store, pat: Pattern, rel: Relation) -> tuple[int, int, bool]:
 
     Each shared variable's distinct codes, ascending, become the native keep
     at every position it takes, on top of any keep already there
-    (:func:`_set_native_keep`): the match leaves out only rows that no row of
-    the relation joins, and the join pairs the others, quad by quad, as the
-    probes would have. The match goes through :func:`_match_resolved_pattern`
+    (:func:`matching.narrow_to`): the match leaves out only rows that no row
+    of the relation joins, and the join pairs the others, quad by quad, as
+    the probes would have. The match goes through :func:`_match_resolved_pattern`
     without the memo: no other step narrows the pattern by these codes, and
     a memoized match would hold its columns until the plan ends. A
     pattern whose count may pass ``SETTINGS.pair_budget`` — one over it, or a
@@ -827,10 +810,7 @@ def _keep_scan(store, pat: Pattern, rel: Relation) -> tuple[int, int, bool]:
     dropped, the pattern left unread. Returns the native calls made, their
     time, as :func:`_match_resolved_pattern` does, and whether the match is
     within the budget."""
-    for var in pat.varpos:
-        if var in rel.schema:
-            codes = relation._distinct_codes(rel.native_column(rel.schema.index(var)))
-            matching._keep_only(pat, var, sorted(codes))
+    matching.narrow_to(pat, rel)
     estimate = pat.estimate
     assert estimate is not None, "a step counts its pattern before it keep-scans it"
     if not pat.estimate_capped and estimate <= SETTINGS.pair_budget:
@@ -933,17 +913,3 @@ def _trace_plan_complete(
         native_probe_call_count=stats.probe_calls,
         rest_pattern_indices=rest or None,
     )
-
-
-def _materialize_eager_restrictions(store, pat: Pattern, bound) -> int:
-    """Apply a matched pattern's deferred per-variable restrictions — over
-    the variables not in ``bound``, the relation it is about to join —
-    compacting it natively to the rows that pass, so its real size, not the
-    match's, is what the join sees. Returns the match's rows before them."""
-    input_rows = pat.nrows
-    pending, pat.deferred = pat.deferred, {}
-    if pending:
-        pending = {v: conjuncts for v, conjuncts in pending.items() if v not in bound}
-    if pending:
-        matching._restrict_pattern(store, pat, pending)
-    return input_rows

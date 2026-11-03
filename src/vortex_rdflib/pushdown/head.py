@@ -337,15 +337,16 @@ def _single_pattern(ctx, store, node: Block, scope) -> Pattern | None:
     var_preds = None
     if isinstance(node, algebra.Filter):
         inner = node.inner
-        if not isinstance(inner, algebra.Bgp) or len(inner.triples) != 1:
+        if inner.single is None:
             return None
         plan = filters.analyze_filter(node.source, algebra._block_vars(ctx, inner, scope), ctx)
         if plan.constant or plan.tuples or plan.exists:
             return None
         var_preds, node = plan.per_var, inner
-    elif not isinstance(node, algebra.Bgp) or len(node.triples) != 1:
+    triple = node.single
+    if triple is None:
         return None
-    pat = matching._pattern_terms(ctx, store, *node.triples[0], scope=scope)
-    if var_preds and matching._push_native_restrictions(store, pat, var_preds):
+    pat = matching.resolve(ctx, store, triple, scope, var_preds)
+    if pat.deferred:
         return None  # a conjunct the native match cannot decide
     return pat

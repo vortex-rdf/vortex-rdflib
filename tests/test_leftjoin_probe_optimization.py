@@ -1,7 +1,9 @@
 import pytest
 from rdflib import Graph, URIRef
 from tests.support import (
+    CTX,
     counting_native,
+    file_codes,
     is_graph_name_check,
     native_spy,
     run,
@@ -287,3 +289,40 @@ def test_an_exists_keep_scans_a_pattern_a_count_cannot_test(tmp_path, monkeypatc
     keyed = [kwargs for name, kwargs in spy.calls if name == "match_codes" and "keep" in kwargs]
     assert [set(kwargs["keep"]) for kwargs in keyed] == [{0}]
     assert "count_quads_many" not in spy.names()
+
+
+@pytest.mark.parametrize("body", ["rows", "cols"])
+def test_one_narrowing_keeps_only_dictionary_codes(tmp_path, body):
+    """A keep-scan narrows its pattern to the codes the relation binds its
+    shared variables to (``matching.narrow_to``), BGP step and block alike:
+    a code outside the dictionary (a query constant's, negative) joins
+    nothing and is left out, and a variable bound to none makes the pattern
+    unsatisfiable; a columnar body is read natively."""
+    from rdflib import Variable
+    from vortex_rdf import U64Column
+
+    from vortex_rdflib.pushdown import matching
+    from vortex_rdflib.pushdown.algebra import _GraphScope
+    from vortex_rdflib.pushdown.relation import Relation
+
+    graph = _graph(tmp_path, size=4)
+    store = graph.store
+    s, o = Variable("s"), Variable("o")
+    o2, o1 = (file_codes(store).term_dict.encode(f"<http://ex/o{i}>") for i in (2, 1))
+
+    def narrowed(codes):
+        pat = matching._pattern_terms(
+            CTX, store, s, URIRef("http://ex/optional"), o, scope=_GraphScope(None)
+        )
+        if body == "rows":
+            rel = Relation.from_rows((o,), [(code,) for code in codes])
+        else:
+            rel = Relation.from_cols((o,), (memoryview(U64Column(codes)).cast("Q"),))
+        matching.narrow_to(pat, rel)
+        return pat
+
+    pat = narrowed([o2, o1, o2] + ([-1] if body == "rows" else []))
+    assert memoryview(pat.nkeep[2]).cast("Q").tolist() == sorted({o1, o2})
+    assert not pat.unsatisfiable
+    if body == "rows":
+        assert narrowed([-1, -2]).unsatisfiable

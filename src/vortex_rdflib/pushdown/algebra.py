@@ -98,6 +98,11 @@ class Block:
         """rdflib's name for the algebra node."""
         return self.source.name
 
+    @property
+    def single(self) -> tuple | None:
+        """The one triple pattern the block is, if it is a BGP of one."""
+        return None
+
     def carries_graph(self, var) -> bool:
         """Whether the rows of the block under ``GRAPH var`` carry its graph
         column: a pattern of the block is matched in that scope, so the
@@ -116,6 +121,10 @@ class Bgp(Block):
     """A basic graph pattern: its ``triples``."""
 
     triples: tuple
+
+    @property
+    def single(self) -> tuple | None:
+        return self.triples[0] if len(self.triples) == 1 else None
 
     def carries_graph(self, var) -> bool:
         return bool(self.triples)
