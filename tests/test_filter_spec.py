@@ -480,3 +480,19 @@ def test_w3c_filter_case(stores, case):
     for row, n in expected["rows"]:
         want[tuple(sorted((var, _as_returned(spelling)) for var, spelling in row))] += n
     assert got == want
+
+
+def test_impure_function_inside_exists_is_seen():
+    """RAND() and BNODE() draw anew per row, so a FILTER holding one is left
+    to rdflib, which evaluates it per row — one in an EXISTS body included,
+    whose FILTERs rdflib keeps only in the translated body."""
+    from rdflib.plugins.sparql import prepareQuery
+
+    from vortex_rdflib.filters import exprs
+
+    query = prepareQuery(
+        PREFIXES
+        + "SELECT ?s WHERE { ?s ex:p ?o FILTER(!EXISTS { ?s ex:p ?x FILTER(RAND() < 0.5) }) }"
+    )
+    expr = query.algebra.p.p.expr
+    assert exprs._is_impure(expr)

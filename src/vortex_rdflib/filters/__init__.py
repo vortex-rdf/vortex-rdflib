@@ -339,7 +339,7 @@ def solution_filter(store, node, ctx) -> Callable[[Any], bool]:
     conjunct holding an EXISTS is rdflib's, over the whole solution, as
     rdflib's ``evalFilter`` binds it. An expression the pushdown hands back
     whole (a random or fresh-node call) raises ``NotImplementedError``."""
-    variables = tuple(dict.fromkeys(exprs.expr_vars(node.expr)))
+    variables = tuple(exprs.expr_vars(node.expr))
     position = {var: i for i, var in enumerate(variables)}
     views: dict = {}
     tests: list[Callable[[tuple, Any], bool]] = []
@@ -349,7 +349,7 @@ def solution_filter(store, node, ctx) -> Callable[[Any], bool]:
         if exprs.has_exists(conjunct_expr):
             tests.append(lambda row, bound, expr=conjunct_expr: rdflib_ebv(expr, bound))
             continue
-        referenced = tuple(dict.fromkeys(exprs.expr_vars(conjunct_expr)))
+        referenced = tuple(exprs.expr_vars(conjunct_expr))
         conjunct = _compile_conjunct(conjunct_expr, referenced, {}, ctx, None)
         if not referenced:
             passes = evaluate_constant(conjunct)

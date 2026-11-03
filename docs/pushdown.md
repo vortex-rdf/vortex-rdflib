@@ -903,7 +903,7 @@ whole. Otherwise it is matched once and hash-joined.
 
 **Shape:** a `FILTER` conjunct that is `EXISTS { body }` or
 `NOT EXISTS { body }`, possibly under one `!`, whose body is a block
-([`exists_shape`](../src/vortex_rdflib/filters/exprs.py#L88)).
+([`exists_shape`](../src/vortex_rdflib/filters/exprs.py#L85)).
 
 ```sparql
 SELECT ?s WHERE {
@@ -928,7 +928,7 @@ the block:
 
 The body is read from rdflib's translated algebra, because rdflib removes the
 body's own `FILTER`s from the parse tree
-([`expr_vars`](../src/vortex_rdflib/filters/exprs.py#L16)). rdflib also wraps the
+([`expr_vars`](../src/vortex_rdflib/filters/exprs.py#L52)). rdflib also wraps the
 body in a `Join` with an empty `BGP`, which the hook skips
 ([`_unwrap_empty_joins`](../src/vortex_rdflib/pushdown/algebra.py#L205)).
 
