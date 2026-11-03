@@ -48,7 +48,7 @@ def _block_nonempty(ctx, store, block) -> bool:
     if pat is not None:
         if pat.unsatisfiable:
             return False
-        if all(len(pos) == 1 for pos in pat.varpos.values()):
+        if not pat.repeats:
             # Existence needs no rows: a count capped at one, which stops a
             # file-backed scan at its first match.
             narrowing = matching._narrowing(pat.nkeep, limit=1)

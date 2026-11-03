@@ -313,27 +313,40 @@ def test_the_budget_reads_its_environment_variable():
 
 def test_the_pair_count_skips_a_product_within_the_budget(monkeypatch):
     """Keys 1, 1, 2 against 1, 2, 2, 3: a product of 12 that makes 4 pairs,
-    counted only once the product passes the budget."""
-    left, right = U64Column([1, 1, 2]), U64Column([1, 2, 2, 3])
+    counted only once the product passes the budget, and refused past it."""
+    k = Variable("k")
+    left = pd.relation.Relation.from_rows((k,), [(1,), (1,), (2,)])
+    right = pd.relation.Relation.from_rows((k,), [(1,), (2,), (2,), (3,)])
     monkeypatch.setattr(SETTINGS, "pair_budget", 12)
-    assert pd.relation._pair_count(left, right) is None
+    joined, pairs = pd.relation._hash_join(left, right)
+    assert (pairs, joined.nrows) == (None, 4)
     monkeypatch.setattr(SETTINGS, "pair_budget", 11)
-    assert pd.relation._pair_count(left, right) == 4
+    assert pd.relation._hash_join(left, right)[1] == 4
+    monkeypatch.setattr(SETTINGS, "pair_budget", 3)
+    with pytest.raises(pd.relation.OverBudget) as over:
+        pd.relation._hash_join(left, right)
+    assert over.value.pairs == 4
 
 
 def test_a_row_step_counts_its_first_shared_variable(monkeypatch):
-    """Past the product bound a row step counts the pairs of its first
+    """Past the product bound a join of rows counts the pairs of its first
     shared variable's codes — with a second shared variable, an upper bound
     of the rows the join makes — and, sharing none, is the product."""
     k, x, y, z = (Variable(name) for name in "kxyz")
-    rows_a = [(1, 5), (1, 6), (2, 7)]
-    rows_b = [(1, 5, 0), (2, 9, 0), (3, 7, 0)]
+    left = pd.relation.Relation.from_rows((k, x), [(1, 5), (1, 6), (2, 7)])
+    right = pd.relation.Relation.from_rows((k, x, y), [(1, 5, 0), (2, 9, 0), (3, 7, 0)])
+    lone = pd.relation.Relation.from_rows((z,), [(1,), (2,)])
+    assert pd.relation._hash_kind(left, right) == "hash_rows"
     monkeypatch.setattr(SETTINGS, "pair_budget", 0)
-    assert pd.relation._row_step_pairs((k, x), rows_a, (k, x, y), rows_b) == 3
-    assert len(pd.relation._join((k, x), rows_a, (k, x, y), rows_b)[1]) == 1
-    assert pd.relation._row_step_pairs((z,), [(1,), (2,)], (k, x, y), rows_b) == 6
+    for side, pairs in ((left, 3), (lone, 6)):
+        with pytest.raises(pd.relation.OverBudget) as over:
+            pd.relation._hash_join(side, right)
+        assert over.value.pairs == pairs
+    monkeypatch.setattr(SETTINGS, "pair_budget", 3)
+    joined, pairs = pd.relation._hash_join(left, right)
+    assert (pairs, joined.rows) == (3, [(1, 5, 0)])
     monkeypatch.setattr(SETTINGS, "pair_budget", 6)
-    assert pd.relation._row_step_pairs((z,), [(1,), (2,)], (k, x, y), rows_b) is None
+    assert pd.relation._hash_join(lone, right)[1] is None
 
 
 def test_small_joins_make_no_count(graph, monkeypatch, capsys):
@@ -861,7 +874,7 @@ def test_a_memoized_match_is_sliced(graph):
     s, x, y = (Variable(name) for name in "sxy")
     native = graph.store._store()
     seed = native.match_codes(None, f"<{EX}p>", None, None)
-    n3 = [None, f"<{EX}q>", None, None]
+    n3 = (None, f"<{EX}q>", None, None)
     match = native.match_codes(*n3)
     pat = pd.matching.Pattern(n3, {s: [0], y: [2]}, estimate=20)
     spy = native_spy(graph)
@@ -917,8 +930,8 @@ def test_tier2_does_not_trust_a_capped_estimate(graph, monkeypatch):
     relation 101 rows make a product of 202, within a budget of 202, yet the
     pattern fits only once its count is known whole."""
     x, d = Variable("x"), Variable("d")
-    seed = pd.matching.Pattern([f"<{EX}ts0>", f"<{EX}ta>", None, None], {x: [2]}, index=0)
-    linked = pd.matching.Pattern([None, f"<{EX}tl>", None, None], {x: [0], d: [2]}, index=1)
+    seed = pd.matching.Pattern((f"<{EX}ts0>", f"<{EX}ta>", None, None), {x: [2]}, index=0)
+    linked = pd.matching.Pattern((None, f"<{EX}tl>", None, None), {x: [0], d: [2]}, index=1)
     pd.bgp._join_incremental_bgp(graph.store, [seed, linked], pd.bgp._BgpStats())
     assert (seed.estimate, seed.estimate_capped) == (1, False)
     assert (linked.estimate, linked.estimate_capped) == (101, True)
@@ -938,9 +951,9 @@ def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
     s, x, d = (Variable(name) for name in "sxd")
     native = graph.store._store()
     seed = native.match_codes(None, f"<{EX}ta>", None, None)
-    n3 = [None, f"<{EX}tl>", None, None]
+    n3 = (None, f"<{EX}tl>", None, None)
     pat = pd.matching.Pattern(n3, {x: [0], d: [2]}, estimate=245)
-    memo = {tuple(n3): native.match_codes(*n3)}
+    memo = {n3: native.match_codes(*n3)}
     cols = (memoryview(seed[0]).cast("Q"), memoryview(seed[2]).cast("Q"))
     columnar = pd.relation.Relation.from_cols((s, x), cols)
     assert columnar.nrows == 120
@@ -1365,28 +1378,45 @@ def test_an_over_budget_keep_scan_with_a_deferred_restriction_goes_back(graph, m
     assert [step["feed"] for step in _streams(events)] == ["chunks"]
 
 
-@pytest.mark.parametrize("planned", [None, {0: (0, 1 << 40)}], ids=["no-keep", "keep"])
-def test_a_put_back_keep_scan_drops_its_keep(graph, planned):
+def test_keep_scan_does_not_memoize_its_match(graph, monkeypatch, capsys):
+    """A keep-scan's match is narrowed by the relation's codes, a keep no
+    other step reads: it is not memoized, so it is let go once its step has
+    joined it rather than held until the plan ends."""
+    memos: list[dict] = []
+    match = pd.matching._match_resolved_pattern
+
+    def spy(store, pat, memo=None, limit=None):
+        if memo is not None and all(seen is not memo for seen in memos):
+            memos.append(memo)
+        return match(store, pat, memo, limit)
+
+    monkeypatch.setattr(pd.matching, "_match_resolved_pattern", spy)
+    (with_pushdown, without_pushdown), events = _traced_both_ways(
+        graph, monkeypatch, capsys, ANCHORED_SCAN
+    )
+    assert with_pushdown == without_pushdown
+    steps = [step["strategy"] for step in _fields(events, "bgp_join_step_complete")]
+    assert steps == ["probe", "keep_scan"]
+    assert memos and [key for memo in memos for key in memo if isinstance(key[-1], tuple)] == []
+
+
+@pytest.mark.parametrize("planned", [{}, {0: (0, 1 << 40)}], ids=["no-keep", "keep"])
+def test_a_keep_scan_narrows_its_copy_only(graph, planned):
     """A keep-scan narrows its step's copy of the pattern to the relation's
-    codes and memoizes its match under that keep. Put back, the pattern
-    still has the keep it was planned with, which the keep-scan left whole,
-    and the match leaves the memo with the copy's narrower keep."""
+    codes: the pattern keeps the keep it was planned with, whole, for a step
+    that puts it back."""
     k, f, p = (Variable(name) for name in "kfp")
     keys = graph.store._store().match_codes(f"<{EX}c0>", f"<{EX}has>", None, None)[2]
-    pat = pd.matching.Pattern([None, None, None, None], {f: [0], p: [1], k: [2]}, estimate=1348)
+    pat = pd.matching.Pattern((None, None, None, None), {f: [0], p: [1], k: [2]}, estimate=1348)
     pat.nkeep = planned
-    whole = None if planned is None else dict(planned)
-    memo: dict = {}
+    whole = dict(planned)
     relation = pd.relation.Relation.from_cols((k,), (memoryview(keys).cast("Q"),))
     work = pat.copy()
-    pd.bgp._keep_scan(graph.store, work, relation, memo)
+    pd.bgp._keep_scan(graph.store, work, relation)
     assert work.nrows == 18
-    assert work.nkeep is not None and set(work.nkeep) == {2} | set(planned or ())
-    assert list(memo) == [pd.matching._pattern_key(work)]
-    pd.bgp._discard_step(pat, work, memo)
-    assert pat.nkeep is planned
-    assert planned == whole
-    assert not pat.matched and memo == {}
+    assert set(work.nkeep) == {2} | set(planned)
+    assert pat.nkeep is planned and planned == whole
+    assert pat.cols is None
 
 
 def test_a_memo_key_holds_its_keep_column():
@@ -1394,7 +1424,7 @@ def test_a_memo_key_holds_its_keep_column():
     identity: a column of the same codes is another key, and the key holds
     its column, so no later column can take its place while the memo keeps
     the entry."""
-    n3 = [None, f"<{EX}q>", None, None]
+    n3 = (None, f"<{EX}q>", None, None)
     keep = U64Column([1, 2])
     key = pd.matching._pattern_key(pd.matching.Pattern(n3, {}, nkeep={2: keep}))
     assert key == pd.matching._pattern_key(pd.matching.Pattern(n3, {}, nkeep={2: keep}))

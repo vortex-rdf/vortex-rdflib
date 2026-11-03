@@ -4,15 +4,14 @@ join they make (:func:`_probe_join`), and the existence probes of
 ``FILTER (NOT) EXISTS``.
 """
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from itertools import islice
 
-from .. import boundary, filters, trace
+from .. import boundary, filters, trace, union
 from ..settings import SETTINGS
 from ..terms import canonical_spelling, unparseable_iri
 from . import matching, tracing
 from .matching import Pattern
-from .relation import _OverBudget
 
 
 def _probe_exists(store, schema, rows, pat: Pattern) -> list:
@@ -21,7 +20,7 @@ def _probe_exists(store, schema, rows, pat: Pattern) -> list:
     batches), no row materialized."""
     bound = [(schema.index(v), pos) for v, pos in pat.varpos.items() if v in schema]
     free_positions = {idx for v, pos in pat.varpos.items() if v not in schema for idx in pos}
-    keep = {p: spec for p, spec in (pat.nkeep or {}).items() if p in free_positions}
+    keep = {p: spec for p, spec in pat.nkeep.items() if p in free_positions}
     narrowing = matching._narrowing(keep, limit=1)
     patterns = _substituted_patterns(store, rows, pat, bound)
     out = []
@@ -108,8 +107,7 @@ def _run_probes(store, probes, count: bool) -> list | Iterator:
     if not probes:
         return []
     native = boundary.native(store)
-    minimum = SETTINGS.memory_scan_batch_min if store.in_memory else SETTINGS.scan_batch_min
-    batched = _batched_probes(store, [n3 for n3, _ in probes]) if len(probes) >= minimum else []
+    batched = _batched_probes(store, [n3 for n3, _ in probes])
     if not count:
         if 0 < len(batched) < len(probes):
             return _probe_matches(store, native, probes, batched)
@@ -139,25 +137,27 @@ def _batch_probe(n3, narrowing):
     return tuple(n3)
 
 
-#: What :func:`_probe_matches` and :func:`_batch_answers` read past a batch's
-#: last answer when the batch has no more.
+class RowsOverBudget(Exception):
+    """A probe join whose rows passed its ``max_rows`` (:func:`_probe_join`):
+    ``calls`` are the probes it sent."""
+
+    def __init__(self, calls: int):
+        super().__init__(calls)
+        self.calls = calls
+
+
+#: What :func:`_checked_batch` reads past a batch's last answer when the
+#: batch has no more.
 _NO_ANSWER = object()
 
 
-def _batch_answers(store, native, probes) -> Iterator:
-    """The code columns of every probe, in order, from one
-    ``match_codes_many`` call the first pull makes: the native iterator's
-    answers, each waited for as it is pulled, while the probes run as far
-    ahead as :func:`_probe_lookahead` lets them. A batch that answers fewer
-    probes than it was given raises ``ValueError`` at the first probe left
-    without an answer, and one that answers more, with its last probe.
-    Closing the iterator releases the batch's answers, which aborts the
+def _checked_batch(answers, total: int) -> Generator:
+    """The answers of one ``match_codes_many`` call given ``total`` probes,
+    each as it is pulled — all but the last through a C-level ``islice``. A
+    batch that answers fewer probes raises ``ValueError`` at the first probe
+    left without an answer, and one that answers more, with its last probe.
+    The batch's iterator is closed however its answers end, which aborts the
     probes still in flight."""
-    total = len(probes)
-    answers = native.match_codes_many(
-        [_batch_probe(*probe) for probe in probes],
-        lookahead=_probe_lookahead(store, [n3 for n3, _ in probes]),
-    )
     try:
         yield from islice(answers, total - 1)
         last = next(answers, _NO_ANSWER)
@@ -172,6 +172,18 @@ def _batch_answers(store, native, probes) -> Iterator:
             close()
 
 
+def _batch_answers(store, native, probes) -> Iterator:
+    """The code columns of every probe, in order, from one
+    ``match_codes_many`` call the first pull makes, checked
+    (:func:`_checked_batch`): each waited for as it is pulled, while the
+    probes run as far ahead as :func:`_probe_lookahead` lets them."""
+    answers = native.match_codes_many(
+        [_batch_probe(*probe) for probe in probes],
+        lookahead=_probe_lookahead(store, [n3 for n3, _ in probes]),
+    )
+    yield from _checked_batch(answers, len(probes))
+
+
 def _probe_matches(store, native, probes, batched) -> Iterator:
     """The code columns of each probe, in order, each made when it is pulled:
     the ``batched`` probes' from the one ``match_codes_many`` call the first
@@ -179,36 +191,27 @@ def _probe_matches(store, native, probes, batched) -> Iterator:
     lets them, while the consumer works through the answers before theirs;
     the others from a ``match_codes`` call at their position. ``native`` is
     the store's handle through the boundary, which gives the batch the
-    query's cancel token and has a plain call race or check it. A batch that
-    answers fewer probes than it was given raises ``ValueError`` at the
-    first probe left without an answer, and one that answers more, with its
-    last probe. Closing the iterator releases the
-    batch's answers, which aborts the probes still in flight."""
+    query's cancel token and has a plain call race or check it. The batch's
+    answers are checked (:func:`_checked_batch`), and closing the iterator
+    releases them, which aborts the probes still in flight."""
     in_batch = set(batched)
-    answers = iter(())
-    if batched:
-        answers = native.match_codes_many(
-            [_batch_probe(*probes[i]) for i in batched],
-            lookahead=_probe_lookahead(store, [probes[i][0] for i in batched]),
-        )
-    unanswered = len(batched)
+    batch = native.match_codes_many(
+        [_batch_probe(*probes[i]) for i in batched],
+        lookahead=_probe_lookahead(store, [probes[i][0] for i in batched]),
+    )
+    answers = _checked_batch(batch, len(batched))
     try:
         for i, (n3, narrowing) in enumerate(probes):
-            if i not in in_batch:
+            if i in in_batch:
+                yield next(answers)
+            else:
                 yield native.match_codes(*n3, **narrowing)
-                continue
-            try:
-                answer = next(answers)
-            except StopIteration:
-                raise ValueError(
-                    f"match_codes_many answered fewer than its {len(batched)} probes"
-                ) from None
-            unanswered -= 1
-            if not unanswered and next(answers, _NO_ANSWER) is not _NO_ANSWER:
-                raise ValueError(f"match_codes_many answered more than its {len(batched)} probes")
-            yield answer
     finally:
-        close = getattr(answers, "close", None)
+        answers.close()
+        # Closed here too: a consumer that stops before the first batched
+        # answer leaves the checked answers unstarted, and closing those
+        # runs nothing.
+        close = getattr(batch, "close", None)
         if close is not None:
             close()
 
@@ -259,10 +262,10 @@ def _probe_join(
     position): one call each, a batch's probes running as far ahead as
     :func:`_probe_lookahead` lets them. An existence probe keeps its row
     once when its triple is there: the quads are unique, and the union over
-    every graph is a set, so its count stops at one row. A probe of a
-    ``distinct`` pattern (the union over the graphs of a store where some
-    triple is in several) keeps one row of each run of equal triples, adjacent in its
-    match (:mod:`vortex_rdflib.union`). The pattern's native keep narrows each probe on the
+    every graph is a set, so its count stops at one row. The answer of a
+    probe of a ``distinct`` pattern (the union over the graphs of a store
+    where some triple is in several) is made a set of triples
+    (:func:`union.distinct_rows`). The pattern's native keep narrows each probe on the
     positions it leaves free (a code range inside the native match, a code
     column over the rows it returns), as do ``row_preds`` over the extended
     row; with ``keep_unmatched`` a row without a continuation is kept, padded
@@ -270,8 +273,12 @@ def _probe_join(
     reaches them and released when the batch ends, however it ends. Once a
     probe's rows take the join past ``max_rows``, it drops the rows it made
     and the batch it is pulling, which aborts the probes still in flight,
-    and raises :class:`_OverBudget` with the probes it sent.
+    and raises :class:`RowsOverBudget` with the probes it sent.
+
+    A left join takes no deferred restriction: evaluated over the joined
+    rows, it would drop the rows the join keeps padded.
     """
+    assert not (keep_unmatched and pat.deferred), "a left join's padded rows meet no restriction"
     bound = [(schema.index(v), pos) for v, pos in pat.varpos.items() if v in schema]
     free = {v: pos for v, pos in pat.varpos.items() if v not in schema}
     eq_checks = [(pos[0], later) for pos in free.values() for later in pos[1:]]
@@ -280,7 +287,7 @@ def _probe_join(
     # A code range rides every probe; a code column is tested on the rows a
     # probe returns, since the native layer would re-read it per probe.
     probe_keep, tests = {}, []
-    for position, spec in (pat.nkeep or {}).items():
+    for position, spec in pat.nkeep.items():
         if position in needed:
             if isinstance(spec, tuple):
                 probe_keep[position] = spec
@@ -302,26 +309,19 @@ def _probe_join(
                 if patterns[i] is None:
                     pass
                 elif not free:
-                    # Existence probe: a count, no columns; the row stands once
-                    # per quad counted.
-                    count = next(answers)
-                    if count and all(pred(row) for pred in row_preds):
-                        out.extend([row] * count)
+                    # Existence probe: a count capped at one row, no columns;
+                    # the row stands once.
+                    if next(answers) and all(pred(row) for pred in row_preds):
+                        out.append(row)
                         matched = True
                 else:
                     cols = next(answers)
                     if cols is None:
                         raise NotImplementedError
+                    if pat.distinct:
+                        cols = union.distinct_rows(cols)
                     views = {idx: memoryview(cols[idx]).cast("Q").tolist() for idx in needed}
-                    previous = None
                     for j in range(len(views[needed[0]])):
-                        if pat.distinct:
-                            # The rows of one triple differ only in their
-                            # graph, which no variable reads: keep the first.
-                            triple = tuple(views[idx][j] for idx in needed)
-                            if triple == previous:
-                                continue
-                            previous = triple
                         if all(views[a][j] == views[b][j] for a, b in eq_checks) and all(
                             test(views[p][j]) for p, test in tests
                         ):
@@ -336,7 +336,7 @@ def _probe_join(
                     sent = sum(n3 is not None for n3 in patterns[:start])
                     pulled = sum(n3 is not None for n3 in patterns[start : i + 1])
                     sent += _batch_probes_sent(store, probes, pulled, count=not free)
-                    raise _OverBudget(None, sent)
+                    raise RowsOverBudget(sent)
         finally:
             close = getattr(answers, "close", None)
             if close is not None:
@@ -345,7 +345,7 @@ def _probe_join(
     # The deferred per-variable restrictions, over the codes the probes
     # actually reached rather than the pattern's whole column. A variable
     # the relation bound was restricted where it was bound.
-    pending, pat.deferred = pat.deferred, None
+    pending, pat.deferred = pat.deferred, {}
     if pending and out:
         restriction_input_rows = len(out)
         for var, conjuncts in pending.items():
@@ -370,7 +370,6 @@ def _probe_join(
                 elapsed_ns=elapsed_ns,
             )
             restriction_input_rows = len(out)
-        pat.probe_rows = len(out)
     return combined_schema, out
 
 

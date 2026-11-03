@@ -110,11 +110,11 @@ def _streamed_step(
     key_var = next(v for v in varpos if v in schema)
     step_schema = schema + tuple(v for v in varpos if v not in schema)
     held = [rel.native_column(i) for i in range(len(schema))]
-    if not pat.matched and matching._pattern_key(pat) in memo:
+    if pat.cols is None and matching._pattern_key(pat) in memo:
         matching._match_resolved_pattern(store, pat, memo)
     pattern_schema = tuple(varpos)
     pattern = None
-    if pat.matched:
+    if pat.cols is not None:
         body = matching._rel_from_pattern(pat)
         pattern = [body.native_column(i) for i in range(len(pattern_schema))]
     if pattern is not None and len(pattern[0]) < len(held[0]):
@@ -159,4 +159,4 @@ def _chunkable(pat: Pattern) -> bool:
     its whole columns — no deferred restriction (:func:`_restrict_pattern`) —
     and no repeated variable asks for a test across a row's columns, which a
     chunk does not make (:func:`_materialize`)."""
-    return not pat.deferred and all(len(positions) == 1 for positions in pat.varpos.values())
+    return not pat.deferred and not pat.repeats

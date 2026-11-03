@@ -550,7 +550,7 @@ def test_probe_join_pads_rows_when_the_pattern_shares_no_variable(graph):
     relation, so nothing is substituted per row. No caller probes such a
     pattern today, but `_probe_join` must not rely on that."""
     pattern = pd.matching.Pattern(
-        [None, "<http://ex.org/nothing>", None, None], {Variable("x"): [0], Variable("a"): [2]}
+        (None, "<http://ex.org/nothing>", None, None), {Variable("x"): [0], Variable("a"): [2]}
     )
     schema, rows = pd.probes._probe_join(
         graph.store, (Variable("z"),), [(0,), (1,)], pattern, keep_unmatched=True

@@ -361,7 +361,7 @@ def test_compacting_a_match_keeps_the_allowed_rows_in_match_order(varpos, keep, 
     kept variable's first position is allowed, in match order; the columns of
     constant positions are dropped, and the match's own columns are untouched."""
     columns = tuple(U64Column(column) for column in MATCH)
-    pat = pd.matching.Pattern([None] * 4, varpos)
+    pat = pd.matching.Pattern((None,) * 4, varpos)
     pat.set_match(columns, len(MATCH[0]))
     kept = [
         i
@@ -370,7 +370,7 @@ def test_compacting_a_match_keeps_the_allowed_rows_in_match_order(varpos, keep, 
     ]
     assert kept == remaining
     pd.matching._compact_pattern(pat, keep)
-    assert pat.nrows == len(kept)
+    assert pat.nrows == len(kept) and pat.cols is not None
     read = {idx for positions in varpos.values() for idx in positions}
     for idx in range(4):
         if idx in read:
@@ -391,13 +391,13 @@ def test_restricting_a_match_compacts_it_to_the_rows_that_pass(tmp_path, limit, 
     columns = _price_match(store)
     subjects, prices = (memoryview(columns[i]).cast("Q").tolist() for i in (0, 2))
     passing = {_price_code(store, i) for i in range(200) if (i * 37) % 1000 < limit}
-    pat = pd.matching.Pattern([None] * 4, {S: [0], V: [2]}, index=0)
+    pat = pd.matching.Pattern((None,) * 4, {S: [0], V: [2]}, index=0)
     pat.set_match(columns, len(subjects))
     [conjunct] = filters.analyze_expr(filter_expr(f"?v < {limit}"), [V], CTX, {}).per_var[V]
     pd.matching._restrict_pattern(store, pat, {V: [conjunct]})
     rows = [i for i, price in enumerate(prices) if price in passing]
     assert 0 < len(rows) and (len(rows) < len(subjects)) == compacted
-    assert pat.nrows == len(rows)
+    assert pat.nrows == len(rows) and pat.cols is not None
     assert memoryview(pat.cols[0]).cast("Q").tolist() == [subjects[i] for i in rows]
     assert memoryview(pat.cols[2]).cast("Q").tolist() == [prices[i] for i in rows]
     if compacted:

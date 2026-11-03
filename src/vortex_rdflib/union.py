@@ -9,7 +9,7 @@ the first row of each run of equal ``(s, p, o)`` codes (``U64Column.run_starts``
 makes the match a set, in one pass and no memory beyond its rows.
 """
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator
 
 #: The positions of a quad's triple: the key a union match is made distinct on.
 TRIPLE = (0, 1, 2)
@@ -28,23 +28,30 @@ def distinct_rows(cols: tuple, key=TRIPLE) -> tuple:
     return tuple(None if col is None else col.take(starts) for col in cols)
 
 
-def distinct_chunks(chunks: Iterable[tuple], key=TRIPLE) -> Iterator[tuple]:
+def distinct_chunks(chunks: Iterable[tuple], key=TRIPLE) -> Generator[tuple, None, None]:
     """:func:`distinct_rows` of each chunk of one match, read in order: a run
-    that crosses a chunk boundary is kept in the chunk it starts in."""
+    that crosses a chunk boundary is kept in the chunk it starts in. The
+    chunks are closed however these end — exhausted, failed or closed —
+    which ends a native chunk iterator's scan."""
     last = None
-    for cols in chunks:
-        cols = distinct_rows(cols, key)
-        rows = len(cols[0])
-        if (
-            rows
-            and last is not None
-            and all(_at(cols[i], 0) == v for i, v in zip(key, last, strict=True))
-        ):
-            cols = tuple(col.slice(1, rows) for col in cols)
-            rows -= 1
-        if rows:
-            last = [_at(cols[i], rows - 1) for i in key]
-        yield cols
+    try:
+        for cols in chunks:
+            cols = distinct_rows(cols, key)
+            rows = len(cols[0])
+            if (
+                rows
+                and last is not None
+                and all(_at(cols[i], 0) == v for i, v in zip(key, last, strict=True))
+            ):
+                cols = tuple(col.slice(1, rows) for col in cols)
+                rows -= 1
+            if rows:
+                last = [_at(cols[i], rows - 1) for i in key]
+            yield cols
+    finally:
+        close = getattr(chunks, "close", None)
+        if close is not None:
+            close()
 
 
 def one_per_triple(rows: Iterable[tuple]) -> Iterator[tuple]:

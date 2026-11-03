@@ -127,8 +127,7 @@ def test_decode_each_step_returns_the_same_codes(store):
     from vortex_rdf import U64Column
 
     from vortex_rdflib import VortexRdflibStore
-    from vortex_rdflib.pushdown.bgp import _decode_each_step
-    from vortex_rdflib.pushdown.relation import Relation
+    from vortex_rdflib.pushdown.relation import Relation, _decode_each_step
 
     st = VortexRdflibStore(str(store))
     st._store()

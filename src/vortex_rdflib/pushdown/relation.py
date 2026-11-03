@@ -8,6 +8,7 @@ from operator import itemgetter
 
 from vortex_rdf import JoinTooLarge, U64Column
 
+from .. import boundary
 from ..cancel import check_cancelled
 from ..settings import SETTINGS
 
@@ -75,7 +76,10 @@ class Relation:
         )
 
     def row_list(self) -> list[tuple]:
-        """A columnar or row body's rows, a columnar one zipped in one pass."""
+        """A columnar or row body's rows, a columnar one zipped in one pass:
+        the body as held, so the relation has no row predicate still to apply
+        and no pattern rdflib still finishes (:func:`_rows_of` reads those)."""
+        assert not self.preds and not self.rest, "the body is not the relation's rows"
         if self.cols is not None:
             return _cols_to_rows(self.cols)
         assert self.rows is not None, "a streamed body has no rows to list"
@@ -83,7 +87,9 @@ class Relation:
 
     def native_column(self, index: int) -> U64Column:
         """Column ``index`` of a columnar or row body as a native column: the
-        one behind a columnar body's view, or one built from the rows."""
+        one behind a columnar body's view, or one built from the rows. The
+        body as held, as :meth:`row_list` reads it."""
+        assert not self.preds and not self.rest, "the body is not the relation's rows"
         if self.cols is not None:
             return _native_column(self.cols[index])
         assert self.rows is not None, "a streamed body has no columns"
@@ -144,21 +150,16 @@ def _filter_relation(rel: Relation, preds) -> Relation:
     return rel.with_rows(rows)
 
 
-class _OverBudget(Exception):
-    """A join step of a BGP over the pair budget (``SETTINGS.pair_budget``:
-    counted by ``join_indices`` capped at the budget in :func:`_join_columns`,
-    by :func:`_pair_count` for a join of rows), raised before the step
-    is built. ``pairs`` is the step's pair count, ``None`` for a probe step
-    or a keep-scan, which stop on their rows. ``calls`` are the native calls
-    the step made before it stopped — a probe step's probes, a keep-scan's
-    match — and ``native_ns`` the keep-scan's time when tracing, for the
-    step's statistics. :func:`_join_incremental_bgp` catches it."""
+class OverBudget(Exception):
+    """A hash join over the pair budget (``SETTINGS.pair_budget``), refused
+    before any pair is built: ``pairs`` is its pair count — counted by
+    ``join_indices`` capped at the budget for a columnar join
+    (:func:`_join_columns`), by ``join_count`` for a join of rows
+    (:func:`_hash_join`)."""
 
-    def __init__(self, pairs: int | None, calls: int = 0, native_ns: int = 0):
+    def __init__(self, pairs: int):
         super().__init__(pairs)
         self.pairs = pairs
-        self.calls = calls
-        self.native_ns = native_ns
 
 
 def _native_column(col) -> U64Column:
@@ -183,32 +184,44 @@ def _cols_to_rows(cols) -> list:
     return list(zip(*(col.tolist() for col in cols), strict=True))
 
 
-def _pair_count(left: U64Column, right: U64Column) -> int | None:
-    """The row pairs a join of the two key columns makes, counted natively
-    (``join_count``, no pair built) — or ``None``, uncounted, when the
-    columns' product is within ``SETTINGS.pair_budget``: the count a join of
-    rows makes before it is built (:func:`_row_step_pairs`)."""
-    if len(left) * len(right) <= SETTINGS.pair_budget:
-        return None
-    return left.join_count(right)
+def _hash_kind(left: "Relation", right: "Relation") -> str:
+    """How :func:`_hash_join` joins two relations: ``"hash_columns"`` —
+    columns out (:func:`_join_columns`) — when both bodies are columnar and
+    share exactly one variable, ``"hash_rows"`` (:func:`_join`) otherwise."""
+    if left.cols is None or right.cols is None:
+        return "hash_rows"
+    shared = [v for v in right.schema if v in left.schema]
+    return "hash_columns" if len(shared) == 1 else "hash_rows"
 
 
-def _row_step_pairs(schema_a, rows_a, schema_b, rows_b) -> int | None:
-    """The pairs :func:`_join` makes of two row relations, as
-    :func:`_pair_count` counts them: ``None`` while their product is within
-    ``SETTINGS.pair_budget``; past it, the pairs of the first shared variable's
-    codes, copied into native columns (with several shared variables an
-    upper bound of the joined rows), or the product when none is shared."""
+def _hash_join(left: "Relation", right: "Relation") -> tuple["Relation", int | None]:
+    """The hash join of two relations — columnar or row bodies — on their
+    shared variables, within ``SETTINGS.pair_budget``, the way
+    :func:`_hash_kind` names: the joined relation and its pair count,
+    ``None`` while the two sides' product is within the budget and the pairs
+    go uncounted. Past it a join of rows counts the pairs of its first
+    shared variable's codes (with several shared variables an upper bound of
+    the rows it makes), or the product when none is shared, before it builds
+    any. A join over the budget raises :class:`OverBudget` with its
+    pairs."""
+    if _hash_kind(left, right) == "hash_columns":
+        joined = _join_columns(left.schema, left.cols, right.schema, right.cols)
+        assert joined is not None, "a columnar join shares one variable"
+        schema, cols, pairs = joined
+        return Relation.from_cols(schema, cols), pairs
+    rows_a, rows_b = left.row_list(), right.row_list()
+    pairs = None
     product = len(rows_a) * len(rows_b)
-    if product <= SETTINGS.pair_budget:
-        return None
-    shared = [v for v in schema_b if v in schema_a]
-    if not shared:
-        return product
-    ia, ib = schema_a.index(shared[0]), schema_b.index(shared[0])
-    return _pair_count(
-        U64Column([row[ia] for row in rows_a]), U64Column([row[ib] for row in rows_b])
-    )
+    if product > SETTINGS.pair_budget:
+        shared = [v for v in right.schema if v in left.schema]
+        pairs = product
+        if shared:
+            ia, ib = left.schema.index(shared[0]), right.schema.index(shared[0])
+            keys_a = U64Column([row[ia] for row in rows_a])
+            pairs = keys_a.join_count(U64Column([row[ib] for row in rows_b]))
+        if pairs > SETTINGS.pair_budget:
+            raise OverBudget(pairs)
+    return Relation.from_rows(*_join(left.schema, rows_a, right.schema, rows_b)), pairs
 
 
 def _join_columns(schema_a, cols_a, schema_b, cols_b):
@@ -224,7 +237,7 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
     those indices. Within the product bound the join is built uncounted.
     Past it, ``join_indices`` has ``SETTINGS.pair_budget`` as its cap, so it
     counts the pairs before it builds any: a join over the budget is refused
-    (``JoinTooLarge``) and raises :class:`_OverBudget` with that count, and
+    (``JoinTooLarge``) and raises :class:`OverBudget` with that count, and
     one within it is built, its pair count the pairs it made.
     """
     shared = [v for v in schema_b if v in schema_a]
@@ -243,7 +256,7 @@ def _join_columns(schema_a, cols_a, schema_b, cols_b):
         try:
             a_idx, b_idx = left[ia].join_indices(key, max_pairs=SETTINGS.pair_budget)
         except JoinTooLarge as refused:
-            raise _OverBudget(refused.pairs) from None
+            raise OverBudget(refused.pairs) from None
         pairs = len(a_idx)
     out = [col.take(a_idx) for col in left]
     out += [_native_column(cols_b[i]).take(b_idx) for i in keep_b]
@@ -371,3 +384,29 @@ def _column_rows(cols, nrows) -> Iterator[tuple]:
         yield from zip(*(view[i:j].tolist() for view in cols), strict=True)
         i, size = j, min(size * 4, SETTINGS.chunk_max)
         check_cancelled()
+
+
+def _decode_each_step(store, rel: Relation) -> Relation:
+    """``VORTEX_RDF_DECODE_EACH_STEP=1``: the relation's codes decoded to their spellings and
+    encoded again — the same codes (tests/test_ablation_switches.py checks it), after the term round
+    trip a term-space evaluator pays at every step. Codes outside the dictionary (negative: query
+    constants) pass through; a streamed relation (pieces) is left as it is."""
+    term_dict = boundary.term_dict(store)
+
+    def again(codes: list) -> list:
+        mine = [c for c in codes if c >= 0]
+        back = iter(term_dict.encode_many(term_dict.decode_many(U64Column(mine))) if mine else ())
+        return [next(back) if c >= 0 else c for c in codes]
+
+    if rel.cols is not None:
+        out = []
+        for col in rel.cols:
+            view = col if isinstance(col, memoryview) else memoryview(col)
+            codes = (view if view.format == "Q" else view.cast("Q")).tolist()
+            out.append(memoryview(U64Column(again(codes))).cast("Q"))
+        return replace(rel, cols=tuple(out))
+    if rel.rows:
+        width = len(rel.rows[0])
+        columns = [again([row[i] for row in rel.rows]) for i in range(width)]
+        return replace(rel, rows=list(zip(*columns, strict=True)) if width else rel.rows)
+    return rel

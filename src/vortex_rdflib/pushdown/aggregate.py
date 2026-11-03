@@ -53,13 +53,13 @@ def _eval_aggregate(ctx, store, part):
     pat = blocks._single_pattern(ctx, store, block, scope) if group_vars is None else None
     if (
         pat is not None
-        and all(len(pos) == 1 for pos in pat.varpos.values())
+        and not pat.repeats
         and all(
             not distinct and (target == "*" or target in pat.varpos or ctx[target] is not None)
             for _, target, distinct in counts
         )
     ):
-        n = matching._count_pattern(store, pat, {}, exact=True)
+        n = matching._exact_count(store, pat)
         return iter([FrozenBindings(ctx, {res: Literal(n) for res, _, _ in counts})])
 
     rel = blocks._solve_block(ctx, store, block, scope=scope)
