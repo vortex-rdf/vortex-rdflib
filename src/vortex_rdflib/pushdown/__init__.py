@@ -147,7 +147,10 @@ The modules, from the hook down:
 - :mod:`.head` — the head above a block: projection, DISTINCT, ORDER BY, LIMIT;
 - :mod:`.aggregate` — ``COUNT`` aggregates;
 - :mod:`.blocks` — FILTER, joins, OPTIONAL, MINUS, EXISTS, VALUES, GRAPH;
-- :mod:`.bgp` — basic graph patterns and the incremental join planner;
+- :mod:`.pushed` — the FILTER conjuncts a FILTER hands down into its block;
+- :mod:`.bgp` — basic graph patterns;
+- :mod:`.planner` — the incremental join planner of a BGP;
+- :mod:`.tracing` — a BGP plan's trace events;
 - :mod:`.streaming` — a last join step over the pair budget, streamed;
 - :mod:`.probes` — probe joins and batched native probes;
 - :mod:`.matching` — one pattern: resolved, narrowed, counted, matched;
@@ -175,10 +178,13 @@ from . import (  # noqa: F401
     head,
     hook,
     matching,
+    planner,
     probes,
+    pushed,
     relation,
     solutions,
     streaming,
+    tracing,
 )
 from .hook import register_sparql_pushdown, unregister_sparql_pushdown
 

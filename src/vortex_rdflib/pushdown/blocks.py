@@ -13,9 +13,10 @@ from rdflib.plugins.sparql.evaluate import evalPart
 
 from .. import boundary, filters, trace
 from ..terms import canonical_spelling, unparseable_iri
-from . import algebra, bgp, matching, probes, relation, solutions
+from . import algebra, bgp, matching, planner, probes, relation, solutions
 from .algebra import Block
 from .matching import Pattern
+from .pushed import NOTHING, Pushed
 from .relation import Relation
 
 
@@ -50,18 +51,18 @@ class _Frame:
     solved independently and joined, which is only exact while nothing
     inside depends on those values (a FILTER that could see them falls
     back). ``pushed`` are the filter conjuncts a FILTER above handed down
-    (:class:`bgp._Pushed`). ``limit`` says only that many rows will be read:
+    (:class:`.pushed.Pushed`). ``limit`` says only that many rows will be read:
     a block that is one native match fetches no more (see
     :func:`bgp._solve_bgp`); any other ignores it. ``stream`` says the
     relation goes straight to :func:`solutions._yield_solutions`: it reaches
     a BGP through FILTER and GRAPH nodes only, where rdflib may finish the
     patterns a join over the pair budget leaves
-    (:func:`bgp._join_incremental_bgp`).
+    (:func:`planner._join_incremental_bgp`).
     """
 
     scope: algebra._GraphScope | None = None
     env: frozenset = frozenset()
-    pushed: bgp._Pushed = bgp.NOTHING
+    pushed: Pushed = NOTHING
     limit: int | None = None
     stream: bool = False
 
@@ -257,7 +258,7 @@ def _solve_filter(ctx, store, node: algebra.Filter, frame: _Frame) -> Relation:
             per_var[var] = [*per_var.get(var, ()), *conjuncts]
     fast_tuples = tuple(conjunct for conjunct in plan.tuples if conjunct.fast is not None)
     views = {} if outer.views is None else outer.views
-    pushed = bgp._Pushed(MappingProxyType(per_var), outer.tuples + fast_tuples, views)
+    pushed = Pushed(MappingProxyType(per_var), outer.tuples + fast_tuples, views)
     rel = _solve_block(
         ctx,
         store,
@@ -645,13 +646,13 @@ def _plan_side(
 ) -> tuple[Pattern, str]:
     """The one-pattern right side of a lazy join, an OPTIONAL or an EXISTS,
     resolved and planned by the rule a BGP's join step follows
-    (:func:`bgp.step_rule`): the pattern, and how it joins the left rows —
+    (:func:`planner.step_rule`): the pattern, and how it joins the left rows —
     ``"probe"``, re-matched per left row, the pattern unread; ``"keep_scan"``,
     matched once, narrowed to the codes the left rows bind its shared
     variables to; ``"hash"``, matched whole.
 
     The pattern is counted before anything is matched, as far as the
-    decision needs (:func:`bgp.count_at_step`): it is probed per left row
+    decision needs (:func:`planner.count_at_step`): it is probed per left row
     where it shares a variable with the left relation, the relation is at
     least ``SETTINGS.probe_fanout`` times smaller than its count and each
     probe is a point lookup, and keep-scanned where each probe would scan;
@@ -676,8 +677,8 @@ def _plan_side(
             store, pat, {v: cs for v, cs in var_preds.items() if v not in left.schema}
         )
     running = len(left_rows)
-    bgp.count_at_step(store, pat, running, {})
-    strategy = bgp.step_rule(store, running, pat, shared)
+    planner.count_at_step(store, pat, running, {})
+    strategy = planner.step_rule(store, running, pat, shared)
     if exists and strategy != "hash":
         repeated = any(len(pos) > 1 for v, pos in pat.varpos.items() if v not in left.schema)
         strategy = "keep_scan" if repeated else "probe"
@@ -704,7 +705,7 @@ def _join_side(
 ) -> _SideJoin:
     """The planned side (:func:`_plan_side`) joined to the left rows: probed
     per row (:func:`probes._probe_join`, with ``options``) while its rows
-    stay within the probe budget (:func:`bgp.probe_budget`), as a BGP's
+    stay within the probe budget (:func:`planner.probe_budget`), as a BGP's
     probe step is, and keep-scanned past it; a keep-scan matched once,
     narrowed to the codes the left rows bind (:func:`matching.narrow_to`: a
     VALUES term outside the dictionary joins nothing), and a hash side
@@ -716,7 +717,7 @@ def _join_side(
     if strategy == "probe":
         try:
             schema, rows = probes._probe_join(
-                store, left.schema, left_rows, pat, max_rows=bgp.probe_budget(), **options
+                store, left.schema, left_rows, pat, max_rows=planner.probe_budget(), **options
             )
         except probes.RowsOverBudget as over:
             calls, strategy = over.calls, "keep_scan"

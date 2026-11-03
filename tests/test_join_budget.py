@@ -932,14 +932,14 @@ def test_tier2_does_not_trust_a_capped_estimate(graph, monkeypatch):
     x, d = Variable("x"), Variable("d")
     seed = pd.matching.Pattern((f"<{EX}ts0>", f"<{EX}ta>", None, None), {x: [2]}, index=0)
     linked = pd.matching.Pattern((None, f"<{EX}tl>", None, None), {x: [0], d: [2]}, index=1)
-    pd.bgp._join_incremental_bgp(graph.store, [seed, linked], pd.bgp._BgpStats())
+    pd.planner._join_incremental_bgp(graph.store, [seed, linked], pd.tracing._BgpStats())
     assert (seed.estimate, seed.estimate_capped) == (1, False)
     assert (linked.estimate, linked.estimate_capped) == (101, True)
     monkeypatch.setattr(SETTINGS, "pair_budget", 202)
     relation = pd.relation.Relation.from_rows((x,), [(1,), (2,)])
-    assert not pd.bgp._fits(relation, linked, {})
+    assert not pd.planner._fits(relation, linked, {})
     linked.estimate_capped = False
-    assert pd.bgp._fits(relation, linked, {})
+    assert pd.planner._fits(relation, linked, {})
 
 
 def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
@@ -959,13 +959,13 @@ def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
     assert columnar.nrows == 120
     bodies = [columnar, pd.relation.Relation.from_rows((s, x), pd.relation._cols_to_rows(cols))]
     monkeypatch.setattr(SETTINGS, "pair_budget", 5)
-    assert [pd.bgp._fits(body, pat, memo) for body in bodies] == [True] * 2
-    assert not pd.bgp._fits(columnar, pat, {})
+    assert [pd.planner._fits(body, pat, memo) for body in bodies] == [True] * 2
+    assert not pd.planner._fits(columnar, pat, {})
     monkeypatch.setattr(SETTINGS, "probe_fanout", 2)
-    assert not pd.bgp._fits(columnar, pat, memo)
+    assert not pd.planner._fits(columnar, pat, memo)
     monkeypatch.setattr(SETTINGS, "probe_fanout", 100)
     monkeypatch.setattr(SETTINGS, "pair_budget", 4)
-    assert [pd.bgp._fits(body, pat, memo) for body in bodies] == [False] * 2
+    assert [pd.planner._fits(body, pat, memo) for body in bodies] == [False] * 2
 
 
 @pytest.mark.parametrize("budget", [119, 60])
@@ -1412,7 +1412,7 @@ def test_a_keep_scan_narrows_its_copy_only(graph, planned):
     whole = dict(planned)
     relation = pd.relation.Relation.from_cols((k,), (memoryview(keys).cast("Q"),))
     work = pat.copy()
-    pd.bgp._keep_scan(graph.store, work, relation)
+    pd.planner._keep_scan(graph.store, work, relation)
     assert work.nrows == 18
     assert set(work.nkeep) == {2} | set(planned)
     assert pat.nkeep is planned and planned == whole
