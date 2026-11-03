@@ -1536,6 +1536,58 @@ def test_count_over_one_pattern_counts_instead_of_matching(graph):
     assert (native.counts, native.matches) == (2, 0)
 
 
+#: COUNT(DISTINCT ?c) of a ?c bound everywhere: ``(query, initBindings,
+#: the counts it answers)`` — by the context, in the columnar route (no
+#: group key, one key) and the row route (two keys), and over no row; by a
+#: VALUES table of the block.
+_BOUND_COUNTS = {
+    "context": (
+        "SELECT (COUNT(DISTINCT ?c) AS ?n) WHERE { ?s <http://ex.org/name> ?o }",
+        {"c": Literal(1)},
+        [1],
+    ),
+    "context-one-key": (
+        "SELECT ?s (COUNT(DISTINCT ?c) AS ?n) WHERE { ?s <http://ex.org/name> ?o } GROUP BY ?s",
+        {"c": Literal(1)},
+        [1] * 8,
+    ),
+    "context-two-keys": (
+        """SELECT ?s ?o (COUNT(DISTINCT ?c) AS ?n)
+        WHERE { ?s <http://ex.org/name> ?o } GROUP BY ?s ?o""",
+        {"c": Literal(1)},
+        [1] * 8,
+    ),
+    "context-no-row": (
+        "SELECT (COUNT(DISTINCT ?c) AS ?n) WHERE { ?s <http://ex.org/nothing> ?o }",
+        {"c": Literal(1)},
+        [0],
+    ),
+    "values": (
+        "SELECT (COUNT(DISTINCT ?c) AS ?n) WHERE { VALUES ?c { 1 } ?s <http://ex.org/name> ?o }",
+        {},
+        [1],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_BOUND_COUNTS))
+def test_count_distinct_of_a_bound_constant(graph, case):
+    """A variable bound in every row has one distinct value per group: rdflib
+    counts 1 per group, and 0 over no row."""
+    sparql, init, counts = _BOUND_COUNTS[case]
+    register_sparql_pushdown()
+    with_pushdown = sorted((tuple(r) for r in graph.query(sparql, initBindings=init)), key=row_key)
+    try:
+        unregister_sparql_pushdown()
+        without_pushdown = sorted(
+            (tuple(r) for r in graph.query(sparql, initBindings=init)), key=row_key
+        )
+    finally:
+        register_sparql_pushdown()
+    assert with_pushdown == without_pushdown
+    assert [row[-1] for row in with_pushdown] == [Literal(n) for n in counts]
+
+
 def test_distinct_decodes_only_the_survivors(tmp_path):
     """``SELECT DISTINCT ?p`` over 700 rows with 7 predicates decodes 7 codes."""
     nt = tmp_path / "wide.nt"

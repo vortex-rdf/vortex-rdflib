@@ -4,6 +4,8 @@ OPTIONAL, a MINUS, a VALUES table, a GRAPH — and the block and ASK
 handlers.
 """
 
+from dataclasses import dataclass, replace
+
 from rdflib.plugins.sparql.evaluate import evalPart
 
 from .. import boundary, filters, trace
@@ -324,8 +326,9 @@ def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None, stream=Fa
 def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
     """``FILTER (NOT) EXISTS { body }`` as a semi- or anti-join on the
     variables the body shares with the block: the body is solved once (or,
-    for a small block and a one-pattern body, probed per row with counts
-    capped at one row, in native batches) instead of once per row. Shapes
+    for a one-pattern body, as :func:`_pattern_side` plans it: for a small
+    block, probed per row with counts capped at one row, in native batches)
+    instead of once per row. Shapes
     rdflib would evaluate differently on an independently solved body — a
     shared variable the block or the body's solutions may leave unbound, a
     body the solver cannot take, a body FILTER that sees the block's bindings
@@ -375,18 +378,12 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
             return rel.with_rows([])
         if body.name == "BGP" and len(body.triples) == 1:
             # Counted before it is matched: probing needs no match at all.
-            pat = matching._pattern_terms(ctx, store, *body.triples[0], scope=scope)
-            repeated_free = any(
-                len(pos) > 1 for v, pos in pat.varpos.items() if v not in rel.schema
-            )
-            if not repeated_free and len(rows) * SETTINGS.probe_fanout < matching._planning_count(
-                store, pat, {}, limit=len(rows) * SETTINGS.probe_fanout + 1
-            ):
-                flags = probes._probe_exists(store, rel.schema, rows, pat)
+            side = _pattern_side(ctx, store, body.triples[0], scope, rel, rows, exists=True)
+            if side.strategy == "probe":
+                flags = probes._probe_exists(store, rel.schema, rows, side.pat)
                 kept = [row for row, found in zip(rows, flags, strict=True) if found != negate]
                 return rel.with_rows(kept)
-            matching._match_resolved_pattern(store, pat)
-            inner = matching._rel_from_pattern(pat)
+            inner = _matched_side(store, side, rel.schema, rows)
         else:
             inner = _solve_block(ctx, store, body, env, None, scope)
     except NotImplementedError:
@@ -450,8 +447,9 @@ def _reject_forgotten_exists(ctx, conjuncts, kept) -> None:
 
 def _solve_join(ctx, store, node, env, var_preds, scope) -> Relation:
     """A group join: both sides solved, then a hash join on the shared
-    variables (a probe of the right pattern when the left side is small).
-    rdflib deduplicates the right side of a non-lazy join."""
+    variables — or, for a lazy join whose right side is one pattern, the
+    join :func:`_pattern_side` plans. rdflib deduplicates the right side of a
+    non-lazy join."""
     lazy = bool(node.lazy)
     left = _solve_block(ctx, store, node.p1, env, var_preds, scope)
     left_rows = relation._rows_of(left)
@@ -460,32 +458,34 @@ def _solve_join(ctx, store, node, env, var_preds, scope) -> Relation:
             v for v in algebra._block_vars(ctx, node.p2, scope) if v not in left.schema
         )
         return Relation(schema, None, [], 0, left.nullable | algebra._block_nullable(node.p2))
-    right_env = env | frozenset(algebra._scoped_vars(node.p1, scope)) if lazy else env
     p2 = node.p2
     if lazy and p2.name == "BGP" and len(p2.triples) == 1:
-        pat, estimate, probe = _plan_pattern_side(
-            ctx, store, p2.triples[0], scope, left, left_rows, var_preds
-        )
-        if probe:
-            schema, rows = probes._probe_join(store, left.schema, left_rows, pat)
-            trace.event(
-                "join_plan_complete",
-                strategy="probe",
-                input_rows=len(left_rows),
-                estimated_right_rows=estimate,
-                native_probe_call_count=len(left_rows),
-                output_rows=len(rows),
-            )
-            return Relation(schema, None, rows, len(rows), left.nullable)
+        side = _pattern_side(ctx, store, p2.triples[0], scope, left, left_rows, var_preds)
+        calls = 0
+        if side.strategy == "probe":
+            schema, rows, calls = _probed(store, side, left, left_rows)
+            if rows is not None:
+                trace.event(
+                    "join_plan_complete",
+                    strategy="probe",
+                    input_rows=len(left_rows),
+                    estimated_right_rows=side.pat.estimate,
+                    native_probe_call_count=calls,
+                    output_rows=len(rows),
+                )
+                return Relation(schema, None, rows, len(rows), left.nullable)
+            side = replace(side, strategy="keep_scan")
+        right = _matched_side(store, side, left.schema, left_rows)
         trace.event(
             "join_plan_complete",
-            strategy="hash",
+            strategy=side.strategy,
             input_rows=len(left_rows),
-            estimated_right_rows=estimate,
-            right_rows=pat.nrows,
+            estimated_right_rows=side.pat.estimate,
+            native_probe_call_count=calls,
+            right_rows=side.pat.nrows,
         )
-        right = matching._rel_from_pattern(pat)
     else:
+        right_env = env | frozenset(algebra._scoped_vars(node.p1, scope)) if lazy else env
         right = _solve_block(ctx, store, p2, right_env, var_preds, scope)
     right_rows = relation._rows_of(right)
     if not lazy:
@@ -498,10 +498,14 @@ def _solve_join(ctx, store, node, env, var_preds, scope) -> Relation:
 
 def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
     """An OPTIONAL: every left row, extended by the matching right rows that
-    pass the hoisted inner FILTER, or padded with unbound variables."""
+    pass the hoisted inner FILTER, or padded with unbound variables. The
+    FILTER is analysed before either side is solved
+    (:func:`_left_join_condition`): one that no pair can pass pads every left
+    row without solving the right side, and one rdflib must evaluate hands the
+    OPTIONAL back before any native work. A right side of one pattern is
+    joined as :func:`_pattern_side` plans."""
     p1, p2, expr = node.p1, node.p2, node.expr
     vars1, vars2 = algebra._scoped_vars(p1, scope), algebra._scoped_vars(p2, scope)
-    condition = expr if getattr(expr, "name", None) != "TrueFilter" else None
     if (
         scope.var is not None
         and scope.var in algebra._group_vars(ctx, p2)
@@ -533,96 +537,121 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
             raise NotImplementedError
         cheated = (env | frozenset(outer)) - init
         if (
-            condition is not None
-            and frozenset(filters.exprs.expr_vars(condition)) & p1_vars & cheated
+            getattr(expr, "name", None) != "TrueFilter"
+            and frozenset(filters.exprs.expr_vars(expr)) & p1_vars & cheated
         ):
             raise NotImplementedError
+    conjuncts = _left_join_condition(ctx, store, node, scope)
 
     left = _solve_block(ctx, store, p1, env, var_preds, scope)
     left_rows = relation._rows_of(left)
     extra = tuple(v for v in algebra._block_vars(ctx, p2, scope) if v not in left.schema)
     nullable = left.nullable | algebra._block_nullable(p2) | frozenset(extra)
-    if not left_rows:
-        return Relation(left.schema + extra, None, [], 0, nullable)
-
-    def condition_preds(schema):
-        if condition is None:
-            return ()
-        init = set(ctx.initBindings or ())
-        visible = {v: term for v, term in outer.items() if v in init}
-        sides = set(algebra._group_vars(ctx, node))
-        plan = filters.analyze_expr(condition, [v for v in schema if v in sides], ctx, visible)
-        if plan.exists:
-            # An OPTIONAL's condition can carry (NOT) EXISTS; a semi-join over
-            # the padded rows is not what rdflib computes, so the whole
-            # LeftJoin goes back to it.
-            raise NotImplementedError
-        conjuncts = plan.tuples + [c for cs in plan.per_var.values() for c in cs]
-        _reject_graph_exists(ctx, store, plan.constant + conjuncts, scope)
-        _reject_forgotten_exists(ctx, plan.constant + conjuncts, init)
-        for conjunct in plan.constant:
-            if not filters.evaluate_constant(conjunct):
-                return None  # no pair can pass: every left row is unmatched
-        return tuple(
-            filters.tuple_predicate(store, c, [schema.index(v) for v in c.vars]) for c in conjuncts
-        )
+    if not left_rows or conjuncts is None:
+        # No left row, or no pair can pass the condition: every left row is
+        # unmatched, and the right side is not solved.
+        rows = [row + (None,) * len(extra) for row in left_rows]
+        if left_rows:
+            trace.event(
+                "left_join_plan_complete",
+                strategy="constant_false",
+                input_rows=len(left_rows),
+                native_initial_match_count=0,
+                native_probe_call_count=0,
+                matched_left_rows=0,
+                unmatched_left_rows=len(left_rows),
+                output_rows=len(rows),
+            )
+        return Relation(left.schema + extra, None, rows, len(rows), nullable)
 
     if p2.name == "BGP" and len(p2.triples) == 1:
         # Counted before it is matched: a selective left relation drives the
         # probes without the complete right match the probes exist to avoid.
         plan_started = trace.stopwatch()
-        pat, estimate, probe = _plan_pattern_side(
-            ctx, store, p2.triples[0], scope, left, left_rows, None
-        )
-        if probe:
-            schema = left.schema + tuple(v for v in pat.varpos if v not in left.schema)
-            preds = condition_preds(schema)
-            if preds is None:
-                rows = [row + (None,) * len(extra) for row in left_rows]
-                schema, unmatched = left.schema + extra, len(left_rows)
-            else:
-                schema, rows = probes._probe_join(
-                    store, left.schema, left_rows, pat, keep_unmatched=True, row_preds=preds
-                )
+        side = _pattern_side(ctx, store, p2.triples[0], scope, left, left_rows)
+        calls = 0
+        if side.strategy == "probe":
+            schema = left.schema + tuple(v for v in side.pat.varpos if v not in left.schema)
+            schema, rows, calls = _probed(
+                store,
+                side,
+                left,
+                left_rows,
+                keep_unmatched=True,
+                row_preds=_condition_preds(store, conjuncts, schema),
+            )
+            if rows is not None:
                 free_count = len(schema) - len(left.schema)
                 unmatched = sum(row[-1] is None for row in rows) if free_count else 0
-            trace.event(
-                "left_join_plan_complete",
-                strategy="constant_false" if preds is None else "probe",
-                input_rows=len(left_rows),
-                estimated_right_rows=estimate,
-                native_initial_match_count=0,
-                native_probe_call_count=0 if preds is None else len(left_rows),
-                matched_left_rows=len(left_rows) - unmatched,
-                unmatched_left_rows=unmatched,
-                output_rows=len(rows),
-                elapsed_ns=plan_started(),
-            )
-            return Relation(schema, None, rows, len(rows), nullable)
+                trace.event(
+                    "left_join_plan_complete",
+                    strategy="probe",
+                    input_rows=len(left_rows),
+                    estimated_right_rows=side.pat.estimate,
+                    native_initial_match_count=0,
+                    native_probe_call_count=calls,
+                    matched_left_rows=len(left_rows) - unmatched,
+                    unmatched_left_rows=unmatched,
+                    output_rows=len(rows),
+                    elapsed_ns=plan_started(),
+                )
+                return Relation(schema, None, rows, len(rows), nullable)
+            side = replace(side, strategy="keep_scan")
+        right = _matched_side(store, side, left.schema, left_rows)
         trace.event(
             "left_join_plan_complete",
-            strategy="hash",
+            strategy=side.strategy,
             input_rows=len(left_rows),
-            estimated_right_rows=estimate,
-            right_rows=pat.nrows,
-            native_initial_match_count=int(not pat.unsatisfiable),
-            native_probe_call_count=0,
+            estimated_right_rows=side.pat.estimate,
+            right_rows=side.pat.nrows,
+            native_initial_match_count=int(not side.pat.unsatisfiable),
+            native_probe_call_count=calls,
             elapsed_ns=plan_started(),
         )
-        right = matching._rel_from_pattern(pat)
     else:
         right = _solve_block(ctx, store, p2, env | frozenset(vars1), None, scope)
     shared = [v for v in right.schema if v in left.schema]
     relation._shared_key_ok(left, right, shared)
     schema = left.schema + tuple(v for v in right.schema if v not in left.schema)
-    preds = condition_preds(schema)
-    if preds is None:
-        rows = [row + (None,) * (len(schema) - len(left.schema)) for row in left_rows]
-        return Relation(schema, None, rows, len(rows), nullable)
     rows = relation._left_join_rows(
-        left.schema, left_rows, right.schema, relation._rows_of(right), preds
+        left.schema,
+        left_rows,
+        right.schema,
+        relation._rows_of(right),
+        _condition_preds(store, conjuncts, schema),
     )
     return Relation(schema, None, rows, len(rows), nullable)
+
+
+def _left_join_condition(ctx, store, node, scope) -> tuple | None:
+    """An OPTIONAL's condition, analysed before either side is solved: its
+    conjuncts (none for ``TrueFilter``), or ``None`` when a constant one is
+    false and no pair can pass. Its block variables are those the
+    OPTIONAL's own solutions bind; of the context it sees the
+    ``initBindings`` alone. A condition holding an EXISTS is left to rdflib:
+    a semi-join over the padded rows is not what rdflib computes."""
+    expr = node.expr
+    if getattr(expr, "name", None) == "TrueFilter":
+        return ()
+    init = frozenset(ctx.initBindings or ())
+    visible = {v: term for v, term in ctx.bindings.items() if v in init}
+    plan = filters.analyze_expr(expr, algebra._group_vars(ctx, node), ctx, visible)
+    if plan.exists:
+        raise NotImplementedError
+    conjuncts = plan.tuples + [c for cs in plan.per_var.values() for c in cs]
+    _reject_graph_exists(ctx, store, plan.constant + conjuncts, scope)
+    _reject_forgotten_exists(ctx, plan.constant + conjuncts, init)
+    if not all(filters.evaluate_constant(conjunct) for conjunct in plan.constant):
+        return None
+    return tuple(conjuncts)
+
+
+def _condition_preds(store, conjuncts, schema) -> tuple:
+    """An OPTIONAL's condition conjuncts as predicates over a joined row of
+    ``schema``."""
+    return tuple(
+        filters.tuple_predicate(store, c, [schema.index(v) for v in c.vars]) for c in conjuncts
+    )
 
 
 def _solve_minus(ctx, store, node, env, var_preds, scope) -> Relation:
@@ -668,39 +697,95 @@ def _solve_minus(ctx, store, node, env, var_preds, scope) -> Relation:
     return left.with_rows(rows)
 
 
-def _plan_pattern_side(ctx, store, triple, scope, left: Relation, left_rows, var_preds):
-    """The one-pattern right side of a lazy join or an OPTIONAL, counted
-    before it is matched.
+@dataclass(frozen=True, slots=True)
+class _PatternSide:
+    """The one-pattern right side of a lazy join, an OPTIONAL or an EXISTS,
+    counted (:func:`_pattern_side`), and how it joins the left rows:
+    ``"probe"`` — re-matched per left row, the pattern unread; ``"keep_scan"``
+    — matched once, narrowed to the codes the left rows bind its shared
+    variables to; ``"hash"`` — matched whole. The pattern's ``estimate`` is
+    the count the decision read."""
 
-    Returns ``(pat, estimate, probe)``. The count stops at
-    ``len(left_rows) * SETTINGS.probe_fanout + 1``, as far as the decision needs:
-    ``estimate`` is exact below that and a lower bound at it. When the
-    pattern shares a variable with the left relation and the relation is at
-    least ``SETTINGS.probe_fanout`` times smaller than the pattern's count, ``probe``
-    is true and ``pat`` is left unmatched — the caller re-probes it per left
-    row, and the per-variable restrictions over its free variables travel
-    with it. Otherwise ``pat`` is matched, restricted on its free variables,
-    and ready for a hash join. A variable the left side binds was restricted
-    there.
+    pat: Pattern
+    strategy: str
+
+
+def _pattern_side(
+    ctx, store, triple, scope, left: Relation, left_rows, var_preds=None, *, exists=False
+) -> _PatternSide:
+    """The one-pattern right side of a lazy join, an OPTIONAL or an EXISTS,
+    planned by the rule a BGP's join step follows (:func:`bgp._step_rule`).
+
+    The pattern is counted before anything is matched, up to
+    ``len(left_rows) * SETTINGS.probe_fanout + 1`` rows, as far as the
+    decision needs. When it shares a variable with the left relation and the
+    relation is at least ``SETTINGS.probe_fanout`` times smaller than its
+    count, it is probed per left row where each probe is a point lookup,
+    and keep-scanned otherwise; any other side is matched whole. A probe join
+    that passes the probe budget is a keep-scan after all (:func:`_probed`).
+    An existence probe is a count capped at one row: it holds no row and
+    stops at its first quad, so an EXISTS probes even where each probe would
+    scan, unless a free variable takes two positions, which a count cannot
+    test.
+
+    A shared variable the left side may leave unbound needs rdflib's
+    compatibility semantics (unbound matches anything), and is left to it.
+    The per-variable restrictions over the pattern's free variables
+    (``var_preds``) narrow its native match where they are keeps, and the
+    rest travel with it as deferred restrictions; a variable the left side
+    binds was restricted there.
     """
     pat = matching._pattern_terms(ctx, store, *triple, scope=scope)
     shared = [v for v in pat.varpos if v in left.schema]
-    free_preds = (
-        {v: var_preds[v] for v in pat.varpos if v in var_preds and v not in left.schema}
-        if var_preds
-        else None
-    )
-    if free_preds:
-        free_preds = matching._push_native_restrictions(store, pat, free_preds)
-    estimate = matching._planning_count(
-        store, pat, {}, limit=len(left_rows) * SETTINGS.probe_fanout + 1
-    )
-    if shared and len(left_rows) * SETTINGS.probe_fanout < estimate:
-        relation._shared_key_ok(left, Relation((), None, [], 0), shared)
-        if free_preds:
-            pat.deferred = free_preds
-        return pat, estimate, True
+    if any(v in left.nullable for v in shared):
+        raise NotImplementedError
+    if var_preds:
+        free = {v: var_preds[v] for v in pat.varpos if v in var_preds and v not in left.schema}
+        if free:
+            pat.deferred = matching._push_native_restrictions(store, pat, free)
+    running = len(left_rows)
+    count_limit = running * SETTINGS.probe_fanout + 1
+    pat.estimate = matching._planning_count(store, pat, {}, limit=count_limit)
+    pat.estimate_capped = pat.estimate >= count_limit
+    strategy = bgp._step_rule(store, running, pat, shared)
+    if exists and strategy != "hash":
+        repeated = any(len(pos) > 1 for v, pos in pat.varpos.items() if v not in left.schema)
+        strategy = "keep_scan" if repeated else "probe"
+    return _PatternSide(pat, strategy)
+
+
+def _probed(store, side: _PatternSide, left: Relation, left_rows, **options) -> tuple:
+    """``(schema, rows, probes sent)`` of the side probed per left row
+    (:func:`probes._probe_join`, with ``options``); ``rows`` is ``None`` once
+    they pass the probe budget (:func:`bgp._probe_budget`), as a BGP's probe
+    step is, and the side is then keep-scanned."""
+    try:
+        schema, rows = probes._probe_join(
+            store, left.schema, left_rows, side.pat, max_rows=bgp._probe_budget(), **options
+        )
+    except probes.RowsOverBudget as over:
+        return (), None, over.calls
+    return schema, rows, len(left_rows)
+
+
+def _matched_side(store, side: _PatternSide, schema, rows) -> Relation:
+    """The side's pattern matched — for a keep-scan narrowed first, at each
+    position of a variable the left rows (``rows`` over ``schema``) bind, to
+    the dictionary codes they bind it to (a VALUES term outside the
+    dictionary joins nothing) — with its deferred restrictions applied, as
+    the relation a hash join takes. A block's join has no pair budget: the
+    match is whole, where a BGP's keep-scan stops one row past the
+    budget."""
+    pat = side.pat
+    if side.strategy == "keep_scan":
+        for var in pat.varpos:
+            if var in schema:
+                index = schema.index(var)
+                codes = sorted(code for code in {row[index] for row in rows} if code >= 0)
+                if not codes:
+                    pat.unsatisfiable = True
+                    break
+                matching._keep_only(pat, var, codes)
     matching._match_resolved_pattern(store, pat)
-    if free_preds:
-        matching._restrict_pattern(store, pat, free_preds)
-    return pat, estimate, False
+    bgp._materialize_eager_restrictions(store, pat, schema)
+    return matching._rel_from_pattern(pat)

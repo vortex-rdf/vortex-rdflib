@@ -51,10 +51,13 @@ FANNED = _PREFIX + "SELECT ?s ?x ?z WHERE { ?s :p ?x . ?s :r ?z }"
 #: Three patterns of one row per subject: at a budget of 0 no second step
 #: fits, so rdflib finishes the last two per row of the first (tier 3).
 TIERED = _PREFIX + "SELECT ?s ?x ?y ?v WHERE { ?s :p ?x . ?s :q ?y . ?s :u ?v }"
+#: Three picked subjects, each probed for its `r` objects with a point
+#: lookup: with every cheap probe batched (`SETTINGS.cheap_batch_min` of 1),
+#: one batch of matches on a file-backed store. In memory no point lookup is
+#: batched.
+OPTIONAL_PROBED = _PREFIX + "SELECT ?s ?z WHERE { :c1 :pick ?s OPTIONAL { ?s :r ?z } }"
 #: Three picked `r` objects, each probed for the subjects that have it with
-#: a probe that scans the store: one batch of matches.
-OPTIONAL_PROBED = _PREFIX + "SELECT ?z ?f WHERE { :c0 :pick ?z OPTIONAL { ?f :r ?z } }"
-#: The same probes as existence counts: one batch of counts.
+#: an existence count that scans the store: one batch of counts.
 EXISTS_PROBED = _PREFIX + "SELECT ?z WHERE { :c0 :pick ?z FILTER EXISTS { ?f :r ?z } }"
 #: One pattern's existence: a count capped at one row.
 ASK = _PREFIX + "ASK { ?s :p ?x }"
@@ -71,6 +74,7 @@ def _statements() -> str:
     lines += [f"<{EX}a0> <{EX}link> <{EX}s{i}> ." for i in range(2)]
     lines += [f"<{EX}b{i}> <{EX}link> <{EX}s{i % SUBJECTS}> ." for i in range(200)]
     lines += [f"<{EX}c0> <{EX}pick> <{EX}z{i}-0> ." for i in range(3)]
+    lines += [f"<{EX}c1> <{EX}pick> <{EX}s{i}> ." for i in range(3)]
     return "\n".join(lines) + "\n"
 
 
@@ -125,29 +129,37 @@ def _call(name: str, *terms: str, **keywords) -> Callable[[str, tuple, dict], bo
     return test
 
 
-#: Per shape: the query it runs (or the store calls), the pair budget it
-#: runs under (the default for ``None``), a test that only a native call the
-#: shape exists for passes, and that call's kind — a ``"wait"`` (a batch or a
+#: Per shape: the query it runs (or the store calls), the settings it runs
+#: under, a test that only a native call the shape exists for passes, and
+#: that call's kind — a ``"wait"`` (a batch or a
 #: chunked match), a one-shot ``"scan"`` or a one-shot ``"point"`` (a point
 #: lookup or a call capped at one row): a probe binding the anchor, a keyed
 #: match, a chunked match, rdflib's read of the last pattern for a row, the
 #: two batches, a count capped at one row, and a ground triple's count in the
 #: default graph.
 SHAPES = {
-    "probe-join": (PROBED, None, _call("match_codes", f"<{EX}a0>"), "point"),
-    "keep-scan": (KEEP_SCANNED, None, _call("match_codes", keep=...), "scan"),
-    "stream": (FANNED, 0, _call("match_code_chunks"), "wait"),
-    "tier3": (TIERED, 0, _call("match_codes", f"<{EX}s0>", f"<{EX}u>"), "point"),
-    "batched-matches": (OPTIONAL_PROBED, None, _call("match_codes_many"), "wait"),
-    "batched-counts": (EXISTS_PROBED, None, _call("count_quads_many"), "wait"),
-    "existence-count": (ASK, None, _call("count_quads", limit=1), "point"),
+    "probe-join": (PROBED, {}, _call("match_codes", f"<{EX}a0>"), "point"),
+    "keep-scan": (KEEP_SCANNED, {}, _call("match_codes", keep=...), "scan"),
+    "stream": (FANNED, {"pair_budget": 0}, _call("match_code_chunks"), "wait"),
+    "tier3": (TIERED, {"pair_budget": 0}, _call("match_codes", f"<{EX}s0>", f"<{EX}u>"), "point"),
+    "batched-matches": (
+        OPTIONAL_PROBED,
+        {"cheap_batch_min": 1},
+        _call("match_codes_many"),
+        "wait",
+    ),
+    "batched-counts": (EXISTS_PROBED, {}, _call("count_quads_many"), "wait"),
+    "existence-count": (ASK, {}, _call("count_quads", limit=1), "point"),
     "store": (
         _store_calls,
-        None,
+        {},
         _call("count_quads", f"<{EX}s0>", f"<{EX}p>", f"<{EX}x0>", ""),
         "point",
     ),
 }
+
+#: The shapes only a file-backed store makes.
+_FILE_ONLY = frozenset({"batched-matches"})
 
 #: The calls whose pulls wait for the native layer: they race a token on
 #: every store.
@@ -168,9 +180,11 @@ def _races(store, name: str, args: tuple, kwargs: dict) -> bool:
 def _run_shape(graph, monkeypatch, shape: str) -> list[tuple[str, tuple, dict]]:
     """The native calls one shape makes, each as ``(name, args, kwargs)``;
     the shape's own call among them."""
-    work, budget, own, _ = SHAPES[shape]
-    if budget is not None:
-        monkeypatch.setattr(SETTINGS, "pair_budget", budget)
+    work, settings, own, _ = SHAPES[shape]
+    if shape in _FILE_ONLY and graph.store.in_memory:
+        pytest.skip("in memory no point lookup is batched")
+    for name, value in settings.items():
+        monkeypatch.setattr(SETTINGS, name, value)
     register_sparql_pushdown()
     spy = native_spy(graph)
     if callable(work):

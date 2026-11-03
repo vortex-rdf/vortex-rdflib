@@ -1489,21 +1489,19 @@ def test_probe_batches_name_their_lookahead(file_graph, monkeypatch):
     """A batch of point lookups names no lookahead, so the binding's default
     applies: the star's ten `q` matches and the twin's ten existence counts,
     each binding its subject, batched on a file-backed store. Probes that
-    scan run a scan per core, up to eight: the nine `ref` probes of an EXISTS
-    and of an OPTIONAL, each binding only its object. The planning counts
-    name none either."""
+    scan run a scan per core, up to eight: the nine `ref` existence counts
+    of an EXISTS, each binding only its object (a join keep-scans instead).
+    The planning counts name none either."""
     monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     monkeypatch.setattr(SETTINGS, "cheap_batch_min", 1)
     register_sparql_pushdown()
     spy = native_spy(file_graph)
     scans = min(os.cpu_count() or 1, 8)
     exists = _PREFIX + "SELECT ?k WHERE { :c0 :has ?k FILTER EXISTS { ?f :ref ?k } }"
-    optional = _PREFIX + "SELECT ?k ?f WHERE { :c0 :has ?k OPTIONAL { ?f :ref ?k } }"
     cases = {
         STAR: [("count_quads_many", None, 2), ("match_codes_many", None, 10)],
         TWIN: [("count_quads_many", None, 2), ("count_quads_many", None, 10)],
         exists: [("count_quads_many", scans, 9)],
-        optional: [("match_codes_many", scans, 9)],
     }
     for sparql, expected in cases.items():
         spy.calls.clear()

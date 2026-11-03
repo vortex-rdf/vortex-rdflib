@@ -9,8 +9,6 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from vortex_rdf import U64Column
-
 from .. import boundary, filters, trace
 from ..settings import SETTINGS
 from . import algebra, matching, probes, relation, streaming
@@ -791,13 +789,10 @@ def _keep_scan(store, pat: Pattern, rel: Relation) -> tuple[int, int, bool]:
     dropped, the pattern left unread. Returns the native calls made, their
     time, as :func:`_match_resolved_pattern` does, and whether the match is
     within the budget."""
-    for var, positions in pat.varpos.items():
-        if var not in rel.schema:
-            continue
-        codes = relation._distinct_codes(rel.native_column(rel.schema.index(var)))
-        keep = U64Column(sorted(codes))
-        for position in positions:
-            matching._set_native_keep(pat, position, keep)
+    for var in pat.varpos:
+        if var in rel.schema:
+            codes = relation._distinct_codes(rel.native_column(rel.schema.index(var)))
+            matching._keep_only(pat, var, sorted(codes))
     estimate = pat.estimate
     assert estimate is not None, "a step counts its pattern before it keep-scans it"
     if not pat.estimate_capped and estimate <= SETTINGS.pair_budget:

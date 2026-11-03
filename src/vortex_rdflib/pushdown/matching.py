@@ -310,6 +310,14 @@ def _set_native_keep(pat: Pattern, position: int, keep) -> None:
     pat.nkeep = nkeep
 
 
+def _keep_only(pat: Pattern, var, codes) -> None:
+    """Narrow the pattern's native match to ``codes``, ascending dictionary
+    codes, at every position ``var`` takes (:func:`_set_native_keep`)."""
+    keep = U64Column(codes)
+    for position in pat.varpos[var]:
+        _set_native_keep(pat, position, keep)
+
+
 def _push_native_restrictions(store, pat: Pattern, var_preds) -> dict:
     """Move the conjuncts vortex-rdf answers with a keep — kind tests and IRI
     equality (:func:`filters.native.native_restriction`) — into the pattern's native
