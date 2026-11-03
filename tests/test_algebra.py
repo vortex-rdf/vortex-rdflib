@@ -7,7 +7,7 @@ from rdflib.plugins.sparql import prepareQuery
 from rdflib.term import Literal, Variable
 
 import vortex_rdflib.pushdown as pd
-from vortex_rdflib import settings
+from vortex_rdflib import filters, settings
 
 A, B, C, D, G = (Variable(name) for name in "abcdg")
 
@@ -104,6 +104,32 @@ def test_every_kind_of_block_has_a_solver():
 
 def test_the_package_exports_the_registration_functions():
     assert pd.__all__ == ["register_sparql_pushdown", "unregister_sparql_pushdown"]
+
+
+def test_a_filter_block_carries_its_expression_and_what_it_may_see():
+    """A FILTER's block carries its expression and the context variables it
+    may see — rdflib's ``_vars`` of the node — or ``None`` directly inside
+    an EXISTS body, where it sees every binding: no solver reads rdflib's
+    node for them."""
+    source = prepareQuery("SELECT * { ?a <p> ?b FILTER(?b > 1) }").algebra.p.p
+    node = pd.algebra.block(source)
+    assert isinstance(node, pd.algebra.Filter)
+    assert node.expr is source.expr
+    assert node.kept == frozenset(source._vars)
+    outer = prepareQuery("SELECT * { ?a <p> ?b FILTER EXISTS { ?b <q> ?c FILTER(?c > ?a) } }")
+    body = filters.exprs.exists_shape(outer.algebra.p.p.expr)[1]
+    inner = pd.algebra.block(pd.algebra._unwrap_empty_joins(body))
+    assert isinstance(inner, pd.algebra.Filter) and inner.kept is None
+
+
+def test_an_optional_block_carries_its_condition():
+    """An OPTIONAL's block carries its condition and its left side's
+    ``_vars``, which rdflib's second pass over an unmatched row keeps."""
+    source = prepareQuery("SELECT * { ?a <p> ?b OPTIONAL { ?b <q> ?c FILTER(?c > 1) } }")
+    node = pd.algebra.block(source.algebra.p.p)
+    assert isinstance(node, pd.algebra.LeftJoin)
+    assert node.expr is source.algebra.p.p.expr
+    assert node.left_kept == frozenset(source.algebra.p.p.p1._vars)
 
 
 def test_values_rows_are_tuples_in_variable_order():

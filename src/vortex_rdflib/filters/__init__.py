@@ -118,25 +118,41 @@ class FilterPlan:
     per_var: dict  # block variable -> conjuncts referencing only it
     tuples: list  # conjuncts referencing several block variables
     exists: list  # ExistsConjunct: (NOT) EXISTS conjuncts, semi/anti-joins
+    #: The context variables the expression sees (:func:`analyze_filter`),
+    #: ``None`` for every one.
+    allowed: frozenset | None = None
+
+    @property
+    def conjuncts(self) -> list:
+        """Every conjunct but the EXISTS ones, the constant ones first."""
+        return self.constant + self.row_conjuncts
+
+    @property
+    def row_conjuncts(self) -> list:
+        """The conjuncts that read a row's variables: those over several,
+        then those over one."""
+        return self.tuples + [c for cs in self.per_var.values() for c in cs]
 
 
-def analyze_filter(node, block_vars, ctx) -> FilterPlan:
-    """Split a ``Filter`` node's expression into conjuncts and route them.
+def analyze_filter(expr, kept: frozenset | None, block_vars, ctx) -> FilterPlan:
+    """Split a FILTER's expression (or an OPTIONAL's condition) into
+    conjuncts and route them.
 
     Visibility follows rdflib's ``evalFilter``: the expression sees the block's
-    own variables, the context's bindings that are in the node's ``_vars`` or
-    in the query's ``initBindings`` (the rest was forgotten), and everything
-    when the filter sits directly inside an EXISTS body
-    (``no_isolated_scope``).
-    """
+    own variables and the context's bindings of the variables rdflib keeps —
+    ``kept``, the node's ``_vars`` (none for a condition), and the query's
+    ``initBindings`` — the rest forgotten; and every binding when ``kept``
+    is ``None``, a filter directly inside an EXISTS body. The plan says which
+    (``FilterPlan.allowed``)."""
     outer = dict(ctx.bindings.items())
-    init = ctx.initBindings or {}
-    if getattr(node, "no_isolated_scope", False):
-        visible = outer
+    if kept is None:
+        allowed, visible = None, outer
     else:
-        allowed = set(node._vars or ()) | set(init)
+        allowed = kept | frozenset(ctx.initBindings or ())
         visible = {v: term for v, term in outer.items() if v in allowed}
-    return analyze_expr(node.expr, block_vars, ctx, visible)
+    plan = analyze_expr(expr, block_vars, ctx, visible)
+    plan.allowed = allowed
+    return plan
 
 
 #: A view of each term kind, ``""`` (no term) included, for a predicate

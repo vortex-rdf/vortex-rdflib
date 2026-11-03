@@ -214,23 +214,21 @@ def _solve_filter(ctx, store, node: algebra.Filter, frame: _Frame) -> Relation:
     The expression's block variables are those its group binds
     (:func:`_group_vars`; see :func:`filters.analyze_filter` for the rest of
     its scope)."""
-    inner, source, scope, env = node.inner, node.source, frame.scope, frame.env
+    inner, scope, env = node.inner, frame.scope, frame.env
     # The columns of the empty relation a false constant conjunct returns.
     block_vars = algebra._block_vars(ctx, inner, scope)
-    plan = filters.analyze_filter(source, algebra._group_vars(ctx, inner), ctx)
+    plan = filters.analyze_filter(node.expr, node.kept, algebra._group_vars(ctx, inner), ctx)
     if plan.exists and scope.var is not None:
         # rdflib evaluates an EXISTS body against the *active* graph. Under a
         # graph variable there is no single active graph — the row's graph is
         # a column here — so the body would be answered over the union. Hand
         # the whole block back and let rdflib walk the graphs itself.
         raise NotImplementedError
-    decided = plan.constant + plan.tuples + [c for cs in plan.per_var.values() for c in cs]
+    decided = plan.conjuncts
     _reject_graph_exists(ctx, store, decided, scope)
-    if not getattr(source, "no_isolated_scope", False):
-        kept = set(source._vars or ()) | set(ctx.initBindings or ())
-        _reject_forgotten_exists(ctx, decided + [e.conjunct for e in plan.exists], kept)
+    _reject_forgotten_exists(ctx, decided + [e.conjunct for e in plan.exists], plan.allowed)
     if env:
-        _reject_env_references(source, plan, env, ctx)
+        _reject_env_references(plan, env)
     for conjunct in plan.constant:
         if not filters.evaluate_constant(conjunct):
             return Relation.from_rows(tuple(block_vars), [])
@@ -360,7 +358,7 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
     return rel.with_rows(kept)
 
 
-def _reject_env_references(node, plan, env, ctx) -> None:
+def _reject_env_references(plan, env) -> None:
     """rdflib evaluates a filter on a lazy join's or an OPTIONAL's right side,
     or in an EXISTS body, once per row of the left side or of the block the
     EXISTS filters, whose variables are ``env``. Its expression sees the
@@ -370,14 +368,11 @@ def _reject_env_references(node, plan, env, ctx) -> None:
     variable bound only where the block binds it too; ``_vars`` leaves out a
     VALUES table's variables, and a filter in a group of an EXISTS body has
     none. Where the two differ, the conjunct is left to rdflib."""
-    everything = getattr(node, "no_isolated_scope", False)
-    allowed = set(node._vars or ()) | set(ctx.initBindings or ())
-    conjuncts = plan.constant + plan.tuples + [c for cs in plan.per_var.values() for c in cs]
-    conjuncts += [exists.conjunct for exists in plan.exists]
-    for conjunct in conjuncts:
+    allowed = plan.allowed
+    for conjunct in plan.conjuncts + [exists.conjunct for exists in plan.exists]:
         for var in filters.exprs.expr_vars(conjunct.expr):
             if var in env and var not in conjunct.consts:
-                if (var in conjunct.vars) != (everything or var in allowed):
+                if (var in conjunct.vars) != (allowed is None or var in allowed):
                     raise NotImplementedError
 
 
@@ -393,11 +388,13 @@ def _reject_graph_exists(ctx, store, conjuncts, scope) -> None:
 
 def _reject_forgotten_exists(ctx, conjuncts, kept) -> None:
     """rdflib evaluates a FILTER, and an OPTIONAL's condition, with the
-    context's bindings outside ``kept`` forgotten (see
-    :func:`filters.analyze_filter`; a condition keeps the ``initBindings``
-    alone). An EXISTS here would see them: its body is solved through the
-    context, and rdflib's evaluator, handed no binding, thaws the whole
-    context. A conjunct holding an EXISTS that names one is left to rdflib."""
+    context's bindings outside ``kept`` forgotten (``FilterPlan.allowed``:
+    see :func:`filters.analyze_filter`; ``None``, nothing forgotten). An
+    EXISTS here would see them: its body is solved through the context, and
+    rdflib's evaluator, handed no binding, thaws the whole context. A
+    conjunct holding an EXISTS that names one is left to rdflib."""
+    if kept is None:
+        return
     for conjunct in conjuncts:
         if filters.exprs.has_exists(conjunct.expr) and any(
             ctx[var] is not None and var not in kept
@@ -452,7 +449,7 @@ def _solve_left_join(ctx, store, node: algebra.LeftJoin, frame: _Frame) -> Relat
     row without solving the right side, and one rdflib must evaluate hands the
     OPTIONAL back before any native work. A right side of one pattern is
     joined as :func:`_plan_side` plans."""
-    p1, p2, expr = node.left, node.right, node.source.expr
+    p1, p2, expr = node.left, node.right, node.expr
     scope, env = frame.scope, frame.env
     vars1, vars2 = algebra._scoped_vars(p1, scope), algebra._scoped_vars(p2, scope)
     if (
@@ -472,9 +469,8 @@ def _solve_left_join(ctx, store, node: algebra.LeftJoin, frame: _Frame) -> Relat
     # are left to rdflib.
     outer = dict(ctx.bindings.items())
     init = frozenset(ctx.initBindings or ())
-    p1_vars = p1.source._vars
+    p1_vars = node.left_kept
     if p1_vars is not None:
-        p1_vars = frozenset(p1_vars)
         dropped = (env | frozenset(outer) | frozenset(vars1)) - init - p1_vars
         # A graph variable is not a binding that flows from p1 into p2: rdflib
         # evaluates the whole OPTIONAL with the graph *active* and labels the
@@ -555,20 +551,17 @@ def _left_join_condition(ctx, store, node: algebra.LeftJoin, scope) -> tuple | N
     OPTIONAL's own solutions bind; of the context it sees the
     ``initBindings`` alone. A condition holding an EXISTS is left to rdflib:
     a semi-join over the padded rows is not what rdflib computes."""
-    expr = node.source.expr
+    expr = node.expr
     if getattr(expr, "name", None) == "TrueFilter":
         return ()
-    init = frozenset(ctx.initBindings or ())
-    visible = {v: term for v, term in ctx.bindings.items() if v in init}
-    plan = filters.analyze_expr(expr, algebra._group_vars(ctx, node), ctx, visible)
+    plan = filters.analyze_filter(expr, frozenset(), algebra._group_vars(ctx, node), ctx)
     if plan.exists:
         raise NotImplementedError
-    conjuncts = plan.tuples + [c for cs in plan.per_var.values() for c in cs]
-    _reject_graph_exists(ctx, store, plan.constant + conjuncts, scope)
-    _reject_forgotten_exists(ctx, plan.constant + conjuncts, init)
+    _reject_graph_exists(ctx, store, plan.conjuncts, scope)
+    _reject_forgotten_exists(ctx, plan.conjuncts, plan.allowed)
     if not all(filters.evaluate_constant(conjunct) for conjunct in plan.constant):
         return None
-    return tuple(conjuncts)
+    return tuple(plan.row_conjuncts)
 
 
 def _condition_preds(store, conjuncts, schema) -> tuple:

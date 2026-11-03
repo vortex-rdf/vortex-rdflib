@@ -5,7 +5,7 @@ patterns are matched in (:class:`_GraphScope`).
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 from rdflib.term import BNode, URIRef, Variable
 
@@ -72,8 +72,8 @@ class Block:
     code-space relation — converted from its algebra node by :func:`block`,
     the one statement of what a block may hold.
 
-    ``source`` is the algebra node. ``vars`` are the variable-like terms the
-    block mentions, in first-seen order (static: what rdflib's ``_vars`` is
+    ``name`` is rdflib's name for the algebra node. ``vars`` are the
+    variable-like terms the block mentions, in first-seen order (static: what rdflib's ``_vars`` is
     made of); ``bound_vars`` those its solutions can bind (a MINUS's right
     side removes rows, it binds nothing); ``nullable`` those it may leave
     unbound — those an OPTIONAL's right side introduces, every one its left
@@ -88,15 +88,10 @@ class Block:
     the same graph.
     """
 
-    source: Any
+    name: ClassVar[str]
     vars: tuple
     bound_vars: tuple
     nullable: frozenset
-
-    @property
-    def name(self) -> str:
-        """rdflib's name for the algebra node."""
-        return self.source.name
 
     @property
     def single(self) -> tuple | None:
@@ -120,6 +115,7 @@ class Block:
 class Bgp(Block):
     """A basic graph pattern: its ``triples``."""
 
+    name: ClassVar[str] = "BGP"
     triples: tuple
 
     @property
@@ -132,8 +128,14 @@ class Bgp(Block):
 
 @dataclass(frozen=True, slots=True, eq=False)
 class Filter(Block):
-    """A FILTER over the ``inner`` block; its expression is the source's."""
+    """A FILTER of ``expr`` over the ``inner`` block. ``kept`` are the context
+    variables rdflib keeps for it when it forgets the others — the node's
+    ``_vars``; the query's ``initBindings`` are kept too — or ``None``
+    directly inside an EXISTS body, where it sees every binding."""
 
+    name: ClassVar[str] = "Filter"
+    expr: Any
+    kept: frozenset | None
     inner: Block
 
     def carries_graph(self, var) -> bool:
@@ -145,6 +147,7 @@ class Join(Block):
     """A group join of ``left`` and ``right``, ``lazy`` where rdflib solves
     the right side per left row."""
 
+    name: ClassVar[str] = "Join"
     left: Block
     right: Block
     lazy: bool
@@ -156,11 +159,16 @@ class Join(Block):
 
 @dataclass(frozen=True, slots=True, eq=False)
 class LeftJoin(Block):
-    """An OPTIONAL of ``right`` on ``left``; its condition is the source's
-    ``expr``."""
+    """An OPTIONAL of ``right`` on ``left`` under the condition ``expr``.
+    ``left_kept`` is the left side's ``_vars``, the bindings rdflib keeps
+    when it evaluates an unmatched row again (``None`` where the node has
+    none)."""
 
+    name: ClassVar[str] = "LeftJoin"
     left: Block
     right: Block
+    expr: Any
+    left_kept: frozenset | None
 
     def carries_graph(self, var) -> bool:
         return _left_carries_graph(self.left, self.right, var)
@@ -170,6 +178,7 @@ class LeftJoin(Block):
 class Minus(Block):
     """``left`` MINUS ``right``."""
 
+    name: ClassVar[str] = "Minus"
     left: Block
     right: Block
 
@@ -182,6 +191,7 @@ class Values(Block):
     """An inline VALUES table: its ``rows``, each a tuple of its terms in
     ``vars`` order, ``None`` for an UNDEF."""
 
+    name: ClassVar[str] = "ToMultiSet"
     rows: tuple
 
 
@@ -191,6 +201,7 @@ class Graph(Block):
     every row of the block below it, and comes last, as it does in a
     matched pattern's schema."""
 
+    name: ClassVar[str] = "Graph"
     term: Any
     inner: Block
 
@@ -220,16 +231,17 @@ def block(node) -> Block:
     if name == "BGP":
         triples = tuple(node.triples)
         found = _merged((), (t for triple in triples for t in triple if isinstance(t, _VAR_LIKE)))
-        return Bgp(node, found, found, frozenset(), triples)
+        return Bgp(found, found, frozenset(), triples)
     if name == "Filter":
         inner = block(node.p)
-        return Filter(node, inner.vars, inner.bound_vars, inner.nullable, inner)
+        isolated = not getattr(node, "no_isolated_scope", False)
+        kept = (_kept(node) or frozenset()) if isolated else None
+        return Filter(inner.vars, inner.bound_vars, inner.nullable, node.expr, kept, inner)
     if name == "Graph":
         inner = block(node.p)
         term = node.term
         own = (term,) if isinstance(term, _VAR_LIKE) else ()
         return Graph(
-            node,
             _merged(inner.vars, own),
             _merged(inner.bound_vars, own),
             inner.nullable,
@@ -240,17 +252,23 @@ def block(node) -> Block:
         left, right = block(node.p1), block(node.p2)
         mentioned = _merged(left.vars, right.vars)
         if name == "Minus":
-            return Minus(node, mentioned, left.bound_vars, left.nullable, left, right)
+            return Minus(mentioned, left.bound_vars, left.nullable, left, right)
         bound = _merged(left.bound_vars, right.bound_vars)
         nullable = left.nullable | right.nullable
         if name == "Join":
-            return Join(node, mentioned, bound, nullable, left, right, bool(node.lazy))
+            return Join(mentioned, bound, nullable, left, right, bool(node.lazy))
         nullable |= frozenset(right.vars) - frozenset(left.bound_vars)
-        return LeftJoin(node, mentioned, bound, nullable, left, right)
+        return LeftJoin(mentioned, bound, nullable, left, right, node.expr, _kept(node.p1))
     if name == "ToMultiSet" and getattr(node.p, "name", None) == "values":
         found, rows, nullable = _values_table(node.p.res)
-        return Values(node, found, found, nullable, rows)
+        return Values(found, found, nullable, rows)
     raise NotImplementedError
+
+
+def _kept(node) -> frozenset | None:
+    """rdflib's ``_vars`` of an algebra node, ``None`` where it has none."""
+    found = getattr(node, "_vars", None)
+    return None if found is None else frozenset(found)
 
 
 def _values_table(rows) -> tuple[tuple, tuple, frozenset]:

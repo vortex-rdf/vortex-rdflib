@@ -340,7 +340,9 @@ def _single_pattern(ctx, store, node: Block, scope) -> Pattern | None:
         inner = node.inner
         if inner.single is None:
             return None
-        plan = filters.analyze_filter(node.source, algebra._block_vars(ctx, inner, scope), ctx)
+        plan = filters.analyze_filter(
+            node.expr, node.kept, algebra._block_vars(ctx, inner, scope), ctx
+        )
         if plan.constant or plan.tuples or plan.exists:
             return None
         var_preds, node = plan.per_var, inner
