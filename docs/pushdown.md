@@ -855,9 +855,9 @@ SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p
   and no row is matched. This also works under a `FILTER` made of keeps only:
   the count uses them.
 - **Otherwise** the block is solved and counted on codes
-  ([`_aggregate_rows`](../src/vortex_rdflib/pushdown/aggregate.py#L127)). A columnar body
+  ([`_aggregate_rows`](../src/vortex_rdflib/pushdown/aggregate.py#L207)). A columnar body
   grouped by at most one variable is counted one column at a time
-  ([`_columnar_groups`](../src/vortex_rdflib/pushdown/aggregate.py#L236)): the native
+  ([`_columnar_groups`](../src/vortex_rdflib/pushdown/aggregate.py#L300)): the native
   `value_counts` of the key column gives every group and its size. For
   `COUNT(DISTINCT ?v)`, each group's rows are gathered natively
   (`join_indices`, `take`, `distinct`) when there are few groups
@@ -1166,7 +1166,7 @@ vortex-rdf opens a file-backed store memory-mapped.
 | `TermDict.encode_many` | `VALUES` constants ([`_constant_codes`](../src/vortex_rdflib/pushdown/blocks.py#L165)), the IRIs of an IRI equality ([`keep_of`](../src/vortex_rdflib/filters/native.py#L135)) and the canonical spellings of the typed literals `DISTINCT` and `COUNT` alias ([`_canonical_twins`](../src/vortex_rdflib/pushdown/aliasing.py#L122)). |
 | `TermDict.decode_many` | Decoding results ([`_prime_decode_cache`](../src/vortex_rdflib/store.py#L502)), the spellings that probes fill in ([`_probe_spellings`](../src/vortex_rdflib/pushdown/probes.py#L356)) and the IRIs `ORDER BY` ranks ([`_rank_codes`](../src/vortex_rdflib/pushdown/head.py#L166)). |
 | `TermDict.prefix_range` | The code range of each term kind ([`KindRanges`](../src/vortex_rdflib/terms.py#L179)). |
-| `U64Column.distinct`, `value_counts` | `DISTINCT` over one variable and a variable's candidate codes ([`_distinct_codes`](../src/vortex_rdflib/pushdown/relation.py#L189)), `GROUP BY` counts ([`_columnar_groups`](../src/vortex_rdflib/pushdown/aggregate.py#L236)). |
+| `U64Column.distinct`, `value_counts` | `DISTINCT` over one variable and a variable's candidate codes ([`_distinct_codes`](../src/vortex_rdflib/pushdown/relation.py#L189)), `GROUP BY` counts ([`_columnar_groups`](../src/vortex_rdflib/pushdown/aggregate.py#L300)). |
 | `U64Column.join_indices`, `take` | The columnar join ([`_join_columns`](../src/vortex_rdflib/pushdown/relation.py#L239)), which passes the pair budget as `max_pairs=` past the product bound, so the kernel counts the pairs before it builds any; compacting a match to the rows a FILTER keeps ([`_compact_pattern`](../src/vortex_rdflib/pushdown/matching.py#L443)), a group's rows for `COUNT(DISTINCT)`, intersecting keeps ([`intersect_keeps`](../src/vortex_rdflib/filters/native.py#L563)). |
 | `U64Column.join_count` | The pairs of a join of Python rows, counted before it is built ([`_hash_join`](../src/vortex_rdflib/pushdown/relation.py#L209)), and whether a pattern fits when a step is reordered ([`_fits`](../src/vortex_rdflib/pushdown/planner.py#L418)). |
 | `U64Column.groups`, `CodeGroups.count` and `gather`, `U64Column.slice` | A streamed join step: the grouped side, the pairs and the columns of each slice or chunk, and the slices of the fed side ([`_streamed_step`](../src/vortex_rdflib/pushdown/streaming.py#L90), [`_gather_pieces`](../src/vortex_rdflib/pushdown/streaming.py#L20), [`_slices`](../src/vortex_rdflib/pushdown/relation.py#L278)). |

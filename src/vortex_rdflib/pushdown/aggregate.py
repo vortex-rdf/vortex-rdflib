@@ -3,8 +3,8 @@ the code columns, a column at a time by the native kernels where the body
 is columnar, with only the group keys decoded.
 """
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, ClassVar
 
 from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import Literal, Variable
@@ -52,71 +52,151 @@ def _eval_aggregate(ctx, store, part):
     # selection's size.
     pat = head._single_pattern(ctx, store, block, scope) if group_vars is None else None
     if pat is not None and not pat.repeats:
-        specs = _count_specs(ctx, {v: i for i, v in enumerate(pat.varpos)}, counts)
-        if all(_counts_rows(spec) for spec in specs):
+        cases = _count_cases(ctx, {v: i for i, v in enumerate(pat.varpos)}, counts)
+        if cases.of_rows:
             n = Literal(matching._exact_count(store, pat))
-            return iter([FrozenBindings(ctx, {spec.res: n for spec in specs})])
+            return iter([FrozenBindings(ctx, {res: n for res, _, _ in counts})])
 
     rel = blocks._solve_block(ctx, store, block, blocks._Frame(scope))
     return _aggregate_rows(ctx, store, rel, group_vars or [], counts, samples, group.expr is None)
 
 
 @dataclass(frozen=True, slots=True)
-class _Fixed:
-    """A COUNT a group's size decides: its rows (``of_rows``) — ``COUNT(*)``,
-    or ``COUNT(?v)`` of a variable the context binds, in every row — or
-    ``value`` — 1 for ``COUNT(DISTINCT ?v)`` of such a variable, one term,
-    and 0 for a variable bound nowhere."""
+class _RowCount:
+    """``COUNT(*)``, or ``COUNT(?v)`` of a variable the context binds, in
+    every row: a group's rows."""
 
     res: Any
-    of_rows: bool
-    value: int = 0
+    #: Whether the COUNT of one pattern's match — every column bound — is
+    #: the match's row count.
+    of_rows: ClassVar[bool] = True
+
+
+@dataclass(frozen=True, slots=True)
+class _Constant:
+    """A COUNT a group's rows leave as it is: ``COUNT(DISTINCT ?v)`` of a
+    variable the context binds — one term, ``value`` 1 — or a COUNT of a
+    variable bound nowhere — ``value`` 0."""
+
+    res: Any
+    value: int
+    of_rows: ClassVar[bool] = False
 
 
 @dataclass(frozen=True, slots=True)
 class _ColumnCount:
     """``COUNT(?v)`` — its bound values — or ``COUNT(DISTINCT ?v)`` — its
-    distinct terms — of a variable the block binds, column ``col``."""
+    distinct terms — of a variable the block binds, column ``col``. A
+    group's tally is the count, or the set of codes seen."""
 
     res: Any
     col: int
     distinct: bool
 
+    @property
+    def of_rows(self) -> bool:
+        """``COUNT(?v)`` of one pattern's match, every column bound, is its
+        row count."""
+        return not self.distinct
+
+    @property
+    def new_tally(self) -> type:
+        """What makes a group's empty tally: ``set``, or ``int`` (0)."""
+        return set if self.distinct else int
+
+    def merge(self, tally, other):
+        """The tally of two groups made one."""
+        return tally | other if self.distinct else tally + other
+
+    def add_codes(self, codes: set, tallies) -> None:
+        """Add to ``codes`` the codes ``tallies`` — one per group — count
+        as terms, which aliases may merge."""
+        if self.distinct:
+            codes.update(*tallies)
+
+    def count(self, tally, aliases: dict) -> int:
+        """The COUNT of a group's ``tally``, equal terms (``aliases``) once."""
+        if not self.distinct:
+            return tally
+        if aliases:
+            return len({aliases.get(c, c) for c in tally})
+        return len(tally)
+
 
 @dataclass(frozen=True, slots=True)
 class _DistinctRows:
-    """``COUNT(DISTINCT *)``: a group's distinct rows."""
+    """``COUNT(DISTINCT *)``: a group's distinct rows, its tally the set of
+    them."""
 
     res: Any
+    of_rows: ClassVar[bool] = False
+    #: What makes a group's empty tally.
+    new_tally: ClassVar[type] = set
+
+    def merge(self, tally, other):
+        """The tally of two groups made one."""
+        return tally | other
+
+    def add_codes(self, codes: set, tallies) -> None:
+        """Add to ``codes`` the codes ``tallies`` — one per group — count
+        as terms, which aliases may merge."""
+        codes.update({c for tally in tallies for row in tally for c in row if c is not None})
+
+    def count(self, tally, aliases: dict) -> int:
+        """The COUNT of a group's ``tally``, rows of equal terms
+        (``aliases``) once."""
+        if aliases:
+            return len({tuple(aliases.get(c, c) for c in row) for row in tally})
+        return len(tally)
 
 
-def _count_specs(ctx, col: dict, counts) -> list:
+@dataclass(slots=True)
+class _Counts:
+    """An aggregate's COUNTs, each as the case that answers it
+    (:func:`_count_cases`): those a group's row count answers
+    (``row_counts``), the ``constants``, and those ``tallied`` over a
+    group's rows — with the row loop's index lists of the tallied ones: the
+    positions of the ``COUNT(DISTINCT *)``s (``row_sets``) and ``(position,
+    column, distinct)`` of each column's (``column_tallies``)."""
+
+    row_counts: list = field(default_factory=list)
+    constants: list = field(default_factory=list)
+    tallied: list = field(default_factory=list)
+    row_sets: list = field(default_factory=list)
+    column_tallies: list = field(default_factory=list)
+
+    @property
+    def of_rows(self) -> bool:
+        """Whether every COUNT of one pattern's match is its row count."""
+        return all(case.of_rows for case in self.row_counts + self.constants + self.tallied)
+
+
+def _count_cases(ctx, col: dict, counts) -> _Counts:
     """Each ``(res, target, distinct)`` COUNT as the case that answers it,
     over a body whose columns ``col`` maps by variable."""
-    specs: list = []
+    cases = _Counts()
     for res, target, distinct in counts:
         if target == "*":
-            specs.append(_DistinctRows(res) if distinct else _Fixed(res, True))
+            if distinct:
+                cases.row_sets.append(len(cases.tallied))
+                cases.tallied.append(_DistinctRows(res))
+            else:
+                cases.row_counts.append(_RowCount(res))
         elif target in col:
-            specs.append(_ColumnCount(res, col[target], distinct))
-        elif ctx[target] is not None:
-            specs.append(_Fixed(res, False, 1) if distinct else _Fixed(res, True))
+            cases.column_tallies.append((len(cases.tallied), col[target], distinct))
+            cases.tallied.append(_ColumnCount(res, col[target], distinct))
+        elif ctx[target] is None:
+            cases.constants.append(_Constant(res, 0))
+        elif distinct:
+            cases.constants.append(_Constant(res, 1))
         else:
-            specs.append(_Fixed(res, False))
-    return specs
-
-
-def _counts_rows(spec) -> bool:
-    """Whether a COUNT over one pattern's match is its row count: every
-    column of a match is bound."""
-    if isinstance(spec, _Fixed):
-        return spec.of_rows
-    return isinstance(spec, _ColumnCount) and not spec.distinct
+            cases.row_counts.append(_RowCount(res))
+    return cases
 
 
 @dataclass(slots=True)
 class _Group:
-    """One group's rows, and a tally per counted COUNT (a
+    """One group's rows, and a tally per tallied COUNT (a
     :class:`_ColumnCount` or :class:`_DistinctRows`): a count of bound
     values, or the set of codes (rows, for ``COUNT(DISTINCT *)``) seen."""
 
@@ -130,23 +210,18 @@ def _aggregate_rows(ctx, store, rel: Relation, group_vars, counts, samples, impl
     # A group key part is a column; a context-bound variable does not split
     # groups and an unbound one contributes a None key part (as rdflib's).
     key_cols = [col[v] for v in group_vars if v in col]
-    specs = _count_specs(ctx, col, counts)
-    counted = [spec for spec in specs if not isinstance(spec, _Fixed)]
-    sets = [isinstance(spec, _DistinctRows) or spec.distinct for spec in counted]
+    cases = _count_cases(ctx, col, counts)
+    tallied = cases.tallied
+    new_tallies = [case.new_tally for case in tallied]
 
     def new_group(rows=0):
-        return _Group(rows, [set() if distinct else 0 for distinct in sets])
+        return _Group(rows, [new_tally() for new_tally in new_tallies])
 
     groups: dict[tuple, _Group] = {}
     if rel.cols is not None and not rel.preds and len(key_cols) <= 1:
-        groups = _columnar_groups(rel, key_cols, counted, new_group)
+        groups = _columnar_groups(rel, key_cols, cases, new_group)
     else:
-        row_sets = [k for k, spec in enumerate(counted) if isinstance(spec, _DistinctRows)]
-        column_tallies = [
-            (k, spec.col, spec.distinct)
-            for k, spec in enumerate(counted)
-            if isinstance(spec, _ColumnCount)
-        ]
+        row_sets, column_tallies = cases.row_sets, cases.column_tallies
         for row in relation._code_rows(rel):
             key = tuple(row[i] for i in key_cols)
             group = groups.get(key)
@@ -172,12 +247,8 @@ def _aggregate_rows(ctx, store, rel: Relation, group_vars, counts, samples, impl
     # Merge groups whose decoded keys are equal terms; distinct counts likewise
     # count equal terms once (see `_alias_codes`).
     codes = {c for key in groups for c in key if c is not None}
-    for group in groups.values():
-        for spec, tally in zip(counted, group.tallies, strict=True):
-            if isinstance(spec, _DistinctRows):
-                codes.update(c for row in tally for c in row if c is not None)
-            elif spec.distinct:
-                codes.update(tally)
+    for k, case in enumerate(tallied):
+        case.add_codes(codes, [group.tallies[k] for group in groups.values()])
     foreign = store._terms().foreign
     aliases: dict = {}
     aliasing._alias_codes(store, codes, aliases)
@@ -191,35 +262,28 @@ def _aggregate_rows(ctx, store, rel: Relation, group_vars, counts, samples, impl
             continue
         base = first[1]
         base.rows += group.rows
-        for k, distinct in enumerate(sets):
-            if distinct:
-                base.tallies[k] |= group.tallies[k]
-            else:
-                base.tallies[k] += group.tallies[k]
+        base.tallies = [
+            case.merge(tally, other)
+            for case, tally, other in zip(tallied, base.tallies, group.tallies, strict=True)
+        ]
 
     key_index = {v: i for i, v in enumerate(v for v in group_vars if v in col)}
     cached = store._prime_decode_cache(
         [c for key, _ in merged.values() for c in key if c is not None and c >= 0]
     )
 
-    def count(spec, tally) -> int:
-        if isinstance(spec, _DistinctRows):
-            if aliases:
-                return len({tuple(aliases.get(c, c) for c in row) for row in tally})
-            return len(tally)
-        if spec.distinct and aliases:
-            return len({aliases.get(c, c) for c in tally})
-        return len(tally) if spec.distinct else tally
-
-    fixed = [spec for spec in specs if isinstance(spec, _Fixed)]
+    constants = {case.res: Literal(case.value) for case in cases.constants}
+    row_counts = [case.res for case in cases.row_counts]
 
     def solutions():
         for key, group in merged.values():
-            row: dict = {}
-            for spec in fixed:
-                row[spec.res] = Literal(group.rows if spec.of_rows else spec.value)
-            for spec, tally in zip(counted, group.tallies, strict=True):
-                row[spec.res] = Literal(count(spec, tally))
+            row: dict = dict(constants)
+            if row_counts:
+                n = Literal(group.rows)
+                for res in row_counts:
+                    row[res] = n
+            for case, tally in zip(tallied, group.tallies, strict=True):
+                row[case.res] = Literal(case.count(tally, aliases))
             for res, var in samples:
                 if var in key_index:
                     code = key[key_index[var]]
@@ -233,7 +297,7 @@ def _aggregate_rows(ctx, store, rel: Relation, group_vars, counts, samples, impl
     return solutions()
 
 
-def _columnar_groups(rel: Relation, key_cols, counted, new_group) -> dict:
+def _columnar_groups(rel: Relation, key_cols, cases: _Counts, new_group) -> dict:
     """The groups of a columnar body by at most one key column, counted a
     column at a time.
 
@@ -261,27 +325,27 @@ def _columnar_groups(rel: Relation, key_cols, counted, new_group) -> dict:
         groups[()] = new_group(rel.nrows)
     if not groups:
         return groups
+    for k in cases.row_sets:
+        rows = set(zip(*(col.tolist() for col in cols), strict=True))
+        for row in rows:
+            groups[tuple(row[i] for i in key_cols)].tallies[k].add(row)
     members = keys = None
-    for k, spec in enumerate(counted):
-        if isinstance(spec, _DistinctRows):
-            rows = set(zip(*(col.tolist() for col in cols), strict=True))
-            for row in rows:
-                groups[tuple(row[i] for i in key_cols)].tallies[k].add(row)
-        elif not spec.distinct:
+    for k, i, distinct in cases.column_tallies:
+        if not distinct:
             for group in groups.values():
                 group.tallies[k] = group.rows
+            continue
+        column = relation._native_column(cols[i])
+        if key_col is None:
+            groups[()].tallies[k] = set(relation._distinct_codes(column))
+        elif len(groups) <= SETTINGS.native_groups_max:
+            if members is None:
+                members = {key: key_col.join_indices(U64Column([key[0]]))[0] for key in groups}
+            for key, rows in members.items():
+                groups[key].tallies[k] = set(relation._distinct_codes(column.take(rows)))
         else:
-            column = relation._native_column(cols[spec.col])
-            if key_col is None:
-                groups[()].tallies[k] = set(relation._distinct_codes(column))
-            elif len(groups) <= SETTINGS.native_groups_max:
-                if members is None:
-                    members = {key: key_col.join_indices(U64Column([key[0]]))[0] for key in groups}
-                for key, rows in members.items():
-                    groups[key].tallies[k] = set(relation._distinct_codes(column.take(rows)))
-            else:
-                if keys is None:
-                    keys = memoryview(key_col).cast("Q").tolist()
-                for key, code in set(zip(keys, memoryview(column).cast("Q").tolist(), strict=True)):
-                    groups[(key,)].tallies[k].add(code)
+            if keys is None:
+                keys = memoryview(key_col).cast("Q").tolist()
+            for key, code in set(zip(keys, memoryview(column).cast("Q").tolist(), strict=True)):
+                groups[(key,)].tallies[k].add(code)
     return groups
