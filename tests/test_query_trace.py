@@ -494,3 +494,46 @@ class _PullCountingNative:
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
+
+
+def test_a_traced_result_flushes_per_chunk(tmp_path, capsys, monkeypatch):
+    """A traced result prints its lines as its decode chunks go by: once the
+    first chunk's rows are read, the native calls rdflib made finishing them
+    (tier 3: at a budget of 0 no second step fits, so rdflib matches the last
+    two patterns per row of the first) are on stderr, not held until the
+    result ends."""
+    source = tmp_path / "tiered.nt"
+    source.write_text(
+        "".join(
+            f"<http://ex.org/s{i}> <http://ex.org/{p}> <http://ex.org/{p}{i}> .\n"
+            for i in range(20)
+            for p in "pqu"
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "tiered.vortex"
+    serialize_rdf(str(source), str(output), layout="dictionary")
+    graph = Graph(store=VortexRdflibStore(str(output), in_memory=True))
+    register_sparql_pushdown()
+    monkeypatch.setattr(SETTINGS, "pair_budget", 0)
+    monkeypatch.setattr(SETTINGS, "chunk_start", 4)
+    monkeypatch.setattr(SETTINGS, "chunk_max", 4)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    rows = iter(
+        graph.query(
+            "SELECT * WHERE { ?s <http://ex.org/p> ?x . ?s <http://ex.org/q> ?y . "
+            "?s <http://ex.org/u> ?v }"
+        )
+    )
+    first = [next(rows) for _ in range(5)]  # the first chunk, and a row of the next
+    early = trace_events(capsys.readouterr().err)
+    planned = max(e["sequence"] for e in early if e["event"] == "eval_part_complete")
+    read = [e["event"] for e in early if e["sequence"] > planned]
+    assert "native_call_complete" in read
+    rest = list(rows)
+    late = trace_events(capsys.readouterr().err)
+    assert len(first) + len(rest) == 20
+    events = early + late
+    assert [e["sequence"] for e in events] == list(range(1, len(events) + 1))
+    assert events[-1]["event"] == "query_iterator_complete"

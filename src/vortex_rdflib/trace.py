@@ -1,6 +1,7 @@
 """The query trace (``VORTEX_RDF_TRACE_QUERY=1``): one JSON line per planning
 step, printed to stderr prefixed ``VORTEX_RDF_QUERY_TRACE``, held until the
-planning it describes is over.
+planning it describes is over, and while a result is read, until its next
+decode chunk.
 
 A query's trace lives on its scope (``QueryScope.trace``,
 :mod:`vortex_rdflib.query_scope`): the pushdown hook makes it when the query
@@ -35,9 +36,10 @@ class QueryTrace:
         self.sequence = 0
         #: How deep the block being solved is nested (``blocks._solve_block``).
         self.depth = 0
-        # Lines wait here until flush(), which runs once the planning (or the
-        # iteration) they describe is over, so a slow stderr never lands in
-        # the timed windows the events report.
+        # Lines wait here until flush(), which runs once the planning they
+        # describe is over, at each decode chunk of the result and at its
+        # end, so a slow stderr never lands in the timed windows the events
+        # report.
         self.pending: list[str] = []
 
     def emit(self, event: str, **fields) -> None:

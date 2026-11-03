@@ -122,7 +122,8 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], project, start, stop)
     ``_yield_solutions``); ``start``/``stop`` slice the rows first. Each
     decode chunk checks the query's cancel token before its rows are pulled
     (:func:`check_cancelled`), so a cancel stops the solutions within one
-    chunk."""
+    chunk; a traced query prints its trace's lines once the chunk is
+    decoded (:func:`trace.flush`), so it holds no more than a chunk's."""
     foreign = store._terms().foreign
     outer = dict(ctx.bindings.items())
     # Normally every solution carries the caller's own context — no per-row
@@ -151,6 +152,8 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], project, start, stop)
                 chunks += 1
                 submitted += len(codes)
             cached = store._prime_decode_cache(codes)
+            if traced:
+                trace.flush()
             for row in chunk:
                 solution = dict(base)
                 for v, i in zip(keys, idx, strict=True):

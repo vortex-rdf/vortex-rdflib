@@ -1193,7 +1193,7 @@ ones too — before it changes any setting; each moves a setting away from its
 default and never back, and a value it refuses raises `ValueError` naming the
 variable. The trace switch is read once per query, when the query starts, and
 the trace is kept on the query's scope
-([`QueryTrace`](../src/vortex_rdflib/trace.py#L27)): its planning and each
+([`QueryTrace`](../src/vortex_rdflib/trace.py#L28)): its planning and each
 step of its result, in whatever thread reads it, are one trace, numbered
 from 1. From Python,
 `register_sparql_pushdown()` and
