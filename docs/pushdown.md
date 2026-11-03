@@ -678,7 +678,7 @@ route writes the one rdflib writes (`1.5 + 4.5` is `"6.0"^^xsd:decimal`), and
 How a single-variable conjunct is decided is settled once, when it is
 compiled ([`_compile_conjunct`](../src/vortex_rdflib/filters/__init__.py#L147)),
 by the switches; vortex-rdf decides some
-([`native_shape`](../src/vortex_rdflib/filters/native.py#L413)), never over the whole
+([`native_shape`](../src/vortex_rdflib/filters/native.py#L457)), never over the whole
 dictionary: a keep narrows the scan itself, and every other shape is evaluated
 over the codes the query produced. Nothing is remembered between calls.
 
@@ -693,8 +693,8 @@ over the codes the query produced. Nothing is remembered between calls.
   lacks has no code, and a pattern left with no code matches nothing: IRIs the
   dictionary lacks, `IN ()` and lists with no IRI in common all leave none.
   Both kinds become a keep on the match of every pattern binding the variable
-  ([`native_restriction`](../src/vortex_rdflib/filters/native.py#L503)), intersected
-  per position ([`intersect_keeps`](../src/vortex_rdflib/filters/native.py#L518)).
+  ([`native_restriction`](../src/vortex_rdflib/filters/native.py#L547)), intersected
+  per position ([`intersect_keeps`](../src/vortex_rdflib/filters/native.py#L562)).
   Rejected rows never leave vortex-rdf, with one exception: a probe carries a
   range keep into vortex-rdf and tests a code-set keep on the rows it gets
   back. An `ASK` or `COUNT` over the pattern counts under the keep.
@@ -1154,7 +1154,7 @@ vortex-rdf opens a file-backed store memory-mapped.
 | `match_codes`, `count_quads` | Every pattern match and count. |
 | `count_quads_many`, `match_codes_many` | Counting several scanning patterns at once ([`_count_patterns`](../src/vortex_rdflib/pushdown/bgp.py#L226)); batched probes for joins, `OPTIONAL` and `EXISTS` ([`_run_probes`](../src/vortex_rdflib/pushdown/probes.py#L90)), whose answers are pulled one at a time as the join reaches them ([`_batch_answers`](../src/vortex_rdflib/pushdown/probes.py#L175), or [`_probe_matches`](../src/vortex_rdflib/pushdown/probes.py#L187) for a batch of some of the probes). `lookahead=` sets how far ahead of the pulls a batch of scanning probes runs; a batch of point lookups keeps the binding's default ([`_probe_lookahead`](../src/vortex_rdflib/pushdown/probes.py#L64)). |
 | `match_code_chunks` | The chunks a streamed join step is fed from ([`_streamed_step`](../src/vortex_rdflib/pushdown/streaming.py#L90)), and the chunks `Store.triples` reads a large pattern in ([`_code_matches`](../src/vortex_rdflib/store.py#L483)). |
-| `keep=` on a match or count | Kind tests and IRI equality ([`native_restriction`](../src/vortex_rdflib/filters/native.py#L503)), dropping the default graph under `GRAPH ?g` ([`_exclude_default_graph`](../src/vortex_rdflib/pushdown/matching.py#L283)), the codes a keep-scan joins on ([`_keep_scan`](../src/vortex_rdflib/pushdown/bgp.py#L810)), exact `ASK` and `COUNT` answers. |
+| `keep=` on a match or count | Kind tests and IRI equality ([`native_restriction`](../src/vortex_rdflib/filters/native.py#L547)), dropping the default graph under `GRAPH ?g` ([`_exclude_default_graph`](../src/vortex_rdflib/pushdown/matching.py#L283)), the codes a keep-scan joins on ([`_keep_scan`](../src/vortex_rdflib/pushdown/bgp.py#L810)), exact `ASK` and `COUNT` answers. |
 | `limit=` on a match or count | `LIMIT` over a single pattern ([`_limit_reaches_match`](../src/vortex_rdflib/pushdown/matching.py#L222)), `ASK`, `EXISTS` probes, the existence probes of a join in a fixed graph, the counts that only decide probe or match ([`_count_pattern`](../src/vortex_rdflib/pushdown/matching.py#L115)), a keep-scan's match (one row past the budget) and `Store.triples`' first match of a pattern (one row past a chunk). `offset=` is not used: an `OFFSET` is applied to the code rows. |
 | `cancel=` on a match, count, batch or chunk call (`CancelToken`) | The token the query runs under: every batch and chunk call is given it, and so is each one-shot call the token can stop ([`boundary.py`](../src/vortex_rdflib/boundary.py)). |
 | `TermDict.filter_codes` | FILTER predicates over the codes a query produced ([`evaluate`](../src/vortex_rdflib/filters/native.py#L172)). |
@@ -1162,7 +1162,7 @@ vortex-rdf opens a file-backed store memory-mapped.
 | `TermDict.decode_many` | Decoding results ([`_prime_decode_cache`](../src/vortex_rdflib/store.py#L552)), the spellings that probes fill in ([`_probe_spellings`](../src/vortex_rdflib/pushdown/probes.py#L376)) and the IRIs `ORDER BY` ranks ([`_rank_codes`](../src/vortex_rdflib/pushdown/head.py#L165)). |
 | `TermDict.prefix_range` | The code range of each term kind ([`KindRanges`](../src/vortex_rdflib/terms.py#L179)). |
 | `U64Column.distinct`, `value_counts` | `DISTINCT` over one variable and a variable's candidate codes ([`_distinct_codes`](../src/vortex_rdflib/pushdown/relation.py#L189)), `GROUP BY` counts ([`_columnar_groups`](../src/vortex_rdflib/pushdown/aggregate.py#L236)). |
-| `U64Column.join_indices`, `take` | The columnar join ([`_join_columns`](../src/vortex_rdflib/pushdown/relation.py#L239)), which passes the pair budget as `max_pairs=` past the product bound, so the kernel counts the pairs before it builds any; compacting a match to the rows a FILTER keeps ([`_compact_pattern`](../src/vortex_rdflib/pushdown/matching.py#L406)), a group's rows for `COUNT(DISTINCT)`, intersecting keeps ([`intersect_keeps`](../src/vortex_rdflib/filters/native.py#L518)). |
+| `U64Column.join_indices`, `take` | The columnar join ([`_join_columns`](../src/vortex_rdflib/pushdown/relation.py#L239)), which passes the pair budget as `max_pairs=` past the product bound, so the kernel counts the pairs before it builds any; compacting a match to the rows a FILTER keeps ([`_compact_pattern`](../src/vortex_rdflib/pushdown/matching.py#L406)), a group's rows for `COUNT(DISTINCT)`, intersecting keeps ([`intersect_keeps`](../src/vortex_rdflib/filters/native.py#L562)). |
 | `U64Column.join_count` | The pairs of a join of Python rows, counted before it is built ([`_hash_join`](../src/vortex_rdflib/pushdown/relation.py#L209)), and whether a pattern fits when a step is reordered ([`_fits`](../src/vortex_rdflib/pushdown/bgp.py#L628)). |
 | `U64Column.groups`, `CodeGroups.count` and `gather`, `U64Column.slice` | A streamed join step: the grouped side, the pairs and the columns of each slice or chunk, and the slices of the fed side ([`_streamed_step`](../src/vortex_rdflib/pushdown/streaming.py#L90), [`_gather_pieces`](../src/vortex_rdflib/pushdown/streaming.py#L20), [`_slices`](../src/vortex_rdflib/pushdown/relation.py#L278)). |
 

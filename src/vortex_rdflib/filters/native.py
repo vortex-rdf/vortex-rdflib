@@ -174,66 +174,68 @@ def evaluate(store, shape: FilterCodes, codes: Collection[int]) -> tuple[set, li
     order — the set that passes ``shape`` and the codes left undecided, for
     the Python routes; every other code fails. A code that is no term's (the
     empty graph name, a code past the dictionary's end, a negative one) is
-    undecided under every shape."""
+    undecided under every shape.
+
+    The codes ``filter_codes`` reads (:func:`_partition`) go to it in one
+    call, around which the kind's rule (:data:`_RULES`) diverts the codes it
+    would answer otherwise than SPARQL before the call and checks the ones
+    it passed after it."""
     if not codes:
         return set(), []
+    rule = _RULES.get(shape.kind, _PLAIN)
+    passed, undecided, inside = _partition(store, codes, shape.as_str, rule.passes_non_literals)
+    column = U64Column(inside) if inside else None
+    if column is not None and rule.pre is not None:
+        inside, column = rule.pre(store, inside, column, undecided)
+    if column is not None:
+        passed.update(_filter_codes(store, shape, rule, inside, column, undecided))
+    return passed, undecided
+
+
+def _partition(store, codes: Collection[int], as_str: bool, passes_non_literals: bool):
+    """``(passed, undecided, inside)`` before any call: the codes no term has
+    undecided, and ``inside`` the ones ``filter_codes`` reads, ascending —
+    the literals, and under ``as_str`` (``STR(?v)``, which reads an IRI as
+    its string) the IRIs too, a blank node then left undecided, as rdflib
+    reads it as its label. Every IRI and blank node passes a kind that
+    ``passes_non_literals`` (no literal, so ``!=`` a number, §17.4.1.7)."""
     ranges = store._file.kind_ranges
     undecided = _not_terms(codes, ranges)
     literal_lo, literal_hi = ranges.range(LITERAL)
     iri_lo, iri_hi = ranges.range(IRI)
     blank_lo, blank_hi = ranges.range(BLANK)
     passed: set = set()
-    # Under as_str (STR(?v): str_prefix always, the string kinds when asked)
-    # filter_codes reads an IRI or a typed literal as STR().
-    as_str = shape.as_str
     if as_str:
-        # STR(?v): an IRI reads as its string, a blank node as its label.
         undecided.extend(code for code in codes if blank_lo <= code < blank_hi)
         inside = sorted(
             code for code in codes if literal_lo <= code < literal_hi or iri_lo <= code < iri_hi
         )
     else:
-        if shape.kind == "num_ne":
-            # An IRI or a blank node is no literal, so != a number (§17.4.1.7).
+        if passes_non_literals:
             passed.update(
                 code for code in codes if iri_lo <= code < iri_hi or blank_lo <= code < blank_hi
             )
         inside = sorted(code for code in codes if literal_lo <= code < literal_hi)
-    if not inside:
-        return passed, undecided
-    column = U64Column(inside)
-    if shape.kind in NUMERIC_KINDS:
-        # vortex-rdf compares an xsd:float as a double, where XPath rounds it
-        # to single precision: those go to the Python routes.
-        floats = _codes(store, "datatype", FLOAT, column)
-        if floats is None:
-            undecided.extend(inside)
-            return passed, undecided
-        if len(floats):
-            diverted = set(memoryview(floats).cast("Q").tolist())
-            undecided.extend(diverted)
-            inside = [code for code in inside if code not in diverted]
-            if not inside:
-                return passed, undecided
-            column = U64Column(inside)
+    return passed, undecided, inside
+
+
+def _filter_codes(store, shape: FilterCodes, rule, inside: list, column, undecided: list) -> list:
+    """The codes of ``column`` (``inside``, as a list) the one
+    ``filter_codes`` call passes, after the rule's check; the codes it
+    leaves undecided join ``undecided`` — every one, for an argument
+    vortex-rdf refuses (a constant outside its value model)."""
     elapsed = trace.stopwatch()
     try:
         yes, maybe = boundary.term_dict(store).filter_codes(
-            shape.kind, shape.arg, column, flags=shape.flags, case=shape.case, as_str=as_str
+            shape.kind, shape.arg, column, flags=shape.flags, case=shape.case, as_str=shape.as_str
         )
     except ValueError:
-        # An argument vortex-rdf refuses (a constant outside its value
-        # model): every candidate goes to the Python routes.
         undecided.extend(inside)
-        return passed, undecided
+        return []
     yes_codes = memoryview(yes).cast("Q").tolist()
     undecided.extend(memoryview(maybe).cast("Q").tolist())
-    if shape.kind in ORDER_KINDS and yes_codes:
-        numbers = _numbers(store, shape, yes)
-        if numbers is not None:
-            undecided.extend(code for code in yes_codes if code not in numbers)
-            yes_codes = [code for code in yes_codes if code in numbers]
-    passed.update(yes_codes)
+    if yes_codes and rule.post is not None:
+        yes_codes = rule.post(store, shape, yes, yes_codes, undecided)
     trace.event(
         "native_filter_complete",
         kind=shape.kind,
@@ -242,7 +244,7 @@ def evaluate(store, shape: FilterCodes, codes: Collection[int]) -> tuple[set, li
         undecided_codes=len(maybe),
         elapsed_ns=elapsed(),
     )
-    return passed, undecided
+    return yes_codes
 
 
 def _codes(store, kind: str, arg: str, column: U64Column) -> U64Column | None:
@@ -254,24 +256,59 @@ def _codes(store, kind: str, arg: str, column: U64Column) -> U64Column | None:
         return None
 
 
-def _numbers(store, shape: FilterCodes, ordered: U64Column) -> set | None:
-    """Of the codes an ordering shape passed, the set that are numbers, or
-    ``None`` when every one is.
+def _divert_floats(store, inside: list, column: U64Column, undecided: list) -> tuple:
+    """Before a numeric comparison: vortex-rdf compares an xsd:float as a
+    double, where XPath rounds it to single precision, so the xsd:float
+    codes go to the Python routes (every code, when vortex-rdf refuses the
+    lookup). The codes left to send, and their column — ``None`` for
+    none."""
+    floats = _codes(store, "datatype", FLOAT, column)
+    if floats is None:
+        undecided.extend(inside)
+        return [], None
+    if not len(floats):
+        return inside, column
+    diverted = set(memoryview(floats).cast("Q").tolist())
+    undecided.extend(diverted)
+    inside = [code for code in inside if code not in diverted]
+    return inside, U64Column(inside) if inside else None
 
-    vortex-rdf orders any literal against a number by datatype IRI, where
-    SPARQL errs unless both are numbers (§17.3). ``num_ne`` passes only
-    numbers, so a passed code is one when ``num_ne`` or, for ``<=`` and
-    ``>=``, ``num_eq`` passes it; the two are disjoint, so their sizes tell
-    whether they cover every code without reading one."""
+
+def _only_numbers(store, shape: FilterCodes, yes: U64Column, yes_codes: list, undecided: list):
+    """After an ordering: of the codes it passed, the numbers; the others go
+    to the Python routes. vortex-rdf orders any literal against a number by
+    datatype IRI, where SPARQL errs unless both are numbers (§17.3).
+    ``num_ne`` passes only numbers, so a passed code is one when ``num_ne``
+    or, for ``<=`` and ``>=``, ``num_eq`` passes it; the two are disjoint,
+    so their sizes tell whether they cover every code without reading one."""
     found = []
     for kind in ("num_ne", "num_eq") if shape.kind in ("num_le", "num_ge") else ("num_ne",):
-        column = _codes(store, kind, shape.arg, ordered)
+        column = _codes(store, kind, shape.arg, yes)
         if column is None:
-            return set()
+            undecided.extend(yes_codes)
+            return []
         found.append(column)
-    if sum(len(column) for column in found) == len(ordered):
-        return None
-    return {code for column in found for code in memoryview(column).cast("Q").tolist()}
+    if sum(len(column) for column in found) == len(yes):
+        return yes_codes
+    numbers = {code for column in found for code in memoryview(column).cast("Q").tolist()}
+    undecided.extend(code for code in yes_codes if code not in numbers)
+    return [code for code in yes_codes if code in numbers]
+
+
+class _Rule(NamedTuple):
+    """What :func:`evaluate` does for a kind around its one ``filter_codes``
+    call: whether every IRI and blank node passes it without one
+    (``passes_non_literals``), the codes it diverts to the Python routes
+    before the call (``pre``) and the check of the codes the call passed
+    (``post``). The numeric kinds need both until vortex-rdf can compare as
+    SPARQL does (vortex-rdf/vortex-rdf#141), when the call alone will do."""
+
+    passes_non_literals: bool = False
+    pre: Callable | None = None
+    post: Callable | None = None
+
+
+_PLAIN = _Rule()
 
 
 #: The relational operators as native numeric predicates, and the operator
@@ -289,9 +326,16 @@ _NUM_KINDS = {
 _SWAPPED = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "=": "=", "!=": "!="}
 
 
-#: The numeric comparisons, and those of them that order.
-NUMERIC_KINDS = frozenset(_NUM_KINDS.values())
+#: The numeric comparisons that order.
 ORDER_KINDS = frozenset({"num_lt", "num_le", "num_gt", "num_ge"})
+
+
+#: Each kind's rule, :data:`_PLAIN` for the kinds without one.
+_RULES = {
+    "num_eq": _Rule(pre=_divert_floats),
+    "num_ne": _Rule(passes_non_literals=True, pre=_divert_floats),
+    **dict.fromkeys(ORDER_KINDS, _Rule(pre=_divert_floats, post=_only_numbers)),
+}
 
 
 #: Language ranges the native basic filtering (RFC 4647 §3.3.1) decides as

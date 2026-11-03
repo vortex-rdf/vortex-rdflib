@@ -402,6 +402,32 @@ def test_only_the_codes_a_predicate_reads_are_sent(spelling_store, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("kind", "calls"),
+    [
+        ("num_eq", ["datatype", "num_eq"]),
+        ("num_ne", ["datatype", "num_ne"]),
+        ("num_lt", ["datatype", "num_lt", "num_ne"]),
+        ("num_gt", ["datatype", "num_gt", "num_ne"]),
+        ("num_le", ["datatype", "num_le", "num_ne", "num_eq"]),
+        ("num_ge", ["datatype", "num_ge", "num_ne", "num_eq"]),
+    ],
+)
+def test_a_numeric_comparison_makes_its_native_calls_in_order(
+    spelling_store, monkeypatch, kind, calls
+):
+    """Each numeric kind's native calls, in order: the xsd:float codes looked
+    up first (diverted to the Python routes), the comparison itself, and for
+    an ordering the check that what it passed are numbers — ``num_ne``, and
+    ``num_eq`` too for ``<=`` and ``>=`` (vortex-rdf/vortex-rdf#141 would
+    make it one call)."""
+    codes = _all_codes(spelling_store)
+    recording = RecordingTermDict(spelling_store._dict)
+    monkeypatch.setattr(spelling_store, "_dict", recording)
+    native.evaluate(spelling_store, FilterCodes(kind, f'"5"^^<{XSD}integer>'), codes)
+    assert [call[0] for call in recording.calls] == calls
+
+
+@pytest.mark.parametrize(
     "constant",
     [
         f'"5"^^<{XSD}integer>',
@@ -413,7 +439,7 @@ def test_only_the_codes_a_predicate_reads_are_sent(spelling_store, monkeypatch):
 )
 def test_num_eq_and_num_ne_pass_only_numbers(spelling_store, constant):
     """The contract an ordering's check for numbers relies on
-    (``native._numbers``): every code ``num_eq`` or ``num_ne`` passes is a
+    (``native._only_numbers``): every code ``num_eq`` or ``num_ne`` passes is a
     well-typed number."""
     codes = sorted(code for code in _all_codes(spelling_store) if _is_literal(spelling_store, code))
     for kind in ("num_eq", "num_ne"):
