@@ -77,16 +77,16 @@ _term = _term_builder()
 
 
 class OpenFile:
-    """One open ``.vortex`` file of ``store``: its native handle
-    (``native``), its term codes (``codes``, ``None`` while the store reads
-    none: a layout without a dictionary, or the code path off), layout,
-    indexes and residency, one rdflib context per graph a match has named
-    (:meth:`context_tuple`, :meth:`context_of_code`), the file's graphs once
-    listed (``all_contexts``) and its union facts once read (``union``,
-    filled by the store)."""
+    """One open ``.vortex`` file: its native handle (``native``), its term
+    codes (``codes``, ``None`` while the store reads none: a layout without a
+    dictionary, or the code path off), layout, indexes and residency, one
+    rdflib context per graph a match has named (:meth:`context_tuple`,
+    :meth:`context_of_code`), the file's graphs once listed
+    (``all_contexts``) and its union facts once read (``union``, filled by
+    the store). It refers to no store, so a store nothing else refers to is
+    freed, with its file, as its last reference goes."""
 
-    def __init__(self, store, native: VortexRdfStore, in_memory: bool, use_codes: bool):
-        self.store = store
+    def __init__(self, native: VortexRdfStore, in_memory: bool, use_codes: bool):
         self.native = native
         term_dict = native.term_dict() if use_codes else None
         self.codes: Codes | None = None if term_dict is None else Codes(term_dict)
@@ -104,9 +104,9 @@ class OpenFile:
         base), or a secondary index serves its bound predicate or object."""
         return n3[0] is not None or bool(self.indexes) and (n3[1] is not None or n3[2] is not None)
 
-    def context_tuple(self, spelling: str) -> tuple:
-        """The one-graph context tuple ``triples()`` yields for a graph of
-        this file.
+    def context_tuple(self, store, spelling: str) -> tuple:
+        """The one-graph context tuple ``store.triples()`` yields for a graph
+        of this file.
 
         Kept per graph: rdflib only ever iterates it, so one tuple per graph
         keeps a match from allocating a context per row. Only graphs the file
@@ -123,11 +123,11 @@ class OpenFile:
                     # else in the graph column is a malformed file.
                     raise ValueError(f"graph name is not an IRI or blank node: {spelling!r}")
                 identifier = name
-            contexts = (Graph(store=self.store, identifier=identifier),)
+            contexts = (Graph(store=store, identifier=identifier),)
             self.contexts_by_spelling[spelling] = contexts
         return contexts
 
-    def context_of_code(self, code: int) -> tuple:
+    def context_of_code(self, store, code: int) -> tuple:
         """The context tuple of a graph column's code, its name decoded
         through this file's dictionary: a ``triples()`` call keeps resolving
         against the file it started on, whatever ``close()`` or ``open()``
@@ -135,5 +135,6 @@ class OpenFile:
         contexts = self.contexts_by_code.get(code)
         if contexts is None:
             assert self.codes is not None, "a graph column's codes come from a dictionary"
-            contexts = self.contexts_by_code[code] = self.context_tuple(self.codes.spelling(code))
+            name = self.codes.spelling(code)
+            contexts = self.contexts_by_code[code] = self.context_tuple(store, name)
         return contexts

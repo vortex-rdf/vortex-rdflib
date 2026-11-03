@@ -146,3 +146,23 @@ def test_a_lazy_result_read_after_close_still_answers(vortex_files, monkeypatch)
     assert sorted([first, *rows]) == expected and len(expected) > 2
     store.close()
     assert len(store) == len(VortexRdflibStore(path))
+
+
+@pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
+def test_a_dropped_store_is_freed_at_once(vortex_files, in_memory):
+    """A store nothing refers to any more is freed when its last reference
+    goes, with its open file — an in-memory one holds the whole file — not
+    whenever the cycle collector next runs: the open file's record refers
+    to no store."""
+    import gc
+    import weakref
+
+    gc.disable()
+    try:
+        store = VortexRdflibStore(str(vortex_files["dictionary"]), in_memory=in_memory)
+        assert len(store) > 0
+        dropped = weakref.ref(store)
+        del store
+        assert dropped() is None
+    finally:
+        gc.enable()

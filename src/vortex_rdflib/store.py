@@ -103,7 +103,7 @@ class VortexRdflibStore(Store):
         if self.path is None:
             return NO_STORE
         native = VortexRdfStore(self.path, in_memory=self.in_memory)
-        self._file = OpenFile(self, native, self.in_memory, self._use_codes)
+        self._file = OpenFile(native, self.in_memory, self._use_codes)
         return VALID_STORE
 
     def close(self, commit_pending_transaction=False):
@@ -322,7 +322,9 @@ class VortexRdflibStore(Store):
             if g_n3 is None:
                 graphs = self._distinct_graphs(*pattern[:3])
                 return [((s, p, o), tuple(graphs))] if graphs else ()
-            return [((s, p, o), opened.context_tuple(g_n3))] if native.count_quads(*pattern) else ()
+            if not native.count_quads(*pattern):
+                return ()
+            return [((s, p, o), opened.context_tuple(self, g_n3))]
         codes = opened.codes
         matches = None if codes is None else self._code_matches(native, pattern)
         if codes is not None and matches is not None:
@@ -357,7 +359,7 @@ class VortexRdflibStore(Store):
                     # named graph's one context tuple (see `fixed`).
                     cache = self._terms().decode
                     if g_n3 is not None:
-                        fixed = opened.context_tuple(g_n3)
+                        fixed = opened.context_tuple(self, g_n3)
                 # Zero-copy u64 views over the Rust column buffers, read a
                 # slice at a time: 64 rows, then four times more, 4096 at most.
                 # Each slice's codes become Python ints, and those the call's
@@ -384,7 +386,7 @@ class VortexRdflibStore(Store):
                         g_codes = part[3].tolist()
                         graphs = set(g_codes)
                         for code in graphs.difference(contexts):
-                            contexts[code] = opened.context_of_code(code)
+                            contexts[code] = opened.context_of_code(self, code)
                         if len(graphs) == 1:
                             shared = contexts[g_codes[0]]
                         else:
@@ -413,7 +415,7 @@ class VortexRdflibStore(Store):
         checks the token before it."""
         g_n3 = pattern[3]
         subjects, predicates, objects, graphs = native.match_columns(*pattern)
-        fixed = opened.context_tuple(g_n3) if g_n3 is not None and subjects else None
+        fixed = opened.context_tuple(self, g_n3) if g_n3 is not None and subjects else None
         parse = self._from_n3_safe
         memo: dict[str, Node] = {}
         for s_raw, p_raw, o_raw, g_raw in zip(subjects, predicates, objects, graphs, strict=True):
@@ -425,7 +427,7 @@ class VortexRdflibStore(Store):
                 row.append(node)
             yield (
                 (row[0], row[1], row[2]),
-                (fixed if fixed is not None else opened.context_tuple(g_raw)),
+                (fixed if fixed is not None else opened.context_tuple(self, g_raw)),
             )
 
     def _code_matches(
@@ -488,9 +490,9 @@ class VortexRdflibStore(Store):
             if cols is not None:
                 # Native distinct, in first-seen order.
                 codes = memoryview(cols[3].distinct()).cast("Q").tolist()
-                return [opened.context_of_code(code)[0] for code in codes]
+                return [opened.context_of_code(self, code)[0] for code in codes]
         *_spo, graphs = native.match_columns(s_n3, p_n3, o_n3, None)
-        return [opened.context_tuple(name)[0] for name in dict.fromkeys(graphs)]
+        return [opened.context_tuple(self, name)[0] for name in dict.fromkeys(graphs)]
 
     def _terms(self) -> QueryTerms:
         """The term state of the query being evaluated (:mod:`.query_scope`),
