@@ -91,12 +91,12 @@ typed path per case.
   file's layout.
 - Every `VORTEX_RDF_*` switch is parsed one way: an on/off switch takes
   `1/true/yes/on` or `0/false/no/off` in any case (only `1` and `0` worked for
-  some), a size is a positive integer, and anything else raises a `ValueError`
-  naming the variable — when a store is constructed or the pushdown
-  registered, not on import. `VORTEX_RDF_TRACE_TRIPLES` is read when a store
-  is constructed. `ablation.flag`, `ablation.positive_int`, the ablation
-  constants, `counters.ON` and `settings.trace_triples()` are gone: the fields
-  of `settings.SETTINGS` replace them.
+  some), a size is a whole number in ASCII digits (no sign, no underscore), and
+  anything else raises a `ValueError` naming the variable — when a store is
+  constructed or the pushdown registered, not on import.
+  `VORTEX_RDF_TRACE_TRIPLES` is read when a store is constructed.
+  `vortex_rdflib.ablation`, `counters.ON` and `settings.trace_triples()` are
+  gone: the fields of `settings.SETTINGS` replace them.
 - The query trace (`VORTEX_RDF_TRACE_QUERY=1`) is one trace per query, kept on
   the query's scope: a `UNION`'s branches no longer restart its numbering, and
   a result never read no longer traces later queries. The `order_start` and
@@ -149,6 +149,25 @@ typed path per case.
 - A frozen frame and pushed conjuncts, applied on the relation (pushdown) ([`baccfa2`](https://github.com/vortex-rdf/vortex-rdflib/commit/baccfa2bf4ed9f1713cf8dbbcc438ab770c95bd4) by @claude)
 - Typed blocks, a solver per kind, handlers as functions (pushdown) ([`21e8f2e`](https://github.com/vortex-rdf/vortex-rdflib/commit/21e8f2e55da081571f7efcf9e73a1635a99299b1) by @claude)
 - Read a VALUES table in one pass (algebra) ([`bf03d3e`](https://github.com/vortex-rdf/vortex-rdflib/commit/bf03d3ed8fe71b5876debf3b5e892b6ff67c749f) by @claude)
+- One REGEX recognizer (filters) ([`b1b36ef`](https://github.com/vortex-rdf/vortex-rdflib/commit/b1b36ef863ef737f6570b4301096dcc731f4f593) by @claude)
+- A query constant's view built directly (filters) ([`bce5ccc`](https://github.com/vortex-rdf/vortex-rdflib/commit/bce5ccc49b8d04c27d636b0d2bde1eba2e6adfba) by @claude)
+- The operand protocol stated once (filters) ([`ac98114`](https://github.com/vortex-rdf/vortex-rdflib/commit/ac98114e303294eae7eb35583b1d11eeca2c0c98) by @claude)
+- One table of value spaces (filters) ([`f6dcb2f`](https://github.com/vortex-rdf/vortex-rdflib/commit/f6dcb2fca285b1c5bfa62aff345c488bc85dfc7c) by @claude)
+- One tagged decision per conjunct, held by identity (filters) ([`31695d8`](https://github.com/vortex-rdf/vortex-rdflib/commit/31695d8e9c06477bba6940d897be2d51e0cfd2ef) by @claude)
+- Native numeric rules as one table (filters) ([`f20c758`](https://github.com/vortex-rdf/vortex-rdflib/commit/f20c75826c77aeeceeb2cef40cd963e452a6f9da) by @claude)
+- The open file owns its handle and its codes (store) ([`3d59826`](https://github.com/vortex-rdf/vortex-rdflib/commit/3d59826aaa2fb52fad64a02422bd2f8b48990ee7) by @claude)
+- Main's cost per call under a token, one token per query (boundary) ([`67febc2`](https://github.com/vortex-rdf/vortex-rdflib/commit/67febc2f71a2100e9cd27181b6e28079e8ec6449) by @claude)
+- The switches as one table; sizes in digits only (settings) ([`3b93eab`](https://github.com/vortex-rdf/vortex-rdflib/commit/3b93eabe8590acffa57ac5173ca5d948809c7c29) by @claude)
+- The trace's JSON helpers in the trace module; no ablation module ([`5ba0804`](https://github.com/vortex-rdf/vortex-rdflib/commit/5ba0804dfc3a00bca97e60caf8df59b175b8e127) by @claude)
+- Triples() reads through one of two readers (store) ([`270c38b`](https://github.com/vortex-rdf/vortex-rdflib/commit/270c38ba5293884809c2be44478bcef44f043888) by @claude)
+- One step ladder for BGP steps and block joins (pushdown) ([`e5fdf4e`](https://github.com/vortex-rdf/vortex-rdflib/commit/e5fdf4ee46e30673ffe3ff2db02ea1a89325e0db) by @claude)
+- A probe join counts the probes it sent as it sends them (probes) ([`d81f2cd`](https://github.com/vortex-rdf/vortex-rdflib/commit/d81f2cda65508601e5ed6386066672cf6ec61428) by @claude)
+- A step's state derived, its tiers functions, no surgery on remaining (bgp) ([`378dfb0`](https://github.com/vortex-rdf/vortex-rdflib/commit/378dfb0a5b2cb27215950fc58aaf4cb11e680198) by @claude)
+- The planner, its trace and the pushed conjuncts in modules of their own (pushdown) ([`f2b697b`](https://github.com/vortex-rdf/vortex-rdflib/commit/f2b697b37d395253b78e244533ccda7849b6e644) by @claude)
+- A frame always carries its scope (blocks) ([`3f34ddd`](https://github.com/vortex-rdf/vortex-rdflib/commit/3f34ddd6636f549b11f0fa5dfd0901b9cf922bc2) by @claude)
+- A VALUES block's rows are tuples in variable order (values) ([`6c4437e`](https://github.com/vortex-rdf/vortex-rdflib/commit/6c4437eb5bf7fd4bbf70782ccfe78a7f0ffce5cd) by @claude)
+- FILTER and OPTIONAL blocks carry their own expressions (blocks) ([`cfe1e05`](https://github.com/vortex-rdf/vortex-rdflib/commit/cfe1e05d0b8b5a3490c0ddc4d3b7a5f7a64f8f0a) by @claude)
+- COUNT cases that carry their behaviour (aggregate) ([`1c96486`](https://github.com/vortex-rdf/vortex-rdflib/commit/1c96486ecc226996efd2c96c97bcaa1d0d5758d2) by @claude)
 
 ### Fixed
 
@@ -162,6 +181,9 @@ typed path per case.
 - Resolve the graph once, and merge the union by code (store) ([`e7bda4b`](https://github.com/vortex-rdf/vortex-rdflib/commit/e7bda4b45341783c6d64431ec38861322fb049fc) by @claude)
 - The FILTER over rdflib's rows keeps nothing per row (filters) ([`ab41173`](https://github.com/vortex-rdf/vortex-rdflib/commit/ab411738a64d80fe2178122024ef1903898adf67) by @claude)
 - One constant evaluator and one REGEX check for both routes (filters) ([`e4d9153`](https://github.com/vortex-rdf/vortex-rdflib/commit/e4d91534052ec72adf6c7199f518b1d1f6229897) by @claude)
+- One IRI check, the package's; a refused IRI names no term (filters) ([`ca48ea0`](https://github.com/vortex-rdf/vortex-rdflib/commit/ca48ea0ed4a8d6c4a340ec858b95d287beb47f7c) by @claude)
+- The open file's record refers to no store (store) ([`a58dd11`](https://github.com/vortex-rdf/vortex-rdflib/commit/a58dd11d46f9857b6cc7ab6a02cf90f162c3467b) by @claude)
+- A traced result flushes per chunk (trace) ([`9585528`](https://github.com/vortex-rdf/vortex-rdflib/commit/958552810b8b1dc5cd6d6c83cc05f671475e8963) by @claude)
 
 ## [0.4.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.3.0...v0.4.0) - 2026-10-24
 
