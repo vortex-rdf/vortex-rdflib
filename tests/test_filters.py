@@ -13,7 +13,7 @@ from tests.oracle import departs, spec_answer
 from tests.support import V, W, filter_expr, typed
 
 from vortex_rdflib import filters
-from vortex_rdflib.terms import BLANK, IRI, LITERAL, TermView, kind_bounds, kind_of, parse_spelling
+from vortex_rdflib.terms import BLANK, IRI, LITERAL, KindRanges, TermView, parse_spelling
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 
@@ -370,7 +370,7 @@ def test_canonical_spelling_round_trips_every_dictionary_term(tmp_path):
         assert term_dict.encode(canonical_spelling(term)) == code
 
 
-def test_kind_bounds_partition_the_dictionary(tmp_path):
+def test_kind_ranges_partition_the_dictionary(tmp_path):
     from vortex_rdf import serialize_rdf
 
     from vortex_rdflib import VortexRdflibStore
@@ -388,13 +388,17 @@ def test_kind_bounds_partition_the_dictionary(tmp_path):
     store = VortexRdflibStore(str(out))
     term_dict = store._dict
     assert term_dict is not None
-    bounds = kind_bounds(term_dict)
-    assert bounds == store._term_kind_bounds()
+    ranges = KindRanges.from_dictionary(term_dict)
+    opened = store._file
+    assert opened is not None and opened.kind_ranges is not None
+    assert [opened.kind_ranges.range(k) for k in (LITERAL, IRI, BLANK)] == [
+        ranges.range(k) for k in (LITERAL, IRI, BLANK)
+    ]
     for code in range(len(term_dict)):
         spelling = term_dict.decode(code)
         assert spelling is not None
         expected = {'"': LITERAL, "<": IRI, "_": BLANK}.get(spelling[:1], "")
-        assert kind_of(code, bounds) == expected, (code, spelling)
+        assert ranges.kind_of(code) == expected, (code, spelling)
 
 
 #: An XML Schema type SPARQL 1.1 names no operator for: what its values equal

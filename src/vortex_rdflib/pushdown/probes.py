@@ -65,8 +65,9 @@ def _substituted_patterns(store, rows, pat: Pattern, bound) -> list:
 def _probe_lookahead(store, batch_n3: Sequence[Sequence[str | None]]) -> int | None:
     """The ``lookahead`` of one batch call over these probes' quad patterns:
     ``None``, the binding's default, when every probe is a point lookup
-    (``store._point_lookup``), else ``SETTINGS.scan_lookahead``."""
-    if all(store._point_lookup(n3) for n3 in batch_n3):
+    (``OpenFile.point_lookup``), else ``SETTINGS.scan_lookahead``."""
+    point_lookup = store._file.point_lookup
+    if all(point_lookup(n3) for n3 in batch_n3):
         return None
     return SETTINGS.scan_lookahead
 
@@ -80,7 +81,8 @@ def _batched_probes(store, patterns) -> list[int]:
     minimum = SETTINGS.memory_scan_batch_min if store.in_memory else SETTINGS.scan_batch_min
     if len(patterns) < minimum:
         return []
-    batched = [i for i, n3 in enumerate(patterns) if not store._point_lookup(n3)]
+    point_lookup = store._file.point_lookup
+    batched = [i for i, n3 in enumerate(patterns) if not point_lookup(n3)]
     if not store.in_memory and len(patterns) - len(batched) >= SETTINGS.cheap_batch_min:
         return list(range(len(patterns)))
     return batched if len(batched) >= minimum else []
@@ -228,7 +230,7 @@ def _batch_probes_sent(store, probes, pulled: int, count: bool) -> int:
 def _probe_shape(pat: Pattern, shared: Sequence) -> list:
     """``pat``'s quad pattern as each probe of a row binds it: a placeholder
     at every position a ``shared`` variable takes, where the row's code goes.
-    It tells ``store._point_lookup`` whether the probes would scan."""
+    It tells ``OpenFile.point_lookup`` whether the probes would scan."""
     shape = list(pat.n3)
     for var in shared:
         for position in pat.varpos[var]:
@@ -386,8 +388,6 @@ def _probe_spellings(store, rows, bound) -> dict:
         for code in distinct
         if code < 0
     }
-    for code, term in zip(codes, boundary.term_dict(store).decode_many(codes), strict=True):
-        if term is None:
-            raise ValueError(f"term code {code} is not in the store dictionary")
+    for code, term in zip(codes, store._spellings(codes), strict=True):
         n3_cache[code] = term
     return n3_cache

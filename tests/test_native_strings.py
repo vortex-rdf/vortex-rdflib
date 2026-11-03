@@ -15,7 +15,7 @@ import pytest
 from rdflib import Graph, Literal, URIRef
 from rdflib.term import Variable
 from tests.oracle import departs, spec_answer
-from tests.support import both_ways, filter_expr, outcome, run
+from tests.support import both_ways, filter_expr, kind_ranges, outcome, run
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
@@ -256,7 +256,7 @@ def test_bsbm_literals_agree_with_python_re():
     CONTAINS/STRSTARTS/STRENDS constants."""
     store = VortexRdflibStore(os.environ["VORTEX_RDFLIB_BSBM_STORE"])
     assert store._dict is not None
-    lo, hi = store._kind_ranges()[LITERAL]
+    lo, hi = kind_ranges(store).range(LITERAL)
     ordered = list(range(lo, hi, max(1, (hi - lo) // 20000)))
     codes = set(ordered)
     spellings = {

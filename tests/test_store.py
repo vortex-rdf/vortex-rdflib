@@ -282,10 +282,10 @@ def test_file_store_dictionary_is_memory_mapped(vortex_files, monkeypatch):
 
 
 def test_residency_budget_is_gone(vortex_files):
-    """max_resident_bytes is not accepted: passing it fails loudly instead of
-    disappearing into **kwargs."""
+    """max_resident_bytes is not accepted: passing it fails loudly, as any
+    unknown keyword does."""
     with pytest.raises(TypeError, match="max_resident_bytes"):
-        VortexRdflibStore(str(vortex_files["dictionary"]), max_resident_bytes=4096)
+        VortexRdflibStore(str(vortex_files["dictionary"]), max_resident_bytes=4096)  # ty: ignore[unknown-argument]
     assert not hasattr(VortexRdflibStore(str(vortex_files["dictionary"])), "max_resident_bytes")
 
 
@@ -296,12 +296,10 @@ def test_in_memory_graph_equality(vortex_files):
     assert sorted(in_mem.triples((None, None, None))) == sorted(on_file.triples((None, None, None)))
 
 
-def test_layout_alias_and_detection(vortex_files):
-    # The aliased layout names are accepted as labels; the detected layout wins.
-    store = VortexRdflibStore(str(vortex_files["dictionary"]), layout="cottas-native-ids")
-    assert store.layout == "dictionary"
-    store = VortexRdflibStore(str(vortex_files["default"]), layout="cottas-native-strings")
-    assert store.layout == "default"
+def test_layout_is_detected(vortex_files):
+    """The layout is the file's own, as vortex-rdf reads it."""
+    for layout in ("default", "typed-object", "dictionary"):
+        assert VortexRdflibStore(str(vortex_files[layout])).layout == layout
 
 
 def test_from_n3_safe_dbpedia_escaped_apostrophe():

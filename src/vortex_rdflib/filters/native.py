@@ -40,7 +40,7 @@ from vortex_rdf import U64Column
 
 from .. import boundary, trace
 from ..settings import SETTINGS
-from ..terms import BLANK, IRI, LITERAL, canonical_spelling
+from ..terms import BLANK, IRI, LITERAL, KindRanges, canonical_spelling
 from . import exprs, values
 from .exprs import _VAR_LIKE
 from .values import _FLOAT, _RDF_NIL, _XSD_STRING, ERROR, NUMERIC_TYPES
@@ -82,7 +82,7 @@ def keep_of(store, shape: NativeShape):
     no stored term) — or ``None`` for any other shape. A spelling the native
     parser refuses raises ``ValueError``."""
     if shape.kind in KIND_TESTS:
-        return store._kind_ranges()[KIND_TESTS[shape.kind]]
+        return store._file.kind_ranges.range(KIND_TESTS[shape.kind])
     if shape.kind == IRI_IN:
         spellings = list(shape.arg)
         found = boundary.term_dict(store).encode_many(spellings) if spellings else []
@@ -90,14 +90,15 @@ def keep_of(store, shape: NativeShape):
     return None
 
 
-def _not_terms(codes: Collection[int], ranges: dict) -> list:
+def _not_terms(codes: Collection[int], ranges: KindRanges) -> list:
     """The codes that are no term's: the empty graph name (below the term
     kinds' ranges), a code past the dictionary's end, a negative one. The
-    ranges are adjacent (literals, IRIs, blank nodes), so the terms are the
-    codes from the lowest bound to the highest, and ``min`` and ``max`` clear
-    a collection of terms without a test per code."""
-    low = min(lo for lo, _ in ranges.values())
-    high = max(hi for _, hi in ranges.values())
+    ranges are adjacent and in byte order (literals, IRIs, blank nodes), so
+    the terms are the codes from the literals' first to the blank nodes'
+    end, and ``min`` and ``max`` clear a collection of terms without a test
+    per code."""
+    low = ranges.range(LITERAL)[0]
+    high = ranges.range(BLANK)[1]
     if min(codes) >= low and max(codes) < high:
         return []
     return [code for code in codes if not low <= code < high]
@@ -115,7 +116,7 @@ def evaluate(store, shape: NativeShape, codes: Collection[int]) -> tuple[set, li
         keep = keep_of(store, shape)
     except ValueError:
         return set(), list(codes)
-    ranges = store._kind_ranges()
+    ranges = store._file.kind_ranges
     undecided = _not_terms(codes, ranges)
     if isinstance(keep, tuple):
         lo, hi = keep
@@ -123,9 +124,9 @@ def evaluate(store, shape: NativeShape, codes: Collection[int]) -> tuple[set, li
     if keep is not None:
         allowed = set(memoryview(keep).cast("Q").tolist())
         return {code for code in codes if code in allowed}, undecided
-    literal_lo, literal_hi = ranges[LITERAL]
-    iri_lo, iri_hi = ranges[IRI]
-    blank_lo, blank_hi = ranges[BLANK]
+    literal_lo, literal_hi = ranges.range(LITERAL)
+    iri_lo, iri_hi = ranges.range(IRI)
+    blank_lo, blank_hi = ranges.range(BLANK)
     passed: set = set()
     # str_prefix is STRSTARTS(STR(?v), ...): it reads STR() like the string
     # kinds under as_str, and filter_codes reads an IRI or a typed literal as

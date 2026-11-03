@@ -1,7 +1,7 @@
 # SPARQL pushdown
 
 `vortex-rdflib` runs SPARQL queries with rdflib's engine. In addition, a
-[`VortexRdflibStore`](../src/vortex_rdflib/store.py#L63) installs a hook that
+[`VortexRdflibStore`](../src/vortex_rdflib/store.py#L33) installs a hook that
 answers the parts of a query it supports itself. The hook works on the store's
 integer term codes instead of rdflib terms. Everything it does not support is
 left to rdflib.
@@ -26,7 +26,7 @@ feature, and where in the code each step happens.
 | &nbsp;&nbsp;[`relation.py`](../src/vortex_rdflib/pushdown/relation.py) | code-space relations, their rows and the join kernels; |
 | &nbsp;&nbsp;[`solutions.py`](../src/vortex_rdflib/pushdown/solutions.py) | turning rows into rdflib solutions; |
 | &nbsp;&nbsp;[`aliasing.py`](../src/vortex_rdflib/pushdown/aliasing.py) | codes whose terms another code represents (two spellings of one typed literal); |
-| &nbsp;&nbsp;[`tracing.py`](../src/vortex_rdflib/pushdown/tracing.py) | what the query trace reports beyond its events' fields, and the native handle traced. |
+| &nbsp;&nbsp;[`tracing.py`](../src/vortex_rdflib/pushdown/tracing.py) | what the query trace reports beyond its events' fields. |
 | [`filters/`](../src/vortex_rdflib/filters/__init__.py) | `FILTER` expressions: splitting them into conjuncts and evaluating each, over the modules: |
 | &nbsp;&nbsp;[`exprs.py`](../src/vortex_rdflib/filters/exprs.py) | walking expression trees: their variables, MINUS and EXISTS, the `&&` chain; |
 | &nbsp;&nbsp;[`values.py`](../src/vortex_rdflib/filters/values.py) | SPARQL 1.1's value semantics over parsed spellings: numbers and their arithmetic, equality, order, truth, `REGEX`; |
@@ -36,7 +36,8 @@ feature, and where in the code each step happens.
 | [`trace.py`](../src/vortex_rdflib/trace.py) | The query trace (`VORTEX_RDF_TRACE_QUERY=1`): one per query, kept on its scope. |
 | [`boundary.py`](../src/vortex_rdflib/boundary.py) | Every call into vortex-rdf's store and term dictionary: the query's cancel token by one policy, the trace's native events and the work counters, and the bare handles when nothing observes. |
 | [`terms.py`](../src/vortex_rdflib/terms.py) | Term spellings: parsing the dictionary's N-Triples strings, building the rdflib terms they stand for, and spelling rdflib terms the way the dictionary stores them. |
-| [`store.py`](../src/vortex_rdflib/store.py) | The rdflib store: opening the file (memory-mapped, or loaded in memory), decoding codes to terms, choosing which graph a query reads, and the store's fixed-size bookkeeping. |
+| [`store.py`](../src/vortex_rdflib/store.py) | The rdflib store: opening the file (memory-mapped, or loaded in memory), decoding codes to terms, and choosing which graph a query reads. |
+| [`open_file.py`](../src/vortex_rdflib/open_file.py) | The file a store has open, as one record dropped on `close()`: its layout and indexes, its graph contexts, its kind ranges and default graph's code, whether some triple is in two graphs; and the checked decode, for which a code outside the dictionary is an error. |
 | [`cancel.py`](../src/vortex_rdflib/cancel.py) | A query's cancel token: `cancel_scope`, and which native calls race the token and which check it. |
 | [`settings.py`](../src/vortex_rdflib/settings.py) | The numbers the planner decides by (pair budget, probe fan-out, batch and chunk sizes) and every environment switch, with when each is read. |
 
@@ -76,7 +77,7 @@ current around each of its steps
 | --- | --- |
 | `SelectQuery`, `AskQuery`, `ConstructQuery`, `DescribeQuery`, offered first, with no scope current | [`_eval_scoped`](../src/vortex_rdflib/pushdown/hook.py#L99): opens the query's scope, then hands the node back to rdflib's `evalPart`, which offers it again |
 | `BGP`, `Filter`, `Join`, `LeftJoin`, `Minus`, `ToMultiSet` (`VALUES`), `Graph` | [`_eval_block_node`](../src/vortex_rdflib/pushdown/blocks.py#L18) |
-| `Project`, `Slice`, `Distinct`, `OrderBy` | [`_eval_head`](../src/vortex_rdflib/pushdown/head.py#L66) |
+| `Project`, `Slice`, `Distinct`, `OrderBy` | [`_eval_head`](../src/vortex_rdflib/pushdown/head.py#L67) |
 | `AggregateJoin` | [`_eval_aggregate`](../src/vortex_rdflib/pushdown/aggregate.py#L19) |
 | `AskQuery`, offered again inside the scope | [`_eval_ask`](../src/vortex_rdflib/pushdown/blocks.py#L37) |
 
@@ -122,21 +123,21 @@ dictionary.
 - Joins, filters, `DISTINCT`, grouping and sorting all work on these integers.
 - A code becomes an rdflib term only when a solution is returned. Each code is
   decoded once per query and kept until the query ends
-  ([`_prime_decode_cache`](../src/vortex_rdflib/store.py#L645)). IRIs, blank
+  ([`_prime_decode_cache`](../src/vortex_rdflib/store.py#L569)). IRIs, blank
   nodes, and plain, language-tagged and `xsd:integer` literals without
   escapes (an integer `int()` reads, a non-canonical one only while
   `rdflib.NORMALIZE_LITERALS` holds), are made without rdflib's constructors,
   with the attributes those set; every other spelling reaches the
   constructors split once. At import, a fixed sample is built both ways, and
   if any term differs the constructors build every term
-  ([`_term_builder`](../src/vortex_rdflib/terms.py#L348)).
+  ([`_term_builder`](../src/vortex_rdflib/terms.py#L375)).
 
 Codes follow the byte order of the term spellings, so each kind of term fills
 one contiguous range of codes: first the default graph's empty name, then
 literals (`"…`), then IRIs (`<…>`), then blank nodes (`_:…`). Asking whether a
 code is an IRI is a range check, with no decoding
-([`kind_bounds`](../src/vortex_rdflib/terms.py#L161),
-[`_kind_ranges`](../src/vortex_rdflib/store.py#L699)).
+([`KindRanges`](../src/vortex_rdflib/terms.py#L161), read once per open file:
+[`OpenFile.kind_ranges`](../src/vortex_rdflib/open_file.py#L53)).
 
 Much of the integer work runs inside vortex-rdf ("natively") instead of in
 Python:
@@ -179,7 +180,7 @@ one solver per node type. The result is a
 The head is what rdflib puts above a block:
 
 - `Slice? → Distinct? → Project → OrderBy? → block`, read by
-  [`_plan_head`](../src/vortex_rdflib/pushdown/head.py#L30) and run by `_eval_head`;
+  [`_plan_head`](../src/vortex_rdflib/pushdown/head.py#L31) and run by `_eval_head`;
 - `AggregateJoin(Group(block))`, run by `_eval_aggregate`;
 - `AskQuery(Project(block))`, run by `_eval_ask`.
 
@@ -202,7 +203,7 @@ match, never decodes the rows it did not read. Columns are turned into Python
 tuples one slice at a time, for the same reason, each slice followed by a check
 of the cancel token
 ([`_column_rows`](../src/vortex_rdflib/pushdown/relation.py#L363)).
-[`Store.triples`](../src/vortex_rdflib/store.py#L368), which rdflib's own
+[`Store.triples`](../src/vortex_rdflib/store.py#L299), which rdflib's own
 evaluator calls for the nodes the hook leaves to it, reads and decodes its
 match in the same chunks.
 
@@ -302,18 +303,18 @@ the join from the pattern sizes:
 5. **Extend.** Each next step takes the smallest remaining pattern that shares
    a variable with the relation (or the smallest one overall, for a cross
    product; an uncounted pattern ranks last) and joins it in one of three ways:
-   - **Probe join** ([`_probe_join`](../src/vortex_rdflib/pushdown/probes.py#L239)),
+   - **Probe join** ([`_probe_join`](../src/vortex_rdflib/pushdown/probes.py#L241)),
      when the relation is at least
      [`SETTINGS.probe_fanout`](../src/vortex_rdflib/settings.py#L147) (100) times
      smaller than the pattern's count and each probe is a point lookup (a
      bound subject, or a pattern a secondary index serves:
-     [`VortexRdflibStore._point_lookup`](../src/vortex_rdflib/store.py#L249)). The pattern is
+     [`OpenFile.point_lookup`](../src/vortex_rdflib/open_file.py#L64)). The pattern is
      never matched as a whole. Instead, each row's codes are filled into the
      pattern, and that narrower pattern (a **probe**) is matched. Probes are
      sent one by one, except on a file-backed store from 256 at a time, which
      go through `match_codes_many` in one batch whose answers are pulled as the
      join reaches them
-     ([`_run_probes`](../src/vortex_rdflib/pushdown/probes.py#L89)). A probe with
+     ([`_run_probes`](../src/vortex_rdflib/pushdown/probes.py#L91)). A probe with
      no free variable is a count capped at one row, and its row stands once
      when the triple is there: in a single graph, and under a union default
      graph, which is a set of triples however many graphs hold one. A probe
@@ -466,7 +467,7 @@ rdflib extends a row only where the rows go straight to the emitter
 flag says so, and [`_solve_block`](../src/vortex_rdflib/pushdown/blocks.py#L116)
 hands it down to the BGP.
 [`_eval_block_node`](../src/vortex_rdflib/pushdown/blocks.py#L18) sets it;
-[`_eval_head`](../src/vortex_rdflib/pushdown/head.py#L66) sets it unless the head
+[`_eval_head`](../src/vortex_rdflib/pushdown/head.py#L67) sets it unless the head
 has an `ORDER BY` or a `DISTINCT`. A `FILTER` passes it on unless it holds an
 `EXISTS` ([`_solve_filter`](../src/vortex_rdflib/pushdown/blocks.py#L249)), and
 `GRAPH` passes it on. A group join, `OPTIONAL`, `MINUS`, an aggregate and an
@@ -567,14 +568,14 @@ evaluated here: its conjunct goes to rdflib, which raises.
 ### Splitting into conjuncts
 
 [`_solve_filter`](../src/vortex_rdflib/pushdown/blocks.py#L249) calls
-[`analyze_filter`](../src/vortex_rdflib/filters/__init__.py#L96), which splits the
+[`analyze_filter`](../src/vortex_rdflib/filters/__init__.py#L95), which splits the
 expression at its top-level `&&`. A row passes only when every part (a
 **conjunct**) is true, so each conjunct can be handled on its own. Conjuncts
 are grouped by how many of the block's variables they use
-([`FilterPlan`](../src/vortex_rdflib/filters/__init__.py#L89)):
+([`FilterPlan`](../src/vortex_rdflib/filters/__init__.py#L88)):
 
 - **No variable:** evaluated once
-  ([`evaluate_constant`](../src/vortex_rdflib/filters/__init__.py#L192)). If it is
+  ([`evaluate_constant`](../src/vortex_rdflib/filters/__init__.py#L191)). If it is
   false, the block is empty and nothing is matched.
 - **One variable:** pushed down to the patterns and `VALUES` tables that bind
   the variable, so rows are dropped before any join.
@@ -591,7 +592,7 @@ are grouped by how many of the block's variables they use
     conjunct is applied after the join.
 - **Several variables:** applied to the joined rows, with each answer
   remembered per distinct tuple of codes
-  ([`tuple_predicate`](../src/vortex_rdflib/filters/__init__.py#L276)). Over columns,
+  ([`tuple_predicate`](../src/vortex_rdflib/filters/__init__.py#L270)). Over columns,
   the test runs while the rows stream out
   ([`_filter_relation`](../src/vortex_rdflib/pushdown/relation.py#L137)), so a `LIMIT`
   above stops it early.
@@ -615,7 +616,7 @@ can compile) gets two more chances to act early:
   ([`_specialize_tuple_conjuncts`](../src/vortex_rdflib/pushdown/bgp.py#L558)):
   when the relation holds a single value for every variable of the conjunct
   but one, the conjunct becomes a test of that one variable
-  ([`specialize`](../src/vortex_rdflib/filters/__init__.py#L179)), evaluated by
+  ([`specialize`](../src/vortex_rdflib/filters/__init__.py#L178)), evaluated by
   vortex-rdf over the codes the pattern binding it brings. For example, once
   `?ref` is bound to a single value, `?v < ?ref + 10` is a numeric comparison
   over the `?v` codes of that match or of those probes.
@@ -624,7 +625,7 @@ can compile) gets two more chances to act early:
 
 Python evaluates a conjunct once per distinct value (or tuple of values), never
 once per row. It has two routes
-([`evaluate_column`](../src/vortex_rdflib/filters/__init__.py#L201)):
+([`evaluate_column`](../src/vortex_rdflib/filters/__init__.py#L200)):
 
 - **Fast route.** [`compile_fast`](../src/vortex_rdflib/filters/compiler.py#L413)
   compiles a known set of expression shapes into a Python function that reads
@@ -637,7 +638,7 @@ once per row. It has two routes
   an error (treated as false). A comparison of values of an XML Schema type
   SPARQL 1.1 leaves open is *unknown*, and goes to the generic route.
 - **Generic route.** rdflib's own evaluator (`_ebv`) on the decoded term
-  ([`Conjunct.generic`](../src/vortex_rdflib/filters/__init__.py#L73)). It handles the
+  ([`Conjunct.generic`](../src/vortex_rdflib/filters/__init__.py#L72)). It handles the
   *unknown* values and every expression the fast route does not cover, with
   rdflib's semantics. For a conjunct of one variable, the values it handles
   are decoded in one `decode_many` call.
@@ -665,8 +666,8 @@ over the codes the query produced. Nothing is remembered between calls.
   lacks has no code, and a pattern left with no code matches nothing: IRIs the
   dictionary lacks, `IN ()` and lists with no IRI in common all leave none.
   Both kinds become a keep on the match of every pattern binding the variable
-  ([`native_restriction`](../src/vortex_rdflib/filters/native.py#L511)), intersected
-  per position ([`intersect_keeps`](../src/vortex_rdflib/filters/native.py#L534)).
+  ([`native_restriction`](../src/vortex_rdflib/filters/native.py#L512)), intersected
+  per position ([`intersect_keeps`](../src/vortex_rdflib/filters/native.py#L535)).
   Rejected rows never leave vortex-rdf, with one exception: a probe carries a
   range keep into vortex-rdf and tests a code-set keep on the rows it gets
   back. An `ASK` or `COUNT` over the pattern counts under the keep.
@@ -682,7 +683,7 @@ over the codes the query produced. Nothing is remembered between calls.
   its matched column, of the join step that binds it, or of the rows the
   probes reached. They go to `TermDict.filter_codes(kind, arg, codes)`, which
   answers each code passed, failed or undecided
-  ([`evaluate`](../src/vortex_rdflib/filters/native.py#L106)). The undecided codes
+  ([`evaluate`](../src/vortex_rdflib/filters/native.py#L107)). The undecided codes
   go on to the Python routes.
 
 Only the codes in a predicate's domain are sent:
@@ -782,13 +783,13 @@ ASK { ?s <p> "42" }
 SELECT DISTINCT ?p WHERE { ?s ?p ?o }
 ```
 
-[`_eval_distinct`](../src/vortex_rdflib/pushdown/head.py#L245) removes duplicates in
+[`_eval_distinct`](../src/vortex_rdflib/pushdown/head.py#L244) removes duplicates in
 two passes, and decodes only what survives:
 
-1. **By code** ([`_code_distinct`](../src/vortex_rdflib/pushdown/head.py#L257)):
+1. **By code** ([`_code_distinct`](../src/vortex_rdflib/pushdown/head.py#L256)):
    duplicate code tuples are dropped. For a single column this is the native
    `U64Column.distinct`, which keeps the first-seen order.
-2. **By term** ([`_term_distinct`](../src/vortex_rdflib/pushdown/head.py#L278)):
+2. **By term** ([`_term_distinct`](../src/vortex_rdflib/pushdown/head.py#L277)):
    rdflib compares terms, and two spellings can be the same typed literal
    (`"042"^^xsd:integer` and `"42"^^xsd:integer` are both 42).
    [`_alias_codes`](../src/vortex_rdflib/pushdown/aliasing.py#L18) maps each such code
@@ -799,7 +800,7 @@ two passes, and decodes only what survives:
    ([`_rewritable`](../src/vortex_rdflib/pushdown/aliasing.py#L94)); the other typed
    literals are turned into terms, and look their canonical spellings up in
    one `TermDict.encode_many` call
-   ([`_canonical_twins`](../src/vortex_rdflib/pushdown/aliasing.py#L125)). Each
+   ([`_canonical_twins`](../src/vortex_rdflib/pushdown/aliasing.py#L121)). Each
    literal code is checked once per query, and the result lives in the
    query's scope; in most stores no code aliases another.
 
@@ -955,10 +956,10 @@ when every sort key is a plain variable.
 SELECT ?s ?v WHERE { ?s <p> ?v } ORDER BY DESC(?v) LIMIT 10
 ```
 
-[`_order_rows`](../src/vortex_rdflib/pushdown/head.py#L103) sorts the code rows:
+[`_order_rows`](../src/vortex_rdflib/pushdown/head.py#L104) sorts the code rows:
 
 1. Each sort variable's distinct codes are ranked once
-   ([`_rank_codes`](../src/vortex_rdflib/pushdown/head.py#L162)), in rdflib's order:
+   ([`_rank_codes`](../src/vortex_rdflib/pushdown/head.py#L163)), in rdflib's order:
    unbound first, then blank nodes, then IRIs, then literals. Blank nodes rank
    by code: the spelling `_:label` sorts as the label. IRIs rank by their
    spelling without the brackets, which is the string rdflib compares; no
@@ -996,14 +997,14 @@ a relation, which then joins like any other:
 - `UNDEF` becomes an unbound value.
 - A constant the dictionary does not hold, or that is not looked up, gets a
   private negative code
-  ([`_foreign_code`](../src/vortex_rdflib/store.py#L714)). It joins nothing,
+  ([`_foreign_code`](../src/vortex_rdflib/store.py#L610)). It joins nothing,
   but is still returned as written.
 - Rows that contradict an outer binding are dropped, as in rdflib.
 - Rows whose term fails a `FILTER` conjunct pushed down to the table are
   dropped, even where a pattern that binds the variable tests it too. Each
   distinct term is tested once, as the query writes it, which is the term
   rdflib binds
-  ([`constant_predicate`](../src/vortex_rdflib/filters/__init__.py#L307)).
+  ([`constant_predicate`](../src/vortex_rdflib/filters/__init__.py#L301)).
 
 **Left to rdflib:** a constant whose rdflib term differs from the dictionary's
 term, such as `"042"^^xsd:integer` (rdflib would return the query's own
@@ -1017,7 +1018,7 @@ current [`_GraphScope`](../src/vortex_rdflib/pushdown/algebra.py#L18):
 
 - Outside any `GRAPH`, it is the graph the query runs on
   ([`_active_scope`](../src/vortex_rdflib/pushdown/algebra.py#L32), which asks
-  [`_graph_n3`](../src/vortex_rdflib/store.py#L255)): `None` (all graphs) for
+  [`_graph_n3`](../src/vortex_rdflib/store.py#L193)): `None` (all graphs) for
   a union default graph, `""` for the default graph of a `Dataset` without
   union, or a graph's name.
 - Under `GRAPH <iri>`, it is that graph's name.
@@ -1108,17 +1109,17 @@ vortex-rdf opens a file-backed store memory-mapped.
 | Primitive | Where it is used |
 | --- | --- |
 | `match_codes`, `count_quads` | Every pattern match and count. |
-| `count_quads_many`, `match_codes_many` | Counting several scanning patterns at once ([`_count_patterns`](../src/vortex_rdflib/pushdown/bgp.py#L190)); batched probes for joins, `OPTIONAL` and `EXISTS` ([`_run_probes`](../src/vortex_rdflib/pushdown/probes.py#L89)), whose answers are pulled one at a time as the join reaches them ([`_batch_answers`](../src/vortex_rdflib/pushdown/probes.py#L145), or [`_probe_matches`](../src/vortex_rdflib/pushdown/probes.py#L173) for a batch of some of the probes). `lookahead=` sets how far ahead of the pulls a batch of scanning probes runs; a batch of point lookups keeps the binding's default ([`_probe_lookahead`](../src/vortex_rdflib/pushdown/probes.py#L65)). |
-| `match_code_chunks` | The chunks a streamed join step is fed from ([`_streamed_step`](../src/vortex_rdflib/pushdown/streaming.py#L90)), and the chunks `Store.triples` reads a large pattern in ([`_code_matches`](../src/vortex_rdflib/store.py#L575)). |
-| `keep=` on a match or count | Kind tests and IRI equality ([`native_restriction`](../src/vortex_rdflib/filters/native.py#L511)), dropping the default graph under `GRAPH ?g` ([`_exclude_default_graph`](../src/vortex_rdflib/pushdown/matching.py#L281)), the codes a keep-scan joins on ([`_keep_scan`](../src/vortex_rdflib/pushdown/bgp.py#L756)), exact `ASK` and `COUNT` answers. |
+| `count_quads_many`, `match_codes_many` | Counting several scanning patterns at once ([`_count_patterns`](../src/vortex_rdflib/pushdown/bgp.py#L190)); batched probes for joins, `OPTIONAL` and `EXISTS` ([`_run_probes`](../src/vortex_rdflib/pushdown/probes.py#L91)), whose answers are pulled one at a time as the join reaches them ([`_batch_answers`](../src/vortex_rdflib/pushdown/probes.py#L147), or [`_probe_matches`](../src/vortex_rdflib/pushdown/probes.py#L175) for a batch of some of the probes). `lookahead=` sets how far ahead of the pulls a batch of scanning probes runs; a batch of point lookups keeps the binding's default ([`_probe_lookahead`](../src/vortex_rdflib/pushdown/probes.py#L65)). |
+| `match_code_chunks` | The chunks a streamed join step is fed from ([`_streamed_step`](../src/vortex_rdflib/pushdown/streaming.py#L90)), and the chunks `Store.triples` reads a large pattern in ([`_code_matches`](../src/vortex_rdflib/store.py#L502)). |
+| `keep=` on a match or count | Kind tests and IRI equality ([`native_restriction`](../src/vortex_rdflib/filters/native.py#L512)), dropping the default graph under `GRAPH ?g` ([`_exclude_default_graph`](../src/vortex_rdflib/pushdown/matching.py#L281)), the codes a keep-scan joins on ([`_keep_scan`](../src/vortex_rdflib/pushdown/bgp.py#L756)), exact `ASK` and `COUNT` answers. |
 | `limit=` on a match or count | `LIMIT` over a single pattern ([`_limit_reaches_match`](../src/vortex_rdflib/pushdown/matching.py#L214)), `ASK`, `EXISTS` probes, the existence probes of a join in a fixed graph, the counts that only decide probe or match ([`_count_pattern`](../src/vortex_rdflib/pushdown/matching.py#L111)), a keep-scan's match (one row past the budget) and `Store.triples`' first match of a pattern (one row past a chunk). `offset=` is not used: an `OFFSET` is applied to the code rows. |
 | `cancel=` on a match, count, batch or chunk call (`CancelToken`) | The token the query runs under: every batch and chunk call is given it, and so is each one-shot call the token can stop ([`boundary.py`](../src/vortex_rdflib/boundary.py)). |
-| `TermDict.filter_codes` | FILTER predicates over the codes a query produced ([`evaluate`](../src/vortex_rdflib/filters/native.py#L106)). |
-| `TermDict.encode_many` | `VALUES` constants ([`_constant_codes`](../src/vortex_rdflib/pushdown/blocks.py#L212)), the IRIs of an IRI equality ([`keep_of`](../src/vortex_rdflib/filters/native.py#L78)) and the canonical spellings of the typed literals `DISTINCT` and `COUNT` alias ([`_canonical_twins`](../src/vortex_rdflib/pushdown/aliasing.py#L125)). |
-| `TermDict.decode_many` | Decoding results ([`_prime_decode_cache`](../src/vortex_rdflib/store.py#L645)), the spellings that probes fill in ([`_probe_spellings`](../src/vortex_rdflib/pushdown/probes.py#L375)) and the IRIs `ORDER BY` ranks ([`_rank_codes`](../src/vortex_rdflib/pushdown/head.py#L162)). |
-| `TermDict.prefix_range`, `lower_bound` | The code range of each term kind ([`kind_bounds`](../src/vortex_rdflib/terms.py#L161), [`_kind_ranges`](../src/vortex_rdflib/store.py#L699)). |
+| `TermDict.filter_codes` | FILTER predicates over the codes a query produced ([`evaluate`](../src/vortex_rdflib/filters/native.py#L107)). |
+| `TermDict.encode_many` | `VALUES` constants ([`_constant_codes`](../src/vortex_rdflib/pushdown/blocks.py#L212)), the IRIs of an IRI equality ([`keep_of`](../src/vortex_rdflib/filters/native.py#L78)) and the canonical spellings of the typed literals `DISTINCT` and `COUNT` alias ([`_canonical_twins`](../src/vortex_rdflib/pushdown/aliasing.py#L121)). |
+| `TermDict.decode_many` | Decoding results ([`_prime_decode_cache`](../src/vortex_rdflib/store.py#L569)), the spellings that probes fill in ([`_probe_spellings`](../src/vortex_rdflib/pushdown/probes.py#L377)) and the IRIs `ORDER BY` ranks ([`_rank_codes`](../src/vortex_rdflib/pushdown/head.py#L163)). |
+| `TermDict.prefix_range` | The code range of each term kind ([`KindRanges`](../src/vortex_rdflib/terms.py#L161)). |
 | `U64Column.distinct`, `value_counts` | `DISTINCT` over one variable and a variable's candidate codes ([`_distinct_codes`](../src/vortex_rdflib/pushdown/relation.py#L176)), `GROUP BY` counts ([`_columnar_groups`](../src/vortex_rdflib/pushdown/aggregate.py#L202)). |
-| `U64Column.join_indices`, `take` | The columnar join ([`_join_columns`](../src/vortex_rdflib/pushdown/relation.py#L214)), which passes the pair budget as `max_pairs=` past the product bound, so the kernel counts the pairs before it builds any; compacting a match to the rows a FILTER keeps ([`_compact_pattern`](../src/vortex_rdflib/pushdown/matching.py#L394)), a group's rows for `COUNT(DISTINCT)`, intersecting keeps ([`intersect_keeps`](../src/vortex_rdflib/filters/native.py#L534)). |
+| `U64Column.join_indices`, `take` | The columnar join ([`_join_columns`](../src/vortex_rdflib/pushdown/relation.py#L214)), which passes the pair budget as `max_pairs=` past the product bound, so the kernel counts the pairs before it builds any; compacting a match to the rows a FILTER keeps ([`_compact_pattern`](../src/vortex_rdflib/pushdown/matching.py#L394)), a group's rows for `COUNT(DISTINCT)`, intersecting keeps ([`intersect_keeps`](../src/vortex_rdflib/filters/native.py#L535)). |
 | `U64Column.join_count` | The pairs of a join of Python rows, counted before it is built ([`_pair_count`](../src/vortex_rdflib/pushdown/relation.py#L186)), and whether a pattern fits when a step is reordered ([`_fits`](../src/vortex_rdflib/pushdown/bgp.py#L713)). |
 | `U64Column.groups`, `CodeGroups.count` and `gather`, `U64Column.slice` | A streamed join step: the grouped side, the pairs and the columns of each slice or chunk, and the slices of the fed side ([`_streamed_step`](../src/vortex_rdflib/pushdown/streaming.py#L90), [`_gather_pieces`](../src/vortex_rdflib/pushdown/streaming.py#L20), [`_slices`](../src/vortex_rdflib/pushdown/relation.py#L253)). |
 
@@ -1174,11 +1175,11 @@ and SPARQL 1.1 disagree ([SPARQL semantics](#sparql-semantics)):
   it; the same with pieces of one and of three rows, which streams every last
   step that shares one variable; and keep-scans for every join step that
   shares a variable. Each forcing is one row of a table,
-  [`FORCINGS`](../tests/test_pushdown.py#L173): the settings it overrides and
+  [`FORCINGS`](../tests/test_pushdown.py#L174): the settings it overrides and
   the corpora and stores it runs over. A test checks in the trace that each of
   these forcings reaches its path.
 - [`tests/support.py`](../tests/support.py) holds what the test modules share:
-  [`both_ways`](../tests/support.py#L39), the trace reader, and the spies over
+  [`both_ways`](../tests/support.py#L40), the trace reader, and the spies over
   the native store and its term dictionary.
   [`tests/corpus.py`](../tests/corpus.py) holds the shared fixture data and
   query corpora.

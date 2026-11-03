@@ -12,6 +12,7 @@ from rdflib.plugins.sparql.sparql import QueryContext
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import register_sparql_pushdown, trace, unregister_sparql_pushdown
+from vortex_rdflib.terms import KindRanges
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 
@@ -54,6 +55,13 @@ def trace_events(text: str) -> list[dict]:
     return [
         json.loads(line[len(prefix) :]) for line in text.splitlines() if line.startswith(prefix)
     ]
+
+
+def kind_ranges(store) -> KindRanges:
+    """The term kinds' code ranges of the file ``store`` has open."""
+    ranges = store._opened().kind_ranges
+    assert ranges is not None
+    return ranges
 
 
 def is_graph_name_check(args) -> bool:

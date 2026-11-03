@@ -7,26 +7,11 @@ from rdflib.term import BNode, IdentifiedNode, Node, URIRef
 from vortex_rdf import VortexRdfStore
 
 from . import boundary, query_scope, settings, union
+from .open_file import DEFAULT_GRAPH, OpenFile, UnionFacts, spelling, spellings
 from .pushdown import register_sparql_pushdown
 from .query_scope import QueryTerms
 from .settings import SETTINGS
-from .terms import (
-    BLANK,
-    IRI,
-    LITERAL,
-    _term_builder,
-    canonical_spelling,
-    kind_bounds,
-    unparseable_iri,
-)
-
-#: Sentinel for a cached lookup whose answer may legitimately be ``None``.
-_UNRESOLVED = object()
-
-#: How the native layer spells the default graph: the fourth column of a quad
-#: no ``GRAPH`` names is the empty string, and ``""`` is also how a pattern
-#: selects those rows — ``None`` being the wildcard over every graph.
-DEFAULT_GRAPH = ""
+from .terms import _term_builder, canonical_spelling, unparseable_iri
 
 
 class _NoGraph(NotImplementedError):
@@ -34,21 +19,6 @@ class _NoGraph(NotImplementedError):
     :meth:`VortexRdflibStore._graph_n3`). As a ``NotImplementedError`` it makes
     the pushdown leave the block to rdflib, whose ``triples()`` answers it with
     nothing."""
-
-
-#: The layout names the constructor accepts: the layouts' own, ``typed_object``
-#: and the ``cottas-native*`` names of COTTAS benchmark scripts. The layout is
-#: only a label here: VortexRdfStore auto-detects the actual layout from the
-#: file.
-_LAYOUT_ALIASES = {
-    "default": "default",
-    "cottas-native-strings": "default",
-    "typed-object": "typed-object",
-    "typed_object": "typed-object",
-    "dictionary": "dictionary",
-    "cottas-native-ids": "dictionary",
-    "cottas-native": "dictionary",
-}
 
 
 def _term_debug(t):
@@ -81,30 +51,20 @@ class VortexRdflibStore(Store):
         configuration=None,
         identifier=None,
         path: str | None = None,
-        layout: str | None = None,
-        backend: str = "native",
         *,
         in_memory: bool | None = None,
-        **kwargs,
     ):
-        # IMPORTANT:
-        # RDFLib Store.__init__ may call self.open(configuration).
-        # Therefore all attributes used by open() must exist BEFORE super().__init__.
-        if "max_resident_bytes" in kwargs:
-            raise TypeError(
-                "max_resident_bytes was removed in vortex-rdflib 0.3.0: file-backed stores are "
-                "memory-mapped and the OS page cache decides what stays in RAM"
-            )
+        """``path`` (or rdflib's ``configuration``) is the ``.vortex`` file,
+        opened at once. A file-backed store is memory-mapped: a query reads
+        only the pages it touches, vortex-rdf keeps a bounded cache of the
+        dictionary windows it reads and the OS page cache holds the rest.
+        ``in_memory=True`` loads the whole file up front instead (default:
+        ``VORTEX_RDF_IN_MEMORY``). Any other argument raises ``TypeError``."""
+        # rdflib's Store.__init__ opens a configuration it is given, so it is
+        # given none, and every attribute open() reads is set first.
         if path is None:
             path = configuration
-
         self.path = str(Path(path)) if path is not None else None
-        self.layout = _LAYOUT_ALIASES.get(layout, layout) if layout else None
-        self.backend = backend
-        # File-backed stores are memory-mapped: a query reads only the pages it
-        # touches. vortex-rdf keeps a bounded cache of the dictionary windows
-        # it reads; the OS page cache holds the rest. in_memory loads the whole
-        # store up front instead. Env override for benchmark sweeps.
         # Every switch is read here, once per store (settings.apply_switches),
         # the pushdown's too when it is off.
         settings.apply_switches()
@@ -112,132 +72,116 @@ class VortexRdflibStore(Store):
             in_memory = settings.in_memory_by_default()
         self.in_memory = in_memory
         self._use_codes = settings.code_path_enabled()
+        # The open file: its native handle, its term dictionary (None while
+        # the store reads no codes) and what the store learns about it
+        # (open_file.OpenFile). Everything a query learns about terms lives
+        # in its scope (query_scope.QueryTerms, through `_terms()`).
         self._native: VortexRdfStore | None = None
         self._dict = None
-        # Everything a query learns about terms lives in its scope
-        # (query_scope.QueryTerms, through `_terms()`); the store keeps
-        # fixed-size structure only: the kind ranges, the default graph's
-        # code, the indexes and one context per graph of the file.
-        self._kind_bounds: tuple[int, int, int] | None = None
-        self._ranges: dict | None = None
-        self._indexes: tuple = ()
-        self._default_code: int | None | object = _UNRESOLVED
-        # One rdflib graph object per graph of the file, so a match yields
-        # contexts without allocating one per row; keyed both ways a match
-        # names a graph (its spelling, its dictionary code).
-        self._contexts_by_spelling: dict[str, tuple] = {}
-        self._contexts_by_code: dict[int, tuple] = {}
-        self._all_contexts: list | None = None
-        # Whether some triple is in more than one graph, so a match over
-        # every graph may return it twice (:meth:`_union_has_repeats`), and
-        # the union's size as a set (:meth:`__len__`): both read once.
-        self._union_repeats: bool | None = None
-        self._union_len: int | None = None
+        self._file: OpenFile | None = None
 
         # Whole-BGP pushdown into code space (no-op for non-Vortex graphs;
         # VORTEX_RDF_DISABLE_PUSHDOWN=1 keeps rdflib's default evaluator).
         register_sparql_pushdown()
 
-        # Do not pass configuration here, otherwise RDFLib calls open()
-        # before our initialization logic is fully under control.
         super().__init__(configuration=None, identifier=identifier)
-
-        # Explicitly open after initialization.
         if self.path is not None:
             self.open(self.path)
 
-    def open(self, configuration, create=False):
-        """RDFLib Store API: configuration is the Vortex file path."""
-        if self.backend != "native":
-            raise ValueError(
-                f"Unsupported Vortex backend: {self.backend!r} (only 'native' is available)"
-            )
+    @property
+    def layout(self) -> str | None:
+        """The open file's layout, as vortex-rdf reads it from the file;
+        ``None`` while the store is closed."""
+        return None if self._file is None else self._file.layout
 
+    def open(self, configuration, create=False):
+        """RDFLib Store API: ``configuration`` is the ``.vortex`` file's path.
+        The file's handle, dictionary and record are made first and set
+        together."""
         if configuration is not None:
             self.path = str(Path(configuration))
-
         if self.path is None:
             return NO_STORE
-
-        self._native = VortexRdfStore(self.path, in_memory=self.in_memory)
-        # Record what the file actually is, whatever label the caller passed.
-        self.layout = self._native.layout()
-        self._indexes = tuple(self._native.indexes())
+        native = VortexRdfStore(self.path, in_memory=self.in_memory)
         # Dictionary-layout stores serve matches as u64 code columns, the
         # dictionary memory-mapped with the file (or loaded with the store);
         # each distinct code is decoded to an rdflib term once per query. None
         # on other layouts -> string fallback path.
-        self._dict = self._native.term_dict() if self._use_codes else None
-        self._kind_bounds = None
-        self._ranges = None
-        self._default_code = _UNRESOLVED
-        self._contexts_by_spelling = {}
-        self._contexts_by_code = {}
-        self._all_contexts = None
-        self._union_repeats = None
-        self._union_len = None
+        term_dict = native.term_dict() if self._use_codes else None
+        opened = OpenFile(native, term_dict, self.in_memory)
+        self._native, self._dict, self._file = native, term_dict, opened
         return VALID_STORE
 
     def close(self, commit_pending_transaction=False):
-        self._native = None
-        self._dict = None
-        self._kind_bounds = None
-        self._ranges = None
-        self._indexes = ()
-        self._default_code = _UNRESOLVED
-        self._contexts_by_spelling = {}
-        self._contexts_by_code = {}
-        self._all_contexts = None
-        self._union_repeats = None
-        self._union_len = None
+        """Drop the open file: its handle, its dictionary and every fact the
+        store learnt about it. A later call opens the file again."""
+        self._native = self._dict = self._file = None
 
     def _store(self) -> VortexRdfStore:
+        """The native handle, the file opened again if the store is closed."""
         if self._native is None:
-            if self.path is None:
-                raise ValueError("VortexRdflibStore has no path; pass one or call open()")
-            self.open(self.path)
+            self._reopen()
         assert self._native is not None  # open() either sets it or raises
         return self._native
+
+    def _opened(self) -> OpenFile:
+        """The open file's record, the file opened again if the store is
+        closed."""
+        if self._file is None:
+            self._reopen()
+        assert self._file is not None  # open() either sets it or raises
+        return self._file
+
+    def _reopen(self) -> None:
+        if self.path is None:
+            raise ValueError("VortexRdflibStore has no path; pass one or call open()")
+        self.open(self.path)
 
     def _union_has_repeats(self) -> bool:
         """Whether a match over every graph can return a triple more than
         once: some triple is in more than one graph. Where none is, the union
         is read as the quads are and pays nothing for being a set: a file of
-        one graph (every N-Triples file), and graphs that partition the data.
-        Read once per open file (:meth:`_read_union_repeats`)."""
-        if self._union_repeats is None:
-            self._union_repeats = self._read_union_repeats()
-        return self._union_repeats
+        one graph (every N-Triples file), and graphs that partition the data."""
+        return self._union_facts().has_repeats
 
-    def _read_union_repeats(self) -> bool:
-        """:meth:`_union_has_repeats`, from the file's own codes, which the
-        code path's switch does not change. A file whose quads are all in its
+    def _union_facts(self) -> UnionFacts:
+        """The open file's union facts, read once per open file
+        (:meth:`_read_union`)."""
+        opened = self._opened()
+        if opened.union is None:
+            opened.union = self._read_union()
+        return opened.union
+
+    def _read_union(self) -> UnionFacts:
+        """:meth:`_union_facts`, from the file's own codes, which the code
+        path's switch does not change. A file whose quads are all in its
         first row's graph has no repeats: a match of one row and a count of
         that graph tell. A file of several graphs has them when it holds
         fewer distinct triples than quads, counted in one pass over its
-        triple codes (:func:`union.distinct_chunks`) and kept as the union's
-        size for ``len()``. A layout without codes has no such pass: a file
-        whose quads are not all in the default graph is taken to have them."""
+        triple codes (:func:`union.distinct_chunks`), which is the union's
+        size. A layout without codes has no such pass: a file whose quads
+        are not all in the default graph is taken to have them."""
         native = boundary.native(self)
         quads = native.count_quads()
         if not quads:
-            return False
+            return UnionFacts(has_repeats=False, size=None)
         first = native.match_codes(limit=1)
         term_dict = boundary.term_dict(self)
         if term_dict is None:
             term_dict = native.term_dict()
         if first is None or term_dict is None:
-            return native.count_quads(None, None, None, DEFAULT_GRAPH) != quads
-        graph = term_dict.decode(memoryview(first[3]).cast("Q")[0])
+            in_default = native.count_quads(None, None, None, DEFAULT_GRAPH)
+            return UnionFacts(has_repeats=in_default != quads, size=None)
+        graph = spelling(term_dict, memoryview(first[3]).cast("Q")[0])
         if native.count_quads(None, None, None, graph) == quads:
-            return False
+            return UnionFacts(has_repeats=False, size=None)
         chunks = native.match_code_chunks(
             columns=("s", "p", "o"), batch_rows=SETTINGS.triples_chunk_rows
         )
         if chunks is None:
-            return True
-        self._union_len = sum(len(cols[0]) for cols in union.distinct_chunks(chunks))
-        return self._union_len != quads
+            return UnionFacts(has_repeats=True, size=None)
+        size = sum(len(cols[0]) for cols in union.distinct_chunks(chunks))
+        return UnionFacts(has_repeats=size != quads, size=size)
 
     def _union_view(self, context) -> bool:
         """Whether ``context`` selects the union over every graph."""
@@ -245,12 +189,6 @@ class VortexRdflibStore(Store):
             return self._graph_n3(context) is None
         except _NoGraph:
             return False
-
-    def _point_lookup(self, n3) -> bool:
-        """Whether the native layer answers the quad pattern ``n3`` without a
-        scan: its subject is bound (a binary search in the subject-ordered
-        base), or a secondary index serves its bound predicate or object."""
-        return n3[0] is not None or bool(self._indexes) and (n3[1] is not None or n3[2] is not None)
 
     def _graph_n3(self, context) -> str | None:
         """The native graph spelling a context selects, ``None`` for the union.
@@ -296,7 +234,7 @@ class VortexRdflibStore(Store):
         if not isinstance(identifier, URIRef):
             raise _NoGraph
         spelling = canonical_spelling(identifier)
-        if spelling not in self._contexts_by_spelling:
+        if spelling not in self._opened().contexts_by_spelling:
             try:
                 boundary.native(self).count_quads(None, None, None, spelling, limit=0)
             except ValueError:
@@ -323,19 +261,17 @@ class VortexRdflibStore(Store):
             names_a_graph = known[spelling] = boundary.native(self).count_quads(*pattern) > 0
         return spelling if names_a_graph else None
 
-    def _context_tuple(self, spelling: str, by_spelling: dict | None = None) -> tuple:
+    def _context_tuple(self, opened: OpenFile, spelling: str) -> tuple:
         """The one-graph context tuple ``triples()`` yields for a graph of the
-        file.
+        file ``opened``.
 
-        Kept per graph: rdflib only ever iterates it, so one tuple per graph
-        keeps a match from allocating a context per row. Only graphs the file
-        holds are asked for: a name read from the graph column, or a name a
-        caller asks for once a matched row proves the file holds it.
-        ``by_spelling`` is the cache to read and fill: the store's, unless a
-        call bound the one of the file it started on.
+        Kept per graph, in the file's record: rdflib only ever iterates it, so
+        one tuple per graph keeps a match from allocating a context per row.
+        Only graphs the file holds are asked for: a name read from the graph
+        column, or a name a caller asks for once a matched row proves the file
+        holds it.
         """
-        if by_spelling is None:
-            by_spelling = self._contexts_by_spelling
+        by_spelling = opened.contexts_by_spelling
         contexts = by_spelling.get(spelling)
         if contexts is None:
             identifier: IdentifiedNode = DATASET_DEFAULT_GRAPH_ID
@@ -349,20 +285,15 @@ class VortexRdflibStore(Store):
             contexts = by_spelling[spelling] = (Graph(store=self, identifier=identifier),)
         return contexts
 
-    def _context_of_code(self, code: int, term_dict, by_code: dict, by_spelling: dict) -> tuple:
-        """The context tuple of a graph column's code, resolved through
-        ``term_dict`` and the context caches ``by_code`` and ``by_spelling``
-        the store held when the caller started: a ``triples()`` call keeps
-        resolving against the file it started on, whatever ``close()`` or
-        ``open()`` does meanwhile (each replaces those, never clears them)."""
-        contexts = by_code.get(code)
+    def _context_of_code(self, opened: OpenFile, code: int) -> tuple:
+        """The context tuple of a graph column's code in the file ``opened``,
+        its name decoded through that file's dictionary: a ``triples()`` call
+        keeps resolving against the file it started on, whatever ``close()``
+        or ``open()`` does meanwhile."""
+        contexts = opened.contexts_by_code.get(code)
         if contexts is None:
-            if term_dict is None:
-                raise ValueError("store has no term dictionary (code path inactive)")
-            spelling = term_dict.decode(code)
-            if spelling is None:
-                raise ValueError(f"term code {code} is not in the store dictionary")
-            contexts = by_code[code] = self._context_tuple(spelling, by_spelling)
+            name = spelling(opened.term_dict, code)
+            contexts = opened.contexts_by_code[code] = self._context_tuple(opened, name)
         return contexts
 
     def triples(self, triple_pattern, context=None):
@@ -439,7 +370,13 @@ class VortexRdflibStore(Store):
                 flush=True,
             )
 
+        # The handle, the dictionary, the file's record (its graph contexts)
+        # and a large pattern's chunk iterator are bound once: rows read after
+        # a close(), or an open() of another file, still come from the file
+        # the call started on.
         native = boundary.native(self)
+        opened = self._opened()
+        term_dict = boundary.term_dict(self)
         pattern = (s_n3, p_n3, o_n3, g_n3)
 
         # Fully-ground pattern: no term needs materializing. In one graph it
@@ -452,29 +389,21 @@ class VortexRdflibStore(Store):
             if g_n3 is not None:
                 count = native.count_quads(*pattern)
                 if count:
-                    fixed = self._context_tuple(g_n3)
+                    fixed = self._context_tuple(opened, g_n3)
                     for _ in range(count):
                         yield triple, fixed
                 return
-            if self._dict is not None:
+            if term_dict is not None:
                 cols = native.match_codes(s_n3, p_n3, o_n3, None)
                 if cols is not None:
-                    term_dict, by_code = boundary.term_dict(self), self._contexts_by_code
-                    by_spelling = self._contexts_by_spelling
                     for code in memoryview(cols[3]).cast("Q").tolist():
-                        yield triple, self._context_of_code(code, term_dict, by_code, by_spelling)
+                        yield triple, self._context_of_code(opened, code)
                     return
             *_, graphs = native.match_columns(s_n3, p_n3, o_n3, None)
-            by_spelling = self._contexts_by_spelling
             for g_raw in graphs:
-                yield triple, self._context_tuple(g_raw, by_spelling)
+                yield triple, self._context_tuple(opened, g_raw)
             return
 
-        # The dictionary, the graph-context caches and a large pattern's chunk
-        # iterator are bound once: rows read after a close(), or an open() of
-        # another file, still come from the file the call started on.
-        term_dict, by_code = boundary.term_dict(self), self._contexts_by_code
-        by_spelling = self._contexts_by_spelling
         matches = None
         if term_dict is not None:
             matches = self._code_matches(native, pattern)
@@ -498,7 +427,7 @@ class VortexRdflibStore(Store):
                         # the named graph's one context tuple (see `fixed`).
                         cache = self._terms().decode
                         if g_n3 is not None:
-                            fixed = self._context_tuple(g_n3, by_spelling)
+                            fixed = self._context_tuple(opened, g_n3)
                     # Zero-copy u64 views over the Rust column buffers, read a
                     # slice at a time: 64 rows, then four times more, 4096 at
                     # most. Each slice's codes become Python ints, and those
@@ -526,9 +455,7 @@ class VortexRdflibStore(Store):
                             g_codes = part[3].tolist()
                             graphs = set(g_codes)
                             for code in graphs.difference(contexts):
-                                contexts[code] = self._context_of_code(
-                                    code, term_dict, by_code, by_spelling
-                                )
+                                contexts[code] = self._context_of_code(opened, code)
                             if len(graphs) == 1:
                                 shared = contexts[g_codes[0]]
                             else:
@@ -557,7 +484,7 @@ class VortexRdflibStore(Store):
         # cancel token, so the boundary checks the token before it.
         subjects, predicates, objects, graphs = native.match_columns(s_n3, p_n3, o_n3, g_n3)
         if g_n3 is not None and subjects:
-            fixed = self._context_tuple(g_n3, by_spelling)
+            fixed = self._context_tuple(opened, g_n3)
         parse = self._from_n3_safe
         memo: dict[str, Node] = {}
         for s_raw, p_raw, o_raw, g_raw in zip(subjects, predicates, objects, graphs, strict=True):
@@ -569,7 +496,7 @@ class VortexRdflibStore(Store):
                 row.append(node)
             yield (
                 (row[0], row[1], row[2]),
-                (fixed if fixed is not None else self._context_tuple(g_raw, by_spelling)),
+                (fixed if fixed is not None else self._context_tuple(opened, g_raw)),
             )
 
     def _code_matches(self, native: VortexRdfStore, pattern: tuple) -> Iterable[tuple] | None:
@@ -606,9 +533,10 @@ class VortexRdflibStore(Store):
         if self.path is None:
             return iter(())
         if triple is None or triple == (None, None, None):
-            if self._all_contexts is None:
-                self._all_contexts = self._distinct_graphs(None, None, None)
-            return iter(self._all_contexts)
+            opened = self._opened()
+            if opened.all_contexts is None:
+                opened.all_contexts = self._distinct_graphs(None, None, None)
+            return iter(opened.all_contexts)
         s, p, o = triple
         if (
             (s is not None and not isinstance(s, (URIRef, BNode)))
@@ -623,19 +551,15 @@ class VortexRdflibStore(Store):
     def _distinct_graphs(self, s_n3, p_n3, o_n3) -> list:
         """The distinct graphs of a pattern's match, in first-seen order."""
         native = boundary.native(self)
+        opened = self._opened()
         if self._dict is not None:
             cols = native.match_codes(s_n3, p_n3, o_n3, None)
             if cols is not None:
                 # Native distinct, in first-seen order.
                 codes = memoryview(cols[3].distinct()).cast("Q").tolist()
-                term_dict, by_code = boundary.term_dict(self), self._contexts_by_code
-                by_spelling = self._contexts_by_spelling
-                return [
-                    self._context_of_code(code, term_dict, by_code, by_spelling)[0]
-                    for code in codes
-                ]
+                return [self._context_of_code(opened, code)[0] for code in codes]
         *_spo, graphs = native.match_columns(s_n3, p_n3, o_n3, None)
-        return [self._context_tuple(name)[0] for name in dict.fromkeys(graphs)]
+        return [self._context_tuple(opened, name)[0] for name in dict.fromkeys(graphs)]
 
     def _terms(self) -> QueryTerms:
         """The term state of the query being evaluated (:mod:`.query_scope`),
@@ -657,8 +581,6 @@ class VortexRdflibStore(Store):
         shared string per distinct code, so the per-term cost collapses from
         one FFI round trip each to one bulk call per batch.
         """
-        if term_dict is None:
-            raise ValueError("store has no term dictionary (code path inactive)")
         distinct: set[int] = set()
         for column in code_columns:
             distinct.update(column)
@@ -672,44 +594,18 @@ class VortexRdflibStore(Store):
             missing = list(distinct.difference(cache))
         if missing:
             build = self._from_n3_safe
-            for code, raw in zip(missing, term_dict.decode_many(missing), strict=True):
-                if raw is None:
-                    raise ValueError(f"term code {code} is not in the store dictionary")
+            for code, raw in zip(missing, spellings(term_dict, missing), strict=True):
                 cache[code] = build(raw)
 
-    def _default_graph_code(self) -> int | None:
-        """The dictionary code of the default graph's empty name, or ``None``
-        when the file holds no default-graph rows (the dictionary is
-        immutable, so this is looked up once)."""
-        if self._default_code is _UNRESOLVED:
-            if self._dict is None:
-                raise ValueError("store has no term dictionary (code path inactive)")
-            self._default_code = boundary.term_dict(self).encode(DEFAULT_GRAPH)
-        return self._default_code  # ty: ignore[invalid-return-type]
+    def _spelling(self, code: int) -> str:
+        """The N-Triples spelling of the dictionary code ``code``; a code the
+        dictionary does not hold raises ``ValueError``
+        (:func:`.open_file.spelling`)."""
+        return spelling(boundary.term_dict(self), code)
 
-    def _term_kind_bounds(self) -> tuple[int, int, int]:
-        """The first code of each term kind (literal, IRI, blank node); the
-        dictionary is immutable, so three binary searches, once."""
-        if self._kind_bounds is None:
-            if self._dict is None:
-                raise ValueError("store has no term dictionary (code path inactive)")
-            self._kind_bounds = kind_bounds(boundary.term_dict(self))
-        return self._kind_bounds
-
-    def _kind_ranges(self) -> dict:
-        """Each term kind's half-open code range (``TermDict.prefix_range``
-        of ``"``, ``<`` and ``_:``): codes rank spellings in byte order, so a
-        kind is one range — the keep a kind test pushes into a match."""
-        if self._ranges is None:
-            if self._dict is None:
-                raise ValueError("store has no term dictionary (code path inactive)")
-            term_dict = boundary.term_dict(self)
-            self._ranges = {
-                LITERAL: tuple(term_dict.prefix_range('"')),
-                IRI: tuple(term_dict.prefix_range("<")),
-                BLANK: tuple(term_dict.prefix_range("_:")),
-            }
-        return self._ranges
+    def _spellings(self, codes) -> list[str]:
+        """:meth:`_spelling` of each of ``codes``, decoded in one batch."""
+        return spellings(boundary.term_dict(self), codes)
 
     def _foreign_code(self, term: Node) -> int:
         """The negative code standing for a term outside the dictionary, for
@@ -727,21 +623,16 @@ class VortexRdflibStore(Store):
             return terms.foreign[code]
         node = terms.decode.get(code)
         if node is None:
-            if self._dict is None:
-                raise ValueError("store has no term dictionary (code path inactive)")
-            raw = boundary.term_dict(self).decode(code)
-            if raw is None:
-                raise ValueError(f"term code {code} is not in the store dictionary")
-            node = terms.decode[code] = self._from_n3_safe(raw)
+            node = terms.decode[code] = self._from_n3_safe(self._spelling(code))
         return node
 
     def __len__(self, context=None):
         """Triples in ``context``: the quads of its graph, or the distinct
         triples of the union view, as ``triples()`` yields them — the store's
-        quads when no triple is in two graphs, else the count
-        :meth:`_read_union_repeats` made, or, in a layout without codes, a
-        count of the union's rows, read once. A context that names no graph
-        the file can hold has none.
+        quads when no triple is in two graphs, else the union's size
+        :meth:`_read_union` counted, or, in a layout without codes, a count
+        of the union's rows, read once. A context that names no graph the
+        file can hold has none.
         """
         if self.path is None:
             return 0
@@ -750,11 +641,13 @@ class VortexRdflibStore(Store):
         except _NoGraph:
             return 0
         if g_n3 is None:
-            if not self._union_has_repeats():
+            facts = self._union_facts()
+            if not facts.has_repeats:
                 return len(self._store())
-            if self._union_len is None:
-                self._union_len = sum(1 for _ in self.triples((None, None, None)))
-            return self._union_len
+            if facts.size is None:
+                size = sum(1 for _ in self.triples((None, None, None)))
+                facts = self._opened().union = UnionFacts(has_repeats=True, size=size)
+            return facts.size
         return boundary.native(self).count_quads(None, None, None, g_n3)
 
     def add(self, triple, context=None, quoted=False):

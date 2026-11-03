@@ -202,7 +202,7 @@ def _count_patterns(store, patterns, counts: dict) -> int:
     The patterns are counted one at a time, except the scans: enough of them
     (``SETTINGS.scan_batch_min``, ``SETTINGS.memory_scan_batch_min``) are counted last, in
     one ``count_quads_many`` batch that runs them concurrently, one GIL
-    release for all — after the point counts (``store._point_lookup``: those
+    release for all — after the point counts (``OpenFile.point_lookup``: those
     the native layer answers without a scan), any of which may still end the
     block first. Returns the counts made."""
     if not SETTINGS.count_order:  # VORTEX_RDF_COUNT_ORDER=0: static estimates, no native counts
@@ -219,7 +219,7 @@ def _count_patterns(store, patterns, counts: dict) -> int:
             for pat in ordered
             if not pat.unsatisfiable
             and tuple(pat.n3) not in counts
-            and not store._point_lookup(pat.n3)
+            and not store._file.point_lookup(pat.n3)
         ]
         if len({tuple(pat.n3) for pat in scans}) < minimum:
             scans = []
@@ -273,7 +273,7 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
     ``SETTINGS.probe_fanout`` times smaller than the pattern's count, the step joins
     the pattern per row of the relation: it re-probes it natively per row
     (``_probe_join``) where each probe is a point lookup
-    (``store._point_lookup``), and where each would scan the store it matches
+    (``OpenFile.point_lookup``), and where each would scan the store it matches
     the pattern once, narrowed to the codes the relation binds its shared
     variables to (a keep-scan, :func:`_keep_scan`). Any other pattern is
     matched once. A matched pattern is hash-joined — columnar while the
@@ -426,7 +426,7 @@ def _join_incremental_bgp(store, patterns, stats: _BgpStats, pushed=None, stream
         if shared and running * SETTINGS.probe_fanout < estimate:
             # Joined per row of the relation: by probes where each is a point
             # lookup, else by one keep-scan rather than a scan per row.
-            cheap = store._point_lookup(probes._probe_shape(work, shared))
+            cheap = store._file.point_lookup(probes._probe_shape(work, shared))
             step.strategy = "probe" if cheap else "keep_scan"
         elif streams and streaming._read_in_chunks(work, running):
             step.strategy = "stream"

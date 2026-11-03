@@ -12,7 +12,7 @@ import rdflib.term
 from rdflib.term import Literal
 
 from .. import boundary
-from ..terms import CANONICAL_INTEGER, INTEGER_SUFFIX, canonical_spelling
+from ..terms import CANONICAL_INTEGER, INTEGER_SUFFIX, LITERAL, canonical_spelling
 
 
 def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
@@ -37,20 +37,20 @@ def _alias_codes(store, codes, foreign: dict, aliases: dict) -> None:
     negative (`_constant_codes`), so no twin is looked up for it. For most
     stores no code aliases another and ``aliases`` stays empty.
     """
-    literal_lo, iri_lo, _ = store._term_kind_bounds()
+    literal_lo, literal_hi = store._file.kind_ranges.range(LITERAL)
     terms = store._terms()
     classified = terms.alias_classified
     pending = [
         c
         for c in codes
-        if c is not None and (c < 0 or literal_lo <= c < iri_lo) and c not in classified
+        if c is not None and (c < 0 or literal_lo <= c < literal_hi) and c not in classified
     ]
     if pending:
         typed = []
         local = [c for c in pending if c >= 0]
         if local:
             cache = terms.decode
-            for code, spelling in _rewritable(local, boundary.term_dict(store).decode_many(local)):
+            for code, spelling in _rewritable(local, store._spellings(local)):
                 term = cache.get(code)
                 if term is None:
                     term = cache[code] = store._from_n3_safe(spelling)
@@ -101,16 +101,12 @@ def _rewritable(codes, spellings) -> Iterator[tuple[int, str]]:
     mapping = _toPythonMapping
     if mapping is None:
         for code, spelling in zip(codes, spellings, strict=True):
-            if spelling is None:
-                raise ValueError(f"term code {code} is not in the store dictionary")
             if spelling.endswith(">"):
                 yield code, spelling
         return
     canonical = _CANONICAL_INTEGER_SPELLING.fullmatch
     converted = None
     for code, spelling in zip(codes, spellings, strict=True):
-        if spelling is None:
-            raise ValueError(f"term code {code} is not in the store dictionary")
         if not spelling.endswith(">") or canonical(spelling) is not None:
             continue
         if converted is None:

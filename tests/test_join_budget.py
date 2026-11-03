@@ -34,6 +34,7 @@ from vortex_rdflib import (
     register_sparql_pushdown,
     unregister_sparql_pushdown,
 )
+from vortex_rdflib.open_file import OpenFile
 from vortex_rdflib.settings import SETTINGS
 
 EX = "http://ex/"
@@ -466,7 +467,7 @@ def test_a_probe_step_over_budget_discards_its_rows(file_graph, monkeypatch, cap
     monkeypatch.setattr(SETTINGS, "pair_budget", 16)
     monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     monkeypatch.setattr(SETTINGS, "probe_batch", 3)
-    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: True)
+    monkeypatch.setattr(OpenFile, "point_lookup", lambda opened, n3: True)
     monkeypatch.setattr(SETTINGS, "cheap_batch_min", 1)
     watched = _WatchedBatches(file_graph.store._store())
     file_graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
@@ -539,7 +540,7 @@ def test_a_batch_short_of_answers_raises(graph, monkeypatch, tokened):
     token or without one: a batch that answers fewer probes than it was
     given raises at the first probe left without an answer rather than
     handing another probe's answer on."""
-    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
+    monkeypatch.setattr(OpenFile, "point_lookup", lambda opened, n3: False)
     monkeypatch.setattr(SETTINGS, "scan_batch_min", 1)
     monkeypatch.setattr(SETTINGS, "memory_scan_batch_min", 1)
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
@@ -572,7 +573,7 @@ def test_a_batch_past_its_probes_raises(graph, monkeypatch, tokened):
     """A batch that answers more probes than it was given, under a cancel
     token or without one, raises at its last probe rather than handing that
     probe an answer the batch may have misplaced."""
-    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
+    monkeypatch.setattr(OpenFile, "point_lookup", lambda opened, n3: False)
     monkeypatch.setattr(SETTINGS, "scan_batch_min", 1)
     monkeypatch.setattr(SETTINGS, "memory_scan_batch_min", 1)
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
@@ -1301,7 +1302,7 @@ def test_an_over_budget_keep_scan_short_of_the_last_step_goes_back(graph, monkey
     finishes both patterns per seed row (tier 3)."""
     monkeypatch.setattr(SETTINGS, "pair_budget", 239)
     monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
-    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
+    monkeypatch.setattr(OpenFile, "point_lookup", lambda opened, n3: False)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, REORDER
     )
@@ -1325,7 +1326,7 @@ def test_an_over_budget_keep_scan_needing_whole_columns_goes_back(graph, monkeyp
     finishes it per row (tier 3)."""
     monkeypatch.setattr(SETTINGS, "pair_budget", 1)
     monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
-    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
+    monkeypatch.setattr(OpenFile, "point_lookup", lambda opened, n3: False)
     spy = native_spy(graph)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         graph, monkeypatch, capsys, LOOPED
@@ -1445,7 +1446,7 @@ def test_probe_multiplicity_under_keep_scan(
     store = VortexRdflibStore(str(multiplicity_vortex), in_memory=in_memory)
     dataset = Dataset(store=store, default_union=union)
     monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
-    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: False)
+    monkeypatch.setattr(OpenFile, "point_lookup", lambda opened, n3: False)
     (with_pushdown, without_pushdown), events = _traced_both_ways(
         dataset, monkeypatch, capsys, sparql
     )

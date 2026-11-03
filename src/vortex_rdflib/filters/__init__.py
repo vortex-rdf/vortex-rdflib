@@ -50,9 +50,8 @@ from typing import Any
 from rdflib.plugins.sparql.evalutils import _ebv as rdflib_ebv
 from rdflib.plugins.sparql.sparql import FrozenBindings
 
-from .. import boundary
 from ..settings import SETTINGS
-from ..terms import TermView, kind_of, parse_spelling
+from ..terms import TermView, parse_spelling
 from . import compiler, exprs, native, values
 from .native import NativeShape
 from .values import UNKNOWN
@@ -208,7 +207,6 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
     their spellings."""
     remaining = codes if isinstance(codes, set) else set(codes)
     views: dict = {}
-    bounds = None
     for conjunct in conjuncts:
         if not remaining:
             break
@@ -223,10 +221,9 @@ def evaluate_column(store, conjuncts: list, codes) -> set:
         elif fast is None:
             unknown = list(pending)
         elif conjunct.kind_only:
-            if bounds is None:
-                bounds = store._term_kind_bounds()
+            kind_of = store._file.kind_ranges.kind_of
             for code in pending:
-                r = fast((TermView(kind_of(code, bounds), None),))
+                r = fast((TermView(kind_of(code), None),))
                 if r is True:
                     passed.add(code)
                 elif r is UNKNOWN:
@@ -261,10 +258,7 @@ def _fast_route(store, fast, views: dict) -> Callable[[tuple], Any]:
             if code < 0:
                 view = views[code] = values.constant_view(store._terms().foreign[code])
             else:
-                spelling = boundary.term_dict(store).decode(code)
-                if spelling is None:
-                    raise ValueError(f"term code {code} is not in the store dictionary")
-                view = views[code] = parse_spelling(spelling)
+                view = views[code] = parse_spelling(store._spelling(code))
         return view
 
     def answer(key: tuple):
@@ -402,9 +396,7 @@ def decode_views(store, codes, views: dict) -> None:
     missing = [code for code in codes if code not in views]
     if not missing:
         return
-    for code, spelling in zip(missing, boundary.term_dict(store).decode_many(missing), strict=True):
-        if spelling is None:
-            raise ValueError(f"term code {code} is not in the store dictionary")
+    for code, spelling in zip(missing, store._spellings(missing), strict=True):
         views[code] = parse_spelling(spelling)
 
 

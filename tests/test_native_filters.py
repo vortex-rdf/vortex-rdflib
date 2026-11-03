@@ -11,7 +11,7 @@ import pytest
 from rdflib.term import Variable
 from tests.corpus import SPELLINGS
 from tests.oracle import departs, spec_answer
-from tests.support import RecordingTermDict, filter_expr, typed
+from tests.support import RecordingTermDict, filter_expr, kind_ranges, typed
 from vortex_rdf import U64Column, serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown, trace
@@ -299,7 +299,7 @@ def test_a_refused_argument_leaves_every_candidate_to_the_python_routes(
     spelling_store, monkeypatch
 ):
     codes = _all_codes(spelling_store)
-    lo, hi = spelling_store._kind_ranges()[LITERAL]
+    lo, hi = kind_ranges(spelling_store).range(LITERAL)
     monkeypatch.setattr(
         spelling_store, "_dict", RecordingTermDict(spelling_store._dict, refuse=True)
     )
@@ -316,7 +316,7 @@ def test_only_the_codes_a_predicate_reads_are_sent(spelling_store, monkeypatch):
     filter_codes requires: the xsd:float codes looked up first, and an
     ordering's passed codes checked for numbers after."""
     codes = _all_codes(spelling_store)
-    lo, hi = spelling_store._kind_ranges()[LITERAL]
+    lo, hi = kind_ranges(spelling_store).range(LITERAL)
     nonliterals = {code for code in codes if not lo <= code < hi}
     assert nonliterals
     recording = RecordingTermDict(spelling_store._dict)
@@ -357,7 +357,7 @@ def test_num_eq_and_num_ne_pass_only_numbers(spelling_store, constant):
 
 
 def _is_literal(store, code: int) -> bool:
-    lo, hi = store._kind_ranges()[LITERAL]
+    lo, hi = kind_ranges(store).range(LITERAL)
     return lo <= code < hi
 
 
@@ -365,9 +365,9 @@ def test_str_of_a_blank_node_is_left_to_the_python_routes(spelling_store, monkey
     """rdflib reads STR(_:abc) as "abc": under STR() the blank nodes are never
     sent, they come back undecided, while the IRIs are sent."""
     codes = _all_codes(spelling_store)
-    ranges = spelling_store._kind_ranges()
-    blanks = {c for c in codes if ranges[BLANK][0] <= c < ranges[BLANK][1]}
-    iris = {c for c in codes if ranges[IRI][0] <= c < ranges[IRI][1]}
+    ranges = kind_ranges(spelling_store)
+    blanks = {c for c in codes if ranges.kind_of(c) == BLANK}
+    iris = {c for c in codes if ranges.kind_of(c) == IRI}
     assert blanks and iris
     recording = RecordingTermDict(spelling_store._dict)
     monkeypatch.setattr(spelling_store, "_dict", recording)
@@ -383,7 +383,7 @@ def test_an_argument_vortex_rdf_cannot_take_leaves_every_candidate_undecided(spe
     read goes to the Python routes, for every string kind and for IRI
     equality."""
     codes = _all_codes(spelling_store)
-    lo, hi = spelling_store._kind_ranges()[LITERAL]
+    lo, hi = kind_ranges(spelling_store).range(LITERAL)
     literals = {code for code in codes if lo <= code < hi}
     for shape in (
         NativeShape("regex", "a|\ud800"),

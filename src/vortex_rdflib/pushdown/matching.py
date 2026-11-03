@@ -226,7 +226,7 @@ def _limit_reaches_match(store, pat: Pattern, residual) -> bool:
     return (
         not residual
         and not pat.distinct
-        and not store._indexes
+        and not store._file.indexes
         and all(len(positions) == 1 for positions in pat.varpos.values())
     )
 
@@ -289,7 +289,7 @@ def _exclude_default_graph(store, pat: Pattern) -> None:
     counts apply. A file with no default-graph rows has no such code and
     needs no restriction at all.
     """
-    default = store._default_graph_code()
+    default = store._file.default_graph_code
     if default is None:
         return
     if default != 0:

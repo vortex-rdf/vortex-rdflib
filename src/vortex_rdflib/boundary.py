@@ -16,7 +16,7 @@ The cancel policy, for the token of the query being evaluated
 - ``count_quads`` and ``match_codes`` race the token (``cancel=``) when the
   call can scan a file-backed store: not on an in-memory store, which
   finishes without waiting, not capped at one row (``limit``), and not a
-  point lookup (``VortexRdflibStore._point_lookup``). Any other checks the
+  point lookup (``OpenFile.point_lookup``). Any other checks the
   token before the call (:func:`~vortex_rdflib.cancel.check_cancelled`).
 - ``match_columns`` and ``get_quads`` check the token before the call.
 - The batches (``count_quads_many``, ``match_codes_many``) and the chunked
@@ -44,7 +44,9 @@ def native(store) -> VortexRdfStore:
     traced = trace.active() is not None
     if token is None and not traced and not SETTINGS.counters:
         return handle
-    return _Native(store, handle, token, traced, SETTINGS.counters)  # ty: ignore[invalid-return-type]
+    # The open file's record, for the cancel policy: the file the handle is.
+    opened = store._opened()
+    return _Native(opened, handle, token, traced, SETTINGS.counters)  # ty: ignore[invalid-return-type]
 
 
 def term_dict(store):
@@ -72,10 +74,10 @@ class _Native:
     (:func:`native`): the cancel policy applied, the call traced and counted.
     Any method not named here passes through, counted."""
 
-    __slots__ = ("_store", "_inner", "_token", "_traced", "_counted")
+    __slots__ = ("_file", "_inner", "_token", "_traced", "_counted")
 
-    def __init__(self, store, inner, token: CancelToken | None, traced: bool, counted: bool):
-        self._store = store
+    def __init__(self, opened, inner, token: CancelToken | None, traced: bool, counted: bool):
+        self._file = opened
         self._inner = inner
         self._token = token
         self._traced = traced
@@ -88,9 +90,9 @@ class _Native:
         token = self._token
         if token is None:
             return options
-        store = self._store
+        opened = self._file
         limit = options.get("limit")
-        if store.in_memory or (limit is not None and limit <= 1) or store._point_lookup(n3):
+        if opened.in_memory or (limit is not None and limit <= 1) or opened.point_lookup(n3):
             check_cancelled()
             return options
         return {**options, "cancel": token}

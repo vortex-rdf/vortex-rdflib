@@ -158,27 +158,54 @@ def unparseable_iri(node) -> bool:
     return isinstance(node, URIRef) and _IRI_FORM.fullmatch(node) is None
 
 
-def kind_bounds(term_dict) -> tuple[int, int, int]:
-    """``(literal_lo, iri_lo, blank_lo)``: the first code of each term kind.
+class KindRanges:
+    """Each term kind's half-open code range in one dictionary: codes rank
+    spellings in byte order and every spelling of a kind starts alike, so a
+    kind is one range (``TermDict.prefix_range`` of ``"``, ``<`` and ``_:``)
+    — the keep a kind test pushes into a match — and a code's kind is the
+    range it falls in. A file's are read once (``OpenFile.kind_ranges``)."""
 
-    Three native binary searches (``TermDict.lower_bound``: the code of the
-    first term not below the needle); the dictionary is immutable, so the
-    store caches the result.
-    """
-    return term_dict.lower_bound('"'), term_dict.lower_bound("<"), term_dict.lower_bound("_")
+    __slots__ = (
+        "_ranges",
+        "_literal_lo",
+        "_literal_hi",
+        "_iri_lo",
+        "_iri_hi",
+        "_blank_lo",
+        "_blank_hi",
+    )
 
+    def __init__(self, literal: tuple[int, int], iri: tuple[int, int], blank: tuple[int, int]):
+        self._ranges = {LITERAL: literal, IRI: iri, BLANK: blank}
+        self._literal_lo, self._literal_hi = literal
+        self._iri_lo, self._iri_hi = iri
+        self._blank_lo, self._blank_hi = blank
 
-def kind_of(code: int, bounds: tuple[int, int, int]) -> str:
-    """A code's term kind from the kind bounds, without decoding it (the
-    empty graph name, below every kind, answers ``""``)."""
-    literal_lo, iri_lo, blank_lo = bounds
-    if code >= blank_lo:
-        return BLANK
-    if code >= iri_lo:
-        return IRI
-    if code >= literal_lo:
-        return LITERAL
-    return ""
+    @classmethod
+    def from_dictionary(cls, term_dict) -> "KindRanges":
+        """The ranges of ``term_dict``: three native prefix searches."""
+        return cls(
+            tuple(term_dict.prefix_range('"')),
+            tuple(term_dict.prefix_range("<")),
+            tuple(term_dict.prefix_range("_:")),
+        )
+
+    def range(self, kind: str) -> tuple[int, int]:
+        """The half-open code range of ``kind``: ``LITERAL``, ``IRI`` or
+        ``BLANK``."""
+        return self._ranges[kind]
+
+    def kind_of(self, code: int) -> str:
+        """The kind of the term ``code`` stands for, without decoding it;
+        ``""`` for a code in no kind's range: the default graph's empty name,
+        a code past the dictionary's end, a negative one."""
+        if self._literal_lo <= code < self._literal_hi:
+            return LITERAL
+        if self._iri_lo <= code < self._iri_hi:
+            return IRI
+        if self._blank_lo <= code < self._blank_hi:
+            return BLANK
+        return ""
 
 
 #: xsd:integer, and its suffix after a literal's closing quote.

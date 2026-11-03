@@ -261,7 +261,7 @@ def test_native_filter_narrows_every_pattern_it_reaches(tmp_path, monkeypatch, c
 
 def indexed_graph_of(tmp_path, anchors=1, size=300, in_memory=True):
     """``graph_of``'s data behind a secondary-by-copy index, where every
-    pattern with a bound predicate is a point pattern (`VortexRdflibStore._point_lookup`); the
+    pattern with a bound predicate is a point pattern (`OpenFile.point_lookup`); the
     anchor rows are subjects s0 to s{anchors - 1}."""
     source = tmp_path / "indexed.nt"
     source.write_text(

@@ -11,8 +11,9 @@ from operator import itemgetter
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.term import Variable
 
-from .. import boundary, trace
+from .. import trace
 from ..settings import SETTINGS
+from ..terms import BLANK, IRI
 from . import algebra, aliasing, blocks, relation, solutions
 from .relation import Relation
 
@@ -176,7 +177,8 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
     elapsed = trace.stopwatch()
     codes = set(codes)
     ranks = {None: -1}
-    literal_lo, iri_lo, blank_lo = store._term_kind_bounds()
+    ranges = store._file.kind_ranges
+    iri_lo, blank_lo = ranges.range(IRI)[0], ranges.range(BLANK)[0]
     blanks, iris, others = [], [], []
     by_kind = all(code is None or code >= 0 for code in codes)
     for code in codes:
@@ -195,10 +197,7 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
     if iris:
         # ``<iri>`` decodes to ``URIRef(iri)``, so the string rdflib compares
         # is the spelling without its brackets.
-        spellings = boundary.term_dict(store).decode_many(iris)
-        if None in spellings:
-            code = iris[spellings.index(None)]
-            raise ValueError(f"term code {code} is not in the store dictionary")
+        spellings = store._spellings(iris)
         keyed = [(spelling[1:-1], code) for spelling, code in zip(spellings, iris, strict=True)]
         rank = _rank_keyed(ranks, keyed, rank)
     local = [code for code in others if code >= 0]

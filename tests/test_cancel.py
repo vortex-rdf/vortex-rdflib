@@ -157,11 +157,12 @@ _WAITING_CALLS = ("count_quads_many", "match_codes_many", "match_code_chunks")
 def _races(store, name: str, args: tuple, kwargs: dict) -> bool:
     """Whether a native call races the token: a batch or a chunked match
     always; a one-shot call only on a file-backed store, when it is no point
-    lookup (``VortexRdflibStore._point_lookup``) and is not capped at one row."""
+    lookup (``OpenFile.point_lookup``) and is not capped at one row."""
     if name in _WAITING_CALLS:
         return True
     limit = kwargs.get("limit")
-    return not store.in_memory and (limit is None or limit > 1) and not store._point_lookup(args)
+    point = store._opened().point_lookup(args)
+    return not store.in_memory and (limit is None or limit > 1) and not point
 
 
 def _run_shape(graph, monkeypatch, shape: str) -> list[tuple[str, tuple, dict]]:

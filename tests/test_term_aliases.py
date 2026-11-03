@@ -13,7 +13,7 @@ import pytest
 import rdflib
 from rdflib import Graph, Literal, URIRef
 from rdflib.term import _toPythonMapping
-from tests.support import both_ways, run
+from tests.support import both_ways, kind_ranges, run
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
@@ -212,8 +212,7 @@ def test_alias_classes_are_rdflibs_term_equality(generated_store, caplog, calls)
     order."""
     caplog.set_level(logging.ERROR, logger="rdflib.term")
     store = generated_store
-    literal_lo, iri_lo, _ = store._term_kind_bounds()
-    local = list(range(literal_lo, iri_lo))
+    local = list(range(*kind_ranges(store).range(LITERAL)))
     spellings = dict(zip(local, store._dict.decode_many(local), strict=True))
     reference = {code: _reference_term(spelling) for code, spelling in spellings.items()}
     typed = sorted({t for t in reference.values() if t.datatype is not None}, key=str)
@@ -364,8 +363,7 @@ def test_the_alias_pass_builds_only_spellings_rdflib_may_rewrite(tmp_path, monke
     built = []
     original = store._from_n3_safe
     monkeypatch.setattr(store, "_from_n3_safe", lambda s: built.append(s) or original(s))
-    literal_lo, iri_lo, _ = store._term_kind_bounds()
-    codes = list(range(literal_lo, iri_lo))
+    codes = list(range(*kind_ranges(store).range(LITERAL)))
     scope = query_scope.QueryScope()
     token = query_scope.enter(scope)
     try:

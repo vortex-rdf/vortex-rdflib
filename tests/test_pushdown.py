@@ -49,6 +49,7 @@ from vortex_rdflib import (
     unregister_sparql_pushdown,
 )
 from vortex_rdflib.cancel import cancel_scope
+from vortex_rdflib.open_file import OpenFile
 from vortex_rdflib.settings import SETTINGS
 
 
@@ -235,7 +236,7 @@ def _force(forcing: Forcing, monkeypatch) -> None:
         monkeypatch.setattr(SETTINGS, name, value)
     if forcing.point is not None:
         monkeypatch.setattr(
-            VortexRdflibStore, "_point_lookup", lambda store, n3, answer=forcing.point: answer
+            OpenFile, "point_lookup", lambda opened, n3, answer=forcing.point: answer
         )
 
 
@@ -842,7 +843,7 @@ def test_traced_batch_does_not_pull_ahead(file_graph, monkeypatch, capsys):
     consumes, and the batch events add up to the probes served."""
     monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
     monkeypatch.setattr(SETTINGS, "probe_batch", 3)
-    monkeypatch.setattr(VortexRdflibStore, "_point_lookup", lambda store, n3: True)
+    monkeypatch.setattr(OpenFile, "point_lookup", lambda opened, n3: True)
     monkeypatch.setattr(SETTINGS, "cheap_batch_min", 1)
     native = _PullCountingNative(file_graph.store._store())
     file_graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
