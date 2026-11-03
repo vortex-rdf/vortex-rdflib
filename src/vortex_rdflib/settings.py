@@ -19,9 +19,17 @@ fails where it is read, naming the variable:
   ``VORTEX_RDF_IN_MEMORY`` (:func:`in_memory_by_default`) and
   ``VORTEX_RDF_DISABLE_CODE_PATH`` (:func:`code_path_enabled`) on
   construction;
-- per call: ``VORTEX_RDF_TRACE_QUERY`` and ``VORTEX_RDF_TRACE_QUERY_ID``
-  (:func:`trace_enabled`, :func:`trace_query_id`), for each algebra node the
-  hook answers outside a traced query.
+- once per query, as it starts: ``VORTEX_RDF_TRACE_QUERY`` and
+  ``VORTEX_RDF_TRACE_QUERY_ID`` (:func:`trace_enabled`,
+  :func:`trace_query_id`), so a query is traced from its start or not at
+  all.
+
+The ablation switches (``VORTEX_RDF_CODE_PREDICATES``,
+``VORTEX_RDF_COUNT_ORDER``, ``VORTEX_RDF_DECODE_EACH_STEP``,
+``VORTEX_RDF_DECODE_CHUNK``, ``VORTEX_RDF_PROBE_BATCH``) measure what each
+pushdown mechanism contributes: each changes how the pushdown answers, never
+what (``tests/test_ablation_switches.py``); the fields they set say what
+each does, and the README lists them.
 """
 
 import os
@@ -98,18 +106,15 @@ def flag(name: str, default: bool) -> bool:
 
 def _int_at_least(name: str, minimum: int) -> int | None:
     """The environment variable ``name`` as an integer of at least
-    ``minimum``, or ``None`` when unset or empty; anything else raises
-    ``ValueError``, naming the variable."""
+    ``minimum``, written in ASCII digits (surrounding blanks aside), or
+    ``None`` when unset or empty; anything else — a sign, an underscore,
+    another script's digits — raises ``ValueError``, naming the variable."""
     value = (getenv(name) or "").strip()
     if not value:
         return None
-    try:
-        number = int(value)
-    except ValueError:
-        number = None
-    if number is None or number < minimum:
+    if not (value.isascii() and value.isdigit()) or int(value) < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
-    return number
+    return int(value)
 
 
 def positive_int(name: str) -> int | None:
@@ -240,45 +245,40 @@ def pushdown_disabled() -> bool:
     return flag("VORTEX_RDF_DISABLE_PUSHDOWN", False)
 
 
+#: The on/off switches :func:`apply_switches` reads: each variable, the
+#: :class:`Settings` field it sets and that field's default, which the switch
+#: moves it away from.
+_FLAGS = (
+    ("VORTEX_RDF_FILTER_FAST", "fast_filters", True),
+    ("VORTEX_RDF_NATIVE_FILTERS", "native_filters", True),
+    ("VORTEX_RDF_CODE_PREDICATES", "code_predicates", True),
+    ("VORTEX_RDF_COUNT_ORDER", "count_order", True),
+    ("VORTEX_RDF_DECODE_EACH_STEP", "decode_each_step", False),
+    ("VORTEX_RDF_COUNTERS", "counters", False),
+    ("VORTEX_RDF_TRACE_TRIPLES", "trace_triples", False),
+)
+
+
 def apply_switches(target: Settings | None = None) -> None:
     """Set ``target`` (:data:`SETTINGS`) by the switches set in the
-    environment: ``VORTEX_RDF_PUSHDOWN_OPS`` (:func:`parse_ops`),
-    ``VORTEX_RDF_FILTER_FAST``, ``VORTEX_RDF_NATIVE_FILTERS``, the pair
-    budget, and the ablation and debugging switches
-    (:mod:`vortex_rdflib.ablation`, ``VORTEX_RDF_COUNTERS``,
-    ``VORTEX_RDF_TRACE_TRIPLES``). A switch moves its settings away from their
-    defaults and never back, and one left unset changes nothing. Every switch
-    is read before any setting changes, so a value refused leaves them all as
-    they were."""
+    environment: ``VORTEX_RDF_PUSHDOWN_OPS`` (:func:`parse_ops`), the on/off
+    switches (:data:`_FLAGS`), the pair budget and the decode and probe
+    batch sizes. A switch moves its settings away from their defaults and
+    never back, and one left unset changes nothing. Every switch is read
+    before any setting changes, so a value refused leaves them all as they
+    were."""
     target = SETTINGS if target is None else target
     spec = getenv(PUSHDOWN_OPS_ENV)
     ops = None if spec is None else parse_ops(spec)
-    fast = flag("VORTEX_RDF_FILTER_FAST", True)
-    native = flag("VORTEX_RDF_NATIVE_FILTERS", True)
-    code_predicates = flag("VORTEX_RDF_CODE_PREDICATES", True)
-    count_order = flag("VORTEX_RDF_COUNT_ORDER", True)
-    decode_each_step = flag("VORTEX_RDF_DECODE_EACH_STEP", False)
-    counters = flag("VORTEX_RDF_COUNTERS", False)
-    trace_triples = flag("VORTEX_RDF_TRACE_TRIPLES", False)
+    flags = [(field, flag(env, default), default) for env, field, default in _FLAGS]
     pair_budget = _int_at_least(PAIR_BUDGET_ENV, 0)
     decode_chunk = positive_int("VORTEX_RDF_DECODE_CHUNK")
     probe_batch = positive_int("VORTEX_RDF_PROBE_BATCH")
     if ops is not None:
         target.enabled_ops = ops
-    if not fast:
-        target.fast_filters = False
-    if not native:
-        target.native_filters = False
-    if not code_predicates:
-        target.code_predicates = False
-    if not count_order:
-        target.count_order = False
-    if decode_each_step:
-        target.decode_each_step = True
-    if counters:
-        target.counters = True
-    if trace_triples:
-        target.trace_triples = True
+    for field_name, value, default in flags:
+        if value != default:
+            setattr(target, field_name, value)
     if pair_budget is not None:
         target.pair_budget = pair_budget
     if decode_chunk is not None:  # one fixed chunk size

@@ -185,3 +185,17 @@ def test_switches_see_the_environment_as_it_changes(monkeypatch):
     assert settings.flag("VORTEX_RDF_X", True) is True
     monkeypatch.setenv("VORTEX_RDF_PROBE_BATCH", "7")
     assert settings.positive_int("VORTEX_RDF_PROBE_BATCH") == 7
+
+
+def test_a_size_switch_takes_digits_only(monkeypatch):
+    """A size is written in ASCII digits: ``int()``'s other spellings (an
+    underscore, a sign, another script's digits) are refused, naming the
+    variable; blanks around the digits are not part of the value."""
+    for bad in ("1_000", "+5", "٣"):
+        monkeypatch.setenv("VORTEX_RDF_PROBE_BATCH", bad)
+        with pytest.raises(ValueError, match="VORTEX_RDF_PROBE_BATCH"):
+            settings.apply_switches(Settings())
+    monkeypatch.setenv("VORTEX_RDF_PROBE_BATCH", " 12 ")
+    target = Settings()
+    settings.apply_switches(target)
+    assert target.probe_batch == 12
