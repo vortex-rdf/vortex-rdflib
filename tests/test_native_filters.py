@@ -13,7 +13,16 @@ import pytest
 from rdflib.term import Variable
 from tests.corpus import SPELLINGS
 from tests.oracle import departs, spec_answer
-from tests.support import CTX, RecordingTermDict, W, file_codes, filter_expr, kind_ranges, typed
+from tests.support import (
+    CTX,
+    RecordingTermDict,
+    W,
+    both_ways,
+    file_codes,
+    filter_expr,
+    kind_ranges,
+    typed,
+)
 from vortex_rdf import U64Column, serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown, trace
@@ -645,8 +654,6 @@ def test_a_mid_size_code_set_goes_to_the_native_layer_whole(tmp_path, monkeypatc
     import json
 
     from rdflib import Graph
-
-    from test_pushdown import both_ways
 
     nt = tmp_path / "s.nt"
     nt.write_text(

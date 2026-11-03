@@ -6,12 +6,25 @@ variable sets them (``tests/test_settings.py``) — and the answers (as
 multisets) are compared with the run with none set."""
 
 import pytest
-from rdflib import Graph, Literal
-from tests.corpus import FIXTURE_NT, QUERIES, RDFLIB_DIVERGES
-from tests.support import file_codes
+from rdflib import Graph, Literal, URIRef
+from tests.corpus import (
+    FIXTURE_NT,
+    QUERIES,
+    RDFLIB_DIVERGES,
+)
+from tests.support import (
+    both_ways,
+    file_codes,
+    run,
+)
 from vortex_rdf import serialize_rdf
 
-from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
+from vortex_rdflib import (
+    VortexRdflibStore,
+    register_sparql_pushdown,
+    settings,
+    unregister_sparql_pushdown,
+)
 from vortex_rdflib.settings import SETTINGS
 
 
@@ -142,3 +155,49 @@ def test_decode_each_step_returns_the_same_codes(store):
     assert rel.cols[0].tolist() == list(range(n))
     rel = _decode_each_step(st, Relation(("a", "b"), None, [(c, c) for c in codes], len(codes)))
     assert rel.cols is None and rel.rows == [(c, c) for c in codes]
+
+
+def test_pushdown_ops_env_switch(store, monkeypatch):
+    monkeypatch.setattr(SETTINGS, "enabled_ops", settings.ALL_OPS)
+    monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "bgp")
+    VortexRdflibStore(str(store))
+    assert SETTINGS.enabled_ops == {"BGP"}
+    monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "BGP, Project")
+    VortexRdflibStore(str(store))
+    assert SETTINGS.enabled_ops == {"BGP", "Project"}
+    monkeypatch.setenv("VORTEX_RDF_PUSHDOWN_OPS", "Bogus")
+    with pytest.raises(ValueError, match="Bogus"):
+        VortexRdflibStore(str(store))
+
+
+def test_native_filters_env_switch(store, monkeypatch):
+    """`VORTEX_RDF_NATIVE_FILTERS=0` keeps every conjunct on the Python
+    routes: no conjunct carries a native predicate, and the answer stands."""
+    monkeypatch.setattr(SETTINGS, "native_filters", True)
+    monkeypatch.setenv("VORTEX_RDF_NATIVE_FILTERS", "0")
+    graph = Graph(store=VortexRdflibStore(str(store)))
+    assert SETTINGS.native_filters is False
+    with_pushdown, without_pushdown = both_ways(
+        graph, "SELECT ?s WHERE { ?s ?p ?o FILTER(isIRI(?o)) }"
+    )
+    assert with_pushdown == without_pushdown
+
+
+def test_non_vortex_graphs_unaffected(store):
+    register_sparql_pushdown()
+    g = Graph()
+    g.add((URIRef("http://ex.org/a"), URIRef("http://ex.org/name"), Literal("A")))
+    rows = run(g, "SELECT ?n WHERE { ?s <http://ex.org/name> ?n }")
+    assert rows == [(Literal("A"),)]
+
+
+def test_string_fallback_when_code_path_disabled(store, monkeypatch):
+    monkeypatch.setenv("VORTEX_RDF_DISABLE_CODE_PATH", "1")
+    graph = Graph(store=VortexRdflibStore(str(store)))
+    rows = run(
+        graph,
+        """SELECT ?n WHERE {
+            <http://ex.org/alice> <http://ex.org/knows> ?x .
+            ?x <http://ex.org/name> ?n }""",
+    )
+    assert {row[0] for row in rows} == {Literal("Bob", lang="en"), Literal("Carol")}

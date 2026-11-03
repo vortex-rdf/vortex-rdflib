@@ -5,13 +5,18 @@ small stores, and FILTER expressions as rdflib's parser builds them."""
 import json
 import weakref
 
-from rdflib import Graph, Variable
+from rdflib import Dataset, Graph, Variable
 from rdflib.plugins.sparql.algebra import translateQuery
 from rdflib.plugins.sparql.parser import parseQuery
 from rdflib.plugins.sparql.sparql import QueryContext
 from vortex_rdf import serialize_rdf
 
-from vortex_rdflib import register_sparql_pushdown, trace, unregister_sparql_pushdown
+from vortex_rdflib import (
+    VortexRdflibStore,
+    register_sparql_pushdown,
+    trace,
+    unregister_sparql_pushdown,
+)
 from vortex_rdflib.open_file import Codes
 from vortex_rdflib.terms import KindRanges
 
@@ -342,3 +347,29 @@ def filter_spy(graph) -> RecordingTermDict:
     spy = RecordingTermDict(file_codes(graph.store).term_dict)
     file_codes(graph.store).term_dict = spy
     return spy
+
+
+def three_predicate_graph(
+    tmp_path, q_subject: str, q_value, n: int = 50, r_per_subject: int = 2, graph_name=None
+) -> Graph:
+    """`n` subjects `s{i}` with an integer `p` of `i` and `r_per_subject`
+    `r` values each (`r{j}` for every `j` congruent to `i` mod `n`), plus `n`
+    integer `q` values `q_value(i)` on subjects `{q_subject}{i}`. `r` is
+    counted above `p` and `q`, so the planner joins it last. With
+    `graph_name` every statement is in that named graph, over a Dataset."""
+    end = " .\n" if graph_name is None else f" <{graph_name}> .\n"
+    lines = []
+    for i in range(n):
+        q = f'"{q_value(i)}"^^<{XSD}integer>'
+        lines.append(f'<http://ex.org/s{i}> <http://ex.org/p> "{i}"^^<{XSD}integer>{end}')
+        lines.append(f"<http://ex.org/{q_subject}{i}> <http://ex.org/q> {q}{end}")
+    for j in range(r_per_subject * n):
+        lines.append(f'<http://ex.org/s{j % n}> <http://ex.org/r> "r{j}"{end}')
+    source = tmp_path / ("data.nt" if graph_name is None else "data.nq")
+    source.write_text("".join(lines), encoding="utf-8")
+    out = tmp_path / "data.vortex"
+    if graph_name is None:
+        serialize_rdf(str(source), str(out), layout="dictionary")
+        return Graph(store=VortexRdflibStore(str(out)))
+    serialize_rdf(str(source), str(out), layout="dictionary", format="nquads")
+    return Dataset(store=VortexRdflibStore(str(out)), default_union=True)

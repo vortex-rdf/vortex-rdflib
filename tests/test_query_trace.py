@@ -1,10 +1,36 @@
+import contextlib
+import io
+import sys
+import time
+from typing import Any
+
 import pytest
 from rdflib import Graph
-from tests.support import trace_events
-from vortex_rdf import serialize_rdf
+from tests.corpus import (
+    FIXTURE_NT,
+)
+from tests.support import (
+    both_ways,
+    counting_native,
+    is_graph_name_check,
+    run,
+    three_predicate_graph,
+    trace_events,
+)
+from vortex_rdf import Cancelled, CancelToken, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
-from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, settings
+from vortex_rdflib import (
+    VortexRdflibStore,
+    boundary,
+    query_scope,
+    register_sparql_pushdown,
+    settings,
+    trace,
+)
+from vortex_rdflib.cancel import CANCEL_TOKEN, cancel_scope
+from vortex_rdflib.open_file import OpenFile
+from vortex_rdflib.settings import SETTINGS
 
 
 @pytest.fixture
@@ -204,3 +230,267 @@ def test_an_untraced_query_builds_no_trace_payload(traced_graph, monkeypatch):
     ]
     for query in queries:
         assert list(traced_graph.query(query))
+
+
+@pytest.fixture(scope="module")
+def corpus_vortex(tmp_path_factory):
+    """The corpus's triples as a dictionary file."""
+    d = tmp_path_factory.mktemp("trace-corpus")
+    nt = d / "fixture.nt"
+    nt.write_text(FIXTURE_NT, encoding="utf-8")
+    out = d / "fixture.vortex"
+    serialize_rdf(str(nt), str(out), layout="dictionary")
+    return out
+
+
+@pytest.fixture
+def file_graph(corpus_vortex):
+    """The corpus's triples, file-backed."""
+    return Graph(store=VortexRdflibStore(str(corpus_vortex), in_memory=False))
+
+
+@contextlib.contextmanager
+def _tracing():
+    """A query trace around the native wrapper under test; the events it
+    emits wait in the trace's pending lines (:func:`_pending_events`). The
+    scope keeps the cancel token current as it starts, as a query's does."""
+    scope = query_scope.QueryScope()
+    scope.cancel = CANCEL_TOKEN.get()
+    scope.trace = trace.QueryTrace(query_id=None)
+    token = query_scope.enter(scope)
+    try:
+        yield scope.trace
+    finally:
+        query_scope.leave(token)
+
+
+def _pending_events(trace) -> list[dict]:
+    """The events a trace holds, not yet flushed to stderr."""
+    return trace_events("\n".join(trace.pending))
+
+
+_PRUNED_SQL = """SELECT ?c WHERE {
+    ?s <http://ex.org/p> ?a .
+    ?s <http://ex.org/q> ?b .
+    ?s <http://ex.org/r> ?c
+    FILTER(?a < ?b) }"""
+
+
+def _pruned_graph(tmp_path) -> Graph:
+    """`?a < ?b` holds for `s0` only, and `r` (400 rows) is large enough for
+    the one surviving row to be probed into: `_PRUNED_SQL` prunes mid-join."""
+    return three_predicate_graph(
+        tmp_path, "s", lambda i: 1000 if i == 0 else i - 1000, r_per_subject=8
+    )
+
+
+def test_trace_records_every_native_call(tmp_path, monkeypatch, capsys):
+    """Every native call a traced query makes is an event — a single call a
+    `native_call_complete`, a batch a `native_batch_complete` carrying its
+    probe count — the per-row probes included, so the events add up to the
+    calls the store served: 3 counts (one batch), the `p` and `q` matches
+    and 1 probe of `r`. The store's own graph-name check is traced too, and
+    left out here as the counter leaves it out (`is_graph_name_check`)."""
+    graph = _pruned_graph(tmp_path)
+    register_sparql_pushdown()
+    native = counting_native(graph)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    run(graph, _PRUNED_SQL)
+    events = trace_events(capsys.readouterr().err)
+    calls = [
+        e
+        for e in events
+        if e["event"] == "native_call_complete" and not is_graph_name_check(tuple(e["pattern"]))
+    ]
+    batches = [e for e in events if e["event"] == "native_batch_complete"]
+    assert (native.counts, native.matches, native.batches) == (3, 3, 1)
+    assert [e["operation"] for e in batches] == ["count_quads_many"]
+    assert len(calls) + sum(e["probe_count"] for e in batches) == native.counts + native.matches
+
+
+_STAR_SQL = """SELECT ?x ?n ?a WHERE {
+    ?x <http://ex.org/name> ?n .
+    ?x <http://ex.org/age> ?a }"""
+
+
+_FOUR_PROBES = [
+    (None, f"<http://ex.org/{name}>", None, None) for name in ("name", "knows", "age", "likes")
+]
+
+
+def test_traced_batch_does_not_pull_ahead(file_graph, monkeypatch, capsys):
+    """A traced ``match_codes_many`` hands its caller the native iterator, not
+    the rows it drained from it: the probe join pulls exactly the answers it
+    consumes, and the batch events add up to the probes served."""
+    monkeypatch.setattr(SETTINGS, "probe_fanout", 0)
+    monkeypatch.setattr(SETTINGS, "probe_batch", 3)
+    monkeypatch.setattr(OpenFile, "point_lookup", lambda opened, n3: True)
+    monkeypatch.setattr(SETTINGS, "cheap_batch_min", 1)
+    native = _PullCountingNative(file_graph.store._opened().native)
+    file_graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
+    file_graph.store._opened().native = native
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    with_pushdown, without_pushdown = both_ways(file_graph, _STAR_SQL)
+    assert with_pushdown == without_pushdown
+    batches = [
+        e
+        for e in trace_events(capsys.readouterr().err)
+        if e["event"] == "native_batch_complete" and e["operation"] == "match_codes_many"
+    ]
+    assert len(native.answers) == len(batches) > 1
+    assert [a.pulls for a in native.answers] == [len(a) for a in native.answers]
+    assert [e["probe_count"] for e in batches] == [len(a) for a in native.answers]
+    assert [e["returned_rows"] for e in batches] == [a.rows for a in native.answers]
+
+
+def test_closing_a_traced_batch_reports_the_pulls_it_made(file_graph):
+    """A batch closed early has pulled only what its caller took, and reports
+    that once: its probe count is the batch's, its rows the pulled answers'."""
+    native = _PullCountingNative(file_graph.store._opened().native)
+    file_graph.store._opened().native = native
+    with _tracing() as trace:
+        traced: Any = boundary.native(file_graph.store)  # the proxy closes what it hands out
+        answers = traced.match_codes_many(_FOUR_PROBES)
+        assert len(answers) == len(_FOUR_PROBES)
+        pulled = [next(answers), next(answers)]
+        assert native.answers[0].pulls == 2 and _pending_events(trace) == []
+        answers.close()
+        answers.close()
+        assert list(answers) == [] and native.answers[0].pulls == 2
+    (event,) = _pending_events(trace)
+    assert (event["event"], event["operation"]) == ("native_batch_complete", "match_codes_many")
+    assert event["probe_count"] == len(_FOUR_PROBES)
+    assert event["first_pattern"] == list(_FOUR_PROBES[0])
+    assert event["returned_rows"] == sum(len(answer[0]) for answer in pulled)
+    assert event["elapsed_ns"] > 0
+
+
+def test_traced_chunks_report_the_chunks_pulled(file_graph):
+    """A chunk iterator reports once, when it is exhausted: the pattern, its
+    keep, the columns and the chunks and rows pulled."""
+    pattern = (None, "<http://ex.org/knows>", None, None)
+    keep = {"o": (0, 1_000_000)}
+    rows = file_graph.store._opened().native.count_quads(*pattern)
+    with _tracing() as trace:
+        traced: Any = boundary.native(file_graph.store)  # the proxy closes what it hands out
+        chunks = traced.match_code_chunks(*pattern, keep=keep, columns=("s", "o"), batch_rows=4)
+        pulled = [next(chunks)]
+        assert _pending_events(trace) == []
+        pulled.extend(chunks)
+        assert len(_pending_events(trace)) == 1
+        chunks.close()
+    (event,) = _pending_events(trace)
+    assert (event["event"], event["operation"]) == ("native_chunks_complete", "match_code_chunks")
+    assert (event["pattern"], event["keep"]) == (list(pattern), {"o": {"range": [0, 1_000_000]}})
+    assert event["columns"] == ["s", "o"]
+    assert (event["chunks"], event["returned_rows"]) == (len(pulled), rows)
+    assert len(pulled) > 1 and all(len(chunk) == 2 for chunk in pulled)
+    assert event["elapsed_ns"] > 0
+
+
+def test_a_traced_chunk_call_without_codes_returns_none(tmp_path):
+    source = tmp_path / "plain.nt"
+    source.write_text(FIXTURE_NT, encoding="utf-8")
+    out = tmp_path / "plain.vortex"
+    serialize_rdf(str(source), str(out), layout="default")
+    with _tracing():
+        assert boundary.native(VortexRdflibStore(str(out))).match_code_chunks() is None
+
+
+def test_the_traced_native_forwards_the_native_keywords(file_graph):
+    """Traced, the boundary passes a call's keywords on and gives it the
+    query's cancel token, which a scan, a chunked match and a batch race."""
+    with cancel_scope(CancelToken()) as token, _tracing():
+        traced: Any = boundary.native(file_graph.store)
+        counts = traced.count_quads_many(_FOUR_PROBES, lookahead=1)
+        answers = traced.match_codes_many(_FOUR_PROBES, lookahead=1)
+        assert counts == [len(answer[0]) for answer in answers]
+        for many in (traced.count_quads_many, traced.match_codes_many):
+            with pytest.raises(ValueError, match="lookahead"):
+                many(_FOUR_PROBES, lookahead=0)
+        token.cancel()
+        for single in (traced.count_quads, traced.match_codes, traced.match_code_chunks):
+            with pytest.raises(Cancelled):
+                single()
+        for many in (traced.count_quads_many, traced.match_codes_many):
+            with pytest.raises(Cancelled):
+                many(_FOUR_PROBES)
+
+
+def test_trace_reports_a_mid_join_prune_between_the_steps_it_links(tmp_path, monkeypatch, capsys):
+    """A mid-join prune is its own trace event, so row counts reconcile step
+    to step: the `p`/`q` join's 50 rows are the prune's input, and its one
+    surviving row is the input of the `r` probe that follows."""
+    graph = _pruned_graph(tmp_path)
+    register_sparql_pushdown()
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    capsys.readouterr()
+    run(graph, _PRUNED_SQL)
+    events = trace_events(capsys.readouterr().err)
+    steps = [e for e in events if e["event"] == "bgp_join_step_complete"]
+    prunes = [e for e in events if e["event"] == "bgp_prune_complete"]
+    assert len(prunes) == 1 and prunes[0]["pruned"] is True
+    prune = prunes[0]
+    assert (steps[0]["output_rows"], prune["input_rows"]) == (50, 50)
+    assert (prune["output_rows"], steps[1]["input_rows"]) == (1, 1)
+
+
+def test_trace_output_is_not_timed_as_native_work(tmp_path, monkeypatch):
+    """Trace lines are written after the planning they describe, so however
+    slowly stderr takes them, the native time the events report is the
+    native calls' own: a 20 ms write must not show up in it."""
+    graph = three_predicate_graph(tmp_path, "s", lambda i: i + 1000, n=5)
+    register_sparql_pushdown()
+
+    class _SlowStderr(io.StringIO):
+        def write(self, text):
+            time.sleep(0.02)
+            return super().write(text)
+
+    slow = _SlowStderr()
+    monkeypatch.setattr(sys, "stderr", slow)
+    monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
+    run(graph, "SELECT ?s WHERE { ?s <http://ex.org/p> ?a . ?s <http://ex.org/q> ?b }")
+    done = next(e for e in trace_events(slow.getvalue()) if e["event"] == "bgp_complete")
+    assert done["native_match_ns"] < 20_000_000
+
+
+class _PullCounter:
+    """The answers a ``match_codes_many`` stand-in returns: the native
+    iterator's, counting the answers pulled and the rows they hold."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.pulls = 0
+        self.rows = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        answer = next(self._inner)
+        self.pulls += 1
+        self.rows += 0 if answer is None else len(answer[0])
+        return answer
+
+    def __len__(self):
+        return len(self._inner)
+
+
+class _PullCountingNative:
+    """A VortexRdfStore stand-in whose ``match_codes_many`` hands out a
+    :class:`_PullCounter` per batch, kept in call order."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.answers: list[_PullCounter] = []
+
+    def match_codes_many(self, probes, **options):
+        answers = _PullCounter(self._inner.match_codes_many(probes, **options))
+        self.answers.append(answers)
+        return answers
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
