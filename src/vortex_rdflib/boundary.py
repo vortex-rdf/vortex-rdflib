@@ -83,6 +83,26 @@ def term_dict(store):
     return _TermDict(dictionary)
 
 
+def codes_of(store, spellings: list[str]) -> list[int | None]:
+    """The dictionary code of each spelling, ``None`` for one the dictionary
+    lacks or the native parser refuses: no file holds such a term, as the
+    parser that wrote the file refuses it too. One ``encode_many``; a refused
+    spelling fails that whole batch, and then each spelling is looked up
+    alone."""
+    dictionary = term_dict(store)
+    try:
+        return dictionary.encode_many(spellings)
+    except ValueError:
+        return [_code_or_none(dictionary, spelling) for spelling in spellings]
+
+
+def _code_or_none(dictionary, spelling: str) -> int | None:
+    try:
+        return dictionary.encode(spelling)
+    except ValueError:
+        return None
+
+
 def _quad(pattern: tuple) -> tuple:
     """A call's positional pattern as the four quad positions it stands for:
     the ones it leaves out are unbound."""

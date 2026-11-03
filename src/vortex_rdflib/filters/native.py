@@ -41,7 +41,7 @@ from rdflib.term import Literal, URIRef
 from vortex_rdf import U64Column
 
 from .. import boundary, trace
-from ..terms import BLANK, IRI, LITERAL, KindRanges, canonical_spelling
+from ..terms import BLANK, IRI, LITERAL, KindRanges, canonical_spelling, unparseable_iri
 from . import values
 from .exprs import VAR_LIKE
 from .values import FLOAT, NUMERIC_TYPES, RDF_NIL
@@ -102,29 +102,24 @@ STRING_KINDS = frozenset({"regex", "contains", "strstarts", "strends"})
 
 def keep_of(store, keep: IriIn | KindRange):
     """The keep a native match takes for ``keep``: the code range of its
-    kinds, or the ascending codes of its IRIs (one ``encode_many``; an IRI
-    the dictionary lacks has no code, as it can match no stored term). A
-    spelling the native parser refuses raises ``ValueError``."""
+    kinds, or the ascending codes of its IRIs (:func:`boundary.codes_of`; an
+    IRI the dictionary lacks or the native parser refuses has no code, as it
+    can match no stored term)."""
     if isinstance(keep, KindRange):
         ranges = store._file.kind_ranges
         bounds = [ranges.range(kind) for kind in keep.kinds]
         return min(lo for lo, _ in bounds), max(hi for _, hi in bounds)
-    spellings = list(keep.spellings)
-    found = boundary.term_dict(store).encode_many(spellings) if spellings else []
+    found = boundary.codes_of(store, list(keep.spellings)) if keep.spellings else []
     return U64Column(sorted({code for code in found if code is not None}))
 
 
 def keep_decides(store, keep: IriIn | KindRange, codes: Collection[int]) -> tuple[set, list]:
     """Of ``codes``, the set ``keep`` admits and the codes of no term (the
     empty graph name, a code past the dictionary's end, a negative one),
-    left undecided for the Python routes; every other code fails. A
-    spelling the native parser refuses leaves every code undecided."""
+    left undecided for the Python routes; every other code fails."""
     if not codes:
         return set(), []
-    try:
-        member = keep_member(keep_of(store, keep))
-    except ValueError:
-        return set(), list(codes)
+    member = keep_member(keep_of(store, keep))
     return {code for code in codes if member(code)}, _not_terms(codes, store._file.kind_ranges)
 
 
@@ -353,15 +348,12 @@ def _regex_shape(expr, var, consts) -> FilterCodes | None:
     return FilterCodes("regex", spec.pattern, flags=spec.flags, case=case, as_str=as_str)
 
 
-#: IRIs ``canonical_spelling`` spells as an N-Triples IRIREF.
-_SPELLABLE_IRI = re.compile(r'[^\x00-\x20<>"{}|^`\\]*')
-
-
 def _iri_spelling(node, consts) -> str | None:
     """The spelling of the IRI an operand without block variables evaluates
-    to, or ``None`` when it is not an IRI the dictionary could hold."""
+    to, or ``None`` when it is not an IRI of the form the native parser takes
+    (:func:`~vortex_rdflib.terms.unparseable_iri`)."""
     iri = _constant_term(node, consts)
-    if not isinstance(iri, URIRef) or not _SPELLABLE_IRI.fullmatch(str(iri)):
+    if not isinstance(iri, URIRef) or unparseable_iri(iri):
         return None
     return canonical_spelling(iri)
 
@@ -497,16 +489,10 @@ def native_restriction(store, conjuncts: list) -> tuple:
     produces (:func:`evaluate_column`)."""
     keeps, residual = [], []
     for conjunct in conjuncts:
-        keep = None
-        if conjunct.keep is not None:
-            try:
-                keep = keep_of(store, conjunct.keep)
-            except ValueError:
-                keep = None  # a constant the native parser refuses
-        if keep is None:
+        if conjunct.keep is None:
             residual.append(conjunct)
         else:
-            keeps.append(keep)
+            keeps.append(keep_of(store, conjunct.keep))
     return (intersect_keeps(keeps) if keeps else None), residual
 
 

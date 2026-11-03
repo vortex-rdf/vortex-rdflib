@@ -122,8 +122,9 @@ def _rewritable(codes, spellings) -> Iterator[tuple[int, str]]:
 def _canonical_twins(store, read: list) -> dict:
     """The code of each term's canonical spelling, for the ``(term,
     spelling)`` pairs of ``read`` whose term was read from another spelling
-    and whose canonical spelling the dictionary holds: one ``encode_many``
-    call, and the codes it finds decoded to confirm the term."""
+    and whose canonical spelling the dictionary holds: one lookup
+    (:func:`~vortex_rdflib.boundary.codes_of`), and the codes it finds
+    decoded to confirm the term."""
     wanted: dict = {}
     for term, spelling in read:
         if term not in wanted:
@@ -132,18 +133,7 @@ def _canonical_twins(store, read: list) -> dict:
                 wanted[term] = canonical
     if not wanted:
         return {}
-    spellings = list(wanted.values())
-    try:
-        found = boundary.term_dict(store).encode_many(spellings)
-    except ValueError:
-        # A spelling the native parser rejects fails the whole batch; alone,
-        # it names no term of the file.
-        found = []
-        for spelling in spellings:
-            try:
-                found.append(boundary.term_dict(store).encode(spelling))
-            except ValueError:
-                found.append(None)
+    found = boundary.codes_of(store, list(wanted.values()))
     hits = [code for code in found if code is not None]
     if not hits:
         return {}

@@ -7,6 +7,8 @@ matrix of spellings is the fast route's (``test_filters``) plus the shapes the
 native value model treats specially: decimals against doubles, integers past
 2^53, 64-bit bounds, language subtags."""
 
+from types import SimpleNamespace
+
 import pytest
 from rdflib.term import Variable
 from tests.corpus import SPELLINGS
@@ -418,8 +420,7 @@ def test_str_of_a_blank_node_is_left_to_the_python_routes(spelling_store, monkey
 def test_an_argument_vortex_rdf_cannot_take_leaves_every_candidate_undecided(spelling_store):
     """filter_codes raises ValueError (here UnicodeEncodeError, a lone
     surrogate) for an argument it cannot take: every candidate it would have
-    read goes to the Python routes, for every string kind and for IRI
-    equality."""
+    read goes to the Python routes, for every string kind."""
     codes = _all_codes(spelling_store)
     lo, hi = kind_ranges(spelling_store).range(LITERAL)
     literals = {code for code in codes if lo <= code < hi}
@@ -430,9 +431,62 @@ def test_an_argument_vortex_rdf_cannot_take_leaves_every_candidate_undecided(spe
     ):
         passed, undecided = native.evaluate(spelling_store, shape, codes)
         assert not passed and literals <= set(undecided), shape
-    shape = native.IriIn(("<http://ex.org/\ud800>",))
-    passed, undecided = _decide(spelling_store, shape, codes)
-    assert not passed and set(undecided) == codes
+
+
+class _RecordingLookups:
+    """A TermDict that records every spelling looked up by ``encode_many``."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.looked_up: list[str] = []
+
+    def encode_many(self, spellings):
+        self.looked_up.extend(spellings)
+        return self._inner.encode_many(spellings)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+@pytest.mark.parametrize(
+    "sparql_expr",
+    ["?v = <foo>", "sameTerm(<foo>, ?v)", "?v IN (<1http://x>, <urn:x>)"],
+)
+def test_an_iri_without_the_parsers_form_is_never_looked_up(
+    spelling_store, monkeypatch, sparql_expr
+):
+    """A relative IRI, or one whose scheme starts with a digit, has no form
+    the native parser takes (``terms.unparseable_iri``): the mapping leaves
+    its equality to the Python routes without asking the dictionary, and the
+    answer is the specification's."""
+    from rdflib import Graph
+
+    assert native.native_shape(filter_expr(sparql_expr), V, {}) is None
+    recording = _RecordingLookups(spelling_store._dict)
+    monkeypatch.setattr(spelling_store, "_dict", recording)
+    register_sparql_pushdown()
+    query = f"SELECT ?s WHERE {{ ?s <http://ex.org/p> ?v FILTER({sparql_expr}) }}"
+    kept = {row[0].n3() for row in Graph(store=spelling_store).query(query)}
+    expected = {"<urn:x>"} if "urn:x" in sparql_expr else set()
+    assert kept == expected
+    assert not {"<foo>", "<1http://x>"} & set(recording.looked_up)
+
+
+@pytest.mark.parametrize("refused", ["<http://x/%zz>", "<http://ex.org/\ud800>"])
+def test_an_iri_the_parser_refuses_names_no_term(spelling_store, refused):
+    """An IRI of the parser's form that it still refuses — a bad percent
+    escape, a lone surrogate — is no term of any file (the parser that wrote
+    the file refuses it too), so it is a miss, as an IRI the dictionary lacks
+    is: the keep holds the other IRIs' codes, and a keep on the match and a
+    keep over a query's codes decide every term alike."""
+    codes = _all_codes(spelling_store)
+    urn = spelling_store._dict.encode("<urn:x>")
+    keep = native.IriIn((refused, "<urn:x>"))
+    assert memoryview(native.keep_of(spelling_store, keep)).cast("Q").tolist() == [urn]
+    assert native.keep_decides(spelling_store, keep, codes) == ({urn}, [])
+    restriction, residual = native.native_restriction(spelling_store, [SimpleNamespace(keep=keep)])
+    assert memoryview(restriction).cast("Q").tolist() == [urn]
+    assert not residual
 
 
 @pytest.mark.parametrize(
