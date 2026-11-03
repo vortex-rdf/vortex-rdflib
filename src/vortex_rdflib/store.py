@@ -259,12 +259,13 @@ class VortexRdflibStore(Store):
             g_n3 = self._graph_n3(context)
         except _NoGraph:
             return
+        # The union facts first, then the pattern's reads, as a lazy reader
+        # would (rows are read once iterated).
+        repeats = g_n3 is None and self._union_has_repeats()
         rows = self._quad_rows(triple_pattern, g_n3)
-        if g_n3 is None and self._union_has_repeats():
-            rows = union.one_per_triple(rows)
-        yield from rows
+        yield from union.one_per_triple(rows) if repeats else rows
 
-    def _quad_rows(self, triple_pattern, g_n3: str | None):
+    def _quad_rows(self, triple_pattern, g_n3: str | None) -> Iterable[tuple]:
         """``((s, p, o), contexts)`` for each quad a pattern matches in the
         graph named ``g_n3`` (``None``: every graph), a triple several graphs
         hold once per graph under the union. The store streams the quads it holds rather than
@@ -287,138 +288,132 @@ class VortexRdflibStore(Store):
         are told apart by identity (:func:`union.one_per_triple`).
         """
         s, p, o = triple_pattern
-
         # RDFLib can propagate an object binding into subject or predicate
-        # position during joins. That pattern is unsatisfiable, not an error.
-        if s is not None and not isinstance(s, (URIRef, BNode)):
-            return
-        if p is not None and not isinstance(p, URIRef):
-            return
+        # position during joins: that pattern is unsatisfiable, not an error.
         # So is one holding an IRI vortex-rdf's parser rejects, which is no
         # term of the file.
-        if unparseable_iri(s) or unparseable_iri(p) or unparseable_iri(o):
-            return
-
-        s_n3 = self._node_to_n3(s)
-        p_n3 = self._node_to_n3(p)
-        o_n3 = self._node_to_n3(o)
-        # One named graph: every matched row is in it, so the contexts are one
-        # tuple and the graph column is never read. The tuple is taken once
-        # the match has a row, which proves the file holds the graph; a name
-        # that matches nothing leaves no state behind.
-        fixed = None
-
+        if (
+            (s is not None and not isinstance(s, (URIRef, BNode)))
+            or (p is not None and not isinstance(p, URIRef))
+            or unparseable_iri(s)
+            or unparseable_iri(p)
+            or unparseable_iri(o)
+        ):
+            return ()
+        pattern = (self._node_to_n3(s), self._node_to_n3(p), self._node_to_n3(o), g_n3)
         if SETTINGS.trace_triples:
             print(
                 "[VortexRdflibStore.triples:start] "
                 f"layout={self.layout} "
                 f"s={_term_debug(s)} p={_term_debug(p)} o={_term_debug(o)} "
-                f"s_n3={s_n3} p_n3={p_n3} o_n3={o_n3} g_n3={g_n3!r}",
+                f"s_n3={pattern[0]} p_n3={pattern[1]} o_n3={pattern[2]} g_n3={g_n3!r}",
                 flush=True,
             )
-
-        # The handle, the file's record (its codes, its graph contexts) and a
-        # large pattern's chunk iterator are bound once: rows read after a
-        # close(), or an open() of another file, still come from the file the
-        # call started on.
+        # The handle and the file's record (its codes, its graph contexts)
+        # are bound once: rows read after a close(), or an open() of another
+        # file, still come from the file the call started on.
         native = boundary.native(self)
         opened = self._opened()
-        codes = opened.codes
-        pattern = (s_n3, p_n3, o_n3, g_n3)
-
-        # Fully-ground pattern: no term needs materializing. A store's quads
-        # are unique, so in one graph the triple is there or not: one count.
-        # Under the union it is one row, with the context of each graph that
-        # holds it (only the graph column is read).
-        if s_n3 is not None and p_n3 is not None and o_n3 is not None:
-            triple = (s, p, o)
+        if None not in pattern[:3]:
+            # Fully ground: no term needs materializing. A store's quads are
+            # unique, so in one graph the triple is there or not: one count.
+            # Under the union it is one row, with the context of each graph
+            # that holds it (only the graph column is read).
             if g_n3 is None:
-                graphs = self._distinct_graphs(s_n3, p_n3, o_n3)
-                if graphs:
-                    yield triple, tuple(graphs)
-            elif native.count_quads(*pattern):
-                yield triple, opened.context_tuple(g_n3)
-            return
-
+                graphs = self._distinct_graphs(*pattern[:3])
+                return [((s, p, o), tuple(graphs))] if graphs else ()
+            return [((s, p, o), opened.context_tuple(g_n3))] if native.count_quads(*pattern) else ()
+        codes = opened.codes
         matches = None if codes is None else self._code_matches(native, pattern)
         if codes is not None and matches is not None:
-            cache = None
-            contexts: dict[int, tuple] = {}
-            try:
-                for cols in matches:
-                    rows = len(cols[0])
-                    # The columns of one native match, or chunk, are equally
-                    # long; reading them by the first one's length would hide
-                    # a native bug.
-                    for column in cols:
-                        if len(column) != rows:
-                            lengths = list(map(len, cols))
-                            raise ValueError(f"match columns of unequal lengths: {lengths}")
-                    if not rows:
-                        continue
-                    if cache is None:
-                        # The match's first row: the call's term cache, and
-                        # the named graph's one context tuple (see `fixed`).
-                        cache = self._terms().decode
-                        if g_n3 is not None:
-                            fixed = opened.context_tuple(g_n3)
-                    # Zero-copy u64 views over the Rust column buffers, read a
-                    # slice at a time: 64 rows, then four times more, 4096 at
-                    # most. Each slice's codes become Python ints, and those
-                    # the call's term cache (the query's, inside one) lacks
-                    # are decoded in one GIL-released decode_many call, so a
-                    # consumer that stops early (rdflib's LIMIT, ASK) decodes
-                    # only the slices it reached.
-                    views = [memoryview(column).cast("Q") for column in cols]
-                    start, size = 0, SETTINGS.chunk_start
-                    while start < rows:
-                        stop = min(start + size, rows)
-                        # A match or chunk that is one slice is read from the
-                        # views whole.
-                        part = views if stop - start == rows else [v[start:stop] for v in views]
-                        s_codes = part[0].tolist()
-                        p_codes = part[1].tolist()
-                        o_codes = part[2].tolist()
-                        self._decode_into(codes, cache, (s_codes, p_codes, o_codes))
-                        shared = fixed
-                        if shared is None:
-                            # Union: the fourth column names each row's graph.
-                            # A slice whose rows all live in one graph — every
-                            # slice of a single-graph file — shares that
-                            # graph's context and pays no per-row lookup.
-                            g_codes = part[3].tolist()
-                            graphs = set(g_codes)
-                            for code in graphs.difference(contexts):
-                                contexts[code] = opened.context_of_code(code)
-                            if len(graphs) == 1:
-                                shared = contexts[g_codes[0]]
-                            else:
-                                for row in zip(s_codes, p_codes, o_codes, g_codes, strict=True):
-                                    yield (
-                                        (cache[row[0]], cache[row[1]], cache[row[2]]),
-                                        contexts[row[3]],
-                                    )
-                        if shared is not None:
-                            for row in zip(s_codes, p_codes, o_codes, strict=True):
-                                yield (cache[row[0]], cache[row[1]], cache[row[2]]), shared
-                        start, size = stop, min(size * 4, SETTINGS.chunk_max)
-                    # Let go of this chunk's columns before the next pull.
-                    del cols, column, views, part
-            finally:
-                # Dropping a chunk iterator ends its native scan (a bare
-                # CodeChunks has no close()): once the rows run out, the
-                # consumer stops or a pull fails.
-                del matches
-            return
+            return self._rows_from_codes(opened, codes, matches, g_n3)
+        return self._rows_from_strings(opened, native, pattern)
 
-        # String fallback (non-dictionary layouts, code path disabled):
-        # match_columns shares one Python string object across repeats of a
-        # term, so memoizing the parse by string turns per-row term
-        # construction into per-distinct-term construction. It takes no
-        # cancel token, so the boundary checks the token before it.
-        subjects, predicates, objects, graphs = native.match_columns(s_n3, p_n3, o_n3, g_n3)
-        if g_n3 is not None and subjects:
-            fixed = opened.context_tuple(g_n3)
+    def _rows_from_codes(self, opened: OpenFile, codes: Codes, matches, g_n3: str | None):
+        """The rows of ``matches`` — the code columns of one native match, or
+        its chunks — each decoded a slice at a time through the call's term
+        cache, with its graph's one context tuple: the named graph's for
+        ``g_n3``, else the graph column's, a slice of one graph sharing its
+        tuple."""
+        # One named graph: every matched row is in it, so the contexts are one
+        # tuple and the graph column is never read. The tuple is taken once
+        # the match has a row, which proves the file holds the graph; a name
+        # that matches nothing leaves no state behind.
+        fixed = None
+        cache = None
+        contexts: dict[int, tuple] = {}
+        try:
+            for cols in matches:
+                rows = len(cols[0])
+                # The columns of one native match, or chunk, are equally long;
+                # reading them by the first one's length would hide a native
+                # bug.
+                if {len(column) for column in cols} != {rows}:
+                    raise ValueError(f"match columns of unequal lengths: {list(map(len, cols))}")
+                if not rows:
+                    continue
+                if cache is None:
+                    # The match's first row: the call's term cache, and the
+                    # named graph's one context tuple (see `fixed`).
+                    cache = self._terms().decode
+                    if g_n3 is not None:
+                        fixed = opened.context_tuple(g_n3)
+                # Zero-copy u64 views over the Rust column buffers, read a
+                # slice at a time: 64 rows, then four times more, 4096 at most.
+                # Each slice's codes become Python ints, and those the call's
+                # term cache (the query's, inside one) lacks are decoded in one
+                # GIL-released decode_many call, so a consumer that stops early
+                # (rdflib's LIMIT, ASK) decodes only the slices it reached.
+                views = [memoryview(column).cast("Q") for column in cols]
+                start, size = 0, SETTINGS.chunk_start
+                while start < rows:
+                    stop = min(start + size, rows)
+                    # A match or chunk that is one slice is read from the
+                    # views whole.
+                    part = views if stop - start == rows else [v[start:stop] for v in views]
+                    s_codes = part[0].tolist()
+                    p_codes = part[1].tolist()
+                    o_codes = part[2].tolist()
+                    self._decode_into(codes, cache, (s_codes, p_codes, o_codes))
+                    shared = fixed
+                    if shared is None:
+                        # Union: the fourth column names each row's graph. A
+                        # slice whose rows all live in one graph — every slice
+                        # of a single-graph file — shares that graph's context
+                        # and pays no per-row lookup.
+                        g_codes = part[3].tolist()
+                        graphs = set(g_codes)
+                        for code in graphs.difference(contexts):
+                            contexts[code] = opened.context_of_code(code)
+                        if len(graphs) == 1:
+                            shared = contexts[g_codes[0]]
+                        else:
+                            for row in zip(s_codes, p_codes, o_codes, g_codes, strict=True):
+                                yield (
+                                    (cache[row[0]], cache[row[1]], cache[row[2]]),
+                                    contexts[row[3]],
+                                )
+                    if shared is not None:
+                        for row in zip(s_codes, p_codes, o_codes, strict=True):
+                            yield (cache[row[0]], cache[row[1]], cache[row[2]]), shared
+                    start, size = stop, min(size * 4, SETTINGS.chunk_max)
+                # Let go of this chunk's columns before the next pull.
+                del cols, views, part
+        finally:
+            # Dropping a chunk iterator ends its native scan (a bare
+            # CodeChunks has no close()): once the rows run out, the consumer
+            # stops or a pull fails.
+            del matches
+
+    def _rows_from_strings(self, opened: OpenFile, native, pattern: tuple):
+        """The rows of the quad pattern ``pattern`` as spellings — a layout
+        without codes, or the code path off — each term built once per
+        distinct spelling: ``match_columns`` shares one Python string object
+        across repeats of a term. It takes no cancel token, so the boundary
+        checks the token before it."""
+        g_n3 = pattern[3]
+        subjects, predicates, objects, graphs = native.match_columns(*pattern)
+        fixed = opened.context_tuple(g_n3) if g_n3 is not None and subjects else None
         parse = self._from_n3_safe
         memo: dict[str, Node] = {}
         for s_raw, p_raw, o_raw, g_raw in zip(subjects, predicates, objects, graphs, strict=True):
