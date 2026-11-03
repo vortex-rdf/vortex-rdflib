@@ -480,7 +480,9 @@ class VortexRdflibStore(Store):
                 (fixed if fixed is not None else self._context_tuple(opened, g_raw)),
             )
 
-    def _code_matches(self, native: VortexRdfStore, pattern: tuple) -> Iterable[tuple] | None:
+    def _code_matches(
+        self, native: boundary.NativeHandle, pattern: tuple
+    ) -> Iterable[tuple] | None:
         """The code columns :meth:`triples` reads for the quad pattern
         ``pattern``, as matches to read in turn: ``match_codes``'s one match of
         a pattern of at most ``SETTINGS.triples_chunk_rows`` rows, or, for a pattern of

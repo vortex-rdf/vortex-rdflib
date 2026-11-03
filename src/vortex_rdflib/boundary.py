@@ -26,8 +26,9 @@ No caller passes ``cancel=`` itself.
 """
 
 import time
+from typing import Any, Protocol
 
-from vortex_rdf import CancelToken, VortexRdfStore
+from vortex_rdf import CancelToken
 
 from . import counters, trace
 from .cancel import CANCEL_TOKEN, check_cancelled
@@ -35,7 +36,31 @@ from .pushdown.tracing import _keep_summary, _probe_pattern
 from .settings import SETTINGS
 
 
-def native(store) -> VortexRdfStore:
+class NativeHandle(Protocol):
+    """What a native call reaches through :func:`native`: the store's own
+    handle (a ``vortex_rdf.VortexRdfStore``), or the proxy that observes the
+    call (:class:`_Native`) — the native methods the package calls."""
+
+    def count_quads(self, *pattern: Any, **options: Any) -> int: ...
+
+    def count_quads_many(self, *probes: Any, **options: Any) -> Any: ...
+
+    def match_codes(self, *pattern: Any, **options: Any) -> Any: ...
+
+    def match_codes_many(self, *probes: Any, **options: Any) -> Any: ...
+
+    def match_code_chunks(self, *pattern: Any, **options: Any) -> Any: ...
+
+    def match_columns(self, *pattern: Any, **options: Any) -> Any: ...
+
+    def get_quads(self, *pattern: Any, **options: Any) -> Any: ...
+
+    def term_dict(self, *args: Any, **options: Any) -> Any: ...
+
+    def __len__(self) -> int: ...
+
+
+def native(store) -> NativeHandle:
     """The store's native handle (opening the store if it is not yet), as
     every native call should reach it: the handle itself while nothing
     observes the call, else a proxy for this call."""
@@ -46,7 +71,7 @@ def native(store) -> VortexRdfStore:
         return handle
     # The open file's record, for the cancel policy: the file the handle is.
     opened = store._opened()
-    return _Native(opened, handle, token, traced, SETTINGS.counters)  # ty: ignore[invalid-return-type]
+    return _Native(opened, handle, token, traced, SETTINGS.counters)
 
 
 def term_dict(store):
@@ -198,6 +223,12 @@ class _Native:
         if self._counted:
             counters.add(native_calls=1)
         return self._inner.get_quads(*pattern, **options)
+
+    def term_dict(self):
+        """The store's term dictionary, counted as any passed-through call."""
+        if self._counted:
+            counters.add(native_calls=1)
+        return self._inner.term_dict()
 
     def __len__(self):  # special methods bypass __getattr__
         return len(self._inner)
