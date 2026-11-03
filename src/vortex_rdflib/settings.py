@@ -12,18 +12,20 @@ A switch is read by one parser per kind of value: :func:`flag` for on and off
 :func:`positive_int` for a size. Nothing is read on import, so a bad value
 fails where it is read, naming the variable:
 
-- each time a store is constructed, and each time the pushdown is
-  registered: the switches :func:`apply_switches` reads, each of which moves
-  a setting away from its default and never back; ``VORTEX_RDF_DISABLE_PUSHDOWN``
-  (:func:`pushdown_disabled`) on registration; ``VORTEX_RDF_IN_MEMORY``
-  (:func:`in_memory_by_default`) and ``VORTEX_RDF_DISABLE_CODE_PATH``
-  (:func:`code_path_enabled`) on construction;
+- each time the pushdown is registered, which constructing a store does
+  once: the switches :func:`apply_switches` reads, each of which moves a
+  setting away from its default and never back, and
+  ``VORTEX_RDF_DISABLE_PUSHDOWN`` (:func:`pushdown_disabled`);
+  ``VORTEX_RDF_IN_MEMORY`` (:func:`in_memory_by_default`) and
+  ``VORTEX_RDF_DISABLE_CODE_PATH`` (:func:`code_path_enabled`) on
+  construction;
 - per call: ``VORTEX_RDF_TRACE_QUERY`` and ``VORTEX_RDF_TRACE_QUERY_ID``
   (:func:`trace_enabled`, :func:`trace_query_id`), for each algebra node the
   hook answers outside a traced query.
 """
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 #: The algebra nodes the pushdown hook answers, by rdflib's name for them:
@@ -54,12 +56,41 @@ _ON = frozenset({"1", "true", "yes", "on"})
 _OFF = frozenset({"0", "false", "no", "off"})
 
 
+def _environment_reader() -> Callable[[str], str | None]:
+    """``os.environ.get``, through the mapping's own dictionary where it keeps
+    one (CPython's and PyPy's ``os.environ`` do): constructing a store reads
+    every switch, and ``os.environ.get`` of a name that is not set raises
+    and catches a ``KeyError`` (about 550 ns, against a 40 ns probe). The
+    dictionary is the one ``os.environ`` updates when a variable is set or
+    removed through it, so a read sees the environment as it is then."""
+    environ = os.environ
+    data = getattr(environ, "_data", None)
+    encodekey = getattr(environ, "encodekey", None)
+    decodevalue = getattr(environ, "decodevalue", None)
+    if not isinstance(data, dict) or encodekey is None or decodevalue is None:
+        return environ.get
+    keys: dict[str, object] = {}
+
+    def read(name: str) -> str | None:
+        key = keys.get(name)
+        if key is None:
+            key = keys[name] = encodekey(name)
+        raw = data.get(key)
+        return None if raw is None else decodevalue(raw)
+
+    return read
+
+
+#: A variable of the environment as it is when read, ``None`` when unset.
+getenv = _environment_reader()
+
+
 def flag(name: str, default: bool) -> bool:
     """The environment variable ``name`` as on or off: ``1``, ``true``,
     ``yes`` or ``on`` is on, ``0``, ``false``, ``no`` or ``off`` off, in any
     case and with surrounding blanks; unset or empty is ``default``; anything
     else raises ``ValueError``, naming the variable."""
-    value = os.environ.get(name, "").strip().lower()
+    value = (getenv(name) or "").strip().lower()
     if not value:
         return default
     if value in _ON:
@@ -73,7 +104,7 @@ def _int_at_least(name: str, minimum: int) -> int | None:
     """The environment variable ``name`` as an integer of at least
     ``minimum``, or ``None`` when unset or empty; anything else raises
     ``ValueError``, naming the variable."""
-    value = os.environ.get(name, "").strip()
+    value = (getenv(name) or "").strip()
     if not value:
         return None
     try:
@@ -224,7 +255,7 @@ def apply_switches(target: Settings | None = None) -> None:
     is read before any setting changes, so a value refused leaves them all as
     they were."""
     target = SETTINGS if target is None else target
-    spec = os.environ.get(PUSHDOWN_OPS_ENV)
+    spec = getenv(PUSHDOWN_OPS_ENV)
     ops = None if spec is None else parse_ops(spec)
     fast = flag("VORTEX_RDF_FILTER_FAST", True)
     native = flag("VORTEX_RDF_NATIVE_FILTERS", True)
@@ -281,4 +312,4 @@ def trace_enabled() -> bool:
 
 def trace_query_id() -> str | None:
     """``VORTEX_RDF_TRACE_QUERY_ID``: the ``query_id`` a trace's events carry."""
-    return os.environ.get("VORTEX_RDF_TRACE_QUERY_ID")
+    return getenv("VORTEX_RDF_TRACE_QUERY_ID")

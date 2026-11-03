@@ -65,9 +65,11 @@ class VortexRdflibStore(Store):
         if path is None:
             path = configuration
         self.path = str(Path(path)) if path is not None else None
-        # Every switch is read here, once per store (settings.apply_switches),
-        # the pushdown's too when it is off.
-        settings.apply_switches()
+        # Every switch is read here, once per store, the pushdown's too when
+        # it is off (settings.apply_switches); and the whole-BGP pushdown into
+        # code space is installed (a no-op for non-Vortex graphs;
+        # VORTEX_RDF_DISABLE_PUSHDOWN=1 keeps rdflib's default evaluator).
+        register_sparql_pushdown()
         if in_memory is None:
             in_memory = settings.in_memory_by_default()
         self.in_memory = in_memory
@@ -79,10 +81,6 @@ class VortexRdflibStore(Store):
         self._native: VortexRdfStore | None = None
         self._dict = None
         self._file: OpenFile | None = None
-
-        # Whole-BGP pushdown into code space (no-op for non-Vortex graphs;
-        # VORTEX_RDF_DISABLE_PUSHDOWN=1 keeps rdflib's default evaluator).
-        register_sparql_pushdown()
 
         super().__init__(configuration=None, identifier=identifier)
         if self.path is not None:

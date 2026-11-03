@@ -43,12 +43,14 @@ assert _HANDLERS.keys() == settings.ALL_OPS
 
 
 def register_sparql_pushdown():
-    """Install the hook into rdflib's CUSTOM_EVALS (idempotent), narrowed by
-    the environment's switches (:func:`.settings.apply_switches`)."""
-    if settings.pushdown_disabled():
-        return
+    """Read the environment's switches into ``SETTINGS``
+    (:func:`.settings.apply_switches`), then install the hook into rdflib's
+    CUSTOM_EVALS (idempotent) unless ``VORTEX_RDF_DISABLE_PUSHDOWN`` is set.
+    Constructing a store calls this: the one read of the switches a store
+    makes."""
     settings.apply_switches()
-    CUSTOM_EVALS.setdefault(_EVAL_KEY, _eval_part)
+    if not settings.pushdown_disabled():
+        CUSTOM_EVALS.setdefault(_EVAL_KEY, _eval_part)
 
 
 def unregister_sparql_pushdown():

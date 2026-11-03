@@ -147,3 +147,41 @@ def test_switches_are_read_when_a_store_is_built(tmp_path, monkeypatch):
     monkeypatch.setenv("VORTEX_RDF_TRACE_TRIPLES", "1")
     VortexRdflibStore(str(tmp_path / "one.vortex"))
     assert SETTINGS.trace_triples
+
+
+def test_a_store_reads_the_switches_once(tmp_path, monkeypatch):
+    """Constructing a store reads every switch once, its registration of the
+    pushdown included: a store opens in tens of microseconds, and each
+    switch read is part of that."""
+    from vortex_rdf import serialize_rdf
+
+    from vortex_rdflib import VortexRdflibStore
+
+    source = tmp_path / "one.nt"
+    source.write_text("<http://ex.org/s> <http://ex.org/p> <http://ex.org/o> .\n", encoding="utf-8")
+    serialize_rdf(str(source), str(tmp_path / "one.vortex"), layout="dictionary")
+    reads: list[str] = []
+    apply = settings.apply_switches
+    monkeypatch.setattr(settings, "apply_switches", lambda *a: reads.append("all") or apply(*a))
+    for disabled in ("0", "1"):
+        monkeypatch.setenv("VORTEX_RDF_DISABLE_PUSHDOWN", disabled)
+        reads.clear()
+        VortexRdflibStore(str(tmp_path / "one.vortex"))
+        assert reads == ["all"], disabled
+
+
+def test_switches_see_the_environment_as_it_changes(monkeypatch):
+    """A switch is read from the environment as it is when read: set, changed
+    and removed through ``os.environ`` alike."""
+    monkeypatch.delenv("VORTEX_RDF_X", raising=False)
+    assert settings.flag("VORTEX_RDF_X", False) is False
+    os.environ["VORTEX_RDF_X"] = "on"
+    try:
+        assert settings.flag("VORTEX_RDF_X", False) is True
+        os.environ["VORTEX_RDF_X"] = "off"
+        assert settings.flag("VORTEX_RDF_X", True) is False
+    finally:
+        del os.environ["VORTEX_RDF_X"]
+    assert settings.flag("VORTEX_RDF_X", True) is True
+    monkeypatch.setenv("VORTEX_RDF_PROBE_BATCH", "7")
+    assert settings.positive_int("VORTEX_RDF_PROBE_BATCH") == 7
