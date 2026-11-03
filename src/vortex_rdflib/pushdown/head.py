@@ -73,7 +73,7 @@ def _eval_head(ctx, store, part):
     # The relation then goes straight to the emitter (``stream``).
     stream = not head.order and not head.distinct
     limit = head.stop if stream else None
-    rel = blocks._solve_block(ctx, store, head.block, limit=limit, stream=stream)
+    rel = blocks._solve_block(ctx, store, head.block, blocks._Frame(limit=limit, stream=stream))
     _trace_block_solved(store, rel, started())
     if head.order:
         # DISTINCT narrows the rows after the sort, so only a plain LIMIT

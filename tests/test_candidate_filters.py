@@ -239,6 +239,30 @@ def test_band_around_an_anchor_is_evaluated_over_the_price_codes(
     assert with_pushdown == without_pushdown
 
 
+#: BAND with a group joined in beside its pattern pair: the band is
+#: specialized inside the left side of the join.
+BAND_JOINED = f"""SELECT ?s ?v ?t WHERE {{
+    {{ <http://ex.org/p0> {PRICE} ?ref . ?s {PRICE} ?v }}
+    {{ ?s <http://ex.org/type> ?t }}
+    FILTER(?v < ?ref + 100 && ?v > ?ref - 100) }}"""
+
+
+def test_a_band_applied_in_one_side_of_a_join_is_not_evaluated_again(tmp_path, monkeypatch):
+    """The band specialized inside the left side of a group join holds for
+    every row the join makes: the join reports it applied, so the FILTER
+    above the join builds no predicate for it."""
+    graph = Graph(store=VortexRdflibStore(products_file(tmp_path), in_memory=True))
+    built = []
+    original = filters.tuple_predicate
+    monkeypatch.setattr(
+        filters, "tuple_predicate", lambda *a, **k: built.append(a[1]) or original(*a, **k)
+    )
+    with_pushdown, without_pushdown = both_ways(graph, BAND_JOINED)
+    assert with_pushdown == without_pushdown
+    assert len(with_pushdown) == sum((i * 37) % 1000 < 100 for i in range(200))
+    assert built == []
+
+
 def test_iri_equality_between_two_variables_is_evaluated_over_the_codes_it_reaches(
     tmp_path, monkeypatch, capsys
 ):

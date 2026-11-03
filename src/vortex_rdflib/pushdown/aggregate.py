@@ -58,7 +58,7 @@ def _eval_aggregate(ctx, store, part):
             n = Literal(matching._exact_count(store, pat))
             return iter([FrozenBindings(ctx, {spec.res: n for spec in specs})])
 
-    rel = blocks._solve_block(ctx, store, block, scope=scope)
+    rel = blocks._solve_block(ctx, store, block, blocks._Frame(scope))
     return _aggregate_rows(ctx, store, rel, group_vars or [], counts, samples, group.expr is None)
 
 

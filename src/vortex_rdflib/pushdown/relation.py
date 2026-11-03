@@ -48,6 +48,11 @@ class Relation:
     the body is then the rows to finish, not the block's solutions, and the
     schema lacks the variables only those patterns bind. Such a relation
     goes to :func:`_yield_solutions` alone.
+
+    ``applied`` holds the ids of the FILTER conjuncts every row passes: the
+    tuple conjuncts a BGP turned into restrictions of its patterns
+    (:func:`_specialize_tuple_conjuncts`), reported up through the joins,
+    so the FILTER that pushed them evaluates them no more.
     """
 
     schema: tuple
@@ -58,6 +63,7 @@ class Relation:
     preds: tuple[Callable[[tuple], bool], ...] = ()
     pieces: Iterator[tuple] | None = None
     rest: tuple = ()
+    applied: frozenset = frozenset()
 
     @classmethod
     def from_rows(cls, schema, rows):
@@ -70,8 +76,16 @@ class Relation:
 
     def with_rows(self, rows: list) -> "Relation":
         """The relation over ``rows`` instead of its body: the same schema,
-        nullable variables and ``rest``."""
-        return Relation(self.schema, None, rows, len(rows), self.nullable, rest=self.rest)
+        nullable variables, ``rest`` and applied conjuncts."""
+        return Relation(
+            self.schema,
+            None,
+            rows,
+            len(rows),
+            self.nullable,
+            rest=self.rest,
+            applied=self.applied,
+        )
 
     def row_list(self) -> list[tuple]:
         """A columnar or row body's rows, a columnar one zipped in one pass:

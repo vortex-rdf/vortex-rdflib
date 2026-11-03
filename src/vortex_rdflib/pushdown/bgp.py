@@ -6,14 +6,51 @@ streamed (:mod:`.streaming`) — and their trace events.
 """
 
 import math
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+from types import MappingProxyType
 
 from .. import boundary, filters, trace
 from ..settings import SETTINGS
 from . import algebra, matching, probes, relation, streaming
 from .matching import Pattern
 from .relation import OverBudget, Relation
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _Pushed:
+    """The filter conjuncts a FILTER hands down into its block.
+
+    ``per_var`` maps each variable to its single-variable conjuncts, for the
+    scans and VALUES tables that bind it. ``tuples`` are the fast conjuncts
+    over several variables, which a BGP that binds all of theirs may prune
+    with mid-join (a pre-filter: the FILTER still applies them) or turn into
+    restrictions of one pattern (:func:`_specialize_tuple_conjuncts`): those
+    every row the BGP yields passes, and its relation reports them
+    (``Relation.applied``). ``views`` are the terms parsed for the tuple
+    conjuncts, shared with the FILTER so none is decoded twice — the
+    FILTER's own, held no longer than it runs.
+
+    They travel wherever the block solvers pass them — a group join's
+    sides, an OPTIONAL's or a MINUS's left side, a GRAPH block — and never
+    an OPTIONAL's or a MINUS's right side, where dropping a row would change
+    the answer: that side gets :data:`NOTHING`.
+    """
+
+    per_var: Mapping = MappingProxyType({})
+    tuples: tuple = ()
+    views: dict | None = None
+
+    def without(self, applied: frozenset) -> "_Pushed":
+        """These conjuncts but the tuple conjuncts ``applied`` names (by
+        id): another block of the group has applied them already."""
+        if not applied or not self.tuples:
+            return self
+        return replace(self, tuples=tuple(c for c in self.tuples if id(c) not in applied))
+
+
+#: No conjunct pushed.
+NOTHING = _Pushed()
 
 
 @dataclass(slots=True)
@@ -33,7 +70,7 @@ class _BgpStats:
 
 
 def _solve_bgp(
-    ctx, store, triples, scope, var_preds=None, limit=None, finishable=False
+    ctx, store, triples, scope, pushed: _Pushed = NOTHING, limit=None, finishable=False
 ) -> Relation:
     """Evaluate a BGP by matching one seed and probing connected patterns.
 
@@ -58,9 +95,9 @@ def _solve_bgp(
         # One empty solution, and nothing ran.
         rel, stats, elapsed = Relation.from_rows((), [()]), _BgpStats(), lambda: 0
     elif len(triples) == 1:
-        rel, stats = _solve_pattern(ctx, store, triples[0], scope, var_preds, limit)
+        rel, stats = _solve_pattern(ctx, store, triples[0], scope, pushed.per_var, limit)
     else:
-        rel, stats = _solve_patterns(ctx, store, triples, scope, var_preds, finishable)
+        rel, stats = _solve_patterns(ctx, store, triples, scope, pushed, finishable)
     _trace_bgp_complete(len(triples), rel, stats, elapsed())
     return rel
 
@@ -87,13 +124,14 @@ def _solve_pattern(ctx, store, triple, scope, var_preds, limit) -> tuple[Relatio
 
 
 def _solve_patterns(
-    ctx, store, triples, scope, var_preds, finishable
+    ctx, store, triples, scope, pushed: _Pushed, finishable
 ) -> tuple[Relation, _BgpStats]:
     """A BGP of several patterns, joined by the incremental planner
     (:func:`_join_incremental_bgp`). Each pattern takes the conjuncts that
     are native keeps into its match; the other conjuncts of its variables
     are deferred to the codes it brings."""
     patterns = []
+    var_preds = pushed.per_var
     for index, triple in enumerate(triples):
         shape = _trace_pattern_start(ctx, index, triple)
         pat = matching._pattern_terms(ctx, store, *triple, scope=scope, index=index)
@@ -108,7 +146,7 @@ def _solve_patterns(
     stats = _BgpStats()
     clock = trace.stopwatch()
     finishable = finishable and scope == algebra._active_scope(ctx, store)
-    rel = _join_incremental_bgp(store, patterns, stats, var_preds, finishable, triples)
+    rel = _join_incremental_bgp(store, patterns, stats, pushed, finishable, triples)
     stats.join_ns = max(0, clock() - stats.native_ns - stats.restriction_ns)
     return rel, stats
 
@@ -248,7 +286,7 @@ def _count_patterns(store, patterns, counts: dict) -> int:
 
 
 def _join_incremental_bgp(
-    store, patterns, stats: _BgpStats, pushed=None, finishable=False, triples=()
+    store, patterns, stats: _BgpStats, pushed: _Pushed = NOTHING, finishable=False, triples=()
 ) -> Relation:
     """Seed with the smallest pattern, then extend one connected pattern at
     a time.
@@ -309,8 +347,10 @@ def _join_incremental_bgp(
     """
     counts: dict[tuple, int] = {}
     memo: dict[tuple, tuple] = {}
-    tuples = pushed.tuples if pushed is not None else ()
-    views = pushed.views if pushed is not None else {}
+    tuples, views = pushed.tuples, pushed.views
+    # The ids of the tuple conjuncts a completed step specialized: every row
+    # the BGP yields passes them (``Relation.applied``).
+    applied: set[int] = set()
 
     clock = trace.stopwatch()
     if any(pat.unsatisfiable for pat in patterns):
@@ -403,11 +443,7 @@ def _join_incremental_bgp(
         # step over the budget leaves the pattern as it was planned — unread,
         # its keep and deferred restrictions its own — for a later step.
         work = pat.copy()
-        specialized = ()
-        if tuples and pushed is not None:
-            # Another block of the group may have applied some since.
-            tuples = tuple(c for c in tuples if id(c) not in pushed.applied)
-            specialized = _specialize_tuple_conjuncts(store, work, rel, tuples, pushed)
+        specialized = _specialize_tuple_conjuncts(store, work, rel, tuples) if tuples else ()
         step = _JoinStep(execution_index, work, running, pat.estimate, count_limit, len(shared))
         joined = None
         for tier in _tiers(store, rel, work, shared, last=not remaining):
@@ -424,9 +460,8 @@ def _join_incremental_bgp(
         rel = joined
         # The step completed: the tuple conjuncts it specialized are applied.
         if specialized:
-            assert pushed is not None
-            pushed.applied.update(id(conjunct) for conjunct, _, _ in specialized)
-            tuples = tuple(c for c in tuples if id(c) not in pushed.applied)
+            applied.update(id(conjunct) for conjunct, _, _ in specialized)
+            tuples = tuple(c for c in tuples if id(c) not in applied)
         _trace_join_step(step, rel, put_back, elapsed())
         put_back.clear()
         order.append(pat.index)
@@ -439,7 +474,7 @@ def _join_incremental_bgp(
         # No pattern left fits. rdflib's evalBGP finishes them per row as the
         # block would only where the rows go straight to the emitter and no
         # FILTER conjunct was pushed into the patterns: it would not apply it.
-        if not finishable or (pushed is not None and (pushed or pushed.tuples)):
+        if not finishable or pushed.per_var or pushed.tuples:
             raise NotImplementedError
         rel.rest = tuple(triples[pat.index] for pat in remaining)
     elif remaining:
@@ -451,10 +486,12 @@ def _join_incremental_bgp(
         rel = Relation.from_rows(schema, [])
     rest = [pat.index for pat in remaining] if put_back else []
     _trace_plan_complete(len(patterns), order + [pat.index for pat in remaining], seed, stats, rest)
+    if applied:
+        rel.applied = frozenset(applied)
     return rel
 
 
-def _specialize_tuple_conjuncts(store, pat: Pattern, rel: Relation, tuples, pushed) -> list:
+def _specialize_tuple_conjuncts(store, pat: Pattern, rel: Relation, tuples) -> list:
     """Turn the tuple conjuncts the relation all but decides into
     per-variable conjuncts of ``pat``.
 
@@ -478,8 +515,6 @@ def _specialize_tuple_conjuncts(store, pat: Pattern, rel: Relation, tuples, push
     specialized: list = []
     single: dict = {}
     for conjunct in tuples:
-        if id(conjunct) in pushed.applied:
-            continue
         free = [v for v in conjunct.vars if v not in rel.schema]
         if len(free) != 1 or free[0] not in pat.varpos:
             continue

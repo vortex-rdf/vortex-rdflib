@@ -5,6 +5,7 @@ handlers.
 """
 
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 
 from rdflib.plugins.sparql.evaluate import evalPart
 
@@ -19,7 +20,8 @@ from .relation import Relation
 
 def _eval_block_node(ctx, store, part):
     algebra._check_block(part)
-    return solutions._yield_solutions(ctx, store, _solve_block(ctx, store, part, stream=True))
+    rel = _solve_block(ctx, store, part, _Frame(stream=True))
+    return solutions._yield_solutions(ctx, store, rel)
 
 
 def _eval_filter(ctx, store, part):
@@ -56,7 +58,7 @@ def _block_nonempty(ctx, store, block) -> bool:
             narrowing = matching._narrowing(pat.nkeep, limit=1)
             check_cancelled()
             return boundary.native(store).count_quads(*pat.n3, **narrowing) > 0
-    rel = _solve_block(ctx, store, block, scope=scope, limit=1)
+    rel = _solve_block(ctx, store, block, _Frame(scope, limit=1))
     # One row is pulled, and the rows are closed after it: a streamed join
     # gathers one piece and releases its feed.
     rows = relation._code_rows(rel)
@@ -90,54 +92,61 @@ def _single_pattern(ctx, store, block, scope) -> Pattern | None:
     return pat
 
 
-class _Pushed(dict):
-    """The filter conjuncts a FILTER hands down into its block. As a dict,
-    each variable's single-variable conjuncts, for the scans and VALUES
-    tables that bind it;
-    ``tuples``, the fast conjuncts over several variables, which a BGP that
-    binds all of theirs may prune with mid-join (a pre-filter: the FILTER
-    still applies them); ``views``, the terms parsed for those, shared with
-    the FILTER so none is decoded twice; ``applied``, the ids of the tuple
-    conjuncts a BGP turned into restrictions of one of its patterns (see
-    :func:`_specialize_tuple_conjuncts`), which every row the block yields
-    therefore passes. They travel together wherever the block solvers pass
-    them — a group join's sides, an OPTIONAL's or a MINUS's left side, a
-    GRAPH block — and never an OPTIONAL's or a MINUS's right side, where
-    dropping a row would change the answer. Empty, it is falsy like
-    ``None``."""
+@dataclass(frozen=True, slots=True)
+class _Frame:
+    """What a block is solved under (:func:`_solve_block`).
 
-    __slots__ = ("tuples", "views", "applied")
-
-    def __init__(self, per_var=(), tuples=(), views=None, applied=None):
-        super().__init__(per_var)
-        self.tuples = tuple(tuples)
-        self.views = {} if views is None else views
-        self.applied = set() if applied is None else applied
-
-
-def _solve_block(
-    ctx, store, node, env=frozenset(), var_preds=None, scope=None, limit=None, stream=False
-) -> Relation:
-    """Solve a block into a relation.
-
-    ``env`` is the set of variables an enclosing lazy join or OPTIONAL binds
-    row by row in rdflib's evaluation — here the sides are solved
-    independently and joined, which is only exact while nothing inside
-    depends on those values (a FILTER that could see them falls back).
-    ``var_preds`` (a :class:`_Pushed`) are the filter conjuncts a FILTER
-    above pushed down: single-variable ones to the pattern scans and VALUES
-    tables binding the variable, tuple ones to the BGPs binding all of
-    theirs. ``scope`` is the graph every pattern below is matched in
-    (:class:`_GraphScope`); ``None`` means the graph the context has made
-    active. ``limit`` says only that many rows will be read: a block that is
-    one native match fetches no more (see :func:`_solve_bgp`); any other
-    ignores it. ``stream`` says the relation goes straight to
-    :func:`_yield_solutions`: it reaches a BGP through FILTER and GRAPH nodes
-    only, where rdflib may finish the patterns a join over the pair budget
-    leaves (:func:`_join_incremental_bgp`).
+    ``scope`` is the graph every pattern below is matched in
+    (:class:`algebra._GraphScope`); ``None`` means the graph the context has
+    made active. ``env`` is the set of variables an enclosing lazy join or
+    OPTIONAL binds row by row in rdflib's evaluation — here the sides are
+    solved independently and joined, which is only exact while nothing
+    inside depends on those values (a FILTER that could see them falls
+    back). ``pushed`` are the filter conjuncts a FILTER above handed down
+    (:class:`bgp._Pushed`). ``limit`` says only that many rows will be read:
+    a block that is one native match fetches no more (see
+    :func:`bgp._solve_bgp`); any other ignores it. ``stream`` says the
+    relation goes straight to :func:`solutions._yield_solutions`: it reaches
+    a BGP through FILTER and GRAPH nodes only, where rdflib may finish the
+    patterns a join over the pair budget leaves
+    (:func:`bgp._join_incremental_bgp`).
     """
-    if scope is None:
-        scope = algebra._active_scope(ctx, store)
+
+    scope: algebra._GraphScope | None = None
+    env: frozenset = frozenset()
+    pushed: bgp._Pushed = bgp.NOTHING
+    limit: int | None = None
+    stream: bool = False
+
+    def inner(self, **changes) -> "_Frame":
+        """The frame of the block a FILTER or a GRAPH holds: this one with
+        ``changes`` — the FILTER's pushed conjuncts and the limit and
+        streaming it lets through, the GRAPH's scope."""
+        return replace(self, **changes)
+
+    def side(self, env=None, pushed=None) -> "_Frame":
+        """The frame of a group join's side, or of an OPTIONAL's or a
+        MINUS's left side: the same scope, ``env`` and pushed conjuncts but
+        where given, every row read."""
+        return _Frame(
+            self.scope,
+            self.env if env is None else env,
+            self.pushed if pushed is None else pushed,
+        )
+
+    def right(self, bound=frozenset()) -> "_Frame":
+        """The frame of an OPTIONAL's or a MINUS's right side: nothing
+        pushed — dropping one of its rows would change the answer — every
+        row read, and ``bound``, the variables rdflib binds row by row from
+        the left side, added to ``env``."""
+        return _Frame(self.scope, self.env | bound)
+
+
+def _solve_block(ctx, store, node, frame: _Frame | None = None) -> Relation:
+    """Solve a block into a relation, under ``frame`` (:class:`_Frame`; by
+    default the active graph, nothing pushed, every row read)."""
+    if frame is None or frame.scope is None:
+        frame = replace(frame or _Frame(), scope=algebra._active_scope(ctx, store))
     name = node.name
     active = trace.active()
     started = trace.stopwatch()
@@ -145,22 +154,24 @@ def _solve_block(
         active.depth += 1
     try:
         if name == "BGP":
-            rel = bgp._solve_bgp(ctx, store, node.triples, scope, var_preds, limit, stream)
+            rel = bgp._solve_bgp(
+                ctx, store, node.triples, frame.scope, frame.pushed, frame.limit, frame.stream
+            )
         elif name == "Filter":
-            rel = _solve_filter(ctx, store, node, env, var_preds, scope, limit, stream)
+            rel = _solve_filter(ctx, store, node, frame)
         elif name == "Join":
-            rel = _solve_join(ctx, store, node, env, var_preds, scope)
+            rel = _solve_join(ctx, store, node, frame)
         elif name == "LeftJoin":
-            rel = _solve_left_join(ctx, store, node, env, var_preds, scope)
+            rel = _solve_left_join(ctx, store, node, frame)
         elif name == "Minus":
-            rel = _solve_minus(ctx, store, node, env, var_preds, scope)
+            rel = _solve_minus(ctx, store, node, frame)
         elif name == "ToMultiSet":
-            rel = _solve_values(ctx, store, node, var_preds)
+            rel = _solve_values(ctx, store, node, frame.pushed)
         elif name == "Graph":
             inner = algebra._graph_scope(ctx, node)
             if inner.var is not None and not algebra._carries_graph(node.p, inner.var):
                 raise NotImplementedError
-            rel = _solve_block(ctx, store, node.p, env, var_preds, inner, limit, stream)
+            rel = _solve_block(ctx, store, node.p, frame.inner(scope=inner))
         else:
             raise NotImplementedError
     finally:
@@ -186,13 +197,13 @@ def _trace_block(node, rel: Relation, depth: int, elapsed_ns: int) -> None:
     )
 
 
-def _solve_values(ctx, store, node, var_preds=None) -> Relation:
+def _solve_values(ctx, store, node, pushed: bgp._Pushed = bgp.NOTHING) -> Relation:
     """An inline VALUES table as a relation: its constants looked up in one
     batch (:func:`_constant_codes`; a term the dictionary does not hold gets
     a negative code, so it joins nothing but is still yielded verbatim),
     UNDEF unbound. A row that contradicts a context binding is dropped, as
     rdflib's ``evalValues`` skips it on AlreadyBound, and so is a row whose
-    term fails a conjunct a FILTER above pushed down (``var_preds``; the
+    term fails a conjunct a FILTER above pushed down (``pushed``; the
     variables they name are bound in every row), tested on the table's own
     terms (:func:`filters.constant_predicate`)."""
     variables = algebra._node_vars(node)
@@ -207,8 +218,10 @@ def _solve_values(ctx, store, node, var_preds=None) -> Relation:
         dict.fromkeys(row[v] for row in rows_in for v in schema if row.get(v, "UNDEF") != "UNDEF")
     )
     codes = dict(zip(terms, _constant_codes(store, terms), strict=True))
-    if var_preds:
-        tests = [(v, filters.constant_predicate(c)) for v in schema for c in var_preds.get(v, ())]
+    if pushed.per_var:
+        tests = [
+            (v, filters.constant_predicate(c)) for v in schema for c in pushed.per_var.get(v, ())
+        ]
         rows_in = [row for row in rows_in if all(test(row[v]) for v, test in tests)]
     rows = [
         tuple(None if row.get(v, "UNDEF") == "UNDEF" else codes[row[v]] for v in schema)
@@ -255,13 +268,14 @@ def _constant_codes(store, terms: list) -> list:
     return codes
 
 
-def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None, stream=False) -> Relation:
+def _solve_filter(ctx, store, node, frame: _Frame) -> Relation:
     """A ``Filter`` over a block: constant conjuncts decide the whole block
     before anything is matched, single-variable conjuncts over variables the
     block always binds restrict the pattern scans and VALUES tables that bind
-    them, the rest filters the solved rows. A ``limit`` reaches the block
-    only when nothing is left to filter above it, and ``stream`` when the
-    filter holds no EXISTS. Where rdflib still finishes the block's rows
+    them, the rest filters the solved rows but those the block reports
+    applied (``Relation.applied``). A ``limit`` reaches the block only when
+    nothing is left to filter above it, and ``stream`` when the filter holds
+    no EXISTS. Where rdflib still finishes the block's rows
     (``rest``), a conjunct over the variables those rows bind tests them
     before it does; one over a variable only the rest binds cannot, and the
     FILTER goes back to rdflib.
@@ -269,7 +283,8 @@ def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None, stream=Fa
     The expression's block variables are those its group binds
     (:func:`_group_vars`; see :func:`filters.analyze_filter` for the rest of
     its scope)."""
-    inner = node.p
+    inner, scope, env = node.p, frame.scope, frame.env
+    assert scope is not None, "a block's frame has its scope (_solve_block)"
     # The columns of the empty relation a false constant conjunct returns.
     block_vars = algebra._block_vars(ctx, inner, scope)
     plan = filters.analyze_filter(node, algebra._group_vars(ctx, inner), ctx)
@@ -290,26 +305,34 @@ def _solve_filter(ctx, store, node, env, var_preds, scope, limit=None, stream=Fa
         if not filters.evaluate_constant(conjunct):
             return Relation.from_rows(tuple(block_vars), [])
     nullable = algebra._block_nullable(inner)
-    outer = var_preds if var_preds is not None else _Pushed()
-    fast_tuples = tuple(conjunct for conjunct in plan.tuples if conjunct.fast is not None)
-    pushed = _Pushed(outer, outer.tuples + fast_tuples, outer.views, outer.applied)
+    outer = frame.pushed
+    per_var = dict(outer.per_var)
     residual = list(plan.tuples)
     for var, conjuncts in plan.per_var.items():
         if var in nullable:
             residual.extend(conjuncts)
         else:
-            pushed[var] = pushed.get(var, []) + conjuncts
-    limit = None if residual or plan.exists else limit
-    stream = stream and not plan.exists
-    rel = _solve_block(ctx, store, inner, env, pushed, scope, limit, stream)
-    residual = [conjunct for conjunct in residual if id(conjunct) not in pushed.applied]
+            per_var[var] = [*per_var.get(var, ()), *conjuncts]
+    fast_tuples = tuple(conjunct for conjunct in plan.tuples if conjunct.fast is not None)
+    views = {} if outer.views is None else outer.views
+    pushed = bgp._Pushed(MappingProxyType(per_var), outer.tuples + fast_tuples, views)
+    rel = _solve_block(
+        ctx,
+        store,
+        inner,
+        frame.inner(
+            pushed=pushed,
+            limit=None if residual or plan.exists else frame.limit,
+            stream=frame.stream and not plan.exists,
+        ),
+    )
+    residual = [conjunct for conjunct in residual if id(conjunct) not in rel.applied]
     if residual:
         if rel.rest and any(v not in rel.schema for c in residual for v in c.vars):
             raise NotImplementedError
         positions = [
             [rel.schema.index(variable) for variable in conjunct.vars] for conjunct in residual
         ]
-        views = pushed.views
         if rel.rows is not None:
             # Only the fast route reads parsed terms; a generic-only conjunct
             # decodes through the query's term cache.
@@ -376,10 +399,8 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
     env = frozenset(rel.schema)
     try:
         if not shared:
-            found = (
-                next(relation._code_rows(_solve_block(ctx, store, body, env, None, scope, 1)), None)
-                is not None
-            )
+            body_rel = _solve_block(ctx, store, body, _Frame(scope, env, limit=1))
+            found = next(relation._code_rows(body_rel), None) is not None
             if found != negate:
                 return rel
             return rel.with_rows([])
@@ -392,7 +413,7 @@ def _apply_exists(ctx, store, rel: Relation, exists, scope) -> Relation:
                 return rel.with_rows(kept)
             inner = _matched_side(store, side, rel.schema, rows)
         else:
-            inner = _solve_block(ctx, store, body, env, None, scope)
+            inner = _solve_block(ctx, store, body, _Frame(scope, env))
     except NotImplementedError:
         return generic()
     if any(v not in inner.schema or v in inner.nullable for v in shared):
@@ -452,13 +473,14 @@ def _reject_forgotten_exists(ctx, conjuncts, kept) -> None:
             raise NotImplementedError
 
 
-def _solve_join(ctx, store, node, env, var_preds, scope) -> Relation:
+def _solve_join(ctx, store, node, frame: _Frame) -> Relation:
     """A group join: both sides solved, then a hash join on the shared
     variables — or, for a lazy join whose right side is one pattern, the
     join :func:`_pattern_side` plans. rdflib deduplicates the right side of a
     non-lazy join."""
-    lazy = bool(node.lazy)
-    left = _solve_block(ctx, store, node.p1, env, var_preds, scope)
+    lazy, scope = bool(node.lazy), frame.scope
+    assert scope is not None, "a block's frame has its scope (_solve_block)"
+    left = _solve_block(ctx, store, node.p1, frame.side())
     left_rows = relation._rows_of(left)
     if not left_rows:
         schema = left.schema + tuple(
@@ -467,7 +489,9 @@ def _solve_join(ctx, store, node, env, var_preds, scope) -> Relation:
         return Relation(schema, None, [], 0, left.nullable | algebra._block_nullable(node.p2))
     p2 = node.p2
     if lazy and p2.name == "BGP" and len(p2.triples) == 1:
-        side = _pattern_side(ctx, store, p2.triples[0], scope, left, left_rows, var_preds)
+        side = _pattern_side(
+            ctx, store, p2.triples[0], scope, left, left_rows, frame.pushed.per_var
+        )
         calls = 0
         if side.strategy == "probe":
             schema, rows, calls = _probed(store, side, left, left_rows)
@@ -480,7 +504,7 @@ def _solve_join(ctx, store, node, env, var_preds, scope) -> Relation:
                     native_probe_call_count=calls,
                     output_rows=len(rows),
                 )
-                return Relation(schema, None, rows, len(rows), left.nullable)
+                return Relation(schema, None, rows, len(rows), left.nullable, applied=left.applied)
             side = replace(side, strategy="keep_scan")
         right = _matched_side(store, side, left.schema, left_rows)
         trace.event(
@@ -492,18 +516,21 @@ def _solve_join(ctx, store, node, env, var_preds, scope) -> Relation:
             right_rows=side.pat.nrows,
         )
     else:
-        right_env = env | frozenset(algebra._scoped_vars(node.p1, scope)) if lazy else env
-        right = _solve_block(ctx, store, p2, right_env, var_preds, scope)
+        # What the left side applied, every joined row passes.
+        pushed = frame.pushed.without(left.applied)
+        env = frame.env | frozenset(algebra._scoped_vars(node.p1, scope)) if lazy else None
+        right = _solve_block(ctx, store, p2, frame.side(env, pushed))
     right_rows = relation._rows_of(right)
     if not lazy:
         right_rows = list(dict.fromkeys(right_rows))
     shared = [v for v in right.schema if v in left.schema]
     relation._shared_key_ok(left, right, shared)
     schema, rows = relation._join(left.schema, left_rows, right.schema, right_rows)
-    return Relation(schema, None, rows, len(rows), left.nullable | right.nullable)
+    nullable = left.nullable | right.nullable
+    return Relation(schema, None, rows, len(rows), nullable, applied=left.applied | right.applied)
 
 
-def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
+def _solve_left_join(ctx, store, node, frame: _Frame) -> Relation:
     """An OPTIONAL: every left row, extended by the matching right rows that
     pass the hoisted inner FILTER, or padded with unbound variables. The
     FILTER is analysed before either side is solved
@@ -512,6 +539,8 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
     OPTIONAL back before any native work. A right side of one pattern is
     joined as :func:`_pattern_side` plans."""
     p1, p2, expr = node.p1, node.p2, node.expr
+    scope, env = frame.scope, frame.env
+    assert scope is not None, "a block's frame has its scope (_solve_block)"
     vars1, vars2 = algebra._scoped_vars(p1, scope), algebra._scoped_vars(p2, scope)
     if (
         scope.var is not None
@@ -550,7 +579,7 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
             raise NotImplementedError
     conjuncts = _left_join_condition(ctx, store, node, scope)
 
-    left = _solve_block(ctx, store, p1, env, var_preds, scope)
+    left = _solve_block(ctx, store, p1, frame.side())
     left_rows = relation._rows_of(left)
     extra = tuple(v for v in algebra._block_vars(ctx, p2, scope) if v not in left.schema)
     nullable = left.nullable | algebra._block_nullable(p2) | frozenset(extra)
@@ -569,7 +598,7 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
                 unmatched_left_rows=len(left_rows),
                 output_rows=len(rows),
             )
-        return Relation(left.schema + extra, None, rows, len(rows), nullable)
+        return Relation(left.schema + extra, None, rows, len(rows), nullable, applied=left.applied)
 
     if p2.name == "BGP" and len(p2.triples) == 1:
         # Counted before it is matched: a selective left relation drives the
@@ -590,7 +619,7 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
             if rows is not None:
                 padded = len(schema) > len(left.schema)
                 _trace_probed_left_join(side, left_rows, rows, padded, calls, plan_started())
-                return Relation(schema, None, rows, len(rows), nullable)
+                return Relation(schema, None, rows, len(rows), nullable, applied=left.applied)
             side = replace(side, strategy="keep_scan")
         right = _matched_side(store, side, left.schema, left_rows)
         trace.event(
@@ -604,7 +633,7 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
             elapsed_ns=plan_started(),
         )
     else:
-        right = _solve_block(ctx, store, p2, env | frozenset(vars1), None, scope)
+        right = _solve_block(ctx, store, p2, frame.right(frozenset(vars1)))
     shared = [v for v in right.schema if v in left.schema]
     relation._shared_key_ok(left, right, shared)
     schema = left.schema + tuple(v for v in right.schema if v not in left.schema)
@@ -615,7 +644,7 @@ def _solve_left_join(ctx, store, node, env, var_preds, scope) -> Relation:
         relation._rows_of(right),
         _condition_preds(store, conjuncts, schema),
     )
-    return Relation(schema, None, rows, len(rows), nullable)
+    return Relation(schema, None, rows, len(rows), nullable, applied=left.applied)
 
 
 def _trace_probed_left_join(
@@ -673,7 +702,7 @@ def _condition_preds(store, conjuncts, schema) -> tuple:
     )
 
 
-def _solve_minus(ctx, store, node, env, var_preds, scope) -> Relation:
+def _solve_minus(ctx, store, node, frame: _Frame) -> Relation:
     """MINUS: an anti-join on the shared variables.
 
     rdflib removes a left row only where a compatible right row shares a
@@ -687,6 +716,8 @@ def _solve_minus(ctx, store, node, env, var_preds, scope) -> Relation:
     graph but is a shared binding only where both sides bind ``?g``, and a
     right side's own ``?g`` matches any term. The shapes that turn on the
     enclosing row, or on that ``?g``, are left to rdflib."""
+    scope, env = frame.scope, frame.env
+    assert scope is not None, "a block's frame has its scope (_solve_block)"
     left_vars, right_vars = algebra._group_vars(ctx, node.p1), algebra._group_vars(ctx, node.p2)
     common = any(v in left_vars for v in right_vars)
     context = bool(dict(ctx.bindings.items()))
@@ -694,7 +725,7 @@ def _solve_minus(ctx, store, node, env, var_preds, scope) -> Relation:
         raise NotImplementedError  # whether the enclosing row binds anything decides
     if any(v in env and v not in left_vars for v in right_vars):
         raise NotImplementedError  # the right side reads the enclosing row's value
-    left = _solve_block(ctx, store, node.p1, env, var_preds, scope)
+    left = _solve_block(ctx, store, node.p1, frame.side())
     if not (common or context):
         return left
     left_rows = relation._rows_of(left)
@@ -702,7 +733,7 @@ def _solve_minus(ctx, store, node, env, var_preds, scope) -> Relation:
         return left
     if scope.var in right_vars and scope.var not in left_vars:
         raise NotImplementedError
-    right = _solve_block(ctx, store, node.p2, env, None, scope)
+    right = _solve_block(ctx, store, node.p2, frame.right())
     shared = [v for v in right.schema if v in left.schema]
     if not shared:
         if next(relation._code_rows(right), None) is not None:
