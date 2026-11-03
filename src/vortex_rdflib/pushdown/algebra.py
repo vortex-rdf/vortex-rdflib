@@ -240,12 +240,28 @@ def block(node) -> Block:
         return LeftJoin(node, mentioned, bound, nullable, left, right)
     if name == "ToMultiSet" and getattr(node.p, "name", None) == "values":
         rows = node.p.res
-        found = _merged((), (term for row in rows for term in row))
-        nullable = frozenset(
-            v for v in found if any(row.get(v, "UNDEF") == "UNDEF" for row in rows)
-        )
-        return Values(node, found, found, nullable, rows)
+        found, undef = _values_vars(rows)
+        return Values(node, found, found, frozenset(undef), rows)
     raise NotImplementedError
+
+
+def _values_vars(rows) -> tuple[tuple, set]:
+    """A VALUES table's variables, in first-seen order, and those some row
+    leaves unbound: ``UNDEF`` there — rdflib's plain string, where a bound
+    value is a term — or no entry at all. One pass, read once per table."""
+    found: dict = {}
+    undef: set = set()
+    for row in rows:
+        for var, value in row.items():
+            if var not in found:
+                found[var] = None
+            if value.__class__ is str and value == "UNDEF":
+                undef.add(var)
+    width = len(found)
+    for row in rows:
+        if len(row) < width:
+            undef.update(var for var in found if var not in row)
+    return tuple(found), undef
 
 
 def _scoped_vars(node: Block, scope: _GraphScope) -> tuple:
