@@ -12,6 +12,7 @@ from rdflib.plugins.sparql.sparql import QueryContext
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import register_sparql_pushdown, trace, unregister_sparql_pushdown
+from vortex_rdflib.open_file import Codes
 from vortex_rdflib.terms import KindRanges
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
@@ -57,11 +58,16 @@ def trace_events(text: str) -> list[dict]:
     ]
 
 
+def file_codes(store) -> Codes:
+    """The term codes of the file ``store`` has open; it reads them."""
+    codes = store._opened().codes
+    assert codes is not None
+    return codes
+
+
 def kind_ranges(store) -> KindRanges:
     """The term kinds' code ranges of the file ``store`` has open."""
-    ranges = store._opened().kind_ranges
-    assert ranges is not None
-    return ranges
+    return file_codes(store).kind_ranges
 
 
 def is_graph_name_check(args) -> bool:
@@ -100,8 +106,8 @@ class CountingTermDict:
 def counting_term_dict(graph) -> CountingTermDict:
     """Install the counter over the store's term dictionary."""
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    counting = CountingTermDict(graph.store._dict)
-    graph.store._dict = counting
+    counting = CountingTermDict(file_codes(graph.store).term_dict)
+    file_codes(graph.store).term_dict = counting
     return counting
 
 
@@ -145,8 +151,8 @@ def counting_native(graph) -> CountingNative:
     """Install the counter. The store's own graph-name check is not counted
     (`is_graph_name_check`): it is not what a query plan costs."""
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    native = CountingNative(graph.store._store())
-    graph.store._native = native
+    native = CountingNative(graph.store._opened().native)
+    graph.store._opened().native = native
     return native
 
 
@@ -243,8 +249,8 @@ class NativeSpy:
 
 def native_spy(graph) -> NativeSpy:
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    spy = NativeSpy(graph.store._store())
-    graph.store._native = spy
+    spy = NativeSpy(graph.store._opened().native)
+    graph.store._opened().native = spy
     return spy
 
 
@@ -333,6 +339,6 @@ def predicate_calls(spy: RecordingTermDict) -> list[tuple]:
 
 def filter_spy(graph) -> RecordingTermDict:
     """Record every ``filter_codes`` call the store's dictionary receives."""
-    spy = RecordingTermDict(graph.store._dict)
-    graph.store._dict = spy
+    spy = RecordingTermDict(file_codes(graph.store).term_dict)
+    file_codes(graph.store).term_dict = spy
     return spy

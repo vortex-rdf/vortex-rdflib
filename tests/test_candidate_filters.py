@@ -15,6 +15,7 @@ from tests.support import (
     W,
     both_ways,
     captured_trace,
+    file_codes,
     filter_expr,
     filter_spy,
     kind_ranges,
@@ -44,12 +45,12 @@ S, X, Y, G = (Variable(name) for name in "sxyg")
 
 
 def _price_code(store, i: int) -> int:
-    return store._dict.encode(f'"{(i * 37) % 1000}"^^<{XSD}integer>')
+    return file_codes(store).term_dict.encode(f'"{(i * 37) % 1000}"^^<{XSD}integer>')
 
 
 def _price_match(store):
     """The four code columns of every price quad."""
-    return store._store().match_codes(None, PRICE, None, None)
+    return store._opened().native.match_codes(None, PRICE, None, None)
 
 
 def _under(limit: int) -> int:
@@ -105,7 +106,7 @@ def test_a_probe_join_evaluates_only_the_codes_its_probes_reached(tmp_path, monk
     rows = run(graph, query)
     [(_, _, _, codes)] = predicate_calls(spy)
     assert codes == sorted(_price_code(store, i) for i in (1, 2, 3))
-    store._dict = spy._inner
+    file_codes(store).term_dict = spy._inner
     with_pushdown, without_pushdown = both_ways(graph, query)
     assert rows == with_pushdown == without_pushdown
 
@@ -122,8 +123,8 @@ def test_undecided_codes_take_the_python_routes(tmp_path):
             super().filter_codes(kind, arg, codes, **options)
             return U64Column([]), codes
 
-    spy = _Undecided(store._dict)
-    store._dict = spy  # ty: ignore[invalid-assignment]
+    spy = _Undecided(file_codes(store).term_dict)
+    file_codes(store).term_dict = spy
     for query in (
         f"SELECT ?s WHERE {{ ?s {PRICE} ?v FILTER(?v < 300) }}",
         'SELECT ?s WHERE { ?s <http://ex.org/label> ?l FILTER(langMatches(lang(?l), "en")) }',
@@ -234,7 +235,7 @@ def test_band_around_an_anchor_is_evaluated_over_the_price_codes(
     assert (restriction["input_rows"], restriction["output_rows"]) == (200, len(expected))
     assert built == []
     monkeypatch.delenv("VORTEX_RDF_TRACE_QUERY")
-    store._dict = spy._inner
+    file_codes(store).term_dict = spy._inner
     with_pushdown, without_pushdown = both_ways(graph, BAND)
     assert with_pushdown == without_pushdown
 
@@ -501,7 +502,7 @@ def test_values_only_rdflib_answers_are_decoded_in_one_batch(tmp_path, monkeypat
     graph = Graph(store=VortexRdflibStore(products_file(tmp_path), in_memory=True))
     monkeypatch.setattr(SETTINGS, "fast_filters", False)
     register_sparql_pushdown()
-    inner = graph.store._dict  # ty: ignore[unresolved-attribute]
+    inner = file_codes(graph.store).term_dict
     calls: list[str] = []
 
     class _Calls:
@@ -518,7 +519,7 @@ def test_values_only_rdflib_answers_are_decoded_in_one_batch(tmp_path, monkeypat
 
     # The file's one-time bookkeeping is not a query's cost.
     graph.store._union_has_repeats()  # ty: ignore[unresolved-attribute]
-    graph.store._dict = _Calls()  # ty: ignore[unresolved-attribute]
+    file_codes(graph.store).term_dict = _Calls()
     query = "SELECT ?s WHERE { ?s <http://ex.org/label> ?l FILTER(strlen(?l) > 10) }"
     assert len(run(graph, query)) == sum(1 for i in range(200) if len(f"product {i}") > 10)
     assert "decode" not in calls

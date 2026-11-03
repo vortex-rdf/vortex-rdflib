@@ -247,7 +247,8 @@ def _count_patterns(store, patterns, counts: dict) -> int:
         return 0
     before = len(counts)
     ordered = sorted(patterns, key=matching._pattern_static_rank)
-    minimum = SETTINGS.memory_scan_batch_min if store.in_memory else SETTINGS.scan_batch_min
+    in_memory = store._opened().in_memory
+    minimum = SETTINGS.memory_scan_batch_min if in_memory else SETTINGS.scan_batch_min
     scans: list = []
     if len(patterns) >= minimum:
         scans = [
@@ -255,7 +256,7 @@ def _count_patterns(store, patterns, counts: dict) -> int:
             for pat in ordered
             if not pat.unsatisfiable
             and pat.n3 not in counts
-            and not store._file.point_lookup(pat.n3)
+            and not store._opened().point_lookup(pat.n3)
         ]
         if len({pat.n3 for pat in scans}) < minimum:
             scans = []
@@ -668,7 +669,7 @@ def _step_rule(store, running: int, pat: Pattern, shared: Sequence) -> str:
     estimate = pat.estimate
     assert estimate is not None, "a step counts its pattern before it plans the join"
     if shared and running * SETTINGS.probe_fanout < estimate:
-        cheap = store._file.point_lookup(probes._probe_shape(pat, shared))
+        cheap = store._opened().point_lookup(probes._probe_shape(pat, shared))
         return "probe" if cheap else "keep_scan"
     return "hash"
 

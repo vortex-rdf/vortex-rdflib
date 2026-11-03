@@ -10,7 +10,7 @@ from rdflib import Graph
 from rdflib.term import Literal, URIRef, Variable
 from tests.corpus import SPELLINGS
 from tests.oracle import departs, spec_answer
-from tests.support import V, W, filter_expr, typed
+from tests.support import V, W, file_codes, filter_expr, typed
 
 from vortex_rdflib import filters
 from vortex_rdflib.terms import BLANK, IRI, LITERAL, KindRanges, TermView, parse_spelling
@@ -366,7 +366,7 @@ def test_fast_reject_predicate_keeps_a_row_the_filter_keeps_over_an_unbound_vari
     out = tmp_path / "five.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
     store = VortexRdflibStore(str(out))
-    dictionary = store._dict
+    dictionary = file_codes(store).term_dict
     assert dictionary is not None  # the code path is active
     expr = filter_expr("!bound(?w) || ?v < ?w")
     conjunct = filters.Conjunct(expr, (V, W), filters.compiler.compile_fast(expr, (V, W), {}))
@@ -413,7 +413,7 @@ def test_canonical_spelling_round_trips_every_dictionary_term(tmp_path):
     out = tmp_path / "spellings.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
     store = VortexRdflibStore(str(out))
-    term_dict = store._dict
+    term_dict = file_codes(store).term_dict
     assert term_dict is not None
     for code in range(len(term_dict)):
         spelling = term_dict.decode(code)
@@ -443,12 +443,12 @@ def test_kind_ranges_partition_the_dictionary(tmp_path):
     out = tmp_path / "kinds.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
     store = VortexRdflibStore(str(out))
-    term_dict = store._dict
+    term_dict = file_codes(store).term_dict
     assert term_dict is not None
     ranges = KindRanges.from_dictionary(term_dict)
-    opened = store._file
-    assert opened is not None and opened.kind_ranges is not None
-    assert [opened.kind_ranges.range(k) for k in (LITERAL, IRI, BLANK)] == [
+    codes = store._opened().codes
+    assert codes is not None
+    assert [codes.kind_ranges.range(k) for k in (LITERAL, IRI, BLANK)] == [
         ranges.range(k) for k in (LITERAL, IRI, BLANK)
     ]
     for code in range(len(term_dict)):

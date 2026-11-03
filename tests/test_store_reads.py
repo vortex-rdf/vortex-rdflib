@@ -58,8 +58,8 @@ def test_triples_on_a_bare_graph_makes_two_native_calls(tmp_path):
     store = VortexRdflibStore(_quads(tmp_path, _TWO_GRAPHS))
     graph = Graph(store=store)
     store._union_has_repeats()  # the file's one-time bookkeeping is not a call's cost
-    calls = _Calls(store._store())
-    store._native = calls  # ty: ignore[invalid-assignment]
+    calls = _Calls(store._opened().native)
+    store._opened().native = calls  # ty: ignore[invalid-assignment]
     for pattern in [(None, None, None), (URIRef(f"{EX}s"), None, None)]:
         calls.names.clear()
         assert list(graph.triples(pattern))
@@ -75,7 +75,7 @@ def test_a_ground_pattern_in_a_named_graph_is_yielded_once(tmp_path):
             return 2  # what no file answers
 
     store = VortexRdflibStore(_quads(tmp_path, _TWO_GRAPHS))
-    store._native = _CountsTwo(store._store())  # ty: ignore[invalid-assignment]
+    store._opened().native = _CountsTwo(store._opened().native)  # ty: ignore[invalid-assignment]
     ground = (URIRef(f"{EX}s"), URIRef(f"{EX}p"), URIRef(f"{EX}o"))
     rows = list(store.triples(ground, Graph(store=store, identifier=URIRef(f"{EX}g1"))))
     assert [triple for triple, _ in rows] == [ground]

@@ -8,6 +8,7 @@ from rdflib import Graph, Literal, URIRef
 from tests.support import (
     both_ways,
     captured_trace,
+    file_codes,
     native_call_events,
     native_spy,
     products_file,
@@ -96,7 +97,7 @@ def test_values_constants_are_encoded_in_one_batch(tmp_path):
     register_sparql_pushdown()
     spy = native_spy(graph)
     encodes = []
-    dictionary = store._dict
+    dictionary = file_codes(store).term_dict
     assert dictionary is not None
 
     class _Dict:
@@ -107,7 +108,7 @@ def test_values_constants_are_encoded_in_one_batch(tmp_path):
         def __getattr__(self, name):
             return getattr(dictionary, name)
 
-    store._dict = _Dict()  # ty: ignore[invalid-assignment]
+    file_codes(store).term_dict = _Dict()
     query = """SELECT ?s ?l WHERE {
         VALUES ?s { <http://ex.org/p1> <http://ex.org/p2> <http://ex.org/absent> }
         ?s <http://ex.org/label> ?l }"""
@@ -116,7 +117,7 @@ def test_values_constants_are_encoded_in_one_batch(tmp_path):
     assert encodes == [["<http://ex.org/p1>", "<http://ex.org/p2>", "<http://ex.org/absent>"]]
     # No native call is spent making sure the absent constant is absent.
     assert not any("<http://ex.org/absent>" in args for args in spy.args)
-    store._dict = dictionary
+    file_codes(store).term_dict = dictionary
     yielded = "SELECT ?s WHERE { VALUES ?s { <http://ex.org/p1> <http://ex.org/absent> } }"
     for sparql in (query, yielded):
         with_pushdown, without_pushdown = both_ways(graph, sparql)
@@ -195,5 +196,5 @@ def test_graph_variable_keeps_the_named_graphs_inside_the_match(tmp_path, monkey
         (URIRef("http://ex.org/g2"), Literal(1)),
     ]
     match = native_call_events(captured_trace(capsys), "match_codes")[0]
-    assert store._dict is not None
-    assert match["keep"] == {"3": {"range": [1, len(store._dict)]}}
+    assert store._opened().codes is not None
+    assert match["keep"] == {"3": {"range": [1, len(file_codes(store).term_dict)]}}

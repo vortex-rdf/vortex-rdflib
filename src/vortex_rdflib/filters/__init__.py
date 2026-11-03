@@ -272,7 +272,7 @@ def _code_views(store, views: dict) -> Callable[[tuple], tuple]:
             if code < 0:
                 view = views[code] = view_of(store._terms().foreign[code])
             else:
-                view = views[code] = parse_spelling(store._spelling(code))
+                view = views[code] = parse_spelling(store._opened().codes.spelling(code))
         return view
 
     def views_of(key: tuple) -> tuple:
@@ -420,7 +420,7 @@ def decode_views(store, codes, views: dict) -> None:
     missing = [code for code in codes if code not in views]
     if not missing:
         return
-    for code, spelling in zip(missing, store._spellings(missing), strict=True):
+    for code, spelling in zip(missing, store._opened().codes.spellings(missing), strict=True):
         views[code] = parse_spelling(spelling)
 
 

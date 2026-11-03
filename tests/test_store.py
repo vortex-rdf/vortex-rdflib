@@ -13,7 +13,7 @@ from rdflib import BNode, Dataset, Graph, Literal, URIRef
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID
 from rdflib.plugins.parsers import ntriples
 from rdflib.term import Node
-from tests.support import both_ways, counting_term_dict, native_spy
+from tests.support import both_ways, counting_term_dict, file_codes, native_spy
 from vortex_rdf import U64Column, serialize_rdf
 
 import vortex_rdflib.terms as terms_mod
@@ -109,11 +109,11 @@ def test_read_only(graph):
 def test_dictionary_graph_uses_code_path(vortex_files, monkeypatch):
     monkeypatch.delenv("VORTEX_RDF_IN_MEMORY", raising=False)
     store = VortexRdflibStore(str(vortex_files["dictionary"]))
-    assert store._dict is not None  # code path active
+    assert store._opened().codes is not None  # code path active
 
     monkeypatch.setenv("VORTEX_RDF_DISABLE_CODE_PATH", "1")
     disabled = VortexRdflibStore(str(vortex_files["dictionary"]))
-    assert disabled._dict is None  # string fallback forced
+    assert disabled._opened().codes is None  # string fallback forced
 
     # Both paths yield identical triples.
     got_codes = sorted(Graph(store=store).triples((None, None, None)))
@@ -127,9 +127,9 @@ def test_file_store_dictionary_is_memory_mapped(vortex_files, monkeypatch):
     monkeypatch.delenv("VORTEX_RDF_IN_MEMORY", raising=False)
     monkeypatch.setenv("VORTEX_RDF_DICT_MAX_RESIDENT_BYTES", str(1 << 40))
     mapped = VortexRdflibStore(str(vortex_files["dictionary"]))
-    assert mapped._dict is not None and mapped._dict.file_backed
+    assert mapped._opened().codes is not None and file_codes(mapped).term_dict.file_backed
     loaded = VortexRdflibStore(str(vortex_files["dictionary"]), in_memory=True)
-    assert loaded._dict is not None and not loaded._dict.file_backed
+    assert loaded._opened().codes is not None and not file_codes(loaded).term_dict.file_backed
     assert sorted(Graph(store=mapped).triples((None, None, None))) == sorted(
         Graph(store=loaded).triples((None, None, None))
     )
@@ -488,7 +488,7 @@ def test_triples_yield_the_rows_and_contexts_of_the_match(chunked_quads, monkeyp
     store = VortexRdflibStore(str(chunked_quads), in_memory=in_memory)
     monkeypatch.setenv("VORTEX_RDF_DISABLE_CODE_PATH", "1")
     oracle = VortexRdflibStore(str(chunked_quads), in_memory=in_memory)
-    assert store._dict is not None and oracle._dict is None
+    assert store._opened().codes is not None and oracle._opened().codes is None
     contexts = {
         "none": lambda s: None,
         "bare-graph": lambda s: Graph(store=s),
@@ -594,7 +594,7 @@ def test_triples_rejects_match_columns_of_unequal_lengths(
     longer, as ``zip(strict=True)`` did, rather than reading every column by
     the first one's length."""
     store = VortexRdflibStore(str(chunked_quads), in_memory=True)
-    native = store._store()
+    native = store._opened().native
 
     def one_code_longer(matched) -> tuple:
         cols = list(matched)
@@ -628,7 +628,7 @@ def test_triples_rejects_match_columns_of_unequal_lengths(
     if chunk_rows is not None:
         monkeypatch.setattr(SETTINGS, "triples_chunk_rows", chunk_rows)
     store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    store._native = _OneCodeLonger()  # ty: ignore[invalid-assignment]
+    store._opened().native = _OneCodeLonger()  # ty: ignore[invalid-assignment]
     with pytest.raises(ValueError, match="unequal lengths") as raised:
         list(store.triples((None, P0, None)))
     if chunk_rows is not None:
@@ -774,7 +774,7 @@ def test_a_read_skips_chunks_without_rows(indexed_quads, monkeypatch):
     store = VortexRdflibStore(indexed_quads["no-index"])
     context = Graph(store=store, identifier=G2)
     want = list(store.triples((None, None, None), context))
-    native = store._store()
+    native = store._opened().native
     asked: list[tuple] = []
 
     class _EmptyChunksFirst:
@@ -790,7 +790,7 @@ def test_a_read_skips_chunks_without_rows(indexed_quads, monkeypatch):
 
     monkeypatch.setattr(SETTINGS, "triples_chunk_rows", 7)
     store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    store._native = _EmptyChunksFirst()  # ty: ignore[invalid-assignment]
+    store._opened().native = _EmptyChunksFirst()  # ty: ignore[invalid-assignment]
     got = list(store.triples((None, None, None), context))
     assert asked == [("s", "p", "o")] and len(got) > 7
     assert [triple for triple, _ in got] == [triple for triple, _ in want]
@@ -819,7 +819,7 @@ def test_a_chunked_read_holds_one_chunk_of_codes_at_a_time(indexed_quads, monkey
     for the chunks, no column of its full first match is alive, and at each
     later pull, no column of the chunk before."""
     store = VortexRdflibStore(indexed_quads["no-index"])
-    native = store._store()
+    native = store._opened().native
     first: list[weakref.ref] = []
     alive_at_chunk_call: list[int] = []
     alive_at_pull: list[int] = []
@@ -852,7 +852,7 @@ def test_a_chunked_read_holds_one_chunk_of_codes_at_a_time(indexed_quads, monkey
 
     monkeypatch.setattr(SETTINGS, "triples_chunk_rows", 7)
     store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    store._native = _WatchedColumns()  # ty: ignore[invalid-assignment]
+    store._opened().native = _WatchedColumns()  # ty: ignore[invalid-assignment]
     assert len(list(store.triples((None, None, None)))) == 300
     assert len(first) == 4 and alive_at_chunk_call == [0]
     # A count per pull, the last made by the pull that found no chunk left.

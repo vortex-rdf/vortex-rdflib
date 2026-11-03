@@ -32,7 +32,7 @@ def graph_of(tmp_path, size=300, in_memory=True):
 
 def test_connected_patterns_are_probed_without_complete_matches(tmp_path, monkeypatch, capsys):
     graph = graph_of(tmp_path)
-    native = graph.store._store()
+    native = graph.store._opened().native
     calls = []
 
     class Counting:
@@ -44,7 +44,7 @@ def test_connected_patterns_are_probed_without_complete_matches(tmp_path, monkey
             return getattr(native, name)
 
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    graph.store._native = Counting()
+    graph.store._opened().native = Counting()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     rows = list(
@@ -97,7 +97,7 @@ def test_seed_is_the_smallest_count_not_the_most_selective_shape(tmp_path, monke
         "<http://ex/s0> <http://ex/rare> <http://ex/target> .\n"
         + "".join(f"<http://ex/s{i}> <http://ex/big> <http://ex/o{i}> .\n" for i in range(300)),
     )
-    native = graph.store._store()
+    native = graph.store._opened().native
     matched_rows = []
 
     class Counting:
@@ -110,7 +110,7 @@ def test_seed_is_the_smallest_count_not_the_most_selective_shape(tmp_path, monke
             return getattr(native, name)
 
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    graph.store._native = Counting()
+    graph.store._opened().native = Counting()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     rows = list(
@@ -136,7 +136,7 @@ def test_pattern_selecting_nothing_ends_the_block_before_any_match(
     tmp_path, monkeypatch, capsys, in_memory
 ):
     graph = graph_of(tmp_path, in_memory=in_memory)
-    native = graph.store._store()
+    native = graph.store._opened().native
     matches = []
 
     class Counting:
@@ -148,7 +148,7 @@ def test_pattern_selecting_nothing_ends_the_block_before_any_match(
             return getattr(native, name)
 
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    graph.store._native = Counting()
+    graph.store._opened().native = Counting()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     rows = list(

@@ -466,12 +466,12 @@ def test_probes_stop_on_cancel(mem_graph):
     register_sparql_pushdown()
     token = CancelToken()
     native = _CancelAfter(
-        mem_graph.store._store(),
+        mem_graph.store._opened().native,
         token,
         lambda name, args: name == "match_codes" and args[0] is not None and args[1] == f"<{EX}r>",
     )
     mem_graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    mem_graph.store._native = native
+    mem_graph.store._opened().native = native
     with cancel_scope(token), pytest.raises(Cancelled):
         mem_graph.query(PROBED_TWICE)
     assert len(native.selected) == 1

@@ -730,7 +730,8 @@ def test_a_query_that_raises_is_counted_and_the_stream_goes_on(tmp_path, tiny_st
 
 def test_a_query_that_raises_is_recorded_up_to_the_raise(tmp_path, tiny_store, monkeypatch, capsys):
     def native_call_then_raise(graph, text, **kwargs):
-        graph.store._store().count_quads()  # through the proxy once the measured stream runs
+        # through the proxy once the measured stream runs
+        graph.store._opened().native.count_quads()
         raise RuntimeError("boom")
 
     monkeypatch.setattr(record_native, "run_instance", native_call_then_raise)
@@ -750,7 +751,7 @@ def test_recording_drops_the_cancel_token(tmp_path, tiny_store, monkeypatch):
     from vortex_rdf import CancelToken
 
     def native_calls_with_a_token(graph, text, **kwargs):
-        native = graph.store._store()  # through the proxy once the measured stream runs
+        native = graph.store._opened().native  # through the proxy once the measured stream runs
         native.count_quads(limit=3, cancel=CancelToken())
         list(native.match_codes_many([(None, None, None, None)], lookahead=2, cancel=CancelToken()))
 

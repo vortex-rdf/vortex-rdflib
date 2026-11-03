@@ -179,7 +179,7 @@ def _rank_codes(store, codes) -> dict:
     elapsed = trace.stopwatch()
     codes = set(codes)
     ranks = {None: -1}
-    ranges = store._file.kind_ranges
+    ranges = store._opened().codes.kind_ranges
     iri_lo, blank_lo = ranges.range(IRI)[0], ranges.range(BLANK)[0]
     blanks, iris, others = [], [], []
     by_kind = all(code is None or code >= 0 for code in codes)
@@ -199,7 +199,7 @@ def _rank_codes(store, codes) -> dict:
     if iris:
         # ``<iri>`` decodes to ``URIRef(iri)``, so the string rdflib compares
         # is the spelling without its brackets.
-        spellings = store._spellings(iris)
+        spellings = store._opened().codes.spellings(iris)
         keyed = [(spelling[1:-1], code) for spelling, code in zip(spellings, iris, strict=True)]
         rank = _rank_keyed(ranks, keyed, rank)
     local = [code for code in others if code >= 0]

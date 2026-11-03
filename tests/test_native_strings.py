@@ -15,7 +15,7 @@ import pytest
 from rdflib import Graph, Literal, URIRef
 from rdflib.term import Variable
 from tests.oracle import departs, spec_answer
-from tests.support import both_ways, filter_expr, kind_ranges, outcome, run
+from tests.support import both_ways, file_codes, filter_expr, kind_ranges, outcome, run
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
@@ -62,8 +62,8 @@ def corpus(tmp_path_factory):
     out = directory / "texts.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
     store = VortexRdflibStore(str(out), in_memory=True)
-    assert store._dict is not None
-    codes = {store._dict.encode(text) for text in TEXTS}
+    assert store._opened().codes is not None
+    codes = {file_codes(store).term_dict.encode(text) for text in TEXTS}
     assert None not in codes
     return store, codes
 
@@ -198,7 +198,7 @@ def _time_limit(seconds: float):
 )
 def test_random_allow_list_patterns_agree_with_python_re(corpus, seed, case, as_str):
     store, codes = corpus
-    spellings = {code: store._dict.decode(code) for code in codes}
+    spellings = {code: file_codes(store).term_dict.decode(code) for code in codes}
     rng = random.Random(seed)
     checked = 0
     for _ in range(40):
@@ -237,7 +237,7 @@ def test_string_functions_follow_the_spec(corpus, sparql_expr):
     passed, undecided = native.evaluate(store, shape, codes)
     decided = 0
     for code in codes - set(undecided):
-        stored = store._dict.decode(code)
+        stored = file_codes(store).term_dict.decode(code)
         if departs(sparql_expr, stored):
             continue
         expected = spec_answer(sparql_expr, {"v": stored})
@@ -256,13 +256,15 @@ def test_bsbm_literals_agree_with_python_re():
     words of string literals from across those codes as
     CONTAINS/STRSTARTS/STRENDS constants."""
     store = VortexRdflibStore(os.environ["VORTEX_RDFLIB_BSBM_STORE"])
-    assert store._dict is not None
+    assert store._opened().codes is not None
     lo, hi = kind_ranges(store).range(LITERAL)
     ordered = list(range(lo, hi, max(1, (hi - lo) // 20000)))
     codes = set(ordered)
     spellings = {
         code: spelling
-        for code, spelling in zip(ordered, store._dict.decode_many(ordered), strict=True)
+        for code, spelling in zip(
+            ordered, file_codes(store).term_dict.decode_many(ordered), strict=True
+        )
         if spelling is not None
     }
     assert len(spellings) == len(ordered)

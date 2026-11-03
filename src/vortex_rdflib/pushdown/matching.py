@@ -231,7 +231,7 @@ def _limit_reaches_match(store, pat: Pattern, residual) -> bool:
     pattern's rows are its match's made a set, so a limit on the match would
     cut short the rows it keeps.
     """
-    return not residual and not pat.distinct and not store._file.indexes and not pat.repeats
+    return not residual and not pat.distinct and not store._opened().indexes and not pat.repeats
 
 
 def _pattern_terms(ctx, store, s, p, o, scope, index: int | None = None) -> Pattern:
@@ -291,12 +291,12 @@ def _exclude_default_graph(store, pat: Pattern) -> None:
     counts apply. A file with no default-graph rows has no such code and
     needs no restriction at all.
     """
-    default = store._file.default_graph_code
+    default = store._opened().codes.default_graph_code
     if default is None:
         return
     if default != 0:
         raise NotImplementedError  # not a dictionary in byte order
-    _set_native_keep(pat, 3, (1, len(store._dict)))
+    _set_native_keep(pat, 3, (1, len(store._opened().codes.term_dict)))
 
 
 def _set_native_keep(pat: Pattern, position: int, keep) -> None:

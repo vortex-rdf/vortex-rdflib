@@ -6,6 +6,7 @@ import pytest
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID
 from rdflib.term import URIRef
 from tests.conftest import GRAPH_1, GRAPH_2
+from tests.support import file_codes
 
 from vortex_rdflib import VortexRdflibStore
 from vortex_rdflib.open_file import UnionFacts
@@ -45,7 +46,7 @@ def test_close_drops_every_file_fact(vortex_quad_files):
     first = store._file
     assert first is not None and first.union == UnionFacts(has_repeats=True, size=5)
     store.close()
-    assert (store._native, store._dict, store._file) == (None, None, None)
+    assert store._file is None
     store.open(path)
     reopened = store._file
     assert reopened is not None and reopened is not first and reopened.union is None
@@ -57,7 +58,7 @@ def test_kind_of_outside_every_range(vortex_files):
     as is the default graph's empty name; each other code inside it is of
     the kind its spelling starts with."""
     store = VortexRdflibStore(str(vortex_files["dictionary"]))
-    term_dict = store._dict
+    term_dict = file_codes(store).term_dict
     assert term_dict is not None
     ranges = KindRanges.from_dictionary(term_dict)
     assert ranges.kind_of(len(term_dict)) == "" and ranges.kind_of(-1) == ""
@@ -103,6 +104,45 @@ def test_stores_without_codes_answer_alike(vortex_quad_files, monkeypatch, varia
         store = VortexRdflibStore(str(vortex_quad_files["dictionary"]))
     else:
         store = VortexRdflibStore(str(vortex_quad_files[variant]))
-    assert store._dict is None
+    assert store._opened().codes is None
     assert expected["len"] == [5, 2, 2, 2]
     assert _answers(store) == expected
+
+
+def test_the_code_path_is_one_gate(vortex_files):
+    """Whether a store reads term codes is one fact of its open file:
+    ``codes`` is the file's dictionary and what it answers, or ``None`` —
+    a layout without one."""
+    opened = VortexRdflibStore(str(vortex_files["dictionary"]))._opened()
+    codes = opened.codes
+    assert codes is not None
+    lo, hi = codes.kind_ranges.range("iri")
+    assert codes.spelling(lo).startswith("<") and codes.spellings([lo, hi - 1])[1].startswith("<")
+    assert codes.default_graph_code == codes.term_dict.encode("")
+    with pytest.raises(ValueError, match="not in the store dictionary"):
+        codes.spelling(len(codes.term_dict) + 5)
+    assert VortexRdflibStore(str(vortex_files["default"]))._opened().codes is None
+
+
+def test_a_lazy_result_read_after_close_still_answers(vortex_files, monkeypatch):
+    """``close()`` drops the open file; whatever reads it after — the rest
+    of a lazy result, decoded a row at a time, and ``len()`` — opens the
+    file again rather than finding the record gone."""
+    from rdflib import Graph
+
+    from vortex_rdflib import register_sparql_pushdown
+    from vortex_rdflib.settings import SETTINGS
+
+    monkeypatch.setattr(SETTINGS, "chunk_start", 1)
+    monkeypatch.setattr(SETTINGS, "chunk_max", 1)
+    register_sparql_pushdown()
+    path = str(vortex_files["dictionary"])
+    query = "SELECT ?s ?o WHERE { ?s ?p ?o FILTER(!isBlank(?o)) }"
+    expected = sorted(Graph(store=VortexRdflibStore(path)).query(query))
+    store = VortexRdflibStore(path)
+    rows = iter(Graph(store=store).query(query))
+    first = next(rows)
+    store.close()
+    assert sorted([first, *rows]) == expected and len(expected) > 2
+    store.close()
+    assert len(store) == len(VortexRdflibStore(path))

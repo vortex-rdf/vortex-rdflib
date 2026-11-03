@@ -34,7 +34,7 @@ def _graph(tmp_path, size=300):
 
 def test_probe_optional_counts_before_match_and_skips_complete_match(tmp_path, monkeypatch, capsys):
     graph = _graph(tmp_path)
-    native = graph.store._store()
+    native = graph.store._opened().native
     matches = []
     counts = []
 
@@ -52,7 +52,7 @@ def test_probe_optional_counts_before_match_and_skips_complete_match(tmp_path, m
             return getattr(native, name)
 
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    graph.store._native = Counting()
+    graph.store._opened().native = Counting()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     rows = list(
@@ -82,7 +82,7 @@ def test_lazy_join_counts_before_match_and_probes(tmp_path, monkeypatch, capsys)
     """A nested group's lazy join takes the same count-first route as an
     OPTIONAL: the 300-row right pattern is counted, never matched whole."""
     graph = _graph(tmp_path)
-    native = graph.store._store()
+    native = graph.store._opened().native
     matches = []
     counts = []
 
@@ -100,7 +100,7 @@ def test_lazy_join_counts_before_match_and_probes(tmp_path, monkeypatch, capsys)
             return getattr(native, name)
 
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    graph.store._native = Counting()
+    graph.store._opened().native = Counting()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     rows = list(

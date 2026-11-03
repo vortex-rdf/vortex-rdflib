@@ -64,23 +64,26 @@ def native(store) -> NativeHandle:
     """The store's native handle (opening the store if it is not yet), as
     every native call should reach it: the handle itself while nothing
     observes the call, else a proxy for this call."""
-    handle = store._store()
+    opened = store._opened()
     token = CANCEL_TOKEN.get()
     traced = trace.active() is not None
     if token is None and not traced and not SETTINGS.counters:
-        return handle
-    # The open file's record, for the cancel policy: the file the handle is.
-    opened = store._opened()
-    return _Native(opened, handle, token, traced, SETTINGS.counters)
+        return opened.native
+    return _Native(opened, opened.native, token, traced, SETTINGS.counters)
 
 
 def term_dict(store):
-    """The store's term dictionary, ``None`` without one: itself while the
-    counters are off, else a proxy that counts its decodes and encodes."""
-    dictionary = store._dict
-    if dictionary is None or not SETTINGS.counters:
-        return dictionary
-    return _TermDict(dictionary)
+    """The store's term dictionary (:func:`dictionary`), opening the store if
+    it is not yet; ``None`` while it reads no term codes."""
+    codes = store._opened().codes
+    return None if codes is None else dictionary(codes)
+
+
+def dictionary(codes):
+    """An open file's term dictionary (``OpenFile.codes``), as every decode
+    and encode should reach it: itself while the counters are off, else a
+    proxy that counts its decodes and encodes."""
+    return codes.term_dict if not SETTINGS.counters else _TermDict(codes.term_dict)
 
 
 def codes_of(store, spellings: list[str]) -> list[int | None]:

@@ -65,7 +65,7 @@ def _probe_lookahead(store, batch_n3: Sequence[Sequence[str | None]]) -> int | N
     """The ``lookahead`` of one batch call over these probes' quad patterns:
     ``None``, the binding's default, when every probe is a point lookup
     (``OpenFile.point_lookup``), else ``SETTINGS.scan_lookahead``."""
-    point_lookup = store._file.point_lookup
+    point_lookup = store._opened().point_lookup
     if all(point_lookup(n3) for n3 in batch_n3):
         return None
     return SETTINGS.scan_lookahead
@@ -77,12 +77,12 @@ def _batched_probes(store, patterns) -> list[int]:
     (``SETTINGS.scan_batch_min``, ``SETTINGS.memory_scan_batch_min``), or all of them when
     enough cheap ones are probing a file-backed store
     (``SETTINGS.cheap_batch_min``)."""
-    minimum = SETTINGS.memory_scan_batch_min if store.in_memory else SETTINGS.scan_batch_min
+    opened = store._opened()
+    minimum = SETTINGS.memory_scan_batch_min if opened.in_memory else SETTINGS.scan_batch_min
     if len(patterns) < minimum:
         return []
-    point_lookup = store._file.point_lookup
-    batched = [i for i, n3 in enumerate(patterns) if not point_lookup(n3)]
-    if not store.in_memory and len(patterns) - len(batched) >= SETTINGS.cheap_batch_min:
+    batched = [i for i, n3 in enumerate(patterns) if not opened.point_lookup(n3)]
+    if not opened.in_memory and len(patterns) - len(batched) >= SETTINGS.cheap_batch_min:
         return list(range(len(patterns)))
     return batched if len(batched) >= minimum else []
 
@@ -387,6 +387,6 @@ def _probe_spellings(store, rows, bound) -> dict:
         for code in distinct
         if code < 0
     }
-    for code, term in zip(codes, store._spellings(codes), strict=True):
+    for code, term in zip(codes, store._opened().codes.spellings(codes), strict=True):
         n3_cache[code] = term
     return n3_cache

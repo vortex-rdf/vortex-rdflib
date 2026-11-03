@@ -13,7 +13,7 @@ import pytest
 from rdflib.term import Variable
 from tests.corpus import SPELLINGS
 from tests.oracle import departs, spec_answer
-from tests.support import CTX, RecordingTermDict, W, filter_expr, kind_ranges, typed
+from tests.support import CTX, RecordingTermDict, W, file_codes, filter_expr, kind_ranges, typed
 from vortex_rdf import U64Column, serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown, trace
@@ -281,9 +281,9 @@ def test_a_kind_test_is_decided_by_the_kinds_it_holds_for(spelling_store, sparql
     assert conjunct.decision == native.Kinds(frozenset(kinds))
     assert conjunct.keep is (conjunct.decision if _one_range(kinds) else None)
     assert filters.native.native_shape(filter_expr(sparql_expr), V, {}) is None
-    kind_of = spelling_store._file.kind_ranges.kind_of
+    kind_of = file_codes(spelling_store).kind_ranges.kind_of
     for code in sorted(_all_codes(spelling_store)):
-        stored = spelling_store._dict.decode(code)
+        stored = file_codes(spelling_store).term_dict.decode(code)
         if departs(sparql_expr, stored):
             continue
         assert (kind_of(code) in kinds) == spec_answer(sparql_expr, {"v": stored}), stored
@@ -319,7 +319,7 @@ def test_expression_outside_the_native_shapes_is_not_mapped(sparql_expr):
 
 
 def _all_codes(store) -> set:
-    return {store._dict.encode(spelling) for spelling in ALL_SPELLINGS}
+    return {file_codes(store).term_dict.encode(spelling) for spelling in ALL_SPELLINGS}
 
 
 @pytest.mark.parametrize("sparql_expr", [m[0] for m in MAPPED])
@@ -336,7 +336,7 @@ def test_native_candidates_follow_the_spec(spelling_store, sparql_expr):
     assert passed <= codes and undecided <= codes and not passed & undecided
     decided = 0
     for code in sorted(codes - undecided):
-        stored = spelling_store._dict.decode(code)
+        stored = file_codes(spelling_store).term_dict.decode(code)
         if departs(sparql_expr, stored):
             continue
         decided += 1
@@ -350,7 +350,7 @@ def test_wide_integers_are_left_undecided(spelling_store):
     compares such a literal by value; vortex-rdf holds them to 64 bits and
     leaves the ones past it undecided."""
     wide = {
-        spelling_store._dict.encode(typed(lexical, datatype))
+        file_codes(spelling_store).term_dict.encode(typed(lexical, datatype))
         for lexical, datatype in [
             ("9223372036854775808", "long"),
             ("-9223372036854775809", "long"),
@@ -369,7 +369,9 @@ def test_a_refused_argument_leaves_every_candidate_to_the_python_routes(
     codes = _all_codes(spelling_store)
     lo, hi = kind_ranges(spelling_store).range(LITERAL)
     monkeypatch.setattr(
-        spelling_store, "_dict", RecordingTermDict(spelling_store._dict, refuse=True)
+        spelling_store._opened().codes,
+        "term_dict",
+        RecordingTermDict(file_codes(spelling_store).term_dict, refuse=True),
     )
     shape = FilterCodes("num_lt", f'"1e400"^^<{XSD}double>')
     passed, undecided = native.evaluate(spelling_store, shape, codes)
@@ -387,8 +389,8 @@ def test_only_the_codes_a_predicate_reads_are_sent(spelling_store, monkeypatch):
     lo, hi = kind_ranges(spelling_store).range(LITERAL)
     nonliterals = {code for code in codes if not lo <= code < hi}
     assert nonliterals
-    recording = RecordingTermDict(spelling_store._dict)
-    monkeypatch.setattr(spelling_store, "_dict", recording)
+    recording = RecordingTermDict(file_codes(spelling_store).term_dict)
+    monkeypatch.setattr(file_codes(spelling_store), "term_dict", recording)
     five = f'"5"^^<{XSD}integer>'
     passed_ne, _ = native.evaluate(spelling_store, FilterCodes("num_ne", five), codes)
     passed_lt, _ = native.evaluate(spelling_store, FilterCodes("num_lt", five), codes)
@@ -421,8 +423,8 @@ def test_a_numeric_comparison_makes_its_native_calls_in_order(
     ``num_eq`` too for ``<=`` and ``>=`` (vortex-rdf/vortex-rdf#141 would
     make it one call)."""
     codes = _all_codes(spelling_store)
-    recording = RecordingTermDict(spelling_store._dict)
-    monkeypatch.setattr(spelling_store, "_dict", recording)
+    recording = RecordingTermDict(file_codes(spelling_store).term_dict)
+    monkeypatch.setattr(file_codes(spelling_store), "term_dict", recording)
     native.evaluate(spelling_store, FilterCodes(kind, f'"5"^^<{XSD}integer>'), codes)
     assert [call[0] for call in recording.calls] == calls
 
@@ -443,9 +445,11 @@ def test_num_eq_and_num_ne_pass_only_numbers(spelling_store, constant):
     well-typed number."""
     codes = sorted(code for code in _all_codes(spelling_store) if _is_literal(spelling_store, code))
     for kind in ("num_eq", "num_ne"):
-        passed, _ = spelling_store._dict.filter_codes(kind, constant, U64Column(codes))
+        passed, _ = file_codes(spelling_store).term_dict.filter_codes(
+            kind, constant, U64Column(codes)
+        )
         for code in memoryview(passed).cast("Q").tolist():
-            stored = spelling_store._dict.decode(code)
+            stored = file_codes(spelling_store).term_dict.decode(code)
             number = filters.values.numeric_operand(parse_spelling(stored))
             assert number is not None, (kind, stored)
 
@@ -463,8 +467,8 @@ def test_str_of_a_blank_node_is_left_to_the_python_routes(spelling_store, monkey
     blanks = {c for c in codes if ranges.kind_of(c) == BLANK}
     iris = {c for c in codes if ranges.kind_of(c) == IRI}
     assert blanks and iris
-    recording = RecordingTermDict(spelling_store._dict)
-    monkeypatch.setattr(spelling_store, "_dict", recording)
+    recording = RecordingTermDict(file_codes(spelling_store).term_dict)
+    monkeypatch.setattr(file_codes(spelling_store), "term_dict", recording)
     _, undecided = native.evaluate(
         spelling_store, FilterCodes("str_prefix", "a", as_str=True), codes
     )
@@ -518,8 +522,8 @@ def test_an_iri_without_the_parsers_form_is_never_looked_up(
     from rdflib import Graph
 
     assert native.native_shape(filter_expr(sparql_expr), V, {}) is None
-    recording = _RecordingLookups(spelling_store._dict)
-    monkeypatch.setattr(spelling_store, "_dict", recording)
+    recording = _RecordingLookups(file_codes(spelling_store).term_dict)
+    monkeypatch.setattr(file_codes(spelling_store), "term_dict", recording)
     register_sparql_pushdown()
     query = f"SELECT ?s WHERE {{ ?s <http://ex.org/p> ?v FILTER({sparql_expr}) }}"
     kept = {row[0].n3() for row in Graph(store=spelling_store).query(query)}
@@ -536,7 +540,7 @@ def test_an_iri_the_parser_refuses_names_no_term(spelling_store, refused):
     is: the keep holds the other IRIs' codes, and a keep on the match and a
     keep over a query's codes decide every term alike."""
     codes = _all_codes(spelling_store)
-    urn = spelling_store._dict.encode("<urn:x>")
+    urn = file_codes(spelling_store).term_dict.encode("<urn:x>")
     keep = native.IriIn((refused, "<urn:x>"))
     assert memoryview(native.keep_of(spelling_store, keep)).cast("Q").tolist() == [urn]
     assert native.keep_decides(spelling_store, keep, codes) == ({urn}, [])
@@ -570,7 +574,7 @@ def test_a_code_that_is_no_term_is_left_undecided_under_every_shape(spelling_sto
     go to the Python routes, which fail on them, and the verdicts on the
     terms are what they are without them. (A test of the term's kind alone
     decides them itself, by whether it holds for no term: ``native.Kinds``.)"""
-    dictionary = spelling_store._dict
+    dictionary = file_codes(spelling_store).term_dict
     assert dictionary.decode(0) == ""
     not_terms = {0, len(dictionary), len(dictionary) + 7, -1}
     codes = _all_codes(spelling_store)

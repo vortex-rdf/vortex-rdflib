@@ -181,7 +181,7 @@ class KindRanges:
     spellings in byte order and every spelling of a kind starts alike, so a
     kind is one range (``TermDict.prefix_range`` of ``"``, ``<`` and ``_:``)
     — the keep a kind test pushes into a match — and a code's kind is the
-    range it falls in. A file's are read once (``OpenFile.kind_ranges``)."""
+    range it falls in. A file's are read once (``Codes.kind_ranges``)."""
 
     __slots__ = (
         "_ranges",

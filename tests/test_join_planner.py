@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import pytest
 from rdflib.term import Variable
+from tests.support import file_codes
 
 from vortex_rdflib.pushdown.relation import Relation
 
@@ -101,7 +102,7 @@ def test_probe_join_drops_union_repeats_per_answer(tmp_path, monkeypatch):
     serialize_rdf(str(source), str(out), layout="dictionary", format="nquads")
     store = VortexRdflibStore(str(out))
     assert store._union_has_repeats()
-    term_dict = store._dict
+    term_dict = file_codes(store).term_dict
     assert term_dict is not None
     s1, s2 = (term_dict.encode(f"<http://ex.org/{name}>") for name in ("s1", "s2"))
     calls = []

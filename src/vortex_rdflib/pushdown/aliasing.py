@@ -37,7 +37,7 @@ def _alias_codes(store, codes, aliases: dict) -> None:
     negative (`_constant_codes`), so no twin is looked up for it. For most
     stores no code aliases another and ``aliases`` stays empty.
     """
-    literal_lo, literal_hi = store._file.kind_ranges.range(LITERAL)
+    literal_lo, literal_hi = store._opened().codes.kind_ranges.range(LITERAL)
     terms = store._terms()
     foreign = terms.foreign
     classified = terms.alias_classified
@@ -51,7 +51,7 @@ def _alias_codes(store, codes, aliases: dict) -> None:
         local = [c for c in pending if c >= 0]
         if local:
             cache = terms.decode
-            for code, spelling in _rewritable(local, store._spellings(local)):
+            for code, spelling in _rewritable(local, store._opened().codes.spellings(local)):
                 term = cache.get(code)
                 if term is None:
                     term = cache[code] = store._from_n3_safe(spelling)

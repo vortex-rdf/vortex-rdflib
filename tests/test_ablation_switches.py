@@ -8,6 +8,7 @@ multisets) are compared with the run with none set."""
 import pytest
 from rdflib import Graph, Literal
 from tests.corpus import FIXTURE_NT, QUERIES, RDFLIB_DIVERGES
+from tests.support import file_codes
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
@@ -130,9 +131,9 @@ def test_decode_each_step_returns_the_same_codes(store):
     from vortex_rdflib.pushdown.relation import Relation, _decode_each_step
 
     st = VortexRdflibStore(str(store))
-    st._store()
-    assert st._dict is not None
-    n = len(st._dict)
+    st._opened()
+    assert st._opened().codes is not None
+    n = len(file_codes(st).term_dict)
     codes = list(range(n)) + [-5]
     rel = _decode_each_step(
         st, Relation(("a",), (memoryview(U64Column(list(range(n)))).cast("Q"),), None, n)

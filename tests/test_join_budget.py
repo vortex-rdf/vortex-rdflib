@@ -482,9 +482,9 @@ def test_a_probe_step_over_budget_discards_its_rows(file_graph, monkeypatch, cap
     monkeypatch.setattr(SETTINGS, "probe_batch", 3)
     monkeypatch.setattr(OpenFile, "point_lookup", lambda opened, n3: True)
     monkeypatch.setattr(SETTINGS, "cheap_batch_min", 1)
-    watched = _WatchedBatches(file_graph.store._store())
+    watched = _WatchedBatches(file_graph.store._opened().native)
     file_graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    file_graph.store._native = watched
+    file_graph.store._opened().native = watched
     if traced:
         monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
@@ -557,7 +557,7 @@ def test_a_batch_short_of_answers_raises(graph, monkeypatch, tokened):
     monkeypatch.setattr(SETTINGS, "scan_batch_min", 1)
     monkeypatch.setattr(SETTINGS, "memory_scan_batch_min", 1)
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    graph.store._native = _ShortBatches(graph.store._store())
+    graph.store._opened().native = _ShortBatches(graph.store._opened().native)
     probes = [((None, f"<{EX}p>", None, None), {}), ((None, f"<{EX}q>", None, None), {})]
     with _scope(tokened):
         answers = iter(pd.probes._run_probes(graph.store, probes, count=False))
@@ -590,7 +590,7 @@ def test_a_batch_past_its_probes_raises(graph, monkeypatch, tokened):
     monkeypatch.setattr(SETTINGS, "scan_batch_min", 1)
     monkeypatch.setattr(SETTINGS, "memory_scan_batch_min", 1)
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    graph.store._native = _LongBatches(graph.store._store())
+    graph.store._opened().native = _LongBatches(graph.store._opened().native)
     probes = [((None, f"<{EX}p>", None, None), {}), ((None, f"<{EX}q>", None, None), {})]
     with _scope(tokened):
         answers = iter(pd.probes._run_probes(graph.store, probes, count=False))
@@ -872,7 +872,7 @@ def test_a_memoized_match_is_sliced(graph):
     matched feeds that match in slices rather than reading it again in
     chunks; its rows are the one-shot join's."""
     s, x, y = (Variable(name) for name in "sxy")
-    native = graph.store._store()
+    native = graph.store._opened().native
     seed = native.match_codes(None, f"<{EX}p>", None, None)
     n3 = (None, f"<{EX}q>", None, None)
     match = native.match_codes(*n3)
@@ -949,7 +949,7 @@ def test_tier2_counts_the_pairs_of_a_memoised_match(graph, monkeypatch):
     not past a budget of 4. A pattern the step would probe fits only by the
     product, memo or not."""
     s, x, d = (Variable(name) for name in "sxd")
-    native = graph.store._store()
+    native = graph.store._opened().native
     seed = native.match_codes(None, f"<{EX}ta>", None, None)
     n3 = (None, f"<{EX}tl>", None, None)
     pat = pd.matching.Pattern(n3, {x: [0], d: [2]}, estimate=245)
@@ -1406,7 +1406,7 @@ def test_a_keep_scan_narrows_its_copy_only(graph, planned):
     codes: the pattern keeps the keep it was planned with, whole, for a step
     that puts it back."""
     k, f, p = (Variable(name) for name in "kfp")
-    keys = graph.store._store().match_codes(f"<{EX}c0>", f"<{EX}has>", None, None)[2]
+    keys = graph.store._opened().native.match_codes(f"<{EX}c0>", f"<{EX}has>", None, None)[2]
     pat = pd.matching.Pattern((None, None, None, None), {f: [0], p: [1], k: [2]}, estimate=1348)
     pat.nkeep = planned
     whole = dict(planned)

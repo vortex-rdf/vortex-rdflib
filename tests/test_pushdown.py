@@ -29,6 +29,7 @@ from tests.support import (
     both_ways,
     counting_native,
     counting_term_dict,
+    file_codes,
     is_graph_name_check,
     row_key,
     run,
@@ -140,7 +141,7 @@ def variant_graph(variant_vortex, request):
     index, kwargs = STORE_VARIANTS[request.param]
     store = VortexRdflibStore(str(variant_vortex[index]), **kwargs)
     if request.param == "file-backed-dictionary":
-        assert store._dict is not None and store._dict.file_backed
+        assert store._opened().codes is not None and file_codes(store).term_dict.file_backed
     return Graph(store=store)
 
 
@@ -326,7 +327,7 @@ def test_store_variants_equal_default_evaluator(variant_graph, sparql):
 @pytest.mark.parametrize("sparql", GRAPH_QUERIES)
 def test_graph_pattern_over_a_file_backed_dictionary(dict_vortex_quads, sparql):
     store = VortexRdflibStore(str(dict_vortex_quads))
-    assert store._dict is not None and store._dict.file_backed
+    assert store._opened().codes is not None and file_codes(store).term_dict.file_backed
     dataset = Dataset(store=store, default_union=True)
     with_pushdown, without_pushdown = both_ways(dataset, sparql)
     assert with_pushdown == spec_corrected(sparql, without_pushdown)
@@ -369,7 +370,7 @@ def test_graph_variable_is_bound_from_the_column(dataset):
     """`GRAPH ?g` is one match with the graph as a schema variable, not one
     match per graph: the store's five graphs cost a single `match_codes`."""
     matches = []
-    inner = dataset.store._store()
+    inner = dataset.store._opened().native
 
     class _Counting:
         def match_codes(self, *args, **kwargs):
@@ -380,12 +381,12 @@ def test_graph_variable_is_bound_from_the_column(dataset):
             return getattr(inner, name)
 
     dataset.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    dataset.store._native = _Counting()
+    dataset.store._opened().native = _Counting()
     register_sparql_pushdown()
     try:
         rows = run(dataset, "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }")
     finally:
-        dataset.store._native = inner
+        dataset.store._opened().native = inner
     # Four named graphs, the default graph excluded, from one wildcard match.
     assert len(rows) == 4
     assert len(matches) == 1
@@ -584,7 +585,7 @@ def _probe_dataset(path, union: bool) -> Dataset:
     """The probe quads, file-backed, with the union default graph or the default
     graph alone."""
     store = VortexRdflibStore(str(path), in_memory=False)
-    assert store._dict is not None and store._dict.file_backed
+    assert store._opened().codes is not None and file_codes(store).term_dict.file_backed
     return Dataset(store=store, default_union=union)
 
 
@@ -845,9 +846,9 @@ def test_traced_batch_does_not_pull_ahead(file_graph, monkeypatch, capsys):
     monkeypatch.setattr(SETTINGS, "probe_batch", 3)
     monkeypatch.setattr(OpenFile, "point_lookup", lambda opened, n3: True)
     monkeypatch.setattr(SETTINGS, "cheap_batch_min", 1)
-    native = _PullCountingNative(file_graph.store._store())
+    native = _PullCountingNative(file_graph.store._opened().native)
     file_graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    file_graph.store._native = native
+    file_graph.store._opened().native = native
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     capsys.readouterr()
     with_pushdown, without_pushdown = both_ways(file_graph, _STAR_SQL)
@@ -866,8 +867,8 @@ def test_traced_batch_does_not_pull_ahead(file_graph, monkeypatch, capsys):
 def test_closing_a_traced_batch_reports_the_pulls_it_made(file_graph):
     """A batch closed early has pulled only what its caller took, and reports
     that once: its probe count is the batch's, its rows the pulled answers'."""
-    native = _PullCountingNative(file_graph.store._store())
-    file_graph.store._native = native
+    native = _PullCountingNative(file_graph.store._opened().native)
+    file_graph.store._opened().native = native
     with _tracing() as trace:
         traced: Any = boundary.native(file_graph.store)  # the proxy closes what it hands out
         answers = traced.match_codes_many(_FOUR_PROBES)
@@ -890,7 +891,7 @@ def test_traced_chunks_report_the_chunks_pulled(file_graph):
     keep, the columns and the chunks and rows pulled."""
     pattern = (None, "<http://ex.org/knows>", None, None)
     keep = {"o": (0, 1_000_000)}
-    rows = file_graph.store._store().count_quads(*pattern)
+    rows = file_graph.store._opened().native.count_quads(*pattern)
     with _tracing() as trace:
         traced: Any = boundary.native(file_graph.store)  # the proxy closes what it hands out
         chunks = traced.match_code_chunks(*pattern, keep=keep, columns=("s", "o"), batch_rows=4)
@@ -1096,7 +1097,7 @@ def test_repeated_pattern_is_matched_once(graph):
     same quad — variables are `None` in a resolved pattern — so a self-chain
     costs one native match, not one per hop."""
     matches = []
-    inner = graph.store._store()
+    inner = graph.store._opened().native
 
     class _Counting:
         def match_codes(self, *args, **kwargs):
@@ -1107,7 +1108,7 @@ def test_repeated_pattern_is_matched_once(graph):
             return getattr(inner, name)
 
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    graph.store._native = _Counting()
+    graph.store._opened().native = _Counting()
     register_sparql_pushdown()
     try:
         rows = run(
@@ -1117,7 +1118,7 @@ def test_repeated_pattern_is_matched_once(graph):
                 ?b <http://ex.org/knows> ?c }""",
         )
     finally:
-        graph.store._native = inner
+        graph.store._opened().native = inner
     assert rows, "the self-chain has solutions to find"
     assert len(matches) == 1, matches
 
@@ -1126,7 +1127,7 @@ def test_distinct_patterns_are_matched_separately(graph):
     """The memo is keyed by the resolved quad, so patterns that differ in a
     bound position still get a match each."""
     matches = []
-    inner = graph.store._store()
+    inner = graph.store._opened().native
 
     class _Counting:
         def match_codes(self, *args, **kwargs):
@@ -1137,7 +1138,7 @@ def test_distinct_patterns_are_matched_separately(graph):
             return getattr(inner, name)
 
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    graph.store._native = _Counting()
+    graph.store._opened().native = _Counting()
     register_sparql_pushdown()
     try:
         run(
@@ -1147,7 +1148,7 @@ def test_distinct_patterns_are_matched_separately(graph):
                 ?s <http://ex.org/name> ?n }""",
         )
     finally:
-        graph.store._native = inner
+        graph.store._opened().native = inner
     assert len(matches) == 2, matches
 
 
@@ -1280,7 +1281,7 @@ def test_native_none_falls_back_at_call_time(graph):
     """A store whose code path declines (``match_codes`` -> None) makes the
     hook raise while rdflib is still listening, so the default evaluator
     answers — no lazily raised NotImplementedError reaches the caller."""
-    inner = graph.store._store()
+    inner = graph.store._opened().native
 
     class _NoCodes:
         def match_codes(self, *args, **kwargs):
@@ -1290,7 +1291,7 @@ def test_native_none_falls_back_at_call_time(graph):
             return getattr(inner, name)
 
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    graph.store._native = _NoCodes()
+    graph.store._opened().native = _NoCodes()
     register_sparql_pushdown()
     rows = run(graph, "SELECT ?o WHERE { ?s <http://ex.org/name> ?o } LIMIT 2")
     assert len(rows) == 2

@@ -67,7 +67,11 @@ def _eval_part(ctx, part):
     from ..store import VortexRdflibStore
 
     store = getattr(getattr(ctx, "graph", None), "store", None)
-    if not isinstance(store, VortexRdflibStore) or store._dict is None:
+    if (
+        not isinstance(store, VortexRdflibStore)
+        or store.path is None
+        or store._opened().codes is None
+    ):
         raise NotImplementedError
     if trace.active() is None:
         return handler(ctx, store, part)

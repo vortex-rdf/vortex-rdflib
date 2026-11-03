@@ -123,7 +123,7 @@ class Kinds:
 
     def split(self, store, codes: Collection[int]) -> tuple[set, list]:
         """The codes of its kinds; none is left undecided."""
-        kind_of = store._file.kind_ranges.kind_of
+        kind_of = store._opened().codes.kind_ranges.kind_of
         return {code for code in codes if kind_of(code) in self.kinds}, []
 
 
@@ -138,7 +138,7 @@ def keep_of(store, keep: IriIn | Kinds):
     (:func:`boundary.codes_of`; an IRI the dictionary lacks or the native
     parser refuses has no code, as it can match no stored term)."""
     if isinstance(keep, Kinds):
-        ranges = store._file.kind_ranges
+        ranges = store._opened().codes.kind_ranges
         bounds = [ranges.range(kind) for kind in keep.kinds]
         return min(lo for lo, _ in bounds), max(hi for _, hi in bounds)
     found = boundary.codes_of(store, list(keep.spellings)) if keep.spellings else []
@@ -152,7 +152,8 @@ def keep_decides(store, keep: IriIn, codes: Collection[int]) -> tuple[set, list]
     if not codes:
         return set(), []
     member = keep_member(keep_of(store, keep))
-    return {code for code in codes if member(code)}, _not_terms(codes, store._file.kind_ranges)
+    ranges = store._opened().codes.kind_ranges
+    return {code for code in codes if member(code)}, _not_terms(codes, ranges)
 
 
 def _not_terms(codes: Collection[int], ranges: KindRanges) -> list:
@@ -199,7 +200,7 @@ def _partition(store, codes: Collection[int], as_str: bool, passes_non_literals:
     its string) the IRIs too, a blank node then left undecided, as rdflib
     reads it as its label. Every IRI and blank node passes a kind that
     ``passes_non_literals`` (no literal, so ``!=`` a number, §17.4.1.7)."""
-    ranges = store._file.kind_ranges
+    ranges = store._opened().codes.kind_ranges
     undecided = _not_terms(codes, ranges)
     literal_lo, literal_hi = ranges.range(LITERAL)
     iri_lo, iri_hi = ranges.range(IRI)

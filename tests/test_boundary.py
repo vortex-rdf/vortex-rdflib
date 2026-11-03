@@ -5,6 +5,7 @@ traced, and counts it while the counters are on — and hands back the bare
 handles when nothing observes."""
 
 import pytest
+from tests.support import file_codes
 from vortex_rdf import Cancelled, CancelToken, serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, boundary
@@ -51,8 +52,8 @@ def _file(tmp_path, quads: bool = False, layout: str = "dictionary") -> str:
 
 def _spied(path: str, **kwargs) -> tuple[VortexRdflibStore, _Spy]:
     store = VortexRdflibStore(path, **kwargs)
-    spy = _Spy(store._store())
-    store._native = spy  # ty: ignore[invalid-assignment]
+    spy = _Spy(store._opened().native)
+    store._opened().native = spy  # ty: ignore[invalid-assignment]
     return store, spy
 
 
@@ -67,9 +68,9 @@ def _cancelled() -> CancelToken:
 
 def test_bare_handles_when_nothing_observes(tmp_path):
     store = VortexRdflibStore(_file(tmp_path))
-    store._store()
-    assert boundary.native(store) is store._native
-    assert boundary.term_dict(store) is store._dict
+    store._opened()
+    assert boundary.native(store) is store._opened().native
+    assert boundary.term_dict(store) is file_codes(store).term_dict
 
 
 def test_a_scan_on_a_file_store_races_the_token(tmp_path):
@@ -126,7 +127,7 @@ def test_a_string_fallback_read_checks_the_token(tmp_path):
 
 def test_none_passes_through_with_counters_on(tmp_path, monkeypatch):
     store = VortexRdflibStore(_file(tmp_path, layout="default"))
-    store._store()
+    store._opened()
     monkeypatch.setattr(SETTINGS, "counters", True)
     assert boundary.native(store).match_code_chunks(*SCAN) is None
 
