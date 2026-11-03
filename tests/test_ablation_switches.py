@@ -10,8 +10,8 @@ from rdflib import Graph, Literal, URIRef
 from tests.corpus import (
     FIXTURE_NT,
     QUERIES,
-    RDFLIB_DIVERGES,
 )
+from tests.divergences import RDFLIB_DIVERGES
 from tests.support import (
     both_ways,
     file_codes,

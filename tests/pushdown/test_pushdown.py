@@ -2,7 +2,7 @@
 evaluator — every query shape is run both ways and compared exactly, on a
 file-backed and on an in-memory store — except where rdflib breaks SPARQL 1.1
 on a FILTER, where the pushdown gives the specification's answer
-(``tests/corpus.py``, ``RDFLIB_DIVERGES``)."""
+(``tests/divergences.py``, ``RDFLIB_DIVERGES``)."""
 
 from dataclasses import dataclass
 from typing import Any
@@ -14,9 +14,8 @@ from tests.corpus import (
     GRAPH_QUERIES,
     ORDER_QUERIES,
     QUERIES,
-    RDFLIB_DIVERGES,
-    spec_corrected,
 )
+from tests.divergences import RDFLIB_DIVERGES, spec_corrected
 from tests.support import (
     both_ways,
     file_codes,

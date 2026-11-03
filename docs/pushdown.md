@@ -1215,7 +1215,7 @@ and SPARQL 1.1 disagree ([SPARQL semantics](#sparql-semantics)):
   twice, with the hook and with rdflib's default evaluator, and compares the
   results — on the corpus queries where rdflib breaks SPARQL 1.1, with rdflib's
   answer corrected by the rows the specification drops or adds
-  ([`RDFLIB_DIVERGES`](../tests/corpus.py), each with its reason). It covers file-backed and in-memory stores, stores with each
+  ([`RDFLIB_DIVERGES`](../tests/divergences.py), each with its reason). It covers file-backed and in-memory stores, stores with each
   secondary index, and every code path forced on its own (file-backed): probe
   joins only, batched probes only, basic graph patterns only, the generic
   FILTER route only, and no native filters. File-backed and in memory, it also
@@ -1223,14 +1223,16 @@ and SPARQL 1.1 disagree ([SPARQL semantics](#sparql-semantics)):
   it; the same with pieces of one and of three rows, which streams every last
   step that shares one variable; and keep-scans for every join step that
   shares a variable. Each forcing is one row of a table,
-  [`FORCINGS`](../tests/pushdown/test_pushdown.py#L111): the settings it overrides and
+  [`FORCINGS`](../tests/pushdown/test_pushdown.py#L110): the settings it overrides and
   the corpora and stores it runs over. A test checks in the trace that each of
   these forcings reaches its path.
 - [`tests/support.py`](../tests/support.py) holds what the test modules share:
   [`both_ways`](../tests/support.py#L46), the trace reader, and the spies over
   the native store and its term dictionary.
   [`tests/corpus.py`](../tests/corpus.py) holds the shared fixture data and
-  query corpora.
+  query corpora, and [`tests/divergences.py`](../tests/divergences.py) the
+  corpus queries on which rdflib's evaluator breaks SPARQL 1.1, with the
+  specification's answer.
 - [`tests/test_filters.py`](../tests/test_filters.py) checks each piece of the
   fast FILTER route against SPARQL 1.1 as Oxigraph evaluates it
   ([`tests/oracle.py`](../tests/oracle.py)), over many literal spellings
@@ -1246,10 +1248,16 @@ and SPARQL 1.1 disagree ([SPARQL semantics](#sparql-semantics)):
   also runs over a BSBM store's literals.
 - [`tests/test_candidate_filters.py`](../tests/test_candidate_filters.py)
   checks which codes reach vortex-rdf.
-- [`tests/test_filter_scope.py`](../tests/test_filter_scope.py) checks which
-  bindings a `FILTER` sees and a group's solutions carry, against rdflib's
-  evaluator: across enclosing joins, `OPTIONAL`, `GRAPH ?g`, `MINUS`, `EXISTS`
-  bodies and `VALUES` tables.
+- The tests in `tests/filter_scope/` check which bindings a `FILTER` sees
+  and a group's solutions carry, against rdflib's evaluator: across
+  enclosing joins, `OPTIONAL`, `GRAPH ?g`, `MINUS` and `EXISTS` bodies
+  ([`test_filter_scope.py`](../tests/filter_scope/test_filter_scope.py)), and
+  over `VALUES` tables
+  ([`test_filter_values.py`](../tests/filter_scope/test_filter_values.py));
+  and which of those shapes the pushdown answers whole
+  ([`test_filter_handled.py`](../tests/filter_scope/test_filter_handled.py)).
+  Their query shapes are in [`tests/filter_corpus.py`](../tests/filter_corpus.py)
+  and [`tests/filter_values_corpus.py`](../tests/filter_values_corpus.py).
 - [`tests/test_order_by.py`](../tests/test_order_by.py) checks that `ORDER BY`
   ranks IRIs by their bare string and blank nodes by their label, as rdflib
   does.
