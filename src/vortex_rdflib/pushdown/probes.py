@@ -71,62 +71,87 @@ def _probe_lookahead(store, batch_n3: Sequence[Sequence[str | None]]) -> int | N
     return SETTINGS.scan_lookahead
 
 
-def _batched_probes(store, patterns) -> list[int]:
-    """The indexes of the quad patterns :func:`_run_probes` answers through
-    one batch call: those that scan, when there are enough of them
-    (``SETTINGS.scan_batch_min``, ``SETTINGS.memory_scan_batch_min``), or all of them when
-    enough cheap ones are probing a file-backed store
+def _batches(store, patterns) -> bool:
+    """Whether :func:`_run_probes` sends a join's probes — of one shape
+    (:func:`_probe_shape`), so all or none of them scan — through one batch
+    call: probes that scan, when there are enough of them
+    (``SETTINGS.scan_batch_min``, ``SETTINGS.memory_scan_batch_min``), and
+    point lookups, when enough of them probe a file-backed store
     (``SETTINGS.cheap_batch_min``)."""
     opened = store._opened()
     minimum = SETTINGS.memory_scan_batch_min if opened.in_memory else SETTINGS.scan_batch_min
     if len(patterns) < minimum:
-        return []
-    batched = [i for i, n3 in enumerate(patterns) if not opened.point_lookup(n3)]
-    if not opened.in_memory and len(patterns) - len(batched) >= SETTINGS.cheap_batch_min:
-        return list(range(len(patterns)))
-    return batched if len(batched) >= minimum else []
+        return False
+    if not opened.point_lookup(patterns[0]):
+        return True
+    return not opened.in_memory and len(patterns) >= SETTINGS.cheap_batch_min
 
 
-def _run_probes(store, probes, count: bool) -> list | Iterator:
+class _Answers:
+    """A batch of probes' answers, in order (``source``, an iterator the
+    join pulls), and how many of the probes have reached the native layer
+    (``sent``): every count, made at once; a batch call's matches, all at
+    its first pull; plain matches, one per pull. The answers count
+    themselves as they are made, so a pull costs no more than the
+    iterator's own."""
+
+    __slots__ = ("source", "sent")
+
+    def __init__(self) -> None:
+        self.source: Iterator = iter(())
+        self.sent = 0
+
+    def __iter__(self) -> Iterator:
+        return self.source
+
+    def close(self) -> None:
+        """Release what the native layer still holds: a batch call's probes
+        still in flight."""
+        close = getattr(self.source, "close", None)
+        if close is not None:
+            close()
+
+
+def _run_probes(store, probes, count: bool) -> _Answers:
     """Native answers to ``(n3, narrowing)`` probes (see :func:`_narrowing`),
-    in order: a list of counts, or an iterator of code columns that makes
-    each answer as it is pulled.
+    in order: counts, all made at once, or code columns, each made as it is
+    pulled.
 
-    The probes :func:`_batched_probes` picks go through one
-    ``count_quads_many`` or ``match_codes_many`` call — every probe parsed
-    before any runs, running as far ahead on the native runtime as
+    A join's probes go through one ``count_quads_many`` or
+    ``match_codes_many`` call where :func:`_batches` says — every probe
+    parsed before any runs, running as far ahead on the native runtime as
     :func:`_probe_lookahead` lets them, a file-backed store overlapping their
-    reads — and the rest through plain calls. The native boundary is taken
-    once (:mod:`vortex_rdflib.boundary`), so the query's cancel token is read
+    reads, the matches checked as they are pulled (:func:`_batch_answers`)
+    — and through plain calls otherwise. The native boundary is taken once
+    (:mod:`vortex_rdflib.boundary`), so the query's cancel token is read
     once: a batch call races it, a plain call races or checks it as the
-    boundary's policy says. The matches come from :func:`_probe_matches`
-    when only some probes are batched; otherwise from a generator over the
-    plain calls, or from the batch's own native iterator
-    (:func:`_batch_answers`).
+    boundary's policy says.
     """
-    if not probes:
-        return []
+    answers = _Answers()
     native = boundary.native(store)
-    batched = _batched_probes(store, [n3 for n3, _ in probes])
-    if not count:
-        if 0 < len(batched) < len(probes):
-            return _probe_matches(store, native, probes, batched)
+    batched = bool(probes) and _batches(store, [n3 for n3, _ in probes])
+    if count:
         if batched:
-            return _batch_answers(store, native, probes)
-        return (native.match_codes(*n3, **narrowing) for n3, narrowing in probes)
-    if not batched:
-        return [native.count_quads(*n3, **narrowing) for n3, narrowing in probes]
-    answers: list = [None] * len(probes)
-    batch = [_batch_probe(*probes[i]) for i in batched]
-    lookahead = _probe_lookahead(store, [probes[i][0] for i in batched])
-    counts = native.count_quads_many(batch, lookahead=lookahead)
-    for i, answer in zip(batched, counts, strict=True):
-        answers[i] = answer
-    done = set(batched)
-    for i, (n3, narrowing) in enumerate(probes):
-        if i not in done:
-            answers[i] = native.count_quads(*n3, **narrowing)
+            counts = native.count_quads_many(
+                [_batch_probe(*probe) for probe in probes],
+                lookahead=_probe_lookahead(store, [n3 for n3, _ in probes]),
+            )
+        else:
+            counts = [native.count_quads(*n3, **narrowing) for n3, narrowing in probes]
+        answers.source, answers.sent = iter(counts), len(probes)
+    elif batched:
+        answers.source = _batch_answers(store, native, probes, answers)
+    else:
+        answers.source = _plain_matches(native, probes, answers)
     return answers
+
+
+def _plain_matches(native, probes, answers: _Answers) -> Iterator:
+    """The code columns of each probe, one ``match_codes`` call per pull,
+    each counted on ``answers`` as it is sent."""
+    for n3, narrowing in probes:
+        answers.sent += 1
+        yield native.match_codes(*n3, **narrowing)
 
 
 def _batch_probe(n3, narrowing):
@@ -172,62 +197,18 @@ def _checked_batch(answers, total: int) -> Generator:
             close()
 
 
-def _batch_answers(store, native, probes) -> Iterator:
+def _batch_answers(store, native, probes, answers: _Answers) -> Iterator:
     """The code columns of every probe, in order, from one
-    ``match_codes_many`` call the first pull makes, checked
-    (:func:`_checked_batch`): each waited for as it is pulled, while the
-    probes run as far ahead as :func:`_probe_lookahead` lets them."""
-    answers = native.match_codes_many(
+    ``match_codes_many`` call the first pull makes — every probe counted on
+    ``answers`` as sent — checked (:func:`_checked_batch`): each waited for
+    as it is pulled, while the probes run as far ahead as
+    :func:`_probe_lookahead` lets them."""
+    batch = native.match_codes_many(
         [_batch_probe(*probe) for probe in probes],
         lookahead=_probe_lookahead(store, [n3 for n3, _ in probes]),
     )
-    yield from _checked_batch(answers, len(probes))
-
-
-def _probe_matches(store, native, probes, batched) -> Iterator:
-    """The code columns of each probe, in order, each made when it is pulled:
-    the ``batched`` probes' from the one ``match_codes_many`` call the first
-    pull makes, whose probes run, as far ahead as :func:`_probe_lookahead`
-    lets them, while the consumer works through the answers before theirs;
-    the others from a ``match_codes`` call at their position. ``native`` is
-    the store's handle through the boundary, which gives the batch the
-    query's cancel token and has a plain call race or check it. The batch's
-    answers are checked (:func:`_checked_batch`), and closing the iterator
-    releases them, which aborts the probes still in flight."""
-    in_batch = set(batched)
-    batch = native.match_codes_many(
-        [_batch_probe(*probes[i]) for i in batched],
-        lookahead=_probe_lookahead(store, [probes[i][0] for i in batched]),
-    )
-    answers = _checked_batch(batch, len(batched))
-    try:
-        for i, (n3, narrowing) in enumerate(probes):
-            if i in in_batch:
-                yield next(answers)
-            else:
-                yield native.match_codes(*n3, **narrowing)
-    finally:
-        answers.close()
-        # Closed here too: a consumer that stops before the first batched
-        # answer leaves the checked answers unstarted, and closing those
-        # runs nothing.
-        close = getattr(batch, "close", None)
-        if close is not None:
-            close()
-
-
-def _batch_probes_sent(store, probes, pulled: int, count: bool) -> int:
-    """How many of one batch's ``(n3, narrowing)`` probes have reached the
-    native layer once ``pulled`` of their answers are taken, as
-    :func:`_run_probes` sends them: every count, all made at once; of
-    matches, the batched ones (:func:`_batched_probes`), sent together at the
-    first pull, and the others pulled so far."""
-    if count:
-        return len(probes)
-    if not pulled:
-        return 0
-    batched = set(_batched_probes(store, [n3 for n3, _ in probes]))
-    return len(batched) + sum(1 for k in range(pulled) if k not in batched)
+    answers.sent = len(probes)
+    yield from _checked_batch(batch, len(probes))
 
 
 def _probe_shape(pat: Pattern, shared: Sequence) -> list:
@@ -273,7 +254,8 @@ def _probe_join(
     reaches them and released when the batch ends, however it ends. Once a
     probe's rows take the join past ``max_rows``, it drops the rows it made
     and the batch it is pulling, which aborts the probes still in flight,
-    and raises :class:`RowsOverBudget` with the probes it sent.
+    and raises :class:`RowsOverBudget` with the probes it sent
+    (:class:`_Answers`).
 
     A left join takes no deferred restriction: evaluated over the joined
     rows, it would drop the rows the join keeps padded.
@@ -298,10 +280,12 @@ def _probe_join(
 
     pad = (None,) * len(free)
     out = []
+    sent = 0  # the probes the batches before this one sent
     for start in range(0, len(rows), SETTINGS.probe_batch):
         batch = range(start, min(start + SETTINGS.probe_batch, len(rows)))
         probes = [(patterns[i], narrowing) for i in batch if patterns[i] is not None]
-        answers = iter(_run_probes(store, probes, count=not free))
+        answers = _run_probes(store, probes, count=not free)
+        pull = answers.source.__next__
         try:
             for i in batch:
                 row = rows[i]
@@ -311,11 +295,11 @@ def _probe_join(
                 elif not free:
                     # Existence probe: a count capped at one row, no columns;
                     # the row stands once.
-                    if next(answers) and all(pred(row) for pred in row_preds):
+                    if pull() and all(pred(row) for pred in row_preds):
                         out.append(row)
                         matched = True
                 else:
-                    cols = next(answers)
+                    cols = pull()
                     if cols is None:
                         raise NotImplementedError
                     if pat.distinct:
@@ -333,14 +317,10 @@ def _probe_join(
                     out.append(row + pad)
                 if max_rows is not None and len(out) > max_rows:
                     out.clear()
-                    sent = sum(n3 is not None for n3 in patterns[:start])
-                    pulled = sum(n3 is not None for n3 in patterns[start : i + 1])
-                    sent += _batch_probes_sent(store, probes, pulled, count=not free)
-                    raise RowsOverBudget(sent)
+                    raise RowsOverBudget(sent + answers.sent)
         finally:
-            close = getattr(answers, "close", None)
-            if close is not None:
-                close()
+            answers.close()
+        sent += answers.sent
     combined_schema = schema + tuple(free.keys())
     # The deferred per-variable restrictions, over the codes the probes
     # actually reached rather than the pattern's whole column. A variable
