@@ -49,7 +49,7 @@ from vortex_rdflib import (
     trace,
     unregister_sparql_pushdown,
 )
-from vortex_rdflib.cancel import cancel_scope
+from vortex_rdflib.cancel import CANCEL_TOKEN, cancel_scope
 from vortex_rdflib.open_file import OpenFile
 from vortex_rdflib.settings import SETTINGS
 
@@ -774,8 +774,10 @@ def test_filter_reuses_the_terms_its_early_pass_decoded(tmp_path):
 @contextlib.contextmanager
 def _tracing():
     """A query trace around the native wrapper under test; the events it
-    emits wait in the trace's pending lines (:func:`_pending_events`)."""
+    emits wait in the trace's pending lines (:func:`_pending_events`). The
+    scope keeps the cancel token current as it starts, as a query's does."""
     scope = query_scope.QueryScope()
+    scope.cancel = CANCEL_TOKEN.get()
     scope.trace = trace.QueryTrace(query_id=None)
     token = query_scope.enter(scope)
     try:
@@ -921,7 +923,7 @@ def test_a_traced_chunk_call_without_codes_returns_none(tmp_path):
 def test_the_traced_native_forwards_the_native_keywords(file_graph):
     """Traced, the boundary passes a call's keywords on and gives it the
     query's cancel token, which a scan, a chunked match and a batch race."""
-    with _tracing(), cancel_scope(CancelToken()) as token:
+    with cancel_scope(CancelToken()) as token, _tracing():
         traced: Any = boundary.native(file_graph.store)
         counts = traced.count_quads_many(_FOUR_PROBES, lookahead=1)
         answers = traced.match_codes_many(_FOUR_PROBES, lookahead=1)

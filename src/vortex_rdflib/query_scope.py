@@ -88,14 +88,12 @@ class QueryScope:
 _CURRENT: ContextVar[QueryScope | None] = ContextVar("vortex_rdflib_query_scope", default=None)
 
 
-def current() -> QueryScope | None:
-    """The scope of the query being evaluated, or ``None`` outside one."""
-    return _CURRENT.get()
-
-
-# Make ``scope`` the current query's, answering the token that ``leave``
-# takes to restore the previous one; the context variable's own methods, so
-# a loop that enters and leaves per row pays no Python frame for either.
+# The scope of the query being evaluated, or ``None`` outside one (``current``);
+# make ``scope`` the current query's, answering the token that ``leave`` takes
+# to restore the previous one (``enter``). The context variable's own
+# methods, so a native call or a loop that reads, enters or leaves per row
+# pays no Python frame for any of them.
+current: Callable[[], QueryScope | None] = _CURRENT.get
 enter: Callable[[QueryScope], Token] = _CURRENT.set
 leave: Callable[[Token], None] = _CURRENT.reset
 

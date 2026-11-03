@@ -91,7 +91,7 @@ decided before the generator exists too: the patterns of a block that a join
 could not take within the [pair budget](#the-pair-budget), which rdflib joins
 into each row as the generator yields it ([tier 3](#tier-3-and-the-emitter)).
 
-**Cancellation.** [`cancel_scope(token)`](../src/vortex_rdflib/cancel.py#L25)
+**Cancellation.** [`cancel_scope(token)`](../src/vortex_rdflib/cancel.py#L30)
 gives the queries started inside it a `vortex_rdf.CancelToken`. The query's
 scope keeps it, so each step of a lazy result runs under it, the steps after
 the block included. A call into vortex-rdf that the token can stop (a batch, a
@@ -101,7 +101,7 @@ chunked match, a one-shot call that scans a file-backed store) is given it
 vortex-rdf goes through and which also traces and counts the call. The one-shot calls
 that finish without waiting (a point lookup, a call capped at one row, any call
 on an in-memory store) check it as they are made
-([`check_cancelled`](../src/vortex_rdflib/cancel.py#L52)); a join's per-row
+([`check_cancelled`](../src/vortex_rdflib/cancel.py#L57)); a join's per-row
 probes are calls of one kind or the other, so each is a check point of its
 own. The loops between calls check it too: the pieces of a streamed join, the
 rows rdflib finishes, and the slices

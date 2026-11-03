@@ -10,8 +10,9 @@ iterator the call returns once. With nothing to observe — no cancel token, no
 traced query, the counters off — they hand back the store's own handles, so
 a call pays nothing for the boundary.
 
-The cancel policy, for the token of the query being evaluated
-(:data:`~vortex_rdflib.cancel.CANCEL_TOKEN`):
+The cancel policy, for the token of the query being evaluated — its
+scope's (:mod:`~vortex_rdflib.query_scope`), or outside any query the one
+:func:`~vortex_rdflib.cancel.cancel_scope` set:
 
 - ``count_quads`` and ``match_codes`` race the token (``cancel=``) when the
   call can scan a file-backed store: not on an in-memory store, which
@@ -28,10 +29,10 @@ No caller passes ``cancel=`` itself.
 import time
 from typing import Any, Protocol
 
-from vortex_rdf import CancelToken
+from vortex_rdf import Cancelled, CancelToken
 
-from . import counters, trace
-from .cancel import CANCEL_TOKEN, check_cancelled
+from . import counters, query_scope, trace
+from .cancel import CANCEL_TOKEN, CANCELLED, check_cancelled
 from .pushdown.tracing import _keep_summary, _probe_pattern
 from .settings import SETTINGS
 
@@ -65,11 +66,15 @@ def native(store) -> NativeHandle:
     every native call should reach it: the handle itself while nothing
     observes the call, else a proxy for this call."""
     opened = store._opened()
-    token = CANCEL_TOKEN.get()
-    traced = trace.active() is not None
-    if token is None and not traced and not SETTINGS.counters:
+    scope = query_scope.current()
+    if scope is None:
+        token, traced = CANCEL_TOKEN.get(), False
+    else:
+        token, traced = scope.cancel, scope.trace is not None
+    counted = SETTINGS.counters
+    if token is None and not traced and not counted:
         return opened.native
-    return _Native(opened, opened.native, token, traced, SETTINGS.counters)
+    return _Native(opened, token, traced, counted)
 
 
 def term_dict(store):
@@ -120,30 +125,29 @@ def _rows(result) -> int:
 class _Native:
     """A store's native handle as one call reaches it while it is observed
     (:func:`native`): the cancel policy applied, the call traced and counted.
-    Any method not named here passes through, counted."""
+    Any method not named here passes through, counted. The two one-shot
+    calls apply the policy inline, over the open file's residency and
+    point-lookup test taken once: a point lookup under a token costs the
+    call's frame and the test's, as it did before the boundary."""
 
-    __slots__ = ("_file", "_inner", "_token", "_traced", "_counted")
+    __slots__ = (
+        "_inner",
+        "_token",
+        "_traced",
+        "_counted",
+        "_observed",
+        "_in_memory",
+        "_point_lookup",
+    )
 
-    def __init__(self, opened, inner, token: CancelToken | None, traced: bool, counted: bool):
-        self._file = opened
-        self._inner = inner
+    def __init__(self, opened, token: CancelToken | None, traced: bool, counted: bool):
+        self._inner = opened.native
         self._token = token
         self._traced = traced
         self._counted = counted
-
-    def _one_shot(self, n3: tuple, options: dict) -> dict:
-        """The keywords of a one-shot call over the quad pattern ``n3``:
-        ``options`` with the token when the call races it; after a check of
-        the token when it does not."""
-        token = self._token
-        if token is None:
-            return options
-        opened = self._file
-        limit = options.get("limit")
-        if opened.in_memory or (limit is not None and limit <= 1) or opened.point_lookup(n3):
-            check_cancelled()
-            return options
-        return {**options, "cancel": token}
+        self._observed = traced or counted
+        self._in_memory = opened.in_memory
+        self._point_lookup = opened.point_lookup
 
     def _racing(self, options: dict) -> dict:
         """The keywords of a batch or a chunked match: ``options`` with the
@@ -151,8 +155,23 @@ class _Native:
         return options if self._token is None else {**options, "cancel": self._token}
 
     def count_quads(self, *pattern, **options):
-        n3 = _quad(pattern)
-        options = self._one_shot(n3, options)
+        token = self._token
+        if token is not None:
+            # The policy: race the token where the call can scan a file,
+            # else check it now (the module docstring).
+            limit = options.get("limit") if options else None
+            if (
+                self._in_memory
+                or (limit is not None and limit <= 1)
+                or (pattern and pattern[0] is not None)
+                or self._point_lookup((*pattern, None, None, None, None)[:4])
+            ):
+                if token.cancelled:
+                    raise Cancelled(CANCELLED)
+            else:
+                options = {**options, "cancel": token}
+        if not self._observed:
+            return self._inner.count_quads(*pattern, **options)
         started = time.perf_counter_ns() if self._traced else 0
         result = self._inner.count_quads(*pattern, **options)
         if self._counted:
@@ -161,7 +180,7 @@ class _Native:
             trace.event(
                 "native_call_complete",
                 operation="count_quads",
-                pattern=list(n3),
+                pattern=list(_quad(pattern)),
                 keep=_keep_summary(options.get("keep")),
                 limit=options.get("limit"),
                 returned_rows=result,
@@ -170,8 +189,22 @@ class _Native:
         return result
 
     def match_codes(self, *pattern, **options):
-        n3 = _quad(pattern)
-        options = self._one_shot(n3, options)
+        token = self._token
+        if token is not None:
+            # The policy, as count_quads applies it.
+            limit = options.get("limit") if options else None
+            if (
+                self._in_memory
+                or (limit is not None and limit <= 1)
+                or (pattern and pattern[0] is not None)
+                or self._point_lookup((*pattern, None, None, None, None)[:4])
+            ):
+                if token.cancelled:
+                    raise Cancelled(CANCELLED)
+            else:
+                options = {**options, "cancel": token}
+        if not self._observed:
+            return self._inner.match_codes(*pattern, **options)
         started = time.perf_counter_ns() if self._traced else 0
         result = self._inner.match_codes(*pattern, **options)
         if self._counted:
@@ -180,7 +213,7 @@ class _Native:
             trace.event(
                 "native_call_complete",
                 operation="match_codes",
-                pattern=list(n3),
+                pattern=list(_quad(pattern)),
                 keep=_keep_summary(options.get("keep")),
                 limit=options.get("limit"),
                 returned_rows=None if result is None else len(result[0]),

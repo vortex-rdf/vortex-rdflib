@@ -14,11 +14,16 @@ from contextvars import ContextVar
 
 from vortex_rdf import Cancelled, CancelToken
 
-#: The cancel token of the query being evaluated: set by :func:`cancel_scope`
-#: for the queries started inside it, kept in the query's scope
-#: (``QueryScope.cancel``) and set again around each step of its lazy result
-#: (``pushdown.hook._scoped_iterator``).
+from . import query_scope
+
+#: The token :func:`cancel_scope` sets: a query started inside the block
+#: keeps it in its scope (``QueryScope.cancel``), which every step of its
+#: lazy result runs under; a call outside any query (``triples()``) reads it
+#: here.
 CANCEL_TOKEN: ContextVar[CancelToken | None] = ContextVar("vortex_rdflib_cancel", default=None)
+
+#: What a cancelled token raises ``vortex_rdf.Cancelled`` with.
+CANCELLED = "cancelled through its CancelToken"
 
 
 @contextlib.contextmanager
@@ -50,10 +55,12 @@ def cancel_scope(token: CancelToken) -> Generator[CancelToken]:
 
 
 def check_cancelled() -> None:
-    """Raise ``vortex_rdf.Cancelled`` when the current query's cancel token is
-    cancelled: the check made per step of a loop that makes no native call,
-    and before a one-shot native call that does not race the token
-    (:mod:`.boundary`)."""
-    token = CANCEL_TOKEN.get()
+    """Raise ``vortex_rdf.Cancelled`` when the current query's cancel token —
+    its scope's (:mod:`.query_scope`), or outside any query the one
+    :func:`cancel_scope` set — is cancelled: the check made per step of a
+    loop that makes no native call, and before a native call that does not
+    race the token (:mod:`.boundary`)."""
+    scope = query_scope.current()
+    token = CANCEL_TOKEN.get() if scope is None else scope.cancel
     if token is not None and token.cancelled:
-        raise Cancelled("cancelled through its CancelToken")
+        raise Cancelled(CANCELLED)

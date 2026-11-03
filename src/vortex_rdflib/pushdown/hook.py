@@ -174,39 +174,31 @@ def _counted(iterator, opened):
 
 
 def _scoped_iterator(iterator, opened):
-    """``iterator`` with the query's scope current around each step, and the
-    query's cancel token (``opened.cancel``) the current one; the scope is
-    cleared when the iterator ends, fails or is closed. The token is set
-    only when the current one is another, as it is for a step pulled after
-    the query's :func:`~.cancel.cancel_scope` block."""
-    cancel = opened.cancel
+    """``iterator`` with the query's scope current around each step — its
+    term state, its cancel token and its trace, so a step pulled after the
+    query's :func:`~.cancel.cancel_scope` block still runs under the token
+    the query started with — and cleared when the iterator ends, fails or is
+    closed."""
     enter, leave = query_scope.enter, query_scope.leave
-    get_cancel, set_cancel, reset_cancel = CANCEL_TOKEN.get, CANCEL_TOKEN.set, CANCEL_TOKEN.reset
     started = 0 if opened.trace is None else time.perf_counter_ns()
     try:
         while True:
             token = enter(opened)
-            reset = set_cancel(cancel) if get_cancel() is not cancel else None
             try:
                 item = next(iterator)
             except StopIteration:
                 return
             finally:
-                if reset is not None:
-                    reset_cancel(reset)
                 leave(token)
             yield item
     finally:
         close = getattr(iterator, "close", None)
         if close is not None:
-            token = query_scope.enter(opened)
-            reset = CANCEL_TOKEN.set(cancel) if CANCEL_TOKEN.get() is not cancel else None
+            token = enter(opened)
             try:
                 close()
             finally:
-                if reset is not None:
-                    CANCEL_TOKEN.reset(reset)
-                query_scope.leave(token)
+                leave(token)
         if opened.trace is not None:
             token = query_scope.enter(opened)
             try:

@@ -4,6 +4,9 @@ the query's cancel token by one policy, traces it while the query is
 traced, and counts it while the counters are on — and hands back the bare
 handles when nothing observes."""
 
+import cProfile
+import pstats
+
 import pytest
 from tests.support import file_codes
 from vortex_rdf import Cancelled, CancelToken, serialize_rdf
@@ -139,3 +142,26 @@ def test_the_union_check_stops_when_cancelled(tmp_path):
     with cancel_scope(_cancelled()) as token, pytest.raises(Cancelled):
         store._union_has_repeats()
     assert spy.calls == [("count_quads", {"cancel": token})]
+
+
+def _python_frames(method, *pattern) -> list[str]:
+    """The Python functions ``method(*pattern)`` runs, by name (no builtins)."""
+    profile = cProfile.Profile()
+    profile.enable()
+    method(*pattern)
+    profile.disable()
+    stats = pstats.Stats(profile).get_stats_profile().func_profiles
+    return sorted(name for name, entry in stats.items() if entry.file_name != "~")
+
+
+def test_a_one_shot_call_under_a_token_costs_main_s_frames(tmp_path):
+    """Under a cancel token a one-shot call through the proxy runs no helper
+    between it and the native call (R2-S6): a lookup by subject is the
+    proxy's one frame, and a scan the proxy's and the open file's
+    point-lookup test, which tells it to race the token."""
+    store = VortexRdflibStore(_file(tmp_path))
+    point = (f"<{EX}s7>", f"<{EX}p>", None, None)
+    with cancel_scope(CancelToken()):
+        native = boundary.native(store)
+        assert _python_frames(native.count_quads, *point) == ["count_quads"]
+        assert _python_frames(native.match_codes, *SCAN) == ["match_codes", "point_lookup"]
