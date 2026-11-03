@@ -1,4 +1,4 @@
-"""The ablation switches (:mod:`vortex_rdflib.ablation`): each changes how
+"""The ablation switches (:func:`vortex_rdflib.settings.apply_switches`): each changes how
 the pushdown answers, never what it answers. Each setting runs the pushdown
 suite's queries over the fixture, file-backed and in memory, with its
 :data:`~vortex_rdflib.settings.SETTINGS` fields set — as its environment

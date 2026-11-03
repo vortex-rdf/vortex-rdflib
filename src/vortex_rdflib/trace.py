@@ -16,6 +16,7 @@ import time
 from collections.abc import Callable
 
 from . import query_scope
+from .terms import is_range
 
 PREFIX = "VORTEX_RDF_QUERY_TRACE "
 
@@ -102,3 +103,22 @@ def stopwatch() -> Callable[[], int]:
         return _no_time
     started = time.perf_counter_ns()
     return lambda: time.perf_counter_ns() - started
+
+
+def keep_summary(keep) -> dict | None:
+    """A native keep as an event's JSON: per position, a code range or a code
+    set's size."""
+    if not keep:
+        return None
+    return {
+        str(position): ({"range": list(spec)} if is_range(spec) else {"codes": len(spec)})
+        for position, spec in keep.items()
+    }
+
+
+def probe_pattern(probe) -> list:
+    """The ``(s, p, o, g)`` of a batch probe, tuple or dict, as an event's
+    JSON."""
+    if isinstance(probe, dict):
+        return [probe.get(key) for key in ("s", "p", "o", "g")]
+    return list(probe)

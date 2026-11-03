@@ -12,7 +12,7 @@ from vortex_rdf import U64Column
 from .. import boundary, filters, trace, union
 from ..settings import SETTINGS
 from ..terms import is_range, unparseable_iri
-from . import relation, tracing
+from . import relation
 from .algebra import _VAR_LIKE
 from .relation import Relation
 
@@ -347,7 +347,7 @@ def _push_native_restrictions(store, pat: Pattern, var_preds) -> dict:
                     variable=str(var),
                     pushed_predicate_count=len(conjuncts) - len(rest),
                     residual_predicate_count=len(rest),
-                    keep=tracing._keep_summary({positions[0]: keep}),
+                    keep=trace.keep_summary({positions[0]: keep}),
                 )
         if rest:
             residual[var] = rest

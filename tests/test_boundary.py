@@ -4,8 +4,10 @@ the query's cancel token by one policy, traces it while the query is
 traced, and counts it while the counters are on — and hands back the bare
 handles when nothing observes."""
 
+import ast
 import cProfile
 import pstats
+from pathlib import Path
 
 import pytest
 from tests.support import file_codes
@@ -165,3 +167,12 @@ def test_a_one_shot_call_under_a_token_costs_main_s_frames(tmp_path):
         native = boundary.native(store)
         assert _python_frames(native.count_quads, *point) == ["count_quads"]
         assert _python_frames(native.match_codes, *SCAN) == ["match_codes", "point_lookup"]
+
+
+def test_the_boundary_imports_nothing_from_the_pushdown():
+    """The native boundary sits below the pushdown, which calls it: the
+    trace helpers it uses are the trace module's, so loading it never
+    reaches into a pushdown package still being initialised."""
+    tree = ast.parse(Path(boundary.__file__).read_text(encoding="utf-8"))
+    imported = [node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
+    assert not [module for module in imported if "pushdown" in module]

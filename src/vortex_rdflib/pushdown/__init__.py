@@ -154,8 +154,7 @@ The modules, from the hook down:
 - :mod:`.algebra` — what a block holds and binds, and its graph scope;
 - :mod:`.relation` — code-space relations, their rows, the join kernels;
 - :mod:`.solutions` — decoding rows into rdflib solutions;
-- :mod:`.aliasing` — codes whose terms another code represents;
-- :mod:`.tracing` — the query trace.
+- :mod:`.aliasing` — codes whose terms another code represents.
 
 The package exports the two registration functions; the modules are its
 internals. Within the package a module calls another's functions through it
@@ -180,7 +179,6 @@ from . import (  # noqa: F401
     relation,
     solutions,
     streaming,
-    tracing,
 )
 from .hook import register_sparql_pushdown, unregister_sparql_pushdown
 

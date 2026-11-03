@@ -33,7 +33,6 @@ from vortex_rdf import Cancelled, CancelToken
 
 from . import counters, query_scope, trace
 from .cancel import CANCEL_TOKEN, CANCELLED, check_cancelled
-from .pushdown.tracing import _keep_summary, _probe_pattern
 from .settings import SETTINGS
 
 
@@ -181,7 +180,7 @@ class _Native:
                 "native_call_complete",
                 operation="count_quads",
                 pattern=list(_quad(pattern)),
-                keep=_keep_summary(options.get("keep")),
+                keep=trace.keep_summary(options.get("keep")),
                 limit=options.get("limit"),
                 returned_rows=result,
                 elapsed_ns=time.perf_counter_ns() - started,
@@ -214,7 +213,7 @@ class _Native:
                 "native_call_complete",
                 operation="match_codes",
                 pattern=list(_quad(pattern)),
-                keep=_keep_summary(options.get("keep")),
+                keep=trace.keep_summary(options.get("keep")),
                 limit=options.get("limit"),
                 returned_rows=None if result is None else len(result[0]),
                 elapsed_ns=time.perf_counter_ns() - started,
@@ -231,7 +230,7 @@ class _Native:
                 "native_batch_complete",
                 operation="count_quads_many",
                 probe_count=len(probes),
-                first_pattern=_probe_pattern(probes[0]) if probes else None,
+                first_pattern=trace.probe_pattern(probes[0]) if probes else None,
                 returned_rows=sum(result),
                 elapsed_ns=time.perf_counter_ns() - started,
             )
@@ -247,7 +246,7 @@ class _Native:
             event = {
                 "operation": "match_codes_many",
                 "probe_count": len(probes),
-                "first_pattern": _probe_pattern(probes[0]) if probes else None,
+                "first_pattern": trace.probe_pattern(probes[0]) if probes else None,
             }
         return _Pulled(answers, self._counted, "native_batch_complete", event, started)
 
@@ -263,7 +262,7 @@ class _Native:
             event = {
                 "operation": "match_code_chunks",
                 "pattern": list(_quad(pattern)),
-                "keep": _keep_summary(options.get("keep")),
+                "keep": trace.keep_summary(options.get("keep")),
                 "columns": list(options.get("columns", ("s", "p", "o", "g"))),
             }
         return _Pulled(chunks, self._counted, "native_chunks_complete", event, started)
