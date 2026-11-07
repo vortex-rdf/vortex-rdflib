@@ -159,16 +159,12 @@ class Join(Block):
 
 @dataclass(frozen=True, slots=True, eq=False)
 class LeftJoin(Block):
-    """An OPTIONAL of ``right`` on ``left`` under the condition ``expr``.
-    ``left_kept`` is the left side's ``_vars``, the bindings rdflib keeps
-    when it evaluates an unmatched row again (``None`` where the node has
-    none)."""
+    """An OPTIONAL of ``right`` on ``left`` under the condition ``expr``."""
 
     name: ClassVar[str] = "LeftJoin"
     left: Block
     right: Block
     expr: Any
-    left_kept: frozenset | None
 
     def carries_graph(self, var) -> bool:
         return _left_carries_graph(self.left, self.right, var)
@@ -260,7 +256,7 @@ def block(node) -> Block:
         if name == "Join":
             return Join(mentioned, bound, nullable, left, right, bool(node.lazy))
         nullable |= frozenset(right.vars) - frozenset(left.bound_vars)
-        return LeftJoin(mentioned, bound, nullable, left, right, node.expr, _kept(node.p1))
+        return LeftJoin(mentioned, bound, nullable, left, right, node.expr)
     if name == "ToMultiSet" and getattr(node.p, "name", None) == "values":
         found, rows, nullable = _values_table(node.p.res)
         return Values(found, found, nullable, rows)

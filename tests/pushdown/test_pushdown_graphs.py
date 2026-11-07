@@ -5,6 +5,7 @@ the parser rejects matches nothing."""
 import pytest
 from rdflib import Dataset, Graph, Literal, URIRef
 from tests.corpus import FIXTURE_NQ, FIXTURE_NT
+from tests.divergences import spec_corrected
 from tests.support import run
 
 import vortex_rdflib.pushdown as pd
@@ -157,12 +158,14 @@ def test_a_term_the_parser_rejects_matches_nothing(dict_vortex, monkeypatch, spa
     """A term vortex-rdf's parser rejects is no term of the file, so a
     pattern holding it matches nothing, as in rdflib's own store: the
     pushdown's pattern is unsatisfiable, a VALUES constant gets a code that
-    joins nothing and is still yielded, and ``triples()`` yields nothing."""
+    joins nothing and is still yielded, and ``triples()`` yields nothing.
+    The pushdown's OPTIONAL keeps the VALUES row it leaves unmatched, as
+    SPARQL 1.1 does and rdflib's own OPTIONAL does not (``RDFLIB_DIVERGES``)."""
     memory = Graph()
     memory.parse(data=FIXTURE_NT, format="nt")
     expected = run(memory, sparql)
     answer = _answer_in_mode(monkeypatch, mode, dict_vortex, lambda s: Graph(store=s), sparql)
-    assert answer == expected
+    assert answer == (spec_corrected(sparql, expected) if mode == "pushdown" else expected)
 
 
 def test_a_context_naming_no_graph_is_empty(dict_vortex_quads):

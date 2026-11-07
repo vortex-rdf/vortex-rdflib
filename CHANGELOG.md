@@ -45,7 +45,10 @@ chunk, and a consumer that stops early (`LIMIT`, `ASK`) stops the read (#27). A
 triple pattern naming a term vortex-rdf's parser refuses (`<http://x/%zz>`, a
 lone surrogate, a second `#`, a language tag BCP 47 refuses) matches nothing
 instead of raising, in `triples()`, `contexts()`, `in` and every SPARQL pattern
-the pushdown resolves, a context binding included (#26). An
+the pushdown resolves, a context binding included (#26). An `OPTIONAL` the
+pushdown evaluates answers as SPARQL 1.1 does where rdflib's evaluator does not:
+it keeps a `VALUES` row no right row matches, and its FILTER sees a left-side
+variable an enclosing join binds (#24). An
 `OPTIONAL`, a nested group join and an `EXISTS` plan a one-pattern right side
 as a BGP's join step does: probed per row only where each probe is a point
 lookup, matched once narrowed to the left side's codes where each would scan
@@ -100,6 +103,17 @@ typed path per case.
     language-tagged pattern or flags, is an error;
   - impure functions (`RAND()`, `BNODE()`, ...) inside an `EXISTS` body are
     seen: the FILTER goes to rdflib and is drawn per row.
+- An `OPTIONAL` the pushdown evaluates answers as SPARQL 1.1 does where rdflib's
+  evaluator does not (#24), checked against Oxigraph. It keeps a `VALUES` row
+  that no right row matches, unextended: `VALUES ?o { <http://ex/unknown> }
+  OPTIONAL { ?s <p> ?o }` gives the row `?o = <http://ex/unknown>` with `?s`
+  unbound, which rdflib dropped whenever the store held a `<p>` triple. Its
+  FILTER sees a variable of its left side that an enclosing join binds too,
+  which rdflib saw unbound, dropping the row that matched. rdflib still answers
+  an `OPTIONAL` it evaluates itself (`LeftJoin` left out of
+  `VORTEX_RDF_PUSHDOWN_OPS`, or one under a binding rdflib substituted), and one
+  under `GRAPH ?g` whose right side alone binds `?g`, where its answer is the
+  specification's.
 - `VortexRdflibStore` takes `(configuration, identifier, path, *, in_memory)`
   and raises `TypeError` on any other argument, so a typo such as
   `in_memroy=True` no longer opens the file another way. The unused `layout`

@@ -123,13 +123,11 @@ def test_a_filter_block_carries_its_expression_and_what_it_may_see():
 
 
 def test_an_optional_block_carries_its_condition():
-    """An OPTIONAL's block carries its condition and its left side's
-    ``_vars``, which rdflib's second pass over an unmatched row keeps."""
+    """An OPTIONAL's block carries its condition."""
     source = prepareQuery("SELECT * { ?a <p> ?b OPTIONAL { ?b <q> ?c FILTER(?c > 1) } }")
     node = pd.algebra.block(source.algebra.p.p)
     assert isinstance(node, pd.algebra.LeftJoin)
     assert node.expr is source.algebra.p.p.expr
-    assert node.left_kept == frozenset(source.algebra.p.p.p1._vars)
 
 
 def test_values_rows_are_tuples_in_variable_order():

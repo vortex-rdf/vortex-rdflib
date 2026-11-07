@@ -146,3 +146,18 @@ def departs(sparql_expr: str, *spellings: str | None) -> str | None:
         if _ORDERING.search(sparql_expr):
             return "Oxigraph orders language-tagged strings of one tag; SPARQL 1.1 does not"
     return None
+
+
+def query_rows(nquads: str, sparql: str) -> list[tuple]:
+    """Oxigraph's solutions to ``sparql`` over the quads ``nquads`` (its
+    default graph the file's, not the union), each a tuple of N-Triples
+    spellings in the query's variable order, ``""`` for unbound, sorted."""
+    store = pyoxigraph.Store()
+    store.load(nquads.encode(), pyoxigraph.RdfFormat.N_QUADS)
+    solutions = store.query(sparql)
+    assert isinstance(solutions, pyoxigraph.QuerySolutions)
+    names = [variable.value for variable in solutions.variables]
+    return sorted(
+        tuple("" if solution[name] is None else str(solution[name]) for name in names)
+        for solution in solutions
+    )

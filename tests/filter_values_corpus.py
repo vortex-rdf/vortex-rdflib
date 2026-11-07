@@ -2,6 +2,7 @@
 and the answers SPARQL 1.1 gives where rdflib's differ (``SPEC_ANSWERS``)."""
 
 import pytest
+from rdflib import Literal, URIRef
 
 # A FILTER pushes a conjunct on one variable down to the pattern scans that
 # bind it, and a VALUES table that binds it applies it too: alone, joined, in a
@@ -16,9 +17,32 @@ OUT_OF_RANGE = """SELECT * WHERE { VALUES ?n { "300"^^<http://www.w3.org/2001/XM
     FILTER (?n > 5) }"""
 
 
+#: An OPTIONAL keeps a VALUES row no right row is compatible with (§18.5):
+#: ex:nowhere has no ex:p, so its row stays with ?o unbound. rdflib re-checks
+#: the row without the table's variables, finds another subject's ex:p and
+#: drops it (docs/pushdown.md). The projection fixes the column order, which
+#: rdflib's ``SELECT *`` takes from a set.
+UNDEF_OPTIONAL = """SELECT ?s ?x ?o WHERE { VALUES (?s ?x) { (ex:nowhere 1) (UNDEF 2) }
+    OPTIONAL { ?s ex:p ?o } }"""
+
+
+def _ex(name: str) -> URIRef:
+    return URIRef("http://ex/" + name)
+
+
 #: The VALUES shapes rdflib answers against the specification, and the
-#: specification's answer.
-SPEC_ANSWERS: dict[str, list] = {OUT_OF_RANGE: []}
+#: specification's answer, its rows sorted as ``tests.support.run`` sorts them.
+SPEC_ANSWERS: dict[str, list] = {
+    OUT_OF_RANGE: [],
+    UNDEF_OPTIONAL: [
+        (_ex("g1"), Literal(2), Literal("gx")),
+        (_ex("nowhere"), Literal(1), None),
+        (_ex("s1"), Literal(2), Literal("a")),
+        (_ex("s2"), Literal(2), Literal("b")),
+        (_ex("s3"), Literal(2), _ex("o3")),
+        (_ex("s4"), Literal(2), Literal("c")),
+    ],
+}
 
 
 VALUES_SHAPES = [
@@ -229,10 +253,7 @@ VALUES_UNDEF_SHAPES = [
         'SELECT * WHERE { VALUES (?s ?o) { (ex:nowhere UNDEF) (UNDEF "a") } ?s ex:p ?o }',
         id="values-undef-unknown-join",
     ),
-    pytest.param(
-        "SELECT * WHERE { VALUES (?s ?x) { (ex:nowhere 1) (UNDEF 2) } OPTIONAL { ?s ex:p ?o } }",
-        id="values-undef-unknown-optional",
-    ),
+    pytest.param(UNDEF_OPTIONAL, id="values-undef-unknown-optional"),
     pytest.param(
         """SELECT * WHERE { VALUES (?s ?o) { (ex:nowhere UNDEF) (UNDEF "a") }
         ?s ex:p ?o FILTER (?o != "b") }""",

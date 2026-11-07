@@ -360,6 +360,13 @@ QUERIES = [
     """SELECT ?x ?a WHERE {
         VALUES ?a { 42 7 }
         ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }""",
+    # an OPTIONAL keeps a VALUES row no right row matches, and its FILTER reads a left
+    # variable an enclosing join binds (§18.5; rdflib departs on both, RDFLIB_DIVERGES)
+    """SELECT ?x ?a WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/nobody> }
+        OPTIONAL { ?x <http://ex.org/age> ?a } }""",
+    """SELECT ?x ?y ?a WHERE { ?x <http://ex.org/name> ?n .
+        { ?x <http://ex.org/knows> ?y
+          OPTIONAL { ?y <http://ex.org/age> ?a FILTER(?x != ?y) } } }""",
     """ASK { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a }
         FILTER(!bound(?a)) }""",
     # --- group joins: nested groups, three groups (non-lazy), cross product, a filtered group

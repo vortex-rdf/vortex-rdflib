@@ -128,9 +128,15 @@ def _shared_key_ok(left: Relation, right: Relation, shared) -> None:
         raise NotImplementedError
 
 
-def _left_join_rows(schema_a, rows_a, schema_b, rows_b, preds) -> list:
+def _left_join_rows(schema_a, rows_a, schema_b, rows_b, preds, *, nullable_left=False) -> list:
     """Hash left join: each left row extended by every compatible right row
-    that passes ``preds`` (over the combined row), or padded with None."""
+    that passes ``preds`` (over the combined row), or padded with None.
+
+    With ``nullable_left`` a left row may leave a shared variable unbound
+    (a VALUES table's UNDEF), which every right row is compatible with on
+    it (SPARQL 1.1 §18.5): such a row joins each right row that agrees on
+    its bound shared variables, and takes the right row's values for the
+    unbound ones. The right rows bind every shared variable."""
     shared = [v for v in schema_b if v in schema_a]
     keep_b = [i for i, v in enumerate(schema_b) if v not in schema_a]
     ia = [schema_a.index(v) for v in shared]
@@ -142,14 +148,33 @@ def _left_join_rows(schema_a, rows_a, schema_b, rows_b, preds) -> list:
     out = []
     for ra in rows_a:
         matched = False
-        for tail in table.get(tuple(ra[i] for i in ia), ()):
-            row = ra + tail
-            if all(pred(row) for pred in preds):
-                out.append(row)
-                matched = True
+        key = tuple(ra[i] for i in ia)
+        if nullable_left and None in key:
+            for row in _compatible_rows(ra, key, ia, ib, keep_b, rows_b):
+                if all(pred(row) for pred in preds):
+                    out.append(row)
+                    matched = True
+        else:
+            for tail in table.get(key, ()):
+                row = ra + tail
+                if all(pred(row) for pred in preds):
+                    out.append(row)
+                    matched = True
         if not matched:
             out.append(ra + pad)
     return out
+
+
+def _compatible_rows(ra: tuple, key: tuple, ia, ib, keep_b, rows_b):
+    """The left row ``ra``, whose shared ``key`` leaves some variables
+    unbound, joined with each right row that agrees on the bound ones."""
+    for rb in rows_b:
+        if all(value is None or rb[j] == value for value, j in zip(key, ib, strict=True)):
+            merged = list(ra)
+            for i, j in zip(ia, ib, strict=True):
+                if merged[i] is None:
+                    merged[i] = rb[j]
+            yield tuple(merged) + tuple(rb[i] for i in keep_b)
 
 
 def _filter_relation(rel: Relation, preds) -> Relation:

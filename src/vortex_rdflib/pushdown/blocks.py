@@ -450,7 +450,7 @@ def _solve_left_join(ctx, store, node: algebra.LeftJoin, frame: _Frame) -> Relat
     OPTIONAL back before any native work. A right side of one pattern is
     joined as :func:`_plan_side` plans."""
     p1, p2, expr = node.left, node.right, node.expr
-    scope, env = frame.scope, frame.env
+    scope = frame.scope
     vars1, vars2 = algebra._scoped_vars(p1, scope), algebra._scoped_vars(p2, scope)
     if (
         scope.var is not None
@@ -461,29 +461,27 @@ def _solve_left_join(ctx, store, node: algebra.LeftJoin, frame: _Frame) -> Relat
         # the OPTIONAL: a left row whose matches all name another graph is
         # dropped there, where the graph column would pad it.
         raise NotImplementedError
-    # rdflib re-evaluates an unmatched OPTIONAL with only p1's `_vars` bound
-    # (its "cheated scope" check). That differs from the first pass when a
-    # variable that pass drops — bound by the context, by an enclosing join,
-    # or by p1 outside its `_vars` (a VALUES table) — reaches p2, or when a
-    # variable it keeps was invisible to the condition before; those shapes
-    # are left to rdflib.
-    outer = dict(ctx.bindings.items())
+    # Both sides are solved here bottom-up, as SPARQL 1.1's LeftJoin is
+    # (§18.5): a left row is extended by every compatible right row whose
+    # pairing passes the condition, else kept unextended, and the condition
+    # sees what both sides bind (and ``initBindings``). That is the
+    # specification's answer where rdflib's evaluator departs: it re-checks
+    # an unmatched row with only p1's ``_vars`` bound (its "cheated scope"),
+    # which leave a VALUES table's variables out, and its condition forgets
+    # a variable an enclosing lazy join substituted into p1. Only a binding
+    # rdflib substituted itself into a part it hands here (``ctx.bindings``
+    # beyond ``initBindings``: a join it evaluates, an EXISTS body) stays
+    # with rdflib, whose evaluation encloses this one: one that reaches p2
+    # but not p1, or that the condition reads on p1.
     init = frozenset(ctx.initBindings or ())
-    p1_vars = node.left_kept
-    if p1_vars is not None:
-        dropped = (env | frozenset(outer) | frozenset(vars1)) - init - p1_vars
-        # A graph variable is not a binding that flows from p1 into p2: rdflib
-        # evaluates the whole OPTIONAL with the graph *active* and labels the
-        # result with it afterwards, so p2 is in that graph however p1 went.
-        # Here both sides carry it as a column and the join on it says the
-        # same thing — including for a padded row, whose graph comes from p1.
-        dropped -= {scope.var}
-        if dropped & frozenset(vars2):
+    substituted = frozenset(dict(ctx.bindings.items())) - init
+    if substituted:
+        left_vars = frozenset(vars1)
+        if (substituted - left_vars) & frozenset(vars2):
             raise NotImplementedError
-        cheated = (env | frozenset(outer)) - init
         if (
             getattr(expr, "name", None) != "TrueFilter"
-            and frozenset(filters.exprs.expr_vars(expr)) & p1_vars & cheated
+            and frozenset(filters.exprs.expr_vars(expr)) & left_vars & substituted
         ):
             raise NotImplementedError
     conjuncts = _left_join_condition(ctx, store, node, scope)
@@ -510,7 +508,11 @@ def _solve_left_join(ctx, store, node: algebra.LeftJoin, frame: _Frame) -> Relat
         return Relation(left.schema + extra, None, rows, len(rows), nullable, applied=left.applied)
 
     single = p2.single
-    if single is not None:
+    # A variable the left side may leave unbound (a VALUES table's UNDEF)
+    # cannot key a probe: a right side over it is matched whole, and joined
+    # by SPARQL's compatibility (relation._left_join_rows).
+    unbound_keys = any(v in left.nullable for v in vars2)
+    if single is not None and not unbound_keys:
         # Counted before it is matched: a selective left relation drives the
         # probes without the complete right match the probes exist to avoid.
         plan_started = trace.stopwatch()
@@ -532,7 +534,11 @@ def _solve_left_join(ctx, store, node: algebra.LeftJoin, frame: _Frame) -> Relat
     else:
         right = _solve_block(ctx, store, p2, frame.right(frozenset(vars1)))
     shared = [v for v in right.schema if v in left.schema]
-    relation._shared_key_ok(left, right, shared)
+    if any(v in right.nullable for v in shared):
+        # A right row leaving a shared variable unbound needs the
+        # compatibility of both sides' gaps, which the hash join does not
+        # give; rdflib answers it.
+        raise NotImplementedError
     schema = left.schema + tuple(v for v in right.schema if v not in left.schema)
     rows = relation._left_join_rows(
         left.schema,
@@ -540,6 +546,7 @@ def _solve_left_join(ctx, store, node: algebra.LeftJoin, frame: _Frame) -> Relat
         right.schema,
         relation._rows_of(right),
         _condition_preds(store, conjuncts, schema),
+        nullable_left=any(v in left.nullable for v in shared),
     )
     return Relation(schema, None, rows, len(rows), nullable, applied=left.applied)
 

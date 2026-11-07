@@ -1,7 +1,7 @@
 """A conjunct on a variable a VALUES table binds holds on the table's rows —
 alone, joined, in a group, on a MINUS's left side, in a MINUS, a GRAPH or
 an EXISTS body — and an UNDEF beside a term the dictionary lacks leaves
-the answer rdflib's."""
+the answer rdflib's, but where rdflib breaks SPARQL 1.1 (``SPEC_ANSWERS``)."""
 
 import pytest
 from tests.filter_corpus import PREFIX
@@ -18,4 +18,4 @@ def test_a_filter_on_a_values_variable_answers_as_rdflib_does(dataset, sparql):
 @pytest.mark.parametrize("sparql", VALUES_UNDEF_SHAPES)
 def test_values_undef_and_unknown_terms_through_joins(dataset, sparql):
     with_pushdown, without_pushdown = both_ways(dataset, PREFIX + sparql)
-    assert with_pushdown == without_pushdown
+    assert with_pushdown == SPEC_ANSWERS.get(sparql, without_pushdown)

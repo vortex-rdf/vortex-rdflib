@@ -1,8 +1,8 @@
 """The pushdown must be observationally identical to rdflib's default
 evaluator — every query shape is run both ways and compared exactly, on a
 file-backed and on an in-memory store — except where rdflib breaks SPARQL 1.1
-on a FILTER, where the pushdown gives the specification's answer
-(``tests/divergences.py``, ``RDFLIB_DIVERGES``)."""
+on a FILTER or an OPTIONAL, where the pushdown gives the specification's
+answer (``tests/divergences.py``, ``RDFLIB_DIVERGES``)."""
 
 from dataclasses import dataclass
 from typing import Any
@@ -65,14 +65,23 @@ class Forcing:
     lookup), and the runs of its equivalence matrix — each a corpus
     (:data:`_CORPORA`) over the views it names (``graph-file`` and
     ``graph-mem`` over the triples, ``dataset-*`` over the quads, as a
-    union-default ``Dataset``). Where the path leaves every FILTER to
-    rdflib's evaluator (``rdflib_filters``), rdflib's semantics apply, so its
-    answer is the expected one even where it breaks SPARQL 1.1."""
+    union-default ``Dataset``). Where the path leaves every FILTER
+    (``rdflib_filters``) or every OPTIONAL (``rdflib_optionals``) to rdflib's
+    evaluator, rdflib's semantics apply to it, so rdflib's answer is the
+    expected one even where it breaks SPARQL 1.1 there."""
 
     settings: dict
     runs: tuple
     point: bool | None = None
     rdflib_filters: bool = False
+    rdflib_optionals: bool = False
+
+    @property
+    def corrected(self) -> frozenset:
+        """The operators whose divergences from rdflib the path corrects:
+        those it does not leave to rdflib (:func:`~tests.divergences.spec_corrected`)."""
+        to_rdflib = {"filter": self.rdflib_filters, "optional": self.rdflib_optionals}
+        return frozenset([of for of, left in to_rdflib.items() if not left])
 
 
 _GRAPH = ("graph-file", "graph-mem")
@@ -103,7 +112,12 @@ FORCINGS = {
     # Only basic graph patterns solved here (VORTEX_RDF_PUSHDOWN_OPS=bgp):
     # every head is rdflib's own operator, and rdflib evaluates a `Graph`
     # node itself, pushing each block down under a constant scope.
-    "bgp_only": Forcing({"enabled_ops": frozenset({"BGP"})}, _FILE_AND_GRAPHS, rdflib_filters=True),
+    "bgp_only": Forcing(
+        {"enabled_ops": frozenset({"BGP"})},
+        _FILE_AND_GRAPHS,
+        rdflib_filters=True,
+        rdflib_optionals=True,
+    ),
     # The native term predicates off: every conjunct they would decide runs
     # on the Python fast route.
     "python_filters": Forcing({"native_filters": False}, _FILE),
@@ -185,10 +199,8 @@ def test_answers_equal_the_default_evaluator(
     _force(FORCINGS[forcing], monkeypatch)
     _, runner = _CORPORA[corpus]
     with_pushdown, without_pushdown = both_ways(target, sparql, runner)
-    if FORCINGS[forcing].rdflib_filters:
-        assert with_pushdown == without_pushdown
-    else:
-        assert with_pushdown == spec_corrected(sparql, without_pushdown)
+    corrected = FORCINGS[forcing].corrected
+    assert with_pushdown == spec_corrected(sparql, without_pushdown, of=corrected)
 
 
 #: The forced paths a trace shows taken, by id: the forcing, and the test
