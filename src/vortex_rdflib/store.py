@@ -280,11 +280,12 @@ class VortexRdflibStore(Store):
         starts, and the native boundary (:mod:`.boundary`) applies it: a
         one-shot native match or count races it where the token can stop
         that call — a scan of a file-backed store — and checks it before the
-        call otherwise, every pull of a chunk races it, and a read through
-        the string fallback, which takes no token, checks it before the call.
+        call otherwise, and every pull of a chunk races it, the string
+        fallback's (``iter_quads``) included.
 
-        Each term it yields is one object per code (per spelling, on the
-        string fallback) for the whole call: the union's rows of one triple
+        Each term it yields is one object per code for the whole call, and on
+        the string fallback one object per spelling within a chunk and across
+        consecutive rows: the union's rows of one triple, which are adjacent,
         are told apart by identity (:func:`union.one_per_triple`).
         """
         s, p, o = triple_pattern
@@ -409,16 +410,30 @@ class VortexRdflibStore(Store):
 
     def _rows_from_strings(self, opened: OpenFile, native, pattern: tuple):
         """The rows of the quad pattern ``pattern`` as spellings — a layout
-        without codes, or the code path off — each term built once per
-        distinct spelling: ``match_columns`` shares one Python string object
-        across repeats of a term. It takes no cancel token, so the boundary
-        checks the token before it."""
+        without codes, or the code path off — streamed by ``iter_quads``
+        ``SETTINGS.triples_chunk_rows`` rows at a time, so a read holds about
+        one chunk and a consumer that stops early stops the read; the
+        boundary races the query's token on the call and on every chunk.
+        Each term is built once per distinct spelling of a chunk: the memo
+        starts over every ``triples_chunk_rows`` rows, so it never holds more
+        than a chunk's terms, and keeps the last row's, so a triple whose
+        rows straddle the restart is still the same objects — the union's
+        rows of one triple are adjacent, told apart by identity."""
         g_n3 = pattern[3]
-        subjects, predicates, objects, graphs = native.match_columns(*pattern)
-        fixed = opened.context_tuple(self, g_n3) if g_n3 is not None and subjects else None
+        chunk_rows = SETTINGS.triples_chunk_rows
+        fixed = None
         parse = self._from_n3_safe
         memo: dict[str, Node] = {}
-        for s_raw, p_raw, o_raw, g_raw in zip(subjects, predicates, objects, graphs, strict=True):
+        left = chunk_rows
+        previous: tuple = ()
+        for quad in native.iter_quads(*pattern, batch_rows=chunk_rows):
+            if not left:
+                memo = {raw: memo[raw] for raw in previous[:3]}
+                left = chunk_rows
+            left -= 1
+            s_raw, p_raw, o_raw, g_raw = previous = quad
+            if g_n3 is not None and fixed is None:
+                fixed = opened.context_tuple(self, g_n3)
             row = []
             for raw in (s_raw, p_raw, o_raw):
                 node = memo.get(raw)
@@ -491,8 +506,10 @@ class VortexRdflibStore(Store):
                 # Native distinct, in first-seen order.
                 codes = memoryview(cols[3].distinct()).cast("Q").tolist()
                 return [opened.context_of_code(self, code)[0] for code in codes]
-        *_spo, graphs = native.match_columns(s_n3, p_n3, o_n3, None)
-        return [opened.context_tuple(self, name)[0] for name in dict.fromkeys(graphs)]
+        # The string fallback: the match streamed, its graph names kept once.
+        quads = native.iter_quads(s_n3, p_n3, o_n3, None, batch_rows=SETTINGS.triples_chunk_rows)
+        names = dict.fromkeys(quad[3] for quad in quads)
+        return [opened.context_tuple(self, name)[0] for name in names]
 
     def _terms(self) -> QueryTerms:
         """The term state of the query being evaluated (:mod:`.query_scope`),
@@ -578,15 +595,17 @@ class VortexRdflibStore(Store):
         return boundary.native(self).count_quads(None, None, None, g_n3)
 
     def _union_size_by_spelling(self) -> int:
-        """The union's distinct triples, in a layout without codes: one match
-        of every quad, as spellings, whose rows of one triple are adjacent
-        (every sort order a store holds ends in the graph), counted by runs
-        of equal ``(s, p, o)`` spellings — no term is built."""
-        subjects, predicates, objects, _ = boundary.native(self).match_columns(
-            None, None, None, None
+        """The union's distinct triples, in a layout without codes: every quad,
+        as spellings, streamed a chunk at a time, whose rows of one triple are
+        adjacent (every sort order a store holds ends in the graph), counted
+        by runs of equal ``(s, p, o)`` spellings across chunks — no term is
+        built."""
+        quads = boundary.native(self).iter_quads(
+            None, None, None, None, batch_rows=SETTINGS.triples_chunk_rows
         )
         size, last = 0, None
-        for key in zip(subjects, predicates, objects, strict=True):
+        for s, p, o, _ in quads:
+            key = (s, p, o)
             if key != last:
                 size += 1
                 last = key

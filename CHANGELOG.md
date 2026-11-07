@@ -18,7 +18,8 @@ whose quads are in one graph, or whose graphs share no triple, reads the union
 as before and pays nothing for it: whether a triple repeats is read once per
 open file, from one pass over its triple codes when it holds several graphs.
 The floor is 0.15.0 because a FILTER's numeric comparison takes vortex-rdf's
-SPARQL 1.1 verdict in one native call, new in vortex-rdf 0.15 (the union drops a
+SPARQL 1.1 verdict in one native call, and a store without term codes streams
+its reads through `iter_quads`, both new in vortex-rdf 0.15 (the union drops a
 run of a triple's repeats with `U64Column.run_starts`, from 0.14). Ablation switches turn one
 mechanism of the pushdown off at a time for measurement
 (`VORTEX_RDF_CODE_PREDICATES=0`, `VORTEX_RDF_COUNT_ORDER=0`,
@@ -36,7 +37,11 @@ against Oxigraph; rdflib's semantics remain wherever rdflib evaluates
 ([docs/pushdown.md](docs/pushdown.md#sparql-semantics) lists every case). A
 numeric comparison is one native call, where it made two to four, and an
 `xsd:float` constant is decided natively: vortex-rdf 0.15 compares numbers as
-SPARQL 1.1 does (vortex-rdf/vortex-rdf#141). An
+SPARQL 1.1 does (vortex-rdf/vortex-rdf#141). On a store without term codes (a
+layout other than `"dictionary"`, or `VORTEX_RDF_DISABLE_CODE_PATH=1`),
+`triples()`, `contexts()` and the union's `len()` stream the match a chunk at a
+time: a read holds about one chunk's terms, a cancel stops it at the next
+chunk, and a consumer that stops early (`LIMIT`, `ASK`) stops the read (#27). An
 `OPTIONAL`, a nested group join and an `EXISTS` plan a one-pattern right side
 as a BGP's join step does: probed per row only where each probe is a point
 lookup, matched once narrowed to the left side's codes where each would scan

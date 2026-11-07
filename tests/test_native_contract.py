@@ -88,7 +88,8 @@ def test_version_is_0_15():
 #: The 0.15 names, and the members of each that the batch, chunk, cancel,
 #: join and union code of this package calls.
 _SURFACE_0_15 = {
-    "VortexRdfStore": ("match_codes_many", "count_quads_many", "match_code_chunks"),
+    "VortexRdfStore": ("match_codes_many", "count_quads_many", "match_code_chunks", "iter_quads"),
+    "QuadIterator": ("__iter__", "__next__"),
     "ProbeAnswers": ("__iter__", "__next__", "__len__"),
     "CodeChunks": ("__iter__", "__next__", "columns", "batch_rows"),
     "CancelToken": ("cancel", "cancelled"),

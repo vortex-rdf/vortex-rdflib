@@ -566,7 +566,7 @@ def test_a_point_read_checks_the_token_itself(graph, pattern, in_default_graph, 
 @pytest.fixture(scope="module")
 def default_vortex(tmp_path_factory):
     """This module's statements in the Default layout: with no dictionary the
-    store reads through ``match_columns``, which takes no token."""
+    store reads through ``iter_quads``, which races the token."""
     d = tmp_path_factory.mktemp("cancel-default")
     nt = d / "cancel.nt"
     nt.write_text(_statements(), encoding="utf-8")
@@ -585,11 +585,10 @@ def default_vortex(tmp_path_factory):
     ],
     ids=["pattern", "ground", "contexts"],
 )
-def test_the_string_fallback_checks_the_token(default_vortex, in_memory, read):
-    """A store without the code path reads through ``match_columns``, which
-    takes no token, so each such read checks it before the call: inside
-    ``cancel_scope`` a read goes through, and once the token is cancelled
-    the next raises ``Cancelled`` before any native call."""
+def test_the_string_fallback_races_the_token(default_vortex, in_memory, read):
+    """A store without the code path reads through ``iter_quads``, which
+    takes the token: inside ``cancel_scope`` a read goes through, and once the
+    token is cancelled the next raises ``Cancelled`` from the native call."""
     graph = Graph(store=VortexRdflibStore(str(default_vortex), in_memory=in_memory))
     spy = native_spy(graph)
     token = CancelToken()
@@ -598,7 +597,8 @@ def test_the_string_fallback_checks_the_token(default_vortex, in_memory, read):
         token.cancel()
         with pytest.raises(Cancelled):
             read(graph.store)
-    assert spy.calls == [("match_columns", {})]
+    assert spy.names() == ["iter_quads", "iter_quads"]
+    assert all(options.get("cancel") is token for _, options in spy.calls)
 
 
 @pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])

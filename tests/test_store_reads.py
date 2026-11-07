@@ -1,14 +1,17 @@
 """How the store reads quads for rdflib (:meth:`VortexRdflibStore.triples`):
-the graph a call reads is resolved once, a ground pattern is one row, and
-the union over every graph is a set by term code — as ``len()`` and the
-pushdown count it."""
+the graph a call reads is resolved once, a ground pattern is one row, the
+union over every graph is a set by term code — as ``len()`` and the pushdown
+count it — and a store without term codes streams its match."""
+
+import gc
 
 import pytest
 from rdflib import Graph, URIRef
-from tests.support import run
-from vortex_rdf import serialize_rdf
+from tests.support import native_spy, run
+from vortex_rdf import Cancelled, CancelToken, serialize_rdf
 
-from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
+from vortex_rdflib import VortexRdflibStore, cancel_scope, register_sparql_pushdown
+from vortex_rdflib.settings import SETTINGS
 
 EX = "http://ex.org/"
 INTEGER = "http://www.w3.org/2001/XMLSchema#integer"
@@ -121,3 +124,101 @@ def test_string_layout_len_counts_distinct_triples(tmp_path, monkeypatch, layout
     monkeypatch.setattr(store, "_from_n3_safe", lambda s: built.append(s) or original(s))
     assert len(store) == 2
     assert built == []
+
+
+# A read of a store without term codes streams its match through iter_quads
+# (#27): rows are pulled as they are consumed, the term memo holds one chunk,
+# a cancel stops the read at its next chunk, and an abandoned read lets the
+# native iterator go.
+
+TWENTY = [f"<{EX}s{i:02d}> <{EX}p> <{EX}o{i:02d}> .\n" for i in range(20)]
+
+
+def _no_code_file(tmp_path, lines, *, quads=False) -> str:
+    """A store file without term codes (the default layout)."""
+    source = tmp_path / ("data.nq" if quads else "data.nt")
+    source.write_text("".join(lines), encoding="utf-8")
+    path = tmp_path / "data.vortex"
+    serialize_rdf(str(source), str(path), layout="default")
+    return str(path)
+
+
+@pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
+def test_a_read_without_codes_pulls_rows_as_they_are_consumed(tmp_path, monkeypatch, in_memory):
+    monkeypatch.setattr(SETTINGS, "triples_chunk_rows", 4)
+    graph = Graph(store=VortexRdflibStore(_no_code_file(tmp_path, TWENTY), in_memory=in_memory))
+    spy = native_spy(graph)
+    first = next(iter(graph.triples((None, None, None))))
+    assert first[1] == URIRef(EX + "p")
+    assert spy.names() == ["iter_quads"]
+    assert spy.rows == [1]
+
+
+def test_a_read_without_codes_parses_a_term_once_per_chunk(tmp_path, monkeypatch):
+    """The term memo starts over every chunk, so it holds one chunk's terms
+    at most, but keeps the last row's: <A>, on the even rows, is parsed once
+    per chunk of four; <B>, on the odd rows and so on every chunk's last
+    row, once."""
+    monkeypatch.setattr(SETTINGS, "triples_chunk_rows", 4)
+    lines = [f"<{EX}s{i:02d}> <{EX}p> <{EX}{'AB'[i % 2]}> .\n" for i in range(20)]
+    graph = Graph(store=VortexRdflibStore(_no_code_file(tmp_path, lines)))
+    parsed, original = [], VortexRdflibStore._from_n3_safe
+    monkeypatch.setattr(
+        VortexRdflibStore,
+        "_from_n3_safe",
+        staticmethod(lambda raw: parsed.append(raw) or original(raw)),
+    )
+    assert len(list(graph.triples((None, None, None)))) == 20
+    assert parsed.count(f"<{EX}A>") == 5
+    assert parsed.count(f"<{EX}B>") == 1
+
+
+@pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
+def test_a_cancel_stops_a_read_without_codes_at_its_next_chunk(tmp_path, monkeypatch, in_memory):
+    monkeypatch.setattr(SETTINGS, "triples_chunk_rows", 4)
+    graph = Graph(store=VortexRdflibStore(_no_code_file(tmp_path, TWENTY), in_memory=in_memory))
+    token = CancelToken()
+    with cancel_scope(token):
+        rows = iter(graph.triples((None, None, None)))
+        next(rows)
+        token.cancel()
+        with pytest.raises(Cancelled):
+            for _ in range(4):
+                next(rows)
+
+
+def test_an_abandoned_read_without_codes_releases_its_native_iterator(tmp_path, monkeypatch):
+    monkeypatch.setattr(SETTINGS, "triples_chunk_rows", 4)
+    graph = Graph(store=VortexRdflibStore(_no_code_file(tmp_path, TWENTY)))
+    spy = native_spy(graph)
+    rows = iter(graph.triples((None, None, None)))
+    next(rows)
+    assert spy.feeds
+    del rows
+    gc.collect()
+    assert all(feed() is None for feed in spy.feeds)
+
+
+def test_the_union_without_codes_counts_a_triple_straddling_chunks_once(tmp_path, monkeypatch):
+    """A triple held by two graphs whose rows a chunk boundary splits is one
+    triple of the union (a guard: it passes before streaming, and fails if a
+    run of one triple restarts at a chunk boundary)."""
+    monkeypatch.setattr(SETTINGS, "triples_chunk_rows", 3)
+    lines = [f"<{EX}s{i}> <{EX}p> <{EX}o> <{EX}g{g}> .\n" for i in range(3) for g in (1, 2)]
+    store = VortexRdflibStore(_no_code_file(tmp_path, lines, quads=True))
+    assert len(store) == 3
+    graphs = store.contexts((URIRef(EX + "s1"), URIRef(EX + "p"), URIRef(EX + "o")))
+    assert sorted(str(graph.identifier) for graph in graphs) == [EX + "g1", EX + "g2"]
+
+
+def test_the_union_without_codes_yields_a_triple_straddling_chunks_once(tmp_path, monkeypatch):
+    """The union's rows of one triple are told apart by identity
+    (``union.one_per_triple``): a triple whose two graphs' rows a chunk
+    boundary splits keeps its term objects across the boundary, and is
+    yielded once with both graphs."""
+    monkeypatch.setattr(SETTINGS, "triples_chunk_rows", 3)
+    lines = [f"<{EX}s{i}> <{EX}p> <{EX}o> <{EX}g{g}> .\n" for i in range(3) for g in (1, 2)]
+    graph = Graph(store=VortexRdflibStore(_no_code_file(tmp_path, lines, quads=True)))
+    rows = list(graph.store.triples((None, None, None)))
+    assert [str(triple[0]) for triple, _ in rows] == [EX + "s0", EX + "s1", EX + "s2"]
+    assert all(len(list(contexts)) == 2 for _, contexts in rows)

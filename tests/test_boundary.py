@@ -123,11 +123,15 @@ def test_batches_and_chunks_always_race(tmp_path):
     assert all(kwargs.get("cancel") is token for _, kwargs in spy.calls)
 
 
-def test_a_string_fallback_read_checks_the_token(tmp_path):
+def test_a_string_fallback_read_races_the_token(tmp_path):
     store, spy = _spied(_file(tmp_path, layout="default"))
-    with cancel_scope(_cancelled()), pytest.raises(Cancelled):
+    store._union_has_repeats()  # the file's one-time check, outside the scope
+    spy.calls.clear()
+    token = _cancelled()
+    with cancel_scope(token), pytest.raises(Cancelled):
         list(store.triples((None, None, None)))
-    assert "match_columns" not in spy.names()
+    assert spy.names() == ["iter_quads"]
+    assert spy.calls[0][1].get("cancel") is token
 
 
 def test_none_passes_through_with_counters_on(tmp_path, monkeypatch):

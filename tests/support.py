@@ -197,8 +197,9 @@ def native_call_events(trace, operation) -> list[dict]:
 
 
 class _Chunks:
-    """A chunk iterator the spy handed out, counting in ``pulls[slot]`` the
-    chunks pulled from it."""
+    """An iterator the spy handed out, counting in ``pulls[slot]`` what was
+    pulled from it: the chunks of ``match_code_chunks``, the rows of
+    ``iter_quads``."""
 
     def __init__(self, inner, pulls: list[int]):
         self._inner = inner
@@ -217,15 +218,17 @@ class _Chunks:
 
 class NativeSpy:
     """The native store with every call recorded by name. The chunk
-    iterators ``match_code_chunks`` returns count their pulls (``pulls``)
-    and are watched by weak references (``feeds``), so a test sees whether
-    they were released."""
+    iterators ``match_code_chunks`` returns count their pulls (``pulls``),
+    the row iterators ``iter_quads`` returns their rows (``rows``), and both
+    are watched by weak references (``feeds``), so a test sees whether they
+    were released."""
 
     def __init__(self, inner):
         self._inner = inner
         self.calls: list[tuple[str, dict]] = []
         self.args: list[tuple] = []
         self.pulls: list[int] = []
+        self.rows: list[int] = []
         self.feeds: list[weakref.ref] = []
 
     def __len__(self):
@@ -243,6 +246,9 @@ class NativeSpy:
             result = attribute(*args, **kwargs)
             if name == "match_code_chunks" and result is not None:
                 result = _Chunks(result, self.pulls)
+                self.feeds.append(weakref.ref(result))
+            elif name == "iter_quads":
+                result = _Chunks(result, self.rows)
                 self.feeds.append(weakref.ref(result))
             return result
 

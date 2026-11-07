@@ -19,9 +19,10 @@ scope's (:mod:`~vortex_rdflib.query_scope`), or outside any query the one
   finishes without waiting, not capped at one row (``limit``), and not a
   point lookup (``OpenFile.point_lookup``). Any other checks the
   token before the call (:func:`~vortex_rdflib.cancel.check_cancelled`).
-- ``match_columns`` and ``get_quads`` check the token before the call.
-- The batches (``count_quads_many``, ``match_codes_many``) and the chunked
-  match (``match_code_chunks``) always race it.
+- ``get_quads`` checks the token before the call.
+- The batches (``count_quads_many``, ``match_codes_many``), the chunked
+  match (``match_code_chunks``) and the streamed quads (``iter_quads``, on the
+  call and on every chunk it pulls) always race it.
 
 No caller passes ``cancel=`` itself.
 """
@@ -51,7 +52,7 @@ class NativeHandle(Protocol):
 
     def match_code_chunks(self, *pattern: Any, **options: Any) -> Any: ...
 
-    def match_columns(self, *pattern: Any, **options: Any) -> Any: ...
+    def iter_quads(self, *pattern: Any, **options: Any) -> Any: ...
 
     def get_quads(self, *pattern: Any, **options: Any) -> Any: ...
 
@@ -267,11 +268,12 @@ class _Native:
             }
         return _Pulled(chunks, self._counted, "native_chunks_complete", event, started)
 
-    def match_columns(self, *pattern, **options):
-        check_cancelled()
+    def iter_quads(self, *pattern, **options):
+        # The string read was never traced (``match_columns`` before it), so
+        # its rows pass unwrapped: no event, and nothing per row.
         if self._counted:
             counters.add(native_calls=1)
-        return self._inner.match_columns(*pattern, **options)
+        return self._inner.iter_quads(*pattern, **self._racing(options))
 
     def get_quads(self, *pattern, **options):
         check_cancelled()
