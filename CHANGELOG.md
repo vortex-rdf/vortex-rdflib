@@ -44,7 +44,8 @@ time: a read holds about one chunk's terms, a cancel stops it at the next
 chunk, and a consumer that stops early (`LIMIT`, `ASK`) stops the read (#27). A
 triple pattern naming a term vortex-rdf's parser refuses (`<http://x/%zz>`, a
 lone surrogate, a second `#`, a language tag BCP 47 refuses) matches nothing
-instead of raising, in `triples()`, `contexts()` and `in` (#26). An
+instead of raising, in `triples()`, `contexts()`, `in` and every SPARQL pattern
+the pushdown resolves, a context binding included (#26). An
 `OPTIONAL`, a nested group join and an `EXISTS` plan a one-pattern right side
 as a BGP's join step does: probed per row only where each probe is a point
 lookup, matched once narrowed to the left side's codes where each would scan

@@ -11,7 +11,7 @@ from vortex_rdf import U64Column
 
 from .. import boundary, filters, trace, union
 from ..settings import SETTINGS
-from ..terms import is_range, unparseable_iri
+from ..terms import is_range
 from . import relation
 from .algebra import _VAR_LIKE
 from .relation import Relation
@@ -252,16 +252,17 @@ def _pattern_terms(ctx, store, s, p, o, scope, index: int | None = None) -> Patt
         if not isinstance(term, (*_VAR_LIKE, URIRef, Literal)):
             raise NotImplementedError
     rs, rp, ro = ctx[s], ctx[p], ctx[o]
+    to_n3 = store._node_to_n3
+    n3 = (to_n3(rs), to_n3(rp), to_n3(ro), scope.n3)
 
     # rdflib joins can propagate a literal into subject or predicate
     # position; that pattern is unsatisfiable, not an error. So is one that
-    # holds an IRI vortex-rdf's parser rejects, which is no term of the file.
+    # names a term vortex-rdf's parser refuses (the graph's name included),
+    # which is no term of the file.
     unsatisfiable = (
         (rs is not None and not isinstance(rs, (URIRef, BNode)))
         or (rp is not None and not isinstance(rp, URIRef))
-        or unparseable_iri(rs)
-        or unparseable_iri(rp)
-        or unparseable_iri(ro)
+        or boundary.any_refused(store, n3)
     )
 
     varpos: dict = {}
@@ -272,8 +273,6 @@ def _pattern_terms(ctx, store, s, p, o, scope, index: int | None = None) -> Patt
     if scope.var is not None:
         varpos.setdefault(scope.var, []).append(3)
 
-    to_n3 = store._node_to_n3
-    n3 = (to_n3(rs), to_n3(rp), to_n3(ro), scope.n3)
     distinct = scope.n3 is None and scope.var is None and store._union_has_repeats()
     pat = Pattern(n3, varpos, unsatisfiable, index=index, distinct=distinct)
     if scope.var is not None:
