@@ -176,6 +176,70 @@ def unparseable_iri(node) -> bool:
     return isinstance(node, URIRef) and _IRI_FORM.fullmatch(node) is None
 
 
+#: A surrogate code point: no spelling holding one can be encoded to UTF-8,
+#: so none can reach vortex-rdf.
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+#: The characters of an ASCII IRI (RFC 3986) besides its delimiters: the
+#: unreserved, the sub-delims and "%" (whose escapes are checked apart).
+_IRI_CHARS = r"A-Za-z0-9\-._~!$&'()*+,;=%"
+_SEGMENT = rf"[{_IRI_CHARS}:@]*+"
+#: An absolute ASCII IRI vortex-rdf always parses: a scheme, then an
+#: authority (user info, a host that is no IP literal, a port of digits) and
+#: its path, or a path that does not start with "//"; a query; at most one
+#: "#". Character classes, not alternations per character, keep it a scan.
+_SAFE_IRI = re.compile(
+    rf"<[A-Za-z][A-Za-z0-9+.\-]*+:"
+    rf"(?://(?:[{_IRI_CHARS}:]*+@)?[{_IRI_CHARS}]*+(?::[0-9]++)?(?:/{_SEGMENT})*+"
+    rf"|(?!//){_SEGMENT}(?:/{_SEGMENT})*+)"
+    rf"(?:\?[{_IRI_CHARS}:@/?]*+)?(?:#[{_IRI_CHARS}:@/?]*+)?>"
+)
+#: A "%" that does not start an escape of two hexadecimal digits.
+_BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+#: A literal as ``canonical_spelling`` spells it, with no suffix or a simple
+#: language tag.
+_SAFE_LITERAL = re.compile(r'"[^"\\]*+(?:\\.[^"\\]*+)*+"(?:@[a-z]{2,3}(?:-[a-z]{2}|-[0-9]{3})?)?')
+_SAFE_BLANK = re.compile(r"_:[A-Za-z0-9]++")
+
+
+def spelling_verdict(spelling: str) -> bool | None:
+    """Whether vortex-rdf's parser refuses the N-Triples ``spelling`` of a
+    pattern term (as ``canonical_spelling`` makes it), where that is decided
+    here: ``True`` refused — a surrogate, or an IRI (a literal's datatype
+    included) without the form every IRI it parses has — ``False`` accepted —
+    the default graph's name ``""``, or a spelling of a shape it always parses
+    — and ``None`` for vortex-rdf to decide
+    (:func:`vortex_rdflib.boundary.refused`). ``tests/test_refused_terms.py``
+    checks the local verdicts against vortex-rdf."""
+    if not spelling:
+        return False
+    if not spelling.isascii() and _SURROGATE.search(spelling):
+        return True
+    first = spelling[0]
+    if first == "<":
+        return _iri_verdict(spelling, 0, len(spelling))
+    if first == '"':
+        if _SAFE_LITERAL.fullmatch(spelling):
+            return False
+        close = spelling.rfind('"')
+        if spelling.startswith("^^<", close + 1):
+            return _iri_verdict(spelling, close + 3, len(spelling))
+        return None
+    if first == "_" and _SAFE_BLANK.fullmatch(spelling):
+        return False
+    return None
+
+
+def _iri_verdict(spelling: str, start: int, end: int) -> bool | None:
+    """:func:`spelling_verdict` of the IRI ``spelling[start:end]``, angle
+    brackets included."""
+    if _SAFE_IRI.fullmatch(spelling, start, end) and (
+        "%" not in spelling or _BAD_ESCAPE.search(spelling, start, end) is None
+    ):
+        return False
+    return True if _IRI_FORM.fullmatch(spelling, start + 1, end - 1) is None else None
+
+
 class KindRanges:
     """Each term kind's half-open code range in one dictionary: codes rank
     spellings in byte order and every spelling of a kind starts alike, so a

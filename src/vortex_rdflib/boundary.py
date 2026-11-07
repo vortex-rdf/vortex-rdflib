@@ -35,6 +35,7 @@ from vortex_rdf import Cancelled, CancelToken
 from . import counters, query_scope, trace
 from .cancel import CANCEL_TOKEN, CANCELLED, check_cancelled
 from .settings import SETTINGS
+from .terms import spelling_verdict
 
 
 class NativeHandle(Protocol):
@@ -109,6 +110,43 @@ def _code_or_none(dictionary, spelling: str) -> int | None:
         return dictionary.encode(spelling)
     except ValueError:
         return None
+
+
+#: The subject of the call that asks vortex-rdf's own parser whether it takes
+#: a spelling: bound, it makes the count a lookup on every layout.
+PARSE_CHECK_SUBJECT = "<urn:vortex-rdflib:parse-check>"
+
+
+def refused(store, spelling: str) -> bool:
+    """Whether vortex-rdf's parser refuses ``spelling``, a pattern term's: no
+    file holds such a term, so a pattern naming it matches nothing. Decided
+    here where :func:`~vortex_rdflib.terms.spelling_verdict` can, else by one
+    count that cannot scan, its subject bound; a ``ValueError`` from it
+    (``UnicodeEncodeError`` included) is the refusal."""
+    verdict = spelling_verdict(spelling)
+    return _parser_refuses(store, spelling) if verdict is None else verdict
+
+
+def any_refused(store, spellings) -> bool:
+    """Whether a pattern's spellings (``None`` for a free position) name a
+    term vortex-rdf refuses (:func:`refused`)."""
+    for spelling in spellings:
+        if spelling is None:
+            continue
+        verdict = spelling_verdict(spelling)
+        if verdict is None:
+            verdict = _parser_refuses(store, spelling)
+        if verdict:
+            return True
+    return False
+
+
+def _parser_refuses(store, spelling: str) -> bool:
+    try:
+        native(store).count_quads(PARSE_CHECK_SUBJECT, None, spelling, None)
+    except ValueError:
+        return True
+    return False
 
 
 def _quad(pattern: tuple) -> tuple:

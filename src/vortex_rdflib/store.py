@@ -11,7 +11,7 @@ from .open_file import DEFAULT_GRAPH, Codes, OpenFile, UnionFacts
 from .pushdown import register_sparql_pushdown
 from .query_scope import QueryTerms
 from .settings import SETTINGS
-from .terms import _term_builder, canonical_spelling, unparseable_iri
+from .terms import _term_builder, canonical_spelling
 
 
 class _NoGraph(NotImplementedError):
@@ -239,7 +239,13 @@ class VortexRdflibStore(Store):
         names_a_graph = known.get(spelling)
         if names_a_graph is None:
             pattern = (None, None, None, spelling)
-            names_a_graph = known[spelling] = boundary.native(self).count_quads(*pattern) > 0
+            try:
+                count = boundary.native(self).count_quads(*pattern)
+            except ValueError:
+                if boundary.refused(self, spelling):
+                    return None  # a label vortex-rdf refuses names no graph of the file
+                raise
+            names_a_graph = known[spelling] = count > 0
         return spelling if names_a_graph else None
 
     def triples(self, triple_pattern, context=None):
@@ -291,14 +297,8 @@ class VortexRdflibStore(Store):
         s, p, o = triple_pattern
         # RDFLib can propagate an object binding into subject or predicate
         # position during joins: that pattern is unsatisfiable, not an error.
-        # So is one holding an IRI vortex-rdf's parser rejects, which is no
-        # term of the file.
-        if (
-            (s is not None and not isinstance(s, (URIRef, BNode)))
-            or (p is not None and not isinstance(p, URIRef))
-            or unparseable_iri(s)
-            or unparseable_iri(p)
-            or unparseable_iri(o)
+        if (s is not None and not isinstance(s, (URIRef, BNode))) or (
+            p is not None and not isinstance(p, URIRef)
         ):
             return ()
         pattern = (self._node_to_n3(s), self._node_to_n3(p), self._node_to_n3(o), g_n3)
@@ -310,6 +310,22 @@ class VortexRdflibStore(Store):
                 f"s_n3={pattern[0]} p_n3={pattern[1]} o_n3={pattern[2]} g_n3={g_n3!r}",
                 flush=True,
             )
+        try:
+            return self._read_rows(triple_pattern, pattern)
+        except ValueError:
+            # So is one naming a term vortex-rdf's parser refuses: no file
+            # holds it. vortex-rdf refuses it before it reads a row, so the
+            # check runs only then, and any other error stands (g_n3 is a
+            # graph name the file can hold, _graph_n3).
+            if boundary.any_refused(self, pattern[:3]):
+                return ()
+            raise
+
+    def _read_rows(self, triple_pattern, pattern: tuple) -> Iterable[tuple]:
+        """:meth:`_quad_rows`' read of the quad pattern ``pattern``: its first
+        native call made here, the rest as the rows are pulled."""
+        s, p, o = triple_pattern
+        g_n3 = pattern[3]
         # The handle and the file's record (its codes, its graph contexts)
         # are bound once: rows read after a close(), or an open() of another
         # file, still come from the file the call started on.
@@ -330,7 +346,8 @@ class VortexRdflibStore(Store):
         matches = None if codes is None else self._code_matches(native, pattern)
         if codes is not None and matches is not None:
             return self._rows_from_codes(opened, codes, matches, g_n3)
-        return self._rows_from_strings(opened, native, pattern)
+        quads = native.iter_quads(*pattern, batch_rows=SETTINGS.triples_chunk_rows)
+        return self._rows_from_strings(opened, quads, g_n3)
 
     def _rows_from_codes(self, opened: OpenFile, codes: Codes, matches, g_n3: str | None):
         """The rows of ``matches`` — the code columns of one native match, or
@@ -408,9 +425,10 @@ class VortexRdflibStore(Store):
             # stops or a pull fails.
             del matches
 
-    def _rows_from_strings(self, opened: OpenFile, native, pattern: tuple):
-        """The rows of the quad pattern ``pattern`` as spellings — a layout
-        without codes, or the code path off — streamed by ``iter_quads``
+    def _rows_from_strings(self, opened: OpenFile, quads, g_n3: str | None):
+        """The rows of a quad pattern in the graph named ``g_n3`` as
+        spellings — a layout without codes, or the code path off — from
+        ``quads``, the pattern's ``iter_quads``, which streams
         ``SETTINGS.triples_chunk_rows`` rows at a time, so a read holds about
         one chunk and a consumer that stops early stops the read; the
         boundary races the query's token on the call and on every chunk.
@@ -419,14 +437,13 @@ class VortexRdflibStore(Store):
         than a chunk's terms, and keeps the last row's, so a triple whose
         rows straddle the restart is still the same objects — the union's
         rows of one triple are adjacent, told apart by identity."""
-        g_n3 = pattern[3]
         chunk_rows = SETTINGS.triples_chunk_rows
         fixed = None
         parse = self._from_n3_safe
         memo: dict[str, Node] = {}
         left = chunk_rows
         previous: tuple = ()
-        for quad in native.iter_quads(*pattern, batch_rows=chunk_rows):
+        for quad in quads:
             if not left:
                 memo = {raw: memo[raw] for raw in previous[:3]}
                 left = chunk_rows
@@ -486,15 +503,18 @@ class VortexRdflibStore(Store):
                 opened.all_contexts = self._distinct_graphs(None, None, None)
             return iter(opened.all_contexts)
         s, p, o = triple
-        if (
-            (s is not None and not isinstance(s, (URIRef, BNode)))
-            or (p is not None and not isinstance(p, URIRef))
-            or any(unparseable_iri(term) for term in triple)
+        if (s is not None and not isinstance(s, (URIRef, BNode))) or (
+            p is not None and not isinstance(p, URIRef)
         ):
             return iter(())
-        return iter(
-            self._distinct_graphs(self._node_to_n3(s), self._node_to_n3(p), self._node_to_n3(o))
-        )
+        spellings = (self._node_to_n3(s), self._node_to_n3(p), self._node_to_n3(o))
+        try:
+            return iter(self._distinct_graphs(*spellings))
+        except ValueError:
+            # A term vortex-rdf's parser refuses names nothing (_quad_rows).
+            if boundary.any_refused(self, spellings):
+                return iter(())
+            raise
 
     def _distinct_graphs(self, s_n3, p_n3, o_n3) -> list:
         """The distinct graphs of a pattern's match, in first-seen order."""
