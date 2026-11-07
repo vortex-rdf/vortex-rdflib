@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.4.0...v0.5.0) - 2026-11-03
 
-Requires vortex-rdf 0.14 (`vortex-rdf>=0.14.0,<0.15`, up from 0.13.1), and the
+Requires vortex-rdf 0.15 (`vortex-rdf>=0.15.0,<0.16`, up from 0.13.1), and the
 union default graph is a set of triples. A plain `Graph` over the store, and a
 `Dataset` whose default graph is the union, yielded a triple that several graphs
 hold once per graph; they now yield it once, with every graph that holds it as
@@ -17,8 +17,9 @@ count it once; `GRAPH ?g` and `quads()` still give one row per graph. A store
 whose quads are in one graph, or whose graphs share no triple, reads the union
 as before and pays nothing for it: whether a triple repeats is read once per
 open file, from one pass over its triple codes when it holds several graphs.
-The floor is 0.14.0 because a run of a triple's repeats is dropped with
-`U64Column.run_starts`, new in vortex-rdf 0.14. Ablation switches turn one
+The floor is 0.15.0 because a FILTER's numeric comparison takes vortex-rdf's
+SPARQL 1.1 verdict in one native call, new in vortex-rdf 0.15 (the union drops a
+run of a triple's repeats with `U64Column.run_starts`, from 0.14). Ablation switches turn one
 mechanism of the pushdown off at a time for measurement
 (`VORTEX_RDF_CODE_PREDICATES=0`, `VORTEX_RDF_COUNT_ORDER=0`,
 `VORTEX_RDF_DECODE_EACH_STEP=1`, `VORTEX_RDF_DECODE_CHUNK=<n>`,
@@ -32,7 +33,10 @@ evaluates gives SPARQL 1.1's answer where rdflib's evaluator differs — errors
 through `||` and `&&`, `IN`, comparisons across types and of ill-typed literals,
 NaN, numeric promotion, language-tag case, `REGEX` flags and patterns — checked
 against Oxigraph; rdflib's semantics remain wherever rdflib evaluates
-([docs/pushdown.md](docs/pushdown.md#sparql-semantics) lists every case). An
+([docs/pushdown.md](docs/pushdown.md#sparql-semantics) lists every case). A
+numeric comparison is one native call, where it made two to four, and an
+`xsd:float` constant is decided natively: vortex-rdf 0.15 compares numbers as
+SPARQL 1.1 does (vortex-rdf/vortex-rdf#141). An
 `OPTIONAL`, a nested group join and an `EXISTS` plan a one-pattern right side
 as a BGP's join step does: probed per row only where each probe is a point
 lookup, matched once narrowed to the left side's codes where each would scan
@@ -46,8 +50,11 @@ typed path per case.
 
 ### Breaking changes
 
-- vortex-rdf 0.13 is no longer supported: the dependency is
-  `vortex-rdf>=0.14.0,<0.15`.
+- vortex-rdf 0.13 and 0.14 are no longer supported: the dependency is
+  `vortex-rdf>=0.15.0,<0.16`. vortex-rdf 0.15 writes Dictionary-layout files in
+  a new edition (`vortexrdf2026.11.0`) that 0.14 and earlier cannot load into
+  memory; files written by 0.12 to 0.14 open and answer as before, and
+  rebuilding one from its quads gives its reads 0.15's zone statistics.
 - The union default graph is a set of triples: a triple in several graphs is
   one triple of the union in `triples()`, `len()` and every query over it. Code
   that counted it once per graph through the union counts it per graph with

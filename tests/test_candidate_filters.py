@@ -69,9 +69,8 @@ def test_a_single_pattern_filter_is_evaluated_over_its_matched_codes(tmp_path, i
     assert (kind, arg) == ("num_lt", f'"300"^^<{XSD}integer>')
     assert options == {"flags": "", "case": None, "as_str": False}
     assert codes == expected  # the 200 distinct prices, nothing dictionary-wide
-    # The checks around it read the same codes or fewer.
-    assert [call[0] for call in spy.calls] == ["datatype", "num_lt", "num_ne"]
-    assert all(set(call[3]) <= set(expected) for call in spy.calls)
+    # The comparison is its one call (vortex-rdf/vortex-rdf#141).
+    assert [call[0] for call in spy.calls] == ["num_lt"]
     with_pushdown, without_pushdown = both_ways(graph, query)
     assert with_pushdown == without_pushdown
 

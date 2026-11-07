@@ -10,6 +10,7 @@ native value model treats specially: decimals against doubles, integers past
 from types import SimpleNamespace
 
 import pytest
+from rdflib import Graph
 from rdflib.term import Variable
 from tests.corpus import SPELLINGS
 from tests.oracle import departs, spec_answer
@@ -21,6 +22,7 @@ from tests.support import (
     file_codes,
     filter_expr,
     kind_ranges,
+    run,
     typed,
 )
 from vortex_rdf import U64Column, serialize_rdf
@@ -28,6 +30,7 @@ from vortex_rdf import U64Column, serialize_rdf
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown, trace
 from vortex_rdflib.filters import native
 from vortex_rdflib.filters.native import FilterCodes
+from vortex_rdflib.settings import SETTINGS
 from vortex_rdflib.terms import BLANK, IRI, LITERAL, parse_spelling
 
 V = Variable("v")
@@ -118,6 +121,9 @@ for _constant, _spelled in [
     ("1e100", f'"1e+100"^^<{XSD}double>'),
     ('"5"^^xsd:int', f'"5"^^<{XSD}int>'),
     ('"5"^^xsd:long', f'"5"^^<{XSD}long>'),
+    # vortex-rdf 0.15 rounds an xsd:float to single precision, as XPath does
+    ('"5"^^xsd:float', f'"5"^^<{XSD}float>'),
+    ('"0.1"^^xsd:float', f'"0.1"^^<{XSD}float>'),
 ]:
     MAPPED.append((f"?v < {_constant}", ("num_lt", _spelled)))
     MAPPED.append((f"?v >= {_constant}", ("num_ge", _spelled)))
@@ -226,10 +232,6 @@ UNMAPPED = [
     "datatype(?v) != xsd:integer",
     "?v + 1 > 3",
     "!isIRI(?v)",
-    # an xsd:float constant: vortex-rdf compares it as a double, where XPath
-    # rounds it to single precision
-    '?v < "5"^^xsd:float',
-    '"5"^^xsd:float = ?v',
     # vortex-rdf compares a constant's language tag as written, SPARQL
     # case-insensitively: an upper-case tag stays with the Python routes
     'contains(?v, "a"@EN)',
@@ -392,8 +394,7 @@ def test_only_the_codes_a_predicate_reads_are_sent(spelling_store, monkeypatch):
     """vortex-rdf fails every code in neither answer set, so the codes outside
     a predicate's domain are decided here — `!=` passes every IRI and blank
     node, `<` fails them — and only literals are sent, sorted and unique, as
-    filter_codes requires: the xsd:float codes looked up first, and an
-    ordering's passed codes checked for numbers after."""
+    filter_codes requires, one call per comparison."""
     codes = _all_codes(spelling_store)
     lo, hi = kind_ranges(spelling_store).range(LITERAL)
     nonliterals = {code for code in codes if not lo <= code < hi}
@@ -406,38 +407,28 @@ def test_only_the_codes_a_predicate_reads_are_sent(spelling_store, monkeypatch):
     assert nonliterals <= passed_ne
     assert not nonliterals & passed_lt
     kinds = [kind for kind, _, _, _ in recording.calls]
-    assert kinds == ["datatype", "num_ne", "datatype", "num_lt", "num_ne"]
+    assert kinds == ["num_ne", "num_lt"]
     for sent in recording.sent:
         assert sent == sorted(set(sent))
         assert not set(sent) & nonliterals
 
 
-@pytest.mark.parametrize(
-    ("kind", "calls"),
-    [
-        ("num_eq", ["datatype", "num_eq"]),
-        ("num_ne", ["datatype", "num_ne"]),
-        ("num_lt", ["datatype", "num_lt", "num_ne"]),
-        ("num_gt", ["datatype", "num_gt", "num_ne"]),
-        ("num_le", ["datatype", "num_le", "num_ne", "num_eq"]),
-        ("num_ge", ["datatype", "num_ge", "num_ne", "num_eq"]),
-    ],
-)
-def test_a_numeric_comparison_makes_its_native_calls_in_order(
-    spelling_store, monkeypatch, kind, calls
-):
-    """Each numeric kind's native calls, in order: the xsd:float codes looked
-    up first (diverted to the Python routes), the comparison itself, and for
-    an ordering the check that what it passed are numbers — ``num_ne``, and
-    ``num_eq`` too for ``<=`` and ``>=`` (vortex-rdf/vortex-rdf#141 would
-    make it one call)."""
+NUMERIC_KINDS = ["num_eq", "num_ne", "num_lt", "num_gt", "num_le", "num_ge"]
+
+
+@pytest.mark.parametrize("kind", NUMERIC_KINDS)
+def test_a_numeric_comparison_is_one_native_call(spelling_store, monkeypatch, kind):
+    """vortex-rdf 0.15 compares numbers as SPARQL 1.1 does
+    (vortex-rdf/vortex-rdf#141): each numeric kind is its one filter_codes
+    call."""
     codes = _all_codes(spelling_store)
     recording = RecordingTermDict(file_codes(spelling_store).term_dict)
     monkeypatch.setattr(file_codes(spelling_store), "term_dict", recording)
     native.evaluate(spelling_store, FilterCodes(kind, f'"5"^^<{XSD}integer>'), codes)
-    assert [call[0] for call in recording.calls] == calls
+    assert [call[0] for call in recording.calls] == [kind]
 
 
+@pytest.mark.parametrize("kind", ["num_eq", "num_lt", "num_gt", "num_le", "num_ge"])
 @pytest.mark.parametrize(
     "constant",
     [
@@ -448,19 +439,45 @@ def test_a_numeric_comparison_makes_its_native_calls_in_order(
         f'"1e+100"^^<{XSD}double>',
     ],
 )
-def test_num_eq_and_num_ne_pass_only_numbers(spelling_store, constant):
-    """The contract an ordering's check for numbers relies on
-    (``native._only_numbers``): every code ``num_eq`` or ``num_ne`` passes is a
-    well-typed number."""
+def test_a_numeric_kind_passes_only_numbers(spelling_store, kind, constant):
+    """What taking filter_codes' answer alone relies on: every literal
+    ``num_eq`` or an ordering passes is a well-typed number (SPARQL 1.1
+    §17.3: ordering a literal without a numeric value is an error)."""
     codes = sorted(code for code in _all_codes(spelling_store) if _is_literal(spelling_store, code))
-    for kind in ("num_eq", "num_ne"):
-        passed, _ = file_codes(spelling_store).term_dict.filter_codes(
-            kind, constant, U64Column(codes)
-        )
-        for code in memoryview(passed).cast("Q").tolist():
-            stored = file_codes(spelling_store).term_dict.decode(code)
-            number = filters.values.numeric_operand(parse_spelling(stored))
-            assert number is not None, (kind, stored)
+    passed, _ = file_codes(spelling_store).term_dict.filter_codes(kind, constant, U64Column(codes))
+    for code in memoryview(passed).cast("Q").tolist():
+        stored = file_codes(spelling_store).term_dict.decode(code)
+        assert filters.values.numeric_operand(parse_spelling(stored)) is not None, stored
+
+
+@pytest.fixture
+def spelling_graph(spelling_store):
+    return Graph(store=spelling_store)
+
+
+#: Constants where vortex-rdf 0.15 may leave numbers undecided or refuse the
+#: constant: the Python route answers those, so both routes agree.
+EDGES = [
+    f'"16777217"^^<{XSD}float>',
+    f'"0.1"^^<{XSD}float>',
+    f'"1.0000000000000001"^^<{XSD}decimal>',
+    f'"9007199254740993"^^<{XSD}integer>',
+    f'"INF"^^<{XSD}double>',
+    f'"NaN"^^<{XSD}double>',
+    f'"abc"^^<{XSD}integer>',
+    f'"18446744073709551616"^^<{XSD}integer>',
+]
+
+
+@pytest.mark.parametrize("op", ["<", "<=", ">", ">=", "=", "!="])
+@pytest.mark.parametrize("constant", EDGES)
+def test_a_numeric_edge_answers_alike_natively_and_in_python(
+    spelling_graph, monkeypatch, op, constant
+):
+    sparql = f"SELECT ?v WHERE {{ ?s ?p ?v FILTER(?v {op} {constant}) }}"
+    native_rows = run(spelling_graph, sparql)
+    monkeypatch.setattr(SETTINGS, "native_filters", False)
+    assert native_rows == run(spelling_graph, sparql)
 
 
 def _is_literal(store, code: int) -> bool:

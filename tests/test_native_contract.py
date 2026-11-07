@@ -81,13 +81,13 @@ def _address(column: U64Column) -> int:
         ctypes.pythonapi.PyBuffer_Release(ctypes.byref(view))
 
 
-def test_version_is_0_14():
-    assert vortex_rdf.__version__.split(".")[:2] == ["0", "14"]
+def test_version_is_0_15():
+    assert vortex_rdf.__version__.split(".")[:2] == ["0", "15"]
 
 
-#: The 0.14 names, and the members of each that the batch, chunk, cancel,
+#: The 0.15 names, and the members of each that the batch, chunk, cancel,
 #: join and union code of this package calls.
-_SURFACE_0_14 = {
+_SURFACE_0_15 = {
     "VortexRdfStore": ("match_codes_many", "count_quads_many", "match_code_chunks"),
     "ProbeAnswers": ("__iter__", "__next__", "__len__"),
     "CodeChunks": ("__iter__", "__next__", "columns", "batch_rows"),
@@ -99,8 +99,8 @@ _SURFACE_0_14 = {
 }
 
 
-def test_surface_is_0_14():
-    for name, members in _SURFACE_0_14.items():
+def test_surface_is_0_15():
+    for name, members in _SURFACE_0_15.items():
         assert hasattr(vortex_rdf, name), name
         for member in members:
             assert hasattr(getattr(vortex_rdf, name), member), f"{name}.{member}"
