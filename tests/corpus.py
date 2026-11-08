@@ -367,6 +367,10 @@ QUERIES = [
     """SELECT ?x ?y ?a WHERE { ?x <http://ex.org/name> ?n .
         { ?x <http://ex.org/knows> ?y
           OPTIONAL { ?y <http://ex.org/age> ?a FILTER(?x != ?y) } } }""",
+    # chained OPTIONALs: the second keys on what the first may leave unbound,
+    # which an unmatched row's every age is compatible with (§18.5)
+    """SELECT ?x ?y ?a WHERE { ?x <http://ex.org/name> ?n
+        OPTIONAL { ?x <http://ex.org/knows> ?y } OPTIONAL { ?y <http://ex.org/age> ?a } }""",
     """ASK { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a }
         FILTER(!bound(?a)) }""",
     # --- group joins: nested groups, three groups (non-lazy), cross product, a filtered group
