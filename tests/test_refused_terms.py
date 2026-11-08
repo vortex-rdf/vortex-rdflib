@@ -14,7 +14,7 @@ from rdflib import Dataset, Graph, Literal, URIRef
 from tests.support import native_spy
 from vortex_rdf import VortexRdfStore, serialize_rdf
 
-from vortex_rdflib import VortexRdflibStore
+from vortex_rdflib import VortexRdflibStore, terms
 from vortex_rdflib.boundary import PARSE_CHECK_SUBJECT
 from vortex_rdflib.terms import canonical_spelling, spelling_verdict
 
@@ -189,6 +189,39 @@ def test_the_local_verdict_agrees_with_vortex_rdf(tmp_path):
         if verdict is not None:
             assert verdict == _vortex_refuses(native, spelling), spelling
     assert min(seen[True], seen[False], seen[None]) >= 10, seen
+
+
+def test_the_ascii_forms_decide_an_ascii_spelling_as_the_full_forms_do():
+    """The safe forms an ASCII spelling is checked against are the full
+    forms without the characters beyond ASCII, which such a spelling cannot
+    hold: on every ASCII spelling of the corpus the two agree."""
+    seen = Counter()
+    for spelling in filter(str.isascii, _spellings()):
+        for ascii_form, full_form in [
+            (terms._SAFE_ASCII_IRI, terms._SAFE_IRI),
+            (terms._SAFE_ASCII_LITERAL, terms._SAFE_LITERAL),
+        ]:
+            matched = full_form.fullmatch(spelling) is not None
+            assert (ascii_form.fullmatch(spelling) is not None) == matched, spelling
+            seen[matched] += 1
+    assert min(seen.values()) >= 100, seen
+
+
+def test_an_ascii_spelling_is_decided_without_the_full_forms(monkeypatch):
+    """The full forms hold RFC 3987's ranges beyond ASCII, which the regex
+    engine tests character by character: a pattern's constants, ASCII in
+    the common case, are checked against the ASCII forms alone."""
+
+    class Unused:
+        def fullmatch(self, *args):
+            raise AssertionError("an ASCII spelling reached a full form")
+
+    monkeypatch.setattr(terms, "_SAFE_IRI", Unused())
+    monkeypatch.setattr(terms, "_SAFE_LITERAL", Unused())
+    for spelling in [f"<{EX}a>", "<urn:isbn:0451450523>", '"x"@en-gb', f'"5"^^<{XSD}integer>']:
+        assert spelling_verdict(spelling) is False, spelling
+    for spelling in ["<rel>", '"x"^^<rel>']:
+        assert spelling_verdict(spelling) is True, spelling
 
 
 def test_ordinary_terms_reach_no_parse_check(tmp_path):

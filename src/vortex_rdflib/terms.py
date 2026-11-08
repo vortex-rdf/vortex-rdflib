@@ -190,18 +190,26 @@ _UCS_CHARS = (
     r"\U000a0000-\U000afffd\U000b0000-\U000bfffd\U000c0000-\U000cfffd"
     r"\U000d0000-\U000dfffd\U000e1000-\U000efffd"
 )
-_SEGMENT = rf"[{_IRI_CHARS}{_UCS_CHARS}:@]*"
-#: An absolute IRI vortex-rdf always parses: a scheme, then an ASCII
-#: authority (user info, a host that is no IP literal, a port of digits) and
-#: its path, or a path that does not start with "//"; a query; at most one
-#: "#". Character classes, not alternations per character, keep it a scan.
-_SAFE_IRI_FORM = (
-    rf"<[A-Za-z][A-Za-z0-9+.\-]*:"
-    rf"(?://(?:[{_IRI_CHARS}:]*@)?[{_IRI_CHARS}]*(?::[0-9]+)?(?:/{_SEGMENT})*"
-    rf"|(?!//){_SEGMENT}(?:/{_SEGMENT})*)"
-    rf"(?:\?[{_IRI_CHARS}{_UCS_CHARS}:@/?]*)?(?:#[{_IRI_CHARS}{_UCS_CHARS}:@/?]*)?>"
-)
-_SAFE_IRI = re.compile(_SAFE_IRI_FORM)
+
+
+def _safe_iri_form(beyond_ascii: str) -> str:
+    """An absolute IRI vortex-rdf always parses, its path, query and
+    fragment taking the characters ``beyond_ascii`` as well: a scheme, then
+    an ASCII authority (user info, a host that is no IP literal, a port of
+    digits) and its path, or a path that does not start with "//"; a query;
+    at most one "#". Character classes, not alternations per character, keep
+    it a scan, and a path is one run of its characters and "/", which
+    matches what its segments and the slashes between them would."""
+    path = rf"[{_IRI_CHARS}{beyond_ascii}:@/]*"
+    tail = rf"[{_IRI_CHARS}{beyond_ascii}:@/?]*"
+    return (
+        rf"<[A-Za-z][A-Za-z0-9+.\-]*:"
+        rf"(?://(?:[{_IRI_CHARS}:]*@)?[{_IRI_CHARS}]*(?::[0-9]+)?(?:/{path})?"
+        rf"|(?!//){path})"
+        rf"(?:\?{tail})?(?:#{tail})?>"
+    )
+
+
 #: A BCP 47 language tag as ``canonical_spelling`` spells it (lower case): a
 #: language of two or three letters, then an optional script, region and
 #: variant, and private-use subtags.
@@ -209,9 +217,23 @@ _SAFE_TAG = (
     r"[a-z]{2,3}(?:-[a-z]{4})?(?:-(?:[a-z]{2}|[0-9]{3}))?"
     r"(?:-(?:[a-z0-9]{5,8}|[0-9][a-z0-9]{3}))?(?:-x(?:-[a-z0-9]{1,8})+)?"
 )
-#: A literal as ``canonical_spelling`` spells it, with no suffix, such a
-#: language tag or such a datatype.
-_SAFE_LITERAL = re.compile(rf'"[^"\\]*(?:\\.[^"\\]*)*"(?:@{_SAFE_TAG}|\^\^{_SAFE_IRI_FORM})?')
+
+
+def _safe_literal_form(iri_form: str) -> str:
+    """A literal as ``canonical_spelling`` spells it, with no suffix, such a
+    language tag or a datatype of ``iri_form``."""
+    return rf'"[^"\\]*(?:\\.[^"\\]*)*"(?:@{_SAFE_TAG}|\^\^{iri_form})?'
+
+
+_SAFE_IRI = re.compile(_safe_iri_form(_UCS_CHARS))
+_SAFE_LITERAL = re.compile(_safe_literal_form(_safe_iri_form(_UCS_CHARS)))
+#: The forms an ASCII spelling — a pattern's constant, as a rule — is
+#: checked against: the full forms less the characters beyond ASCII, which
+#: such a spelling cannot hold, so they decide it alike. Their classes are
+#: tables the regex engine tests a character against in one step, where it
+#: walks the full forms' ranges beyond ASCII one by one.
+_SAFE_ASCII_IRI = re.compile(_safe_iri_form(""))
+_SAFE_ASCII_LITERAL = re.compile(_safe_literal_form(_safe_iri_form("")))
 _SAFE_BLANK = re.compile(r"_:[A-Za-z0-9]+")
 #: A "%" that does not start an escape of two hexadecimal digits.
 _BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
@@ -228,21 +250,24 @@ def spelling_verdict(spelling: str) -> bool | None:
     checks the local verdicts against vortex-rdf."""
     if not spelling:
         return False
-    if not spelling.isascii():
+    if spelling.isascii():
+        safe_iri, safe_literal = _SAFE_ASCII_IRI, _SAFE_ASCII_LITERAL
+    else:
         try:
             spelling.encode()
         except UnicodeEncodeError:
             return True  # a surrogate: it cannot reach vortex-rdf at all
+        safe_iri, safe_literal = _SAFE_IRI, _SAFE_LITERAL
     first = spelling[0]
     if first == "<":
-        if _SAFE_IRI.fullmatch(spelling) and (
+        if safe_iri.fullmatch(spelling) and (
             "%" not in spelling or _BAD_ESCAPE.search(spelling) is None
         ):
             return False
         return True if _IRI_FORM.fullmatch(spelling, 1, len(spelling) - 1) is None else None
     if first == '"':
         close = spelling.rfind('"')
-        if _SAFE_LITERAL.fullmatch(spelling) and (
+        if safe_literal.fullmatch(spelling) and (
             "%" not in spelling or _BAD_ESCAPE.search(spelling, close) is None
         ):
             return False
