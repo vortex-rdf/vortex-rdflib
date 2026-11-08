@@ -43,6 +43,7 @@ from rdflib.term import Literal, URIRef
 from vortex_rdf import U64Column
 
 from .. import boundary, trace
+from ..nodes import field, term_class, var_like
 from ..terms import (
     BLANK,
     IRI,
@@ -54,7 +55,6 @@ from ..terms import (
     view_of,
 )
 from . import values
-from .exprs import VAR_LIKE
 from .values import NUMERIC_TYPES, RDF_NIL
 
 
@@ -264,7 +264,7 @@ _LANG_RANGE = re.compile(r"\*|[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 
 def _call_on(node, name: str, var) -> bool:
     """Whether ``node`` is the builtin ``name`` applied to ``var`` itself."""
-    return isinstance(node, CompValue) and node.name == name and node.arg == var
+    return isinstance(node, CompValue) and node.name == name and field(node, "arg") == var
 
 
 #: The string functions with a native kind, by rdflib's builtin name.
@@ -285,8 +285,8 @@ def _text_shape(node, var) -> tuple[str | None, bool] | None:
     anything else."""
     case = None
     if isinstance(node, CompValue) and node.name in _CASE_WRAPPERS:
-        case, node = _CASE_WRAPPERS[node.name], node.arg
-    if isinstance(node, VAR_LIKE) and node == var:
+        case, node = _CASE_WRAPPERS[node.name], field(node, "arg")
+    if var_like(node) and node == var:
         return case, False
     if _call_on(node, "Builtin_STR", var):
         return case, True
@@ -318,7 +318,7 @@ def _regex_shape(expr, var, consts) -> FilterCodes | None:
     every call errs on, a pattern only rdflib can compile, and XPath's ``x``
     and ``q``, which vortex-rdf does not read, stay with the Python
     routes."""
-    text = _text_shape(expr.text, var)
+    text = _text_shape(field(expr, "text"), var)
     if text is None:
         return None
     spec = values.regex_spec(expr, consts)
@@ -333,7 +333,7 @@ def _iri_spelling(node, consts) -> str | None:
     to, or ``None`` when it is not an IRI of the form the native parser takes
     (:func:`~vortex_rdflib.terms.unparseable_iri`)."""
     iri = _constant_term(node, consts)
-    if not isinstance(iri, URIRef) or unparseable_iri(iri):
+    if term_class(iri) is not URIRef or unparseable_iri(iri):
         return None
     return canonical_spelling(iri)
 
@@ -343,7 +343,7 @@ def _iri_equality(left, right, var, consts) -> IriIn | None:
     for exactly that IRI — rdflib's ``eq`` and ``==`` are term equality for
     an IRI, and no literal or blank node equals one."""
     for side, other in ((left, right), (right, left)):
-        if isinstance(side, VAR_LIKE) and side == var:
+        if var_like(side) and side == var:
             spelling = _iri_spelling(other, consts)
             return None if spelling is None else IriIn((spelling,))
     return None
@@ -353,7 +353,7 @@ def _iri_list(left, right, var, consts) -> IriIn | None:
     """``var IN (<iri>, ...)``: true for exactly those IRIs. rdflib's parser
     spells an empty list as rdf:nil, which its evaluator reads back as the
     empty list."""
-    if not (isinstance(left, VAR_LIKE) and left == var):
+    if not (var_like(left) and left == var):
         return None
     if not isinstance(right, list):
         return IriIn(()) if right == RDF_NIL else None
@@ -370,7 +370,7 @@ def _constant_term(node, consts: dict):
     """The rdflib term an operand without block variables evaluates to
     (:func:`values.fold`), or ``None`` — for an error too."""
     term = values.fold(node, consts)
-    return term if isinstance(term, (Literal, URIRef)) else None
+    return term if term_class(term) in (Literal, URIRef) else None
 
 
 def native_shape(expr, var, consts: dict) -> IriIn | FilterCodes | None:
@@ -396,16 +396,16 @@ def native_shape(expr, var, consts: dict) -> IriIn | FilterCodes | None:
         return None
     name = expr.name
     if name == "Builtin_LANGMATCHES":
-        if not _call_on(expr.arg1, "Builtin_LANG", var):
+        if not _call_on(field(expr, "arg1"), "Builtin_LANG", var):
             return None
         # A range is a simple literal (§17.4.3.12); any other is an error
         # for every value, which the Python routes answer.
-        rng = _constant_term(expr.arg2, consts)
+        rng = _constant_term(field(expr, "arg2"), consts)
         if rng is None or not values.simple_literal(view_of(rng)):
             return None
         return FilterCodes("lang_matches", str(rng)) if _LANG_RANGE.fullmatch(str(rng)) else None
-    if name == "Builtin_STRSTARTS" and _call_on(expr.arg1, "Builtin_STR", var):
-        prefix = _constant_term(expr.arg2, consts)
+    if name == "Builtin_STRSTARTS" and _call_on(field(expr, "arg1"), "Builtin_STR", var):
+        prefix = _constant_term(field(expr, "arg2"), consts)
         if prefix is not None and values.simple_literal(view_of(prefix)):
             return FilterCodes("str_prefix", str(prefix), as_str=True)
     if name in _STRING_FUNCTIONS:
@@ -413,10 +413,10 @@ def native_shape(expr, var, consts: dict) -> IriIn | FilterCodes | None:
     if name == "Builtin_REGEX":
         return _regex_shape(expr, var, consts)
     if name == "Builtin_sameTerm":
-        return _iri_equality(expr.arg1, expr.arg2, var, consts)
-    if name != "RelationalExpression" or expr.other is None:
+        return _iri_equality(field(expr, "arg1"), field(expr, "arg2"), var, consts)
+    if name != "RelationalExpression" or field(expr, "other") is None:
         return None
-    op, left, right = expr.op, expr.expr, expr.other
+    op, left, right = field(expr, "op"), field(expr, "expr"), field(expr, "other")
     if op == "IN":
         return _iri_list(left, right, var, consts)
     if isinstance(right, list):
@@ -439,9 +439,9 @@ def native_shape(expr, var, consts: dict) -> IriIn | FilterCodes | None:
     kind = _NUM_KINDS.get(op)
     if kind is None:
         return None
-    if isinstance(left, VAR_LIKE) and left == var:
+    if var_like(left) and left == var:
         constant = _constant_term(right, consts)
-    elif isinstance(right, VAR_LIKE) and right == var:
+    elif var_like(right) and right == var:
         constant = _constant_term(left, consts)
         kind = _NUM_KINDS[_SWAPPED[op]]
     else:

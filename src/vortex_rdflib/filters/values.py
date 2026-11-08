@@ -22,8 +22,9 @@ from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.plugins.sparql.sparql import SPARQLError
 from rdflib.term import Literal, URIRef
 
+from ..nodes import field, var_like
 from ..terms import LITERAL, TermView, view_of
-from .exprs import VAR_LIKE, expr_vars
+from .exprs import expr_vars
 
 
 class _Sentinel:
@@ -479,7 +480,7 @@ def fold(node, consts: dict):
     through it, and the native recognizer every constant."""
     if isinstance(node, (Literal, URIRef)):
         return node
-    if isinstance(node, VAR_LIKE):
+    if var_like(node):
         term = consts.get(node)
         return term if isinstance(term, (Literal, URIRef)) else None
     if not isinstance(node, CompValue) or any(v not in consts for v in expr_vars(node)):
@@ -650,9 +651,10 @@ def regex_spec(node, consts: dict):
     per row, or a pattern XPath accepts and ``re`` cannot compile
     (:data:`_COMPILE_ERRORS`), which only rdflib's evaluator can try. The
     fast route and the native recognizer read a REGEX through it."""
-    pattern = fold(node.pattern, consts)
-    flags = None if node.flags is None else fold(node.flags, consts)
-    if pattern is None or (node.flags is not None and flags is None):
+    given = field(node, "flags")
+    pattern = fold(field(node, "pattern"), consts)
+    flags = None if given is None else fold(given, consts)
+    if pattern is None or (given is not None and flags is None):
         return None
     operands = (pattern,) if flags is None else (pattern, flags)
     if not all(isinstance(term, Literal) and simple_literal(view_of(term)) for term in operands):

@@ -9,10 +9,8 @@ from typing import Any, ClassVar
 
 from rdflib.term import BNode, URIRef, Variable
 
+from ..nodes import field, var_like
 from ..terms import canonical_spelling, unparseable_iri
-
-# Query bnodes act as variables, exactly as rdflib's evalBGP treats them.
-_VAR_LIKE = (Variable, BNode)
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,20 +223,20 @@ def block(node) -> Block:
     anything is matched."""
     name = getattr(node, "name", None)
     if name == "BGP":
-        triples = tuple(node.triples)
-        found = tuple(
-            dict.fromkeys([t for triple in triples for t in triple if isinstance(t, _VAR_LIKE)])
-        )
+        triples = tuple(field(node, "triples"))
+        found = tuple(dict.fromkeys([t for triple in triples for t in triple if var_like(t)]))
         return Bgp(found, found, frozenset(), triples)
     if name == "Filter":
-        inner = block(node.p)
-        isolated = not getattr(node, "no_isolated_scope", False)
+        inner = block(field(node, "p"))
+        isolated = not field(node, "no_isolated_scope")
         kept = (_kept(node) or frozenset()) if isolated else None
-        return Filter(inner.vars, inner.bound_vars, inner.nullable, node.expr, kept, inner)
+        return Filter(
+            inner.vars, inner.bound_vars, inner.nullable, field(node, "expr"), kept, inner
+        )
     if name == "Graph":
-        inner = block(node.p)
-        term = node.term
-        own = (term,) if isinstance(term, _VAR_LIKE) else ()
+        inner = block(field(node, "p"))
+        term = field(node, "term")
+        own = (term,) if var_like(term) else ()
         return Graph(
             _merged(inner.vars, own),
             _merged(inner.bound_vars, own),
@@ -247,25 +245,25 @@ def block(node) -> Block:
             inner,
         )
     if name in ("Join", "LeftJoin", "Minus"):
-        left, right = block(node.p1), block(node.p2)
+        left, right = block(field(node, "p1")), block(field(node, "p2"))
         mentioned = _merged(left.vars, right.vars)
         if name == "Minus":
             return Minus(mentioned, left.bound_vars, left.nullable, left, right)
         bound = _merged(left.bound_vars, right.bound_vars)
         nullable = left.nullable | right.nullable
         if name == "Join":
-            return Join(mentioned, bound, nullable, left, right, bool(node.lazy))
+            return Join(mentioned, bound, nullable, left, right, bool(field(node, "lazy")))
         nullable |= frozenset(right.vars) - frozenset(left.bound_vars)
-        return LeftJoin(mentioned, bound, nullable, left, right, node.expr)
-    if name == "ToMultiSet" and getattr(node.p, "name", None) == "values":
-        found, rows, nullable = _values_table(node.p.res)
+        return LeftJoin(mentioned, bound, nullable, left, right, field(node, "expr"))
+    if name == "ToMultiSet" and getattr(values := field(node, "p"), "name", None) == "values":
+        found, rows, nullable = _values_table(field(values, "res"))
         return Values(found, found, nullable, rows)
     raise NotImplementedError
 
 
 def _kept(node) -> frozenset | None:
     """rdflib's ``_vars`` of an algebra node, ``None`` where it has none."""
-    found = getattr(node, "_vars", None)
+    found = field(node, "_vars")
     return None if found is None else frozenset(found)
 
 
@@ -319,10 +317,10 @@ def _unwrap_empty_joins(node):
     """rdflib never simplifies an EXISTS body, so a group translates to a
     Join with an empty BGP on one side; look through those."""
     while getattr(node, "name", None) == "Join":
-        p1, p2 = node.p1, node.p2
-        if getattr(p1, "name", None) == "BGP" and not p1.triples:
+        p1, p2 = field(node, "p1"), field(node, "p2")
+        if getattr(p1, "name", None) == "BGP" and not field(p1, "triples"):
             node = p2
-        elif getattr(p2, "name", None) == "BGP" and not p2.triples:
+        elif getattr(p2, "name", None) == "BGP" and not field(p2, "triples"):
             node = p1
         else:
             break

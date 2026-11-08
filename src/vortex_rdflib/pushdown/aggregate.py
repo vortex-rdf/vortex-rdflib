@@ -10,9 +10,9 @@ from rdflib.plugins.sparql.sparql import FrozenBindings
 from rdflib.term import Literal, Variable
 from vortex_rdf import U64Column
 
+from .. import nodes
 from ..settings import SETTINGS
 from . import algebra, aliasing, blocks, head, matching, relation
-from .algebra import _VAR_LIKE
 from .relation import Relation
 
 
@@ -25,25 +25,26 @@ def _eval_aggregate(ctx, store, part):
     itself (that is how rdflib carries the group variable into the row);
     every other aggregate is rdflib's.
     """
-    group = part.p
+    group = nodes.field(part, "p")
     if getattr(group, "name", None) != "Group":
         raise NotImplementedError
-    block = algebra.block(group.p)
+    block = algebra.block(nodes.field(group, "p"))
     block, scope = algebra._peel_graph(ctx, block, algebra._active_scope(ctx, store))
-    group_vars = None if group.expr is None else list(group.expr)
-    if group_vars is not None and not all(isinstance(v, Variable) for v in group_vars):
+    keys = nodes.field(group, "expr")
+    group_vars = None if keys is None else list(keys)
+    if group_vars is not None and not all(nodes.term_class(v) is Variable for v in group_vars):
         raise NotImplementedError
     counts, samples = [], []
-    for agg in part.A:
+    for agg in nodes.field(part, "A"):
+        target, res = nodes.field(agg, "vars"), nodes.field(agg, "res")
         if agg.name == "Aggregate_Count":
-            target = agg.vars
-            if target != "*" and not isinstance(target, _VAR_LIKE):
+            if target != "*" and not nodes.var_like(target):
                 raise NotImplementedError
-            counts.append((agg.res, target, bool(agg.distinct)))
+            counts.append((res, target, bool(nodes.field(agg, "distinct"))))
         elif agg.name == "Aggregate_Sample":
-            if group_vars is None or agg.vars not in group_vars:
+            if group_vars is None or target not in group_vars:
                 raise NotImplementedError
-            samples.append((agg.res, agg.vars))
+            samples.append((res, target))
         else:
             raise NotImplementedError
 
@@ -58,7 +59,7 @@ def _eval_aggregate(ctx, store, part):
             return iter([FrozenBindings(ctx, {res: n for res, _, _ in counts})])
 
     rel = blocks._solve_block(ctx, store, block, blocks._Frame(scope))
-    return _aggregate_rows(ctx, store, rel, group_vars or [], counts, samples, group.expr is None)
+    return _aggregate_rows(ctx, store, rel, group_vars or [], counts, samples, keys is None)
 
 
 @dataclass(frozen=True, slots=True)

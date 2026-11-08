@@ -7,14 +7,11 @@ form.
 from collections.abc import Iterator
 
 from rdflib.plugins.sparql.parserutils import CompValue
-from rdflib.term import BNode, Variable
 
+from ..nodes import field, var_like
 from ..terms import BLANK, IRI, LITERAL
 
 _IMPURE = frozenset({"Builtin_RAND", "Builtin_UUID", "Builtin_STRUUID", "Builtin_BNODE"})
-
-
-VAR_LIKE = (Variable, BNode)
 
 
 #: The builtins that test a term's kind, and the kind each is true for.
@@ -66,7 +63,7 @@ def _named(node, names) -> bool:
 def expr_vars(node) -> list:
     """The variable-like terms an expression references, in first-seen
     order, an EXISTS body's included."""
-    return list(dict.fromkeys(n for n in _walk(node) if isinstance(n, VAR_LIKE)))
+    return list(dict.fromkeys(n for n in _walk(node) if var_like(n)))
 
 
 def has_minus(node) -> bool:
@@ -88,8 +85,12 @@ def is_impure(node) -> bool:
 
 
 def flatten_and(expr, out: list) -> list:
-    if isinstance(expr, CompValue) and expr.name == "ConditionalAndExpression" and expr.other:
-        for x in [expr.expr, *expr.other]:
+    if (
+        isinstance(expr, CompValue)
+        and expr.name == "ConditionalAndExpression"
+        and (other := field(expr, "other"))
+    ):
+        for x in [field(expr, "expr"), *other]:
             flatten_and(x, out)
     else:
         out.append(expr)
@@ -104,7 +105,7 @@ def exists_shape(expr):
     node = expr
     if isinstance(node, CompValue) and node.name == "UnaryNot":
         negate = True
-        node = node.expr
+        node = field(node, "expr")
     if isinstance(node, CompValue) and node.name in _EXISTS:
         body = getattr(node, "graph", None)
         if not isinstance(body, CompValue):

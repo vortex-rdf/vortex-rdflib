@@ -14,6 +14,7 @@ from rdflib.plugins.sparql.evalutils import _val
 from rdflib.term import Variable
 
 from .. import boundary, filters, trace
+from ..nodes import field, term_class
 from ..settings import SETTINGS
 from ..terms import BLANK, IRI
 from . import algebra, aliasing, blocks, matching, relation, solutions
@@ -41,27 +42,28 @@ def _plan_head(part) -> _Head:
     """
     node, start, stop, distinct, order = part, 0, None, False, []
     if node.name == "Slice":
-        start = int(node.start or 0)
-        # The key is absent without LIMIT; CompValue then answers None.
-        length = node.length
+        start = int(field(node, "start") or 0)
+        # The key is absent without LIMIT; the field is then None.
+        length = field(node, "length")
         stop = None if length is None else start + int(length)
-        node = node.p
+        node = field(node, "p")
     if node.name == "Distinct":
         distinct = True
-        node = node.p
+        node = field(node, "p")
     pv = None
     if node.name == "Project":
-        pv = node.PV
-        pv = (pv,) if isinstance(pv, Variable) else tuple(pv)
-        node = node.p
+        pv = field(node, "PV")
+        pv = (pv,) if term_class(pv) is Variable else tuple(pv)
+        node = field(node, "p")
     elif distinct or start or stop is not None:
         raise NotImplementedError
     if node.name == "OrderBy":
-        for condition in node.expr:
-            if not isinstance(condition.expr, Variable):
+        for condition in field(node, "expr"):
+            key = field(condition, "expr")
+            if term_class(key) is not Variable:
                 raise NotImplementedError
-            order.append((condition.expr, condition.order == "DESC"))
-        node = node.p
+            order.append((key, field(condition, "order") == "DESC"))
+        node = field(node, "p")
     if pv is None and not order:
         raise NotImplementedError
     return _Head(algebra.block(node), pv, start, stop, distinct, order)
@@ -296,10 +298,10 @@ def _term_distinct(store, tuples: Iterator[tuple]) -> Iterator[tuple]:
 
 def _eval_ask(ctx, store, part):
     """``ASK`` over a block: whether it has a solution."""
-    project = part.p
+    project = field(part, "p")
     if getattr(project, "name", None) != "Project":
         raise NotImplementedError
-    node = algebra.block(project.p)
+    node = algebra.block(field(project, "p"))
     return {"type_": "ASK", "askAnswer": _block_nonempty(ctx, store, node)}
 
 

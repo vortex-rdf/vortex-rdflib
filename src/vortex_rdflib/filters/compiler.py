@@ -11,9 +11,9 @@ from functools import partial
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import Literal, URIRef
 
+from ..nodes import field, term_class, var_like
 from ..terms import BLANK, IRI, LITERAL, TermView, view_of
 from . import exprs, values
-from .exprs import VAR_LIKE
 from .values import (
     ERROR,
     RDF_LANGSTRING,
@@ -106,13 +106,13 @@ def _compile(node, slots: dict, consts: dict):
     (unbound), ``ERROR`` or ``UNKNOWN``. ``consts`` maps the context-bound
     variables to rdflib terms. A subexpression that reads no block variable
     is evaluated once, here: by the whitelist, else by rdflib."""
-    if isinstance(node, VAR_LIKE):
+    if var_like(node):
         if node in slots:
             index = slots[node]
             return lambda env: env[index]
         term = consts.get(node)
         return _const(None if term is None else _view(term))
-    if isinstance(node, (Literal, URIRef)):
+    if term_class(node) in (Literal, URIRef):
         return _const(view_of(node))
     if not isinstance(node, CompValue):
         raise _NotFast
@@ -132,24 +132,27 @@ def _compile_node(node, slots: dict, consts: dict):
     if name == "AdditiveExpression":
         return _compile_additive(node, slots, consts)
     if name in ("ConditionalAndExpression", "ConditionalOrExpression"):
-        if node.other is None:
+        other = field(node, "other")
+        if other is None:
             raise _NotFast
-        parts = [_compile(x, slots, consts) for x in [node.expr, *node.other]]
+        parts = [_compile(x, slots, consts) for x in [field(node, "expr"), *other]]
         return _and(parts) if name == "ConditionalAndExpression" else _or(parts)
     if name == "UnaryNot":
-        inner = _compile(node.expr, slots, consts)
+        inner = _compile(field(node, "expr"), slots, consts)
         return lambda env: values.logical_not(values.truth(inner(env)))
     if name == "Builtin_BOUND":
-        if not isinstance(node.arg, VAR_LIKE):
+        target = field(node, "arg")
+        if not var_like(target):
             raise _NotFast
-        arg = _compile(node.arg, slots, consts)
+        arg = _compile(target, slots, consts)
         return lambda env: _bound(arg(env))
     one_arg = _ONE_ARG.get(name)
     if one_arg is not None:
-        return _strict(one_arg, _compile(node.arg, slots, consts))
+        return _strict(one_arg, _compile(field(node, "arg"), slots, consts))
     two_args = _TWO_ARGS.get(name)
     if two_args is not None:
-        a, b = _compile(node.arg1, slots, consts), _compile(node.arg2, slots, consts)
+        a = _compile(field(node, "arg1"), slots, consts)
+        b = _compile(field(node, "arg2"), slots, consts)
         return _strict2(two_args, a, b)
     if name == "Builtin_REGEX":
         return _compile_regex(node, slots, consts)
@@ -193,15 +196,17 @@ def _or(parts):
 def _compile_additive(node, slots, consts):
     """Compile ``+`` and ``-`` (§17.3): numbers promoted to the wider of
     their types (:func:`values.add`), anything else a type error."""
-    if node.other is None:
+    others, first_operand = field(node, "other"), field(node, "expr")
+    if others is None:
         # The add-expr production wraps a bare operand; rdflib's own
         # evaluator returns `expr` unchanged, so compile straight through.
-        return _compile(node.expr, slots, consts)
-    others = node.other if isinstance(node.other, list) else [node.other]
-    operators = node.op if isinstance(node.op, list) else [node.op]
+        return _compile(first_operand, slots, consts)
+    others = others if isinstance(others, list) else [others]
+    operators = field(node, "op")
+    operators = operators if isinstance(operators, list) else [operators]
     if len(others) != len(operators) or any(op not in ("+", "-") for op in operators):
         raise _NotFast
-    first = _compile(node.expr, slots, consts)
+    first = _compile(first_operand, slots, consts)
     signed = [
         (op == "-", _compile(part, slots, consts))
         for op, part in zip(operators, others, strict=True)
@@ -222,12 +227,12 @@ def _compile_additive(node, slots, consts):
 
 
 def _compile_relational(node, slots, consts):
-    op = node.op
-    if node.other is None:
+    op, other = field(node, "op"), field(node, "other")
+    if other is None:
         raise _NotFast
-    left = _compile(node.expr, slots, consts)
+    left = _compile(field(node, "expr"), slots, consts)
     if op in ("IN", "NOT IN"):
-        others = node.other
+        others = other
         if not isinstance(others, list):
             others = [] if others == RDF_NIL else [others]
         items = [_compile(x, slots, consts) for x in others]
@@ -253,7 +258,7 @@ def _compile_relational(node, slots, consts):
         return fn_in
     if op not in ("=", "!=", "<", ">", "<=", ">="):
         raise _NotFast
-    right = _compile(node.other, slots, consts)
+    right = _compile(other, slots, consts)
     return _strict2(partial(values.compare, op), left, right)
 
 
@@ -363,7 +368,7 @@ def _compile_regex(node, slots, consts):
         raise _NotFast
     if spec is ERROR:
         return _const(ERROR)
-    text = _compile(node.text, slots, consts)
+    text = _compile(field(node, "text"), slots, consts)
     search = spec.regex.search
 
     def fn(env):
@@ -398,15 +403,16 @@ def compile_fast(expr, variables: tuple, consts: dict) -> Callable | None:
 
 def is_kind_only(expr) -> bool:
     """Whether the fast predicate only needs each variable's term kind."""
-    if isinstance(expr, VAR_LIKE):
+    if var_like(expr):
         return False  # a bare variable is evaluated as a term
     if not isinstance(expr, CompValue):
         return True
     name = expr.name
     if name in _KIND_LEAVES:
-        return isinstance(expr.arg, VAR_LIKE)
+        return var_like(field(expr, "arg"))
     if name in ("ConditionalAndExpression", "ConditionalOrExpression"):
-        return expr.other is not None and all(is_kind_only(x) for x in [expr.expr, *expr.other])
+        other = field(expr, "other")
+        return other is not None and all(is_kind_only(x) for x in [field(expr, "expr"), *other])
     if name == "UnaryNot":
-        return is_kind_only(expr.expr)
+        return is_kind_only(field(expr, "expr"))
     return False

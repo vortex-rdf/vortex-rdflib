@@ -6,14 +6,14 @@ read as a relation.
 
 from dataclasses import dataclass, field, replace
 
-from rdflib.term import BNode, Literal, URIRef, Variable
+from rdflib.term import BNode, URIRef, Variable
 from vortex_rdf import U64Column
 
 from .. import boundary, filters, trace, union
+from ..nodes import term_class
 from ..settings import SETTINGS
 from ..terms import is_range
 from . import relation
-from .algebra import _VAR_LIKE
 from .relation import Relation
 
 
@@ -249,7 +249,7 @@ def _pattern_terms(ctx, store, s, p, o, scope, index: int | None = None) -> Patt
     for term in (s, p, o):
         # RDF-star quoted triples (or anything else exotic) in a pattern
         # position: not supported here, use the default evaluator.
-        if not isinstance(term, (*_VAR_LIKE, URIRef, Literal)):
+        if term_class(term) is None:
             raise NotImplementedError
     rs, rp, ro = ctx[s], ctx[p], ctx[o]
     to_n3 = store._node_to_n3
@@ -260,8 +260,8 @@ def _pattern_terms(ctx, store, s, p, o, scope, index: int | None = None) -> Patt
     # names a term vortex-rdf's parser refuses (the graph's name included),
     # which is no term of the file.
     unsatisfiable = (
-        (rs is not None and not isinstance(rs, (URIRef, BNode)))
-        or (rp is not None and not isinstance(rp, URIRef))
+        (rs is not None and term_class(rs) not in (URIRef, BNode))
+        or (rp is not None and term_class(rp) is not URIRef)
         or boundary.any_refused(store, n3)
     )
 
