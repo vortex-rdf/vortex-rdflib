@@ -119,17 +119,18 @@ PARSE_CHECK_SUBJECT = "<urn:vortex-rdflib:parse-check>"
 
 def refused(store, spelling: str) -> bool:
     """Whether vortex-rdf's parser refuses ``spelling``, a pattern term's: no
-    file holds such a term, so a pattern naming it matches nothing. Decided
-    here where :func:`~vortex_rdflib.terms.spelling_verdict` can, else by one
-    count that cannot scan, its subject bound; a ``ValueError`` from it
-    (``UnicodeEncodeError`` included) is the refusal."""
-    verdict = spelling_verdict(spelling)
-    return _parser_refuses(store, spelling) if verdict is None else verdict
+    file holds such a term, so a pattern naming it matches nothing
+    (:func:`any_refused` of the one spelling)."""
+    return any_refused(store, (spelling,))
 
 
 def any_refused(store, spellings) -> bool:
     """Whether a pattern's spellings (``None`` for a free position) name a
-    term vortex-rdf refuses (:func:`refused`)."""
+    term vortex-rdf's parser refuses. Each is decided here where
+    :func:`~vortex_rdflib.terms.spelling_verdict` can, else by one count that
+    cannot scan, its subject bound; a ``ValueError`` from it
+    (``UnicodeEncodeError`` included) is the refusal. A plain loop: the
+    pushdown asks once per pattern it resolves."""
     for spelling in spellings:
         if spelling is None:
             continue
