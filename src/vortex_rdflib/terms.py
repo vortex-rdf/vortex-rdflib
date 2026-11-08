@@ -18,6 +18,12 @@ from collections.abc import Callable
 import rdflib.term
 from rdflib.term import BNode, Literal, Node, URIRef
 
+from .nodes import TERM_CLASSES, term_class
+
+#: The term classes, told apart by a node's exact class without a call; a
+#: node of any other class is looked up (:func:`~vortex_rdflib.nodes.term_class`).
+_EXACT_TERMS = frozenset(TERM_CLASSES)
+
 LITERAL = "literal"
 IRI = "iri"
 BLANK = "blank"
@@ -43,17 +49,16 @@ def unescape(raw: str) -> str:
 class TermView:
     """A parsed spelling.
 
-    ``kind`` is one of ``LITERAL``, ``IRI``, ``BLANK``. For a literal ``lex``
-    is the unescaped lexical form, ``dt`` the datatype IRI (``None`` for
-    plain and language-tagged literals) and ``lang`` the language tag; for
-    an IRI ``lex`` is the IRI, for a blank node the label. A kind-only view
-    (``lex`` None) is enough for the predicates that never look at the
-    spelling.
+    ``kind`` is one of ``LITERAL``, ``IRI``, ``BLANK`` — or ``""`` for no
+    term, in the views a test of a term's kind alone is asked about. For a
+    literal ``lex`` is the unescaped lexical form, ``dt`` the datatype IRI
+    (``None`` for plain and language-tagged literals) and ``lang`` the
+    language tag; for an IRI ``lex`` is the IRI, for a blank node the label.
     """
 
     __slots__ = ("kind", "lex", "dt", "lang")
 
-    def __init__(self, kind: str, lex: str | None, dt: str | None = None, lang: str | None = None):
+    def __init__(self, kind: str, lex: str, dt: str | None = None, lang: str | None = None):
         self.kind = kind
         self.lex = lex
         self.dt = dt
@@ -77,21 +82,21 @@ class TermView:
 def parse_spelling(spelling: str) -> TermView:
     """Parse a canonical N-Triples spelling into a ``TermView``.
 
-    The closing quote of a literal is found from the end: a plain literal
-    ends with ``"``, a typed one with ``>`` after the last ``"^^<``, a
-    language-tagged one with the tag after the last ``"@`` — a quote inside
-    the lexical form is always escaped, so the last delimiter is the real one.
+    A literal's closing quote is its last ``"`` — a quote inside the lexical
+    form is escaped, and neither a tag nor a datatype IRI holds one — and
+    what follows it is nothing, ``@tag`` or ``^^<iri>``: the split every
+    reader of a spelling makes (:func:`_term_by_constructors`).
     """
     if spelling.startswith('"'):
-        if spelling.endswith('"'):
-            return TermView(LITERAL, unescape(spelling[1:-1]))
-        if spelling.endswith(">"):
-            cut = spelling.rfind('"^^<')
-            if cut > 0:
-                return TermView(LITERAL, unescape(spelling[1:cut]), dt=spelling[cut + 4 : -1])
-        cut = spelling.rfind('"@')
-        if cut > 0:
-            return TermView(LITERAL, unescape(spelling[1:cut]), lang=spelling[cut + 2 :])
+        end = spelling.rfind('"')
+        suffix = spelling[end + 1 :]
+        if end > 0:
+            if not suffix:
+                return TermView(LITERAL, unescape(spelling[1:end]))
+            if suffix.startswith("^^<") and suffix.endswith(">"):
+                return TermView(LITERAL, unescape(spelling[1:end]), dt=suffix[3:-1])
+            if suffix.startswith("@") and len(suffix) > 1:
+                return TermView(LITERAL, unescape(spelling[1:end]), lang=suffix[1:])
         raise ValueError(f"malformed literal spelling: {spelling!r}")
     if spelling.startswith("<") and spelling.endswith(">"):
         return TermView(IRI, spelling[1:-1])
@@ -131,11 +136,14 @@ def canonical_spelling(node) -> str:
     """The spelling the dictionary would hold for an rdflib term — the
     inverse of ``parse_spelling`` for what ``encode`` needs: lowercase
     language tags, no ``^^xsd:string``, the store's escapes."""
-    if isinstance(node, URIRef):
+    cls = type(node)
+    if cls not in _EXACT_TERMS:
+        cls = term_class(node)
+    if cls is URIRef:
         return f"<{node}>"
-    if isinstance(node, BNode):
+    if cls is BNode:
         return f"_:{node}"
-    if isinstance(node, Literal):
+    if cls is Literal:
         body = f'"{escape(str(node))}"'
         if node.language:
             return f"{body}@{node.language.lower()}"
@@ -143,6 +151,28 @@ def canonical_spelling(node) -> str:
         if datatype is None or str(datatype) == _XSD_STRING:
             return body
         return f"{body}^^<{datatype}>"
+    raise TypeError(f"not an RDF term: {node!r}")
+
+
+def view_of(node) -> TermView:
+    """An rdflib term as the term view its stored spelling parses to
+    (``parse_spelling(canonical_spelling(node))``, built directly): a
+    literal's lexical form as rdflib left it, well-typed or not, its
+    language tag lowercased, ``xsd:string`` dropped."""
+    cls = type(node)
+    if cls not in _EXACT_TERMS:
+        cls = term_class(node)
+    if cls is URIRef:
+        return TermView(IRI, str(node))
+    if cls is BNode:
+        return TermView(BLANK, str(node))
+    if cls is Literal:
+        if node.language:
+            return TermView(LITERAL, str(node), lang=node.language.lower())
+        datatype = node.datatype
+        if datatype is None or str(datatype) == _XSD_STRING:
+            return TermView(LITERAL, str(node))
+        return TermView(LITERAL, str(node), dt=str(datatype))
     raise TypeError(f"not an RDF term: {node!r}")
 
 
@@ -155,30 +185,174 @@ def unparseable_iri(node) -> bool:
     """Whether ``node`` is an IRI without the form of every IRI vortex-rdf
     parses — a relative one (no BASE), say. It is no term of a file, and the
     native parser rejects its spelling."""
-    return isinstance(node, URIRef) and _IRI_FORM.fullmatch(node) is None
+    cls = type(node)
+    if cls not in _EXACT_TERMS:
+        cls = term_class(node)
+    return cls is URIRef and _IRI_FORM.fullmatch(node) is None
 
 
-def kind_bounds(term_dict) -> tuple[int, int, int]:
-    """``(literal_lo, iri_lo, blank_lo)``: the first code of each term kind.
+#: The characters of an ASCII IRI (RFC 3986) besides its delimiters: the
+#: unreserved, the sub-delims and "%" (whose escapes are checked apart).
+_IRI_CHARS = r"A-Za-z0-9\-._~!$&'()*+,;=%"
+#: RFC 3987's ``ucschar``, the characters an IRI's path, query and fragment
+#: take beyond ASCII. The bidirectional formatting characters RFC 3987 bars
+#: (U+200E, U+200F, U+202A-U+202E) are left out.
+_UCS_CHARS = (
+    r"\u00a0-\u200d\u2010-\u2029\u202f-\ud7ff\uf900-\ufdcf\ufdf0-\uffef"
+    r"\U00010000-\U0001fffd\U00020000-\U0002fffd\U00030000-\U0003fffd"
+    r"\U00040000-\U0004fffd\U00050000-\U0005fffd\U00060000-\U0006fffd"
+    r"\U00070000-\U0007fffd\U00080000-\U0008fffd\U00090000-\U0009fffd"
+    r"\U000a0000-\U000afffd\U000b0000-\U000bfffd\U000c0000-\U000cfffd"
+    r"\U000d0000-\U000dfffd\U000e1000-\U000efffd"
+)
 
-    Three native binary searches (``TermDict.lower_bound``: the code of the
-    first term not below the needle); the dictionary is immutable, so the
-    store caches the result.
-    """
-    return term_dict.lower_bound('"'), term_dict.lower_bound("<"), term_dict.lower_bound("_")
+
+def _safe_iri_form(beyond_ascii: str) -> str:
+    """An absolute IRI vortex-rdf always parses, its path, query and
+    fragment taking the characters ``beyond_ascii`` as well: a scheme, then
+    an ASCII authority (user info, a host that is no IP literal, a port of
+    digits) and its path, or a path that does not start with "//"; a query;
+    at most one "#". Character classes, not alternations per character, keep
+    it a scan, and a path is one run of its characters and "/", which
+    matches what its segments and the slashes between them would."""
+    path = rf"[{_IRI_CHARS}{beyond_ascii}:@/]*"
+    tail = rf"[{_IRI_CHARS}{beyond_ascii}:@/?]*"
+    return (
+        rf"<[A-Za-z][A-Za-z0-9+.\-]*:"
+        rf"(?://(?:[{_IRI_CHARS}:]*@)?[{_IRI_CHARS}]*(?::[0-9]+)?(?:/{path})?"
+        rf"|(?!//){path})"
+        rf"(?:\?{tail})?(?:#{tail})?>"
+    )
 
 
-def kind_of(code: int, bounds: tuple[int, int, int]) -> str:
-    """A code's term kind from the kind bounds, without decoding it (the
-    empty graph name, below every kind, answers ``""``)."""
-    literal_lo, iri_lo, blank_lo = bounds
-    if code >= blank_lo:
-        return BLANK
-    if code >= iri_lo:
-        return IRI
-    if code >= literal_lo:
-        return LITERAL
-    return ""
+#: A BCP 47 language tag as ``canonical_spelling`` spells it (lower case): a
+#: language of two or three letters, then an optional script, region and
+#: variant, and private-use subtags.
+_SAFE_TAG = (
+    r"[a-z]{2,3}(?:-[a-z]{4})?(?:-(?:[a-z]{2}|[0-9]{3}))?"
+    r"(?:-(?:[a-z0-9]{5,8}|[0-9][a-z0-9]{3}))?(?:-x(?:-[a-z0-9]{1,8})+)?"
+)
+
+
+def _safe_literal_form(iri_form: str) -> str:
+    """A literal as ``canonical_spelling`` spells it, with no suffix, such a
+    language tag or a datatype of ``iri_form``."""
+    return rf'"[^"\\]*(?:\\.[^"\\]*)*"(?:@{_SAFE_TAG}|\^\^{iri_form})?'
+
+
+_SAFE_IRI = re.compile(_safe_iri_form(_UCS_CHARS))
+_SAFE_LITERAL = re.compile(_safe_literal_form(_safe_iri_form(_UCS_CHARS)))
+#: The forms an ASCII spelling — a pattern's constant, as a rule — is
+#: checked against: the full forms less the characters beyond ASCII, which
+#: such a spelling cannot hold, so they decide it alike. Their classes are
+#: tables the regex engine tests a character against in one step, where it
+#: walks the full forms' ranges beyond ASCII one by one.
+_SAFE_ASCII_IRI = re.compile(_safe_iri_form(""))
+_SAFE_ASCII_LITERAL = re.compile(_safe_literal_form(_safe_iri_form("")))
+_SAFE_BLANK = re.compile(r"_:[A-Za-z0-9]+")
+#: A "%" that does not start an escape of two hexadecimal digits.
+_BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+
+
+def spelling_verdict(spelling: str) -> bool | None:
+    """Whether vortex-rdf's parser refuses the N-Triples ``spelling`` of a
+    pattern term (as ``canonical_spelling`` makes it), where that is decided
+    here: ``True`` refused — a surrogate, or an IRI (a literal's datatype
+    included) without the form every IRI it parses has — ``False`` accepted —
+    the default graph's name ``""``, or a spelling of a shape it always parses
+    — and ``None`` for vortex-rdf to decide
+    (:func:`vortex_rdflib.boundary.refused`). ``tests/test_refused_terms.py``
+    checks the local verdicts against vortex-rdf."""
+    if not spelling:
+        return False
+    if spelling.isascii():
+        safe_iri, safe_literal = _SAFE_ASCII_IRI, _SAFE_ASCII_LITERAL
+    else:
+        try:
+            spelling.encode()
+        except UnicodeEncodeError:
+            return True  # a surrogate: it cannot reach vortex-rdf at all
+        safe_iri, safe_literal = _SAFE_IRI, _SAFE_LITERAL
+    first = spelling[0]
+    if first == "<":
+        if safe_iri.fullmatch(spelling) and (
+            "%" not in spelling or _BAD_ESCAPE.search(spelling) is None
+        ):
+            return False
+        return True if _IRI_FORM.fullmatch(spelling, 1, len(spelling) - 1) is None else None
+    if first == '"':
+        close = spelling.rfind('"')
+        if safe_literal.fullmatch(spelling) and (
+            "%" not in spelling or _BAD_ESCAPE.search(spelling, close) is None
+        ):
+            return False
+        datatype = close + 4  # past '"^^<'
+        if (
+            spelling.startswith("^^<", close + 1)
+            and _IRI_FORM.fullmatch(spelling, datatype, len(spelling) - 1) is None
+        ):
+            return True
+        return None
+    if first == "_" and _SAFE_BLANK.fullmatch(spelling):
+        return False
+    return None
+
+
+class KindRanges:
+    """Each term kind's half-open code range in one dictionary: codes rank
+    spellings in byte order and every spelling of a kind starts alike, so a
+    kind is one range (``TermDict.prefix_range`` of ``"``, ``<`` and ``_:``)
+    — the keep a kind test pushes into a match — and a code's kind is the
+    range it falls in. A file's are read once (``Codes.kind_ranges``)."""
+
+    __slots__ = (
+        "_ranges",
+        "_literal_lo",
+        "_literal_hi",
+        "_iri_lo",
+        "_iri_hi",
+        "_blank_lo",
+        "_blank_hi",
+    )
+
+    def __init__(self, literal: tuple[int, int], iri: tuple[int, int], blank: tuple[int, int]):
+        self._ranges = {LITERAL: literal, IRI: iri, BLANK: blank}
+        self._literal_lo, self._literal_hi = literal
+        self._iri_lo, self._iri_hi = iri
+        self._blank_lo, self._blank_hi = blank
+
+    @classmethod
+    def from_dictionary(cls, term_dict) -> "KindRanges":
+        """The ranges of ``term_dict``: three native prefix searches."""
+        return cls(
+            tuple(term_dict.prefix_range('"')),
+            tuple(term_dict.prefix_range("<")),
+            tuple(term_dict.prefix_range("_:")),
+        )
+
+    def range(self, kind: str) -> tuple[int, int]:
+        """The half-open code range of ``kind``: ``LITERAL``, ``IRI`` or
+        ``BLANK``."""
+        return self._ranges[kind]
+
+    def kind_of(self, code: int) -> str:
+        """The kind of the term ``code`` stands for, without decoding it;
+        ``""`` for a code in no kind's range: the default graph's empty name,
+        a code past the dictionary's end, a negative one."""
+        if self._literal_lo <= code < self._literal_hi:
+            return LITERAL
+        if self._iri_lo <= code < self._iri_hi:
+            return IRI
+        if self._blank_lo <= code < self._blank_hi:
+            return BLANK
+        return ""
+
+
+def is_range(keep) -> bool:
+    """Whether a native keep — what narrows a native match at one position —
+    is a code range, ``(lo, hi)`` half-open (a kind's, :class:`KindRanges`),
+    rather than a column of ascending codes."""
+    return isinstance(keep, tuple)
 
 
 #: xsd:integer, and its suffix after a literal's closing quote.
@@ -193,7 +367,8 @@ def _term_by_constructors(value: str) -> Node:
     """The rdflib term for a stored N-Triples spelling, built by rdflib's
     constructors: an IRI, a blank node, or a literal whose lexical form is
     unescaped by the N-Triples rules (:func:`unescape`), so an escaped
-    backslash before ``x41`` decodes to a backslash and ``x41``."""
+    backslash before ``x41`` decodes to a backslash and ``x41``. A literal
+    is split as :func:`parse_spelling` splits it."""
     if len(value) >= 2 and value[0] == "<" and value[-1] == ">":
         return URIRef(value[1:-1])
     if value.startswith("_:"):
@@ -201,7 +376,13 @@ def _term_by_constructors(value: str) -> Node:
     end = value.rfind('"')
     if not value.startswith('"') or end <= 0:
         raise ValueError(f"Could not parse returned RDF term as N-Triples: {value!r}")
-    lexical, suffix = unescape(value[1:end]), value[end + 1 :]
+    return _literal_by_constructors(unescape(value[1:end]), value[end + 1 :], value)
+
+
+def _literal_by_constructors(lexical: str, suffix: str, value: str) -> Literal:
+    """The literal of an unescaped lexical form and the suffix its spelling
+    ``value`` has after the closing quote, built by rdflib's constructors; a
+    suffix no literal has raises ``ValueError``."""
     if not suffix:
         return Literal(lexical)
     if suffix.startswith("@") and len(suffix) > 1:
@@ -251,8 +432,9 @@ def _term_built_directly(value: str) -> Node:
         return term
     elif suffix[0] == "@":
         language = suffix[1:]
-        # Not None: `_term_builder` picks this builder only when rdflib has it.
-        if _is_valid_langtag(language):  # ty: ignore[call-non-callable]
+        # `_term_builder` picks this builder only when rdflib has the check.
+        check = _is_valid_langtag
+        if check is not None and check(language):
             term = _new_str(Literal, lexical)
             term._language = language
             term._datatype = None
@@ -277,14 +459,7 @@ def _term_built_directly(value: str) -> Node:
         term._value = number
         term._ill_typed = False
         return term
-    # The rest of `_term_by_constructors`, on the parts split above.
-    if not suffix:
-        return Literal(lexical)
-    if suffix.startswith("@") and len(suffix) > 1:
-        return Literal(lexical, lang=suffix[1:])
-    if suffix.startswith("^^<") and suffix.endswith(">"):
-        return Literal(lexical, datatype=URIRef(suffix[3:-1]))
-    raise ValueError(f"Could not parse returned RDF term as N-Triples: {value!r}")
+    return _literal_by_constructors(lexical, suffix, value)
 
 
 #: Spellings `_term_builder` builds both ways: each kind

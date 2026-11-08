@@ -13,7 +13,7 @@ import pytest
 import rdflib
 from rdflib import Graph, Literal, URIRef
 from rdflib.term import _toPythonMapping
-from tests.support import both_ways, run
+from tests.support import both_ways, file_codes, kind_ranges, run
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
@@ -212,9 +212,8 @@ def test_alias_classes_are_rdflibs_term_equality(generated_store, caplog, calls)
     order."""
     caplog.set_level(logging.ERROR, logger="rdflib.term")
     store = generated_store
-    literal_lo, iri_lo, _ = store._term_kind_bounds()
-    local = list(range(literal_lo, iri_lo))
-    spellings = dict(zip(local, store._dict.decode_many(local), strict=True))
+    local = list(range(*kind_ranges(store).range(LITERAL)))
+    spellings = dict(zip(local, file_codes(store).term_dict.decode_many(local), strict=True))
     reference = {code: _reference_term(spelling) for code, spelling in spellings.items()}
     typed = sorted({t for t in reference.values() if t.datatype is not None}, key=str)
     rng = random.Random(calls)
@@ -229,7 +228,9 @@ def test_alias_classes_are_rdflibs_term_equality(generated_store, caplog, calls)
     token = query_scope.enter(scope)
     try:
         foreign_terms = [
-            term for term in constants if store._dict.encode(canonical_spelling(term)) is None
+            term
+            for term in constants
+            if file_codes(store).term_dict.encode(canonical_spelling(term)) is None
         ]
         foreign = {store._foreign_code(term): term for term in foreign_terms}
         codes = local + list(foreign)
@@ -242,7 +243,7 @@ def test_alias_classes_are_rdflibs_term_equality(generated_store, caplog, calls)
             batches = [codes]
         aliases: dict = {}
         for batch in batches:
-            pd.aliasing._alias_codes(store, batch, store._terms().foreign, aliases)
+            pd.aliasing._alias_codes(store, batch, aliases)
     finally:
         query_scope.leave(token)
     expected = _partition(codes, lambda c: reference[c] if c >= 0 else foreign[c])
@@ -279,11 +280,16 @@ def test_query_constants_look_up_no_twin(generated_store, monkeypatch):
             Literal("1.25", datatype=URIRef(f"{XSD}decimal")),
             Literal("never", datatype=URIRef(UNCONVERTED[0])),
         ]
-        assert all(store._dict.encode(canonical_spelling(term)) is None for term in constants)
+        assert all(
+            file_codes(store).term_dict.encode(canonical_spelling(term)) is None
+            for term in constants
+        )
         codes = [store._foreign_code(term) for term in constants]
-        monkeypatch.setattr(store, "_dict", _Lookups(store._dict))
+        monkeypatch.setattr(
+            store._opened().codes, "term_dict", _Lookups(file_codes(store).term_dict)
+        )
         aliases: dict = {}
-        pd.aliasing._alias_codes(store, codes, store._terms().foreign, aliases)
+        pd.aliasing._alias_codes(store, codes, aliases)
     finally:
         query_scope.leave(token)
     assert len(set(codes)) == 3 and all(code < 0 for code in codes)
@@ -305,7 +311,7 @@ def test_canonical_twins_look_up_alone_after_a_rejected_batch_and_check_the_term
     out = tmp_path / "twins.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
     store = VortexRdflibStore(str(out), in_memory=True)
-    real = store._dict
+    real = file_codes(store).term_dict
     assert real is not None
     encode = real.encode
     forty_two = Literal("042", datatype=URIRef(INTEGER))  # rdflib reads 42
@@ -327,13 +333,13 @@ def test_canonical_twins_look_up_alone_after_a_rejected_batch_and_check_the_term
             raise ValueError("not a term")
         return encode(spelling)
 
-    monkeypatch.setattr(store, "_dict", _Stub(reject_batch, reject_one))
+    monkeypatch.setattr(file_codes(store), "term_dict", _Stub(reject_batch, reject_one))
     assert pd.aliasing._canonical_twins(store, read) == {forty_two: encode(f'"42"^^<{INTEGER}>')}
 
     def another_term(spellings):
         return [encode('"x"@en') for _ in spellings]
 
-    monkeypatch.setattr(store, "_dict", _Stub(another_term, encode))
+    monkeypatch.setattr(file_codes(store), "term_dict", _Stub(another_term, encode))
     assert pd.aliasing._canonical_twins(store, read[:1]) == {}
 
 
@@ -360,24 +366,23 @@ def test_the_alias_pass_builds_only_spellings_rdflib_may_rewrite(tmp_path, monke
     out = tmp_path / "built.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
     store = VortexRdflibStore(str(out), in_memory=True)
-    assert store._dict is not None
+    assert store._opened().codes is not None
     built = []
     original = store._from_n3_safe
     monkeypatch.setattr(store, "_from_n3_safe", lambda s: built.append(s) or original(s))
-    literal_lo, iri_lo, _ = store._term_kind_bounds()
-    codes = list(range(literal_lo, iri_lo))
+    codes = list(range(*kind_ranges(store).range(LITERAL)))
     scope = query_scope.QueryScope()
     token = query_scope.enter(scope)
     try:
         aliases: dict = {}
-        pd.aliasing._alias_codes(store, codes, {}, aliases)
+        pd.aliasing._alias_codes(store, codes, aliases)
     finally:
         query_scope.leave(token)
     assert sorted(built) == sorted(
         [f'"042"^^<{INTEGER}>', f'"+007"^^<{INTEGER}>', f'"1.5"^^<{XSD}decimal>']
         + [f'"42"^^<{INTEGER}>']  # 042's canonical twin, decoded to confirm it
     )
-    code_of = dict(zip(store._dict.decode_many(codes), codes, strict=True))
+    code_of = dict(zip(file_codes(store).term_dict.decode_many(codes), codes, strict=True))
     assert aliases == {code_of[f'"042"^^<{INTEGER}>']: code_of[f'"42"^^<{INTEGER}>']}
     graph = Graph(store=store)
     for sparql in (

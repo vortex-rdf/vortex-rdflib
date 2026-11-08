@@ -102,3 +102,37 @@ def test_a_streamed_join_holds_one_piece(tmp_path):
     assert (rows, steps) == (PAIRS, ["stream"])
     assert streamed < one_shot / 4, (streamed, one_shot)
     assert streamed < 16, (streamed, one_shot)
+
+
+#: An OPTIONAL over a VALUES row whose key is UNDEF: every right row is
+#: compatible with it (SPARQL 1.1 §18.3), and the condition keeps the 200 of
+#: 200,000 whose object is <o7>.
+UNDEF_QUERY = f"""SELECT ?s ?x ?o WHERE {{ VALUES (?s ?x) {{ (UNDEF 1) }}
+    OPTIONAL {{ ?s <{EX}p> ?o FILTER(?o = <{EX}o7>) }} }}"""
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="peak RSS is read from /proc/self/status")
+def test_an_optional_over_an_undef_key_streams_its_right_side(tmp_path):
+    """The right side of an OPTIONAL a VALUES row's UNDEF keys is read once,
+    row by row, rather than held as Python rows and an index of them: 200,000
+    right rows, of which the condition keeps 200, grow the peak by less than
+    16 MiB (the match's own code columns are about 3 MiB)."""
+    lines = [f"<{EX}s{i}> <{EX}p> <{EX}o{i % 1000}> ." for i in range(200_000)]
+    source = tmp_path / "wide.nt"
+    source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path = tmp_path / "wide.vortex"
+    serialize_rdf(str(source), str(path), layout="dictionary")
+    env = {key: value for key, value in os.environ.items() if not key.startswith("VORTEX_RDF")}
+    warmup = f"SELECT ?o WHERE {{ <{EX}s1> <{EX}p> ?o }}"
+    done = subprocess.run(
+        [sys.executable, "-c", _CHILD, str(path), UNDEF_QUERY, warmup],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    rows, growth = (int(field) for field in done.stdout.split())
+    assert rows == 200
+    assert growth < 16, growth

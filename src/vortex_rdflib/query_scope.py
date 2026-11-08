@@ -17,9 +17,13 @@ is produced or the result is closed. A call outside any query (rdflib's
 
 from collections.abc import Callable
 from contextvars import ContextVar, Token
+from typing import TYPE_CHECKING
 
 from rdflib.term import Node
 from vortex_rdf import CancelToken
+
+if TYPE_CHECKING:
+    from .trace import QueryTrace
 
 
 class QueryTerms:
@@ -55,15 +59,17 @@ class QueryTerms:
 
 
 class QueryScope:
-    """The term state of one query, per store it reads (one, in practice),
-    and the query's cancel token (``cancel.cancel_scope``), ``None`` for a
-    query started outside a block."""
+    """The term state of one query, per store it reads (one, in practice);
+    the query's cancel token (``cancel.cancel_scope``), ``None`` for a query
+    started outside a block; and its trace (:mod:`vortex_rdflib.trace`),
+    ``None`` for a query not traced."""
 
-    __slots__ = ("_by_store", "cancel", "__weakref__")
+    __slots__ = ("_by_store", "cancel", "trace", "__weakref__")
 
     def __init__(self) -> None:
         self._by_store: dict[int, tuple[object, QueryTerms]] = {}
         self.cancel: CancelToken | None = None
+        self.trace: QueryTrace | None = None
 
     def terms(self, store) -> QueryTerms:
         entry = self._by_store.get(id(store))
@@ -72,22 +78,22 @@ class QueryScope:
         return entry[1]
 
     def clear(self) -> None:
-        """Drop everything the query learned, and its cancel token."""
+        """Drop everything the query learned, its cancel token and its
+        trace."""
         self._by_store.clear()
         self.cancel = None
+        self.trace = None
 
 
 _CURRENT: ContextVar[QueryScope | None] = ContextVar("vortex_rdflib_query_scope", default=None)
 
 
-def current() -> QueryScope | None:
-    """The scope of the query being evaluated, or ``None`` outside one."""
-    return _CURRENT.get()
-
-
-# Make ``scope`` the current query's, answering the token that ``leave``
-# takes to restore the previous one; the context variable's own methods, so
-# a loop that enters and leaves per row pays no Python frame for either.
+# The scope of the query being evaluated, or ``None`` outside one (``current``);
+# make ``scope`` the current query's, answering the token that ``leave`` takes
+# to restore the previous one (``enter``). The context variable's own
+# methods, so a native call or a loop that reads, enters or leaves per row
+# pays no Python frame for any of them.
+current: Callable[[], QueryScope | None] = _CURRENT.get
 enter: Callable[[QueryScope], Token] = _CURRENT.set
 leave: Callable[[Token], None] = _CURRENT.reset
 

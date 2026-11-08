@@ -22,7 +22,7 @@ import math
 import os
 import signal
 import threading
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from itertools import groupby
 from time import perf_counter_ns
@@ -59,7 +59,7 @@ class Deadline:
 
 
 @contextmanager
-def deadline(seconds: float | None) -> Iterator[Deadline]:
+def deadline(seconds: float | None) -> Generator[Deadline]:
     """Raise ``QueryTimeout`` in the block after ``seconds``, and mark the
     yielded ``Deadline`` expired: a store that catches the interrupt and raises
     an error of its own, or swallows it, cannot hide that the time ran out.

@@ -67,8 +67,10 @@ def test_native_candidate_trace(tmp_path, capsys, monkeypatch):
     )
     artifact = tmp_path / "native.vortex"
     serialize_rdf(str(source), str(artifact), layout="dictionary")
-    graph = Graph(store=VortexRdflibStore(str(artifact), in_memory=True))
+    store = VortexRdflibStore(str(artifact), in_memory=True)
+    graph = Graph(store=store)
     register_sparql_pushdown()
+    store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     rows = list(
         graph.query(

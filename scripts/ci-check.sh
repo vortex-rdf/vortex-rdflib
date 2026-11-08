@@ -35,7 +35,7 @@ if ! scripts/check-doc-anchors.sh; then
 fi
 
 # --- test job ---
-# CI's version matrix (3.11–3.14, plus macOS/Windows) is not mirrored here —
+# CI's version matrix (3.12–3.15, plus macOS/Windows) is not mirrored here —
 # one local interpreter catches real breakage; GitHub runs the rest.
 info "uv run pytest"
 uv run pytest

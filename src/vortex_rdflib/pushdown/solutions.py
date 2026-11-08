@@ -9,11 +9,11 @@ from itertools import islice
 from rdflib.plugins.sparql.evaluate import evalBGP
 from rdflib.plugins.sparql.sparql import FrozenBindings
 
+from .. import trace
 from ..cancel import check_cancelled
 from ..settings import SETTINGS
-from . import relation, tracing
+from . import relation
 from .relation import Relation
-from .tracing import _TRACE
 
 
 class _Solution(FrozenBindings):
@@ -58,10 +58,8 @@ def _yield_solutions(ctx, store, rel: Relation, project=None, start=0, stop=None
     projected and windowed.
     """
     if not rel.rest:
-        return _yield_rows(
-            ctx, store, rel.schema, relation._code_rows(rel), rel.foreign, project, start, stop
-        )
-    rows = _yield_rows(ctx, store, rel.schema, relation._body_rows(rel), rel.foreign, None, 0, None)
+        return _yield_rows(ctx, store, rel.schema, relation._code_rows(rel), project, start, stop)
+    rows = _yield_rows(ctx, store, rel.schema, relation._body_rows(rel), None, 0, None)
     return _project_window(_finish_with_rdflib(ctx, rows, rel.rest), project, start, stop)
 
 
@@ -119,12 +117,14 @@ def _pushed_graph(ctx) -> bool:
     return dataset is not None and ctx.graph is not dataset
 
 
-def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, start, stop):
+def _yield_rows(ctx, store, schema, rows: Iterator[tuple], project, start, stop):
     """Decode code rows over ``schema`` into solutions (see
     ``_yield_solutions``); ``start``/``stop`` slice the rows first. Each
     decode chunk checks the query's cancel token before its rows are pulled
     (:func:`check_cancelled`), so a cancel stops the solutions within one
-    chunk."""
+    chunk; a traced query prints its trace's lines once the chunk is
+    decoded (:func:`trace.flush`), so it holds no more than a chunk's."""
+    foreign = store._terms().foreign
     outer = dict(ctx.bindings.items())
     # Normally every solution carries the caller's own context — no per-row
     # scope, unlike rdflib's `evalBGP`. Under a graph rdflib pushed, each row
@@ -138,8 +138,8 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, sta
         base = {v: outer[v] for v in project if v not in schema and v in outer}
     rows = islice(rows, start, stop)
     size = SETTINGS.chunk_start
-    traced = _TRACE.get() is not None
-    elapsed = tracing._stopwatch()
+    traced = trace.active() is not None
+    elapsed = trace.stopwatch()
     yielded = chunks = submitted = 0
     try:
         while True:
@@ -152,6 +152,8 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, sta
                 chunks += 1
                 submitted += len(codes)
             cached = store._prime_decode_cache(codes)
+            if traced:
+                trace.flush()
             for row in chunk:
                 solution = dict(base)
                 for v, i in zip(keys, idx, strict=True):
@@ -163,7 +165,7 @@ def _yield_rows(ctx, store, schema, rows: Iterator[tuple], foreign, project, sta
             size = min(size * 4, SETTINGS.chunk_max)
     finally:
         if traced:
-            tracing._trace_event(
+            trace.event(
                 "yield_rows_complete",
                 offset=start,
                 stop=stop,

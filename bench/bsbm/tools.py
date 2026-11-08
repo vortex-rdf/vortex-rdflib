@@ -97,12 +97,7 @@ def fetch_tools(cache: Path | None = None, fetch: Callable[[str], bytes] = downl
     staging = Path(tempfile.mkdtemp(prefix=".unpack-", dir=root))
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-            if hasattr(tarfile, "data_filter"):
-                archive.extractall(staging, filter="data")
-            else:
-                # Python < 3.11.4 has no extraction filters; the checksum above vouches
-                # for the archive.
-                archive.extractall(staging)
+            archive.extractall(staging, filter="data")
         unpacked = staging / f"bsbm-tools-{TOOLS_COMMIT}"
         if not (unpacked / "lib" / "bsbm.jar").is_file():
             raise ToolsError(f"{TOOLS_URL} holds no bsbm-tools-{TOOLS_COMMIT}/lib/bsbm.jar")

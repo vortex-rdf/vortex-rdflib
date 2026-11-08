@@ -52,6 +52,7 @@ _:b0 <http://ex.org/knows> <http://ex.org/alice> .
     '"2020-01-01T00:00:00"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n'
 )
 
+
 #: Graph names the quad fixture spreads the same statements over; the empty
 #: one is the default graph, which `GRAPH ?g` must never bind. `_:g4` is a
 #: blank-node graph name — legal in N-Quads, and the case a bare `Graph`'s own
@@ -82,6 +83,7 @@ def as_quads(ntriples: str) -> str:
 
 
 FIXTURE_NQ = as_quads(FIXTURE_NT)
+
 
 QUERIES = [
     # single patterns
@@ -358,6 +360,17 @@ QUERIES = [
     """SELECT ?x ?a WHERE {
         VALUES ?a { 42 7 }
         ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a } }""",
+    # an OPTIONAL keeps a VALUES row no right row matches, and its FILTER reads a left
+    # variable an enclosing join binds (§18.5; rdflib departs on both, RDFLIB_DIVERGES)
+    """SELECT ?x ?a WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/nobody> }
+        OPTIONAL { ?x <http://ex.org/age> ?a } }""",
+    """SELECT ?x ?y ?a WHERE { ?x <http://ex.org/name> ?n .
+        { ?x <http://ex.org/knows> ?y
+          OPTIONAL { ?y <http://ex.org/age> ?a FILTER(?x != ?y) } } }""",
+    # chained OPTIONALs: the second keys on what the first may leave unbound,
+    # which an unmatched row's every age is compatible with (§18.3)
+    """SELECT ?x ?y ?a WHERE { ?x <http://ex.org/name> ?n
+        OPTIONAL { ?x <http://ex.org/knows> ?y } OPTIONAL { ?y <http://ex.org/age> ?a } }""",
     """ASK { ?x <http://ex.org/name> ?n OPTIONAL { ?x <http://ex.org/age> ?a }
         FILTER(!bound(?a)) }""",
     # --- group joins: nested groups, three groups (non-lazy), cross product, a filtered group
@@ -456,6 +469,7 @@ QUERIES = [
         ?x <http://ex.org/age> ?a } ORDER BY ?a""",
 ]
 
+
 #: ORDER BY queries whose order is total (every tie broken by a unique variable),
 #: compared as sequences: the pushdown must sort exactly as rdflib does. The
 #: NaN score is kept out of sorted columns (`?o = ?o`): rdflib's comparator
@@ -483,7 +497,10 @@ ORDER_QUERIES = [
     "SELECT ?x ?n WHERE { ?x <http://ex.org/name> ?n } ORDER BY ?zzz ?n ?x",
 ]
 
+
 XSD_PREFIX = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> "
+
+
 QUERIES += [
     # --- VALUES: present and absent constants, UNDEF, spellings, joins, standalone
     """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/bob> <http://ex.org/nobody> }
@@ -529,11 +546,14 @@ QUERIES += [
     """SELECT ?x ?n WHERE { VALUES ?x { <http://ex.org/nobody> <http://ex.org/bob> }
         ?x <http://ex.org/name> ?n } ORDER BY ?x""",
 ]
+
+
 ORDER_QUERIES += [
     """SELECT ?x ?y WHERE {
         VALUES (?x ?y) { (<http://ex.org/nobody> 3) (<http://ex.org/bob> 1) (UNDEF 2) } }
         ORDER BY ?x ?y""",
 ]
+
 
 #: Two-variable FILTERs over composite blocks. Their fast conjuncts reach
 #: every BGP the single-variable ones do, as a mid-join pre-filter (always
@@ -559,6 +579,7 @@ QUERIES += [
         FILTER(?a < ?s) }""",
 ]
 
+
 #: The string shapes vortex-rdf evaluates over candidate codes:
 #: lowered and upper-cased texts, STR() over IRIs, blank nodes and typed
 #: literals, tagged constants (an upper-case tag never matches a stored one),
@@ -578,6 +599,7 @@ QUERIES += [
     'SELECT ?s ?o WHERE { ?s ?p ?o FILTER(strstarts(str(?o), "http://ex.org/c")) }',
 ]
 
+
 #: IRI equality as a keep: =, sameTerm and IN over IRIs only, constants the
 #: dictionary lacks, the empty list, the predicate position.
 QUERIES += [
@@ -592,6 +614,7 @@ QUERIES += [
     """SELECT ?x ?n WHERE { ?x <http://ex.org/knows> ?y . ?y <http://ex.org/name> ?n
         FILTER(?y IN (<http://ex.org/bob>, <http://ex.org/carol>)) }""",
 ]
+
 
 #: Shapes that name a graph. rdflib evaluates the `Graph` node itself — a
 #: bound name scopes the block below, an unbound one fans out over the
@@ -720,7 +743,9 @@ PROBE_QUADS = """\
 <http://ex/s4> <http://ex/p> <http://ex/o1> <http://ex/g1> .
 """
 
+
 EX_PREFIX = "PREFIX : <http://ex/> "
+
 
 #: Per shape: whether the default graph is the union of the graphs, the query,
 #: the rows rdflib answers, the probe the pushdown takes when it probes, and

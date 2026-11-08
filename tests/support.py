@@ -1,19 +1,24 @@
 """What the test modules share: running a query both ways, reading the
 query trace, spies over the native store and its dictionary, building
-small stores, and FILTER expressions with rdflib's own answer for them."""
+small stores, and FILTER expressions as rdflib's parser builds them."""
 
 import json
 import weakref
 
-from rdflib import Graph, Variable
+from rdflib import Dataset, Graph, Variable
 from rdflib.plugins.sparql.algebra import translateQuery
-from rdflib.plugins.sparql.evalutils import _ebv
 from rdflib.plugins.sparql.parser import parseQuery
-from rdflib.plugins.sparql.sparql import FrozenBindings, QueryContext
+from rdflib.plugins.sparql.sparql import QueryContext
 from vortex_rdf import serialize_rdf
 
-import vortex_rdflib.pushdown as pd
-from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown, unregister_sparql_pushdown
+from vortex_rdflib import (
+    VortexRdflibStore,
+    register_sparql_pushdown,
+    trace,
+    unregister_sparql_pushdown,
+)
+from vortex_rdflib.open_file import Codes
+from vortex_rdflib.terms import KindRanges
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 
@@ -52,10 +57,22 @@ def both_ways(graph, sparql, runner=run):
 
 def trace_events(text: str) -> list[dict]:
     """The query-trace events printed to ``text`` (captured stderr)."""
-    prefix = pd.tracing._TRACE_PREFIX
+    prefix = trace.PREFIX
     return [
         json.loads(line[len(prefix) :]) for line in text.splitlines() if line.startswith(prefix)
     ]
+
+
+def file_codes(store) -> Codes:
+    """The term codes of the file ``store`` has open; it reads them."""
+    codes = store._opened().codes
+    assert codes is not None
+    return codes
+
+
+def kind_ranges(store) -> KindRanges:
+    """The term kinds' code ranges of the file ``store`` has open."""
+    return file_codes(store).kind_ranges
 
 
 def is_graph_name_check(args) -> bool:
@@ -94,8 +111,8 @@ class CountingTermDict:
 def counting_term_dict(graph) -> CountingTermDict:
     """Install the counter over the store's term dictionary."""
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    counting = CountingTermDict(graph.store._dict)
-    graph.store._dict = counting
+    counting = CountingTermDict(file_codes(graph.store).term_dict)
+    file_codes(graph.store).term_dict = counting
     return counting
 
 
@@ -139,8 +156,8 @@ def counting_native(graph) -> CountingNative:
     """Install the counter. The store's own graph-name check is not counted
     (`is_graph_name_check`): it is not what a query plan costs."""
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    native = CountingNative(graph.store._store())
-    graph.store._native = native
+    native = CountingNative(graph.store._opened().native)
+    graph.store._opened().native = native
     return native
 
 
@@ -167,9 +184,9 @@ def products_file(tmp_path, n=200, indexes=()) -> str:
 
 def captured_trace(capsys) -> list[dict]:
     return [
-        json.loads(line[len(pd.tracing._TRACE_PREFIX) :])
+        json.loads(line[len(trace.PREFIX) :])
         for line in capsys.readouterr().err.splitlines()
-        if line.startswith(pd.tracing._TRACE_PREFIX)
+        if line.startswith(trace.PREFIX)
     ]
 
 
@@ -180,8 +197,9 @@ def native_call_events(trace, operation) -> list[dict]:
 
 
 class _Chunks:
-    """A chunk iterator the spy handed out, counting in ``pulls[slot]`` the
-    chunks pulled from it."""
+    """An iterator the spy handed out, counting in ``pulls[slot]`` what was
+    pulled from it: the chunks of ``match_code_chunks``, the rows of
+    ``iter_quads``."""
 
     def __init__(self, inner, pulls: list[int]):
         self._inner = inner
@@ -200,15 +218,17 @@ class _Chunks:
 
 class NativeSpy:
     """The native store with every call recorded by name. The chunk
-    iterators ``match_code_chunks`` returns count their pulls (``pulls``)
-    and are watched by weak references (``feeds``), so a test sees whether
-    they were released."""
+    iterators ``match_code_chunks`` returns count their pulls (``pulls``),
+    the row iterators ``iter_quads`` returns their rows (``rows``), and both
+    are watched by weak references (``feeds``), so a test sees whether they
+    were released."""
 
     def __init__(self, inner):
         self._inner = inner
         self.calls: list[tuple[str, dict]] = []
         self.args: list[tuple] = []
         self.pulls: list[int] = []
+        self.rows: list[int] = []
         self.feeds: list[weakref.ref] = []
 
     def __len__(self):
@@ -227,6 +247,9 @@ class NativeSpy:
             if name == "match_code_chunks" and result is not None:
                 result = _Chunks(result, self.pulls)
                 self.feeds.append(weakref.ref(result))
+            elif name == "iter_quads":
+                result = _Chunks(result, self.rows)
+                self.feeds.append(weakref.ref(result))
             return result
 
         return call
@@ -237,8 +260,8 @@ class NativeSpy:
 
 def native_spy(graph) -> NativeSpy:
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    spy = NativeSpy(graph.store._store())
-    graph.store._native = spy
+    spy = NativeSpy(graph.store._opened().native)
+    graph.store._opened().native = spy
     return spy
 
 
@@ -270,17 +293,6 @@ def filter_expr(sparql_expr: str):
 # rdflib's own contexts always carry an initBindings mapping; an unbound
 # variable is looked up there last (Graph.query defaults it to {}).
 CTX = QueryContext(graph=Graph(), initBindings={})
-
-
-RAISES = "rdflib raises"
-
-
-def rdflib_answer(expr, spelling):
-    bindings = {} if spelling is None else {V: VortexRdflibStore._from_n3_safe(spelling)}
-    try:
-        return _ebv(expr, FrozenBindings(CTX, bindings))
-    except Exception:  # noqa: BLE001 - rdflib's own bugs (e.g. NaN vs Decimal) are the oracle
-        return RAISES
 
 
 class RecordingTermDict:
@@ -318,8 +330,52 @@ def outcome(graph, sparql):
         return type(error)
 
 
+def predicate_calls(spy: RecordingTermDict) -> list[tuple]:
+    """The ``filter_codes`` calls that evaluate a predicate, without the two
+    checks a numeric one makes around its call (``filters.native.evaluate``):
+    the lookup of the xsd:float codes before it, which go to the Python routes,
+    and, after an ordering, ``num_ne`` (and ``num_eq``) over the codes it
+    passed, which keep only the numbers."""
+    calls: list[tuple] = []
+    for call in spy.calls:
+        kind, arg = call[0], call[1]
+        if kind == "datatype" and arg == XSD + "float":
+            continue
+        ordering = calls and calls[-1][0] in ("num_lt", "num_le", "num_gt", "num_ge")
+        if ordering and kind in ("num_ne", "num_eq") and arg == calls[-1][1]:
+            continue
+        calls.append(call)
+    return calls
+
+
 def filter_spy(graph) -> RecordingTermDict:
     """Record every ``filter_codes`` call the store's dictionary receives."""
-    spy = RecordingTermDict(graph.store._dict)
-    graph.store._dict = spy
+    spy = RecordingTermDict(file_codes(graph.store).term_dict)
+    file_codes(graph.store).term_dict = spy
     return spy
+
+
+def three_predicate_graph(
+    tmp_path, q_subject: str, q_value, n: int = 50, r_per_subject: int = 2, graph_name=None
+) -> Graph:
+    """`n` subjects `s{i}` with an integer `p` of `i` and `r_per_subject`
+    `r` values each (`r{j}` for every `j` congruent to `i` mod `n`), plus `n`
+    integer `q` values `q_value(i)` on subjects `{q_subject}{i}`. `r` is
+    counted above `p` and `q`, so the planner joins it last. With
+    `graph_name` every statement is in that named graph, over a Dataset."""
+    end = " .\n" if graph_name is None else f" <{graph_name}> .\n"
+    lines = []
+    for i in range(n):
+        q = f'"{q_value(i)}"^^<{XSD}integer>'
+        lines.append(f'<http://ex.org/s{i}> <http://ex.org/p> "{i}"^^<{XSD}integer>{end}')
+        lines.append(f"<http://ex.org/{q_subject}{i}> <http://ex.org/q> {q}{end}")
+    for j in range(r_per_subject * n):
+        lines.append(f'<http://ex.org/s{j % n}> <http://ex.org/r> "r{j}"{end}')
+    source = tmp_path / ("data.nt" if graph_name is None else "data.nq")
+    source.write_text("".join(lines), encoding="utf-8")
+    out = tmp_path / "data.vortex"
+    if graph_name is None:
+        serialize_rdf(str(source), str(out), layout="dictionary")
+        return Graph(store=VortexRdflibStore(str(out)))
+    serialize_rdf(str(source), str(out), layout="dictionary", format="nquads")
+    return Dataset(store=VortexRdflibStore(str(out)), default_union=True)

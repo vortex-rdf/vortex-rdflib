@@ -1,17 +1,16 @@
-"""What a block of the algebra is, read without matching anything: whether
-the block solver takes it (:func:`_check_block`), the variables it
-mentions, binds and may leave unbound, and the graph scope its patterns
-are matched in (:class:`_GraphScope`).
+"""What a block of the algebra is, read without matching anything: the
+typed block the solver takes (:func:`block`, which refuses any other), the
+variables it mentions, binds and may leave unbound, and the graph scope its
+patterns are matched in (:class:`_GraphScope`).
 """
 
 from dataclasses import dataclass
+from typing import Any, ClassVar
 
 from rdflib.term import BNode, URIRef, Variable
 
+from ..nodes import field, term_class, var_like
 from ..terms import canonical_spelling, unparseable_iri
-
-# Query bnodes act as variables, exactly as rdflib's evalBGP treats them.
-_VAR_LIKE = (Variable, BNode)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,8 +36,8 @@ def _active_scope(ctx, store) -> _GraphScope:
     return _GraphScope(store._graph_n3(getattr(ctx, "graph", None)))
 
 
-def _graph_scope(ctx, node) -> _GraphScope:
-    """The scope a ``Graph`` node establishes, mirroring rdflib's ``evalGraph``:
+def _graph_scope(ctx, node: "Graph") -> _GraphScope:
+    """The scope a ``GRAPH`` block establishes, mirroring rdflib's ``evalGraph``:
     a bound term names one graph, an unbound variable ranges over the named
     graphs. A term that cannot name a graph is left to rdflib rather than
     guessed at: one other than an IRI or a blank node, and an IRI vortex-rdf's
@@ -48,168 +47,280 @@ def _graph_scope(ctx, node) -> _GraphScope:
     value = ctx[term]
     if value is None:
         return _GraphScope(None, term)
-    if not isinstance(value, (URIRef, BNode)) or unparseable_iri(value):
+    if term_class(value) not in (URIRef, BNode) or unparseable_iri(value):
         raise NotImplementedError
     return _GraphScope(canonical_spelling(value), None)
 
 
-def _peel_graph(ctx, node, scope) -> tuple:
-    """Look through ``GRAPH`` nodes that name one graph, so the single-pattern
-    fast paths below still apply to a block inside a named graph."""
-    while getattr(node, "name", None) == "Graph":
+def _peel_graph(ctx, node: "Block", scope) -> tuple:
+    """Look through ``GRAPH`` blocks that name one graph, so the
+    single-pattern fast paths below still apply to a block inside a named
+    graph."""
+    while isinstance(node, Graph):
         inner = _graph_scope(ctx, node)
         if inner.var is not None:
             break
-        node, scope = node.p, inner
+        node, scope = node.inner, inner
     return node, scope
 
 
-def _check_block(node) -> None:
-    """Eagerly reject anything the block solver does not handle.
+@dataclass(frozen=True, slots=True, eq=False)
+class Block:
+    """A block — a subtree of the algebra the solver takes into one
+    code-space relation — converted from its algebra node by :func:`block`,
+    the one statement of what a block may hold.
 
-    A *block* is a subtree solved into one code-space relation; this walk and
-    `_solve_block`'s dispatch are the two statements of what that subtree may
-    contain.
+    ``name`` is rdflib's name for the algebra node. ``vars`` are the
+    variable-like terms the block mentions, in first-seen order (static: what rdflib's ``_vars`` is
+    made of); ``bound_vars`` those its solutions can bind (a MINUS's right
+    side removes rows, it binds nothing); ``nullable`` those it may leave
+    unbound — those an OPTIONAL's right side introduces, every one its left
+    side does not bind, and a VALUES table's UNDEF.
+
+    A ``GRAPH ?g``'s variable is nullable only where an OPTIONAL's right side
+    names it and its left side does not bind it, or a VALUES table leaves it
+    UNDEF; the solver leaves both to rdflib (see ``blocks._solve_left_join``,
+    ``blocks._solve_minus`` and :func:`relation._shared_key_ok`). Otherwise
+    the graph column is bound in every row below the ``GRAPH``, and when both
+    sides of an OPTIONAL are under the same one, the join on it keeps them in
+    the same graph.
     """
+
+    name: ClassVar[str]
+    vars: tuple
+    bound_vars: tuple
+    nullable: frozenset
+
+    @property
+    def single(self) -> tuple | None:
+        """The one triple pattern the block is, if it is a BGP of one."""
+        return None
+
+    def carries_graph(self, var) -> bool:
+        """Whether the rows of the block under ``GRAPH var`` carry its graph
+        column: a pattern of the block is matched in that scope, so the
+        column names the graph each row was solved in.
+
+        A part without the column (an empty group, a VALUES table, a
+        ``GRAPH`` of another graph) is the same in every named graph. A join
+        with a part that has it repeats it per graph, as rdflib does; an
+        OPTIONAL or a MINUS whose right side alone has it cannot, and raises
+        ``NotImplementedError``."""
+        return False
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Bgp(Block):
+    """A basic graph pattern: its ``triples``."""
+
+    name: ClassVar[str] = "BGP"
+    triples: tuple
+
+    @property
+    def single(self) -> tuple | None:
+        return self.triples[0] if len(self.triples) == 1 else None
+
+    def carries_graph(self, var) -> bool:
+        return bool(self.triples)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Filter(Block):
+    """A FILTER of ``expr`` over the ``inner`` block. ``kept`` are the context
+    variables rdflib keeps for it when it forgets the others — the node's
+    ``_vars``; the query's ``initBindings`` are kept too — or ``None``
+    directly inside an EXISTS body, where it sees every binding."""
+
+    name: ClassVar[str] = "Filter"
+    expr: Any
+    kept: frozenset | None
+    inner: Block
+
+    def carries_graph(self, var) -> bool:
+        return self.inner.carries_graph(var)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Join(Block):
+    """A group join of ``left`` and ``right``, ``lazy`` where rdflib solves
+    the right side per left row."""
+
+    name: ClassVar[str] = "Join"
+    left: Block
+    right: Block
+    lazy: bool
+
+    def carries_graph(self, var) -> bool:
+        left, right = self.left.carries_graph(var), self.right.carries_graph(var)
+        return left or right
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class LeftJoin(Block):
+    """An OPTIONAL of ``right`` on ``left`` under the condition ``expr``."""
+
+    name: ClassVar[str] = "LeftJoin"
+    left: Block
+    right: Block
+    expr: Any
+
+    def carries_graph(self, var) -> bool:
+        return _left_carries_graph(self.left, self.right, var)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Minus(Block):
+    """``left`` MINUS ``right``."""
+
+    name: ClassVar[str] = "Minus"
+    left: Block
+    right: Block
+
+    def carries_graph(self, var) -> bool:
+        return _left_carries_graph(self.left, self.right, var)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Values(Block):
+    """An inline VALUES table: its ``rows``, each a tuple of its terms in
+    ``vars`` order, ``None`` for an UNDEF."""
+
+    name: ClassVar[str] = "ToMultiSet"
+    rows: tuple
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Graph(Block):
+    """A GRAPH ``term`` over the ``inner`` block. The graph term binds in
+    every row of the block below it, and comes last, as it does in a
+    matched pattern's schema."""
+
+    name: ClassVar[str] = "Graph"
+    term: Any
+    inner: Block
+
+    def carries_graph(self, var) -> bool:
+        return self.term == var and self.inner.carries_graph(var)
+
+
+def _left_carries_graph(left: Block, right: Block, var) -> bool:
+    """An OPTIONAL's or a MINUS's :meth:`Block.carries_graph`: its left
+    side's, which a right side that alone carries it cannot be."""
+    left_carries, right_carries = left.carries_graph(var), right.carries_graph(var)
+    if right_carries and not left_carries:
+        raise NotImplementedError
+    return left_carries
+
+
+def _merged(first: tuple, second) -> tuple:
+    """``first``, then the terms of ``second`` it lacks, in order."""
+    return first + tuple(dict.fromkeys([term for term in second if term not in first]))
+
+
+def block(node) -> Block:
+    """``node`` as the block the solver takes; ``NotImplementedError`` for
+    anything it does not — the capability check, made eagerly, before
+    anything is matched."""
     name = getattr(node, "name", None)
     if name == "BGP":
-        return
-    if name in ("Filter", "Graph"):
-        _check_block(node.p)
-        return
+        triples = tuple(field(node, "triples"))
+        found = tuple(dict.fromkeys([t for triple in triples for t in triple if var_like(t)]))
+        return Bgp(found, found, frozenset(), triples)
+    if name == "Filter":
+        inner = block(field(node, "p"))
+        isolated = not field(node, "no_isolated_scope")
+        kept = (_kept(node) or frozenset()) if isolated else None
+        return Filter(
+            inner.vars, inner.bound_vars, inner.nullable, field(node, "expr"), kept, inner
+        )
+    if name == "Graph":
+        inner = block(field(node, "p"))
+        term = field(node, "term")
+        own = (term,) if var_like(term) else ()
+        return Graph(
+            _merged(inner.vars, own),
+            _merged(inner.bound_vars, own),
+            inner.nullable,
+            term,
+            inner,
+        )
     if name in ("Join", "LeftJoin", "Minus"):
-        _check_block(node.p1)
-        _check_block(node.p2)
-        return
-    if name == "ToMultiSet" and getattr(node.p, "name", None) == "values":
-        return
+        left, right = block(field(node, "p1")), block(field(node, "p2"))
+        mentioned = _merged(left.vars, right.vars)
+        if name == "Minus":
+            return Minus(mentioned, left.bound_vars, left.nullable, left, right)
+        bound = _merged(left.bound_vars, right.bound_vars)
+        nullable = left.nullable | right.nullable
+        if name == "Join":
+            return Join(mentioned, bound, nullable, left, right, bool(field(node, "lazy")))
+        nullable |= frozenset(right.vars) - frozenset(left.bound_vars)
+        return LeftJoin(mentioned, bound, nullable, left, right, field(node, "expr"))
+    if name == "ToMultiSet" and getattr(values := field(node, "p"), "name", None) == "values":
+        found, rows, nullable = _values_table(field(values, "res"))
+        return Values(found, found, nullable, rows)
     raise NotImplementedError
 
 
-def _node_vars(node, out: list | None = None, *, bound: bool = False) -> list:
-    """Every variable-like term a block mentions, in first-seen order
-    (static: what rdflib's ``_vars`` is made of). With ``bound``, only those
-    its solutions can bind: a MINUS's right side removes rows, it binds
-    nothing."""
-    if out is None:
-        out = []
-    name = node.name
-    if name == "BGP":
-        for triple in node.triples:
-            for term in triple:
-                if isinstance(term, _VAR_LIKE) and term not in out:
-                    out.append(term)
-    elif name == "Filter":
-        _node_vars(node.p, out, bound=bound)
-    elif name == "ToMultiSet":
-        for row in node.p.res:
-            for term in row:
-                if term not in out:
-                    out.append(term)
-    elif name == "Graph":
-        # The graph term binds in every row of the block below it, and comes
-        # last, as it does in a matched pattern's schema.
-        _node_vars(node.p, out, bound=bound)
-        if isinstance(node.term, _VAR_LIKE) and node.term not in out:
-            out.append(node.term)
-    else:
-        _node_vars(node.p1, out, bound=bound)
-        if not (bound and name == "Minus"):
-            _node_vars(node.p2, out, bound=bound)
-    return out
+def _kept(node) -> frozenset | None:
+    """rdflib's ``_vars`` of an algebra node, ``None`` where it has none."""
+    found = field(node, "_vars")
+    return None if found is None else frozenset(found)
 
 
-def _scoped_vars(node, scope: _GraphScope) -> list:
+def _values_table(rows) -> tuple[tuple, tuple, frozenset]:
+    """A VALUES table as ``(variables, rows, nullable)``: its variables, in
+    first-seen order; each row a tuple of its terms in that order
+    (:func:`_cell`); and the variables some row leaves unbound."""
+    found: dict = {}
+    for row in rows:
+        for var in row:
+            if var not in found:
+                found[var] = None
+    variables = tuple(found)
+    table = tuple([tuple([_cell(row.get(var)) for var in variables]) for row in rows])
+    nullable = frozenset(
+        [var for i, var in enumerate(variables) if any([row[i] is None for row in table])]
+    )
+    return variables, table, nullable
+
+
+def _cell(value):
+    """A VALUES row's term for a variable: ``None`` for ``UNDEF`` — rdflib's
+    plain string, where a bound value is a term — or for no entry at all."""
+    return None if value.__class__ is str and value == "UNDEF" else value
+
+
+def _scoped_vars(node: Block, scope: _GraphScope) -> tuple:
     """A block's variable-like terms, plus the graph variable an enclosing
     ``GRAPH ?g`` binds in every row of it."""
-    out = _node_vars(node)
-    if scope.var is not None and scope.var not in out:
-        out.append(scope.var)
-    return out
+    if scope.var is not None and scope.var not in node.vars:
+        return (*node.vars, scope.var)
+    return node.vars
 
 
-def _block_vars(ctx, node, scope: _GraphScope) -> list:
+def _block_vars(ctx, node: Block, scope: _GraphScope) -> list:
     """The variables a block binds: its variable-like terms the context has
     not bound, in first-seen order (static, no matching)."""
     return [term for term in _scoped_vars(node, scope) if ctx[term] is None]
 
 
-def _group_vars(ctx, node) -> list:
+def _group_vars(ctx, node: Block) -> list:
     """The variables a block's own solutions bind in rdflib's evaluation: its
     variable-like terms the context has not bound, none from a MINUS's right
     side, and an enclosing ``GRAPH ?g``'s variable only where the block binds
     it itself — rdflib's ``evalGraph`` joins the graph in after the group is
     solved."""
-    return [var for var in _node_vars(node, bound=True) if ctx[var] is None]
-
-
-def _carries_graph(node, var) -> bool:
-    """Whether the rows of a block under ``GRAPH var`` carry its graph
-    column: a pattern of the block is matched in that scope, so the column
-    names the graph each row was solved in.
-
-    A part without the column (an empty group, a VALUES table, a ``GRAPH`` of
-    another graph) is the same in every named graph. A join with a part that
-    has it repeats it per graph, as rdflib does; an OPTIONAL or a MINUS whose
-    right side alone has it cannot, and raises ``NotImplementedError``.
-    """
-    name = node.name
-    if name == "BGP":
-        return bool(node.triples)
-    if name == "Filter":
-        return _carries_graph(node.p, var)
-    if name == "Graph":
-        return node.term == var and _carries_graph(node.p, var)
-    if name in ("Join", "LeftJoin", "Minus"):
-        left, right = _carries_graph(node.p1, var), _carries_graph(node.p2, var)
-        if name == "Join":
-            return left or right
-        if right and not left:
-            raise NotImplementedError
-        return left
-    return False
-
-
-def _block_nullable(node) -> frozenset:
-    """The variables a block may leave unbound: those an OPTIONAL side
-    introduces, every one its left side does not bind.
-
-    A ``GRAPH ?g``'s variable is among them only where an OPTIONAL's right
-    side names it and its left side does not bind it, or a VALUES table
-    leaves it UNDEF; the solver leaves both to rdflib (see
-    :func:`_solve_left_join`, :func:`_solve_minus` and :func:`_shared_key_ok`).
-    Otherwise the graph column is bound in every row below the ``GRAPH``,
-    and when both sides of an OPTIONAL are under the same one, the join on it
-    keeps them in the same graph.
-    """
-    name = node.name
-    if name == "BGP":
-        return frozenset()
-    if name == "Graph":
-        return _block_nullable(node.p)
-    if name == "ToMultiSet":
-        rows = node.p.res
-        return frozenset(
-            v for v in _node_vars(node) if any(row.get(v, "UNDEF") == "UNDEF" for row in rows)
-        )
-    if name == "Filter":
-        return _block_nullable(node.p)
-    if name == "Minus":
-        return _block_nullable(node.p1)
-    nullable = _block_nullable(node.p1) | _block_nullable(node.p2)
-    if name == "LeftJoin":
-        nullable |= frozenset(_node_vars(node.p2)) - frozenset(_node_vars(node.p1, bound=True))
-    return nullable
+    return [var for var in node.bound_vars if ctx[var] is None]
 
 
 def _unwrap_empty_joins(node):
     """rdflib never simplifies an EXISTS body, so a group translates to a
     Join with an empty BGP on one side; look through those."""
     while getattr(node, "name", None) == "Join":
-        p1, p2 = node.p1, node.p2
-        if getattr(p1, "name", None) == "BGP" and not p1.triples:
+        p1, p2 = field(node, "p1"), field(node, "p2")
+        if getattr(p1, "name", None) == "BGP" and not field(p1, "triples"):
             node = p2
-        elif getattr(p2, "name", None) == "BGP" and not p2.triples:
+        elif getattr(p2, "name", None) == "BGP" and not field(p2, "triples"):
             node = p1
         else:
             break

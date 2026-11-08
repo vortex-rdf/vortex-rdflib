@@ -147,22 +147,29 @@ The modules, from the hook down:
 - :mod:`.head` — the head above a block: projection, DISTINCT, ORDER BY, LIMIT;
 - :mod:`.aggregate` — ``COUNT`` aggregates;
 - :mod:`.blocks` — FILTER, joins, OPTIONAL, MINUS, EXISTS, VALUES, GRAPH;
-- :mod:`.bgp` — basic graph patterns and the incremental join planner;
+- :mod:`.pushed` — the FILTER conjuncts a FILTER hands down into its block;
+- :mod:`.bgp` — basic graph patterns;
+- :mod:`.planner` — the incremental join planner of a BGP;
+- :mod:`.tracing` — a BGP plan's trace events;
 - :mod:`.streaming` — a last join step over the pair budget, streamed;
 - :mod:`.probes` — probe joins and batched native probes;
 - :mod:`.matching` — one pattern: resolved, narrowed, counted, matched;
 - :mod:`.algebra` — what a block holds and binds, and its graph scope;
 - :mod:`.relation` — code-space relations, their rows, the join kernels;
 - :mod:`.solutions` — decoding rows into rdflib solutions;
-- :mod:`.aliasing` — codes whose terms another code represents;
-- :mod:`.tracing` — the query trace.
+- :mod:`.aliasing` — codes whose terms another code represents.
 
-Within the package a module calls another's functions through it
+The package exports the two registration functions; the modules are its
+internals. Within the package a module calls another's functions through it
 (``matching._rel_from_pattern``), so a test that patches a function on its
-module reaches every caller.
+module reaches every caller — but for the handlers and the block solvers,
+held in tables (``hook._HANDLERS``, ``blocks._SOLVERS``): a test patches
+their entries.
 """
 
-from . import (
+# The package's modules, loaded with it, so the package's attributes name
+# them (tests reach them as ``pushdown.<module>``); none is exported.
+from . import (  # noqa: F401
     aggregate,
     algebra,
     aliasing,
@@ -171,7 +178,9 @@ from . import (
     head,
     hook,
     matching,
+    planner,
     probes,
+    pushed,
     relation,
     solutions,
     streaming,
@@ -179,20 +188,4 @@ from . import (
 )
 from .hook import register_sparql_pushdown, unregister_sparql_pushdown
 
-__all__ = [
-    "aggregate",
-    "algebra",
-    "aliasing",
-    "bgp",
-    "blocks",
-    "head",
-    "hook",
-    "matching",
-    "probes",
-    "register_sparql_pushdown",
-    "relation",
-    "solutions",
-    "streaming",
-    "tracing",
-    "unregister_sparql_pushdown",
-]
+__all__ = ["register_sparql_pushdown", "unregister_sparql_pushdown"]

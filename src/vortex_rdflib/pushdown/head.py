@@ -1,5 +1,7 @@
 """The head above a block — ``Project``, ``Distinct``, ``OrderBy`` and
-``Slice`` — applied to its code-space relation (:func:`_eval_head`).
+``Slice`` — applied to its code-space relation (:func:`_eval_head`), and
+``ASK`` over a block (:func:`_eval_ask`): one pattern counted, or one row
+pulled.
 """
 
 import heapq
@@ -11,15 +13,19 @@ from operator import itemgetter
 from rdflib.plugins.sparql.evalutils import _val
 from rdflib.term import Variable
 
+from .. import boundary, filters, trace
+from ..nodes import field, term_class
 from ..settings import SETTINGS
-from . import algebra, aliasing, blocks, relation, solutions, tracing
+from ..terms import BLANK, IRI
+from . import algebra, aliasing, blocks, matching, relation, solutions
+from .algebra import Block
+from .matching import Pattern
 from .relation import Relation
-from .tracing import _TRACE
 
 
 @dataclass(slots=True)
 class _Head:
-    block: object
+    block: Block
     pv: tuple | None
     start: int
     stop: int | None
@@ -36,37 +42,61 @@ def _plan_head(part) -> _Head:
     """
     node, start, stop, distinct, order = part, 0, None, False, []
     if node.name == "Slice":
-        start = int(node.start or 0)
-        # The key is absent without LIMIT; CompValue then answers None.
-        length = node.length
+        start = int(field(node, "start") or 0)
+        # The key is absent without LIMIT; the field is then None.
+        length = field(node, "length")
         stop = None if length is None else start + int(length)
-        node = node.p
+        node = field(node, "p")
     if node.name == "Distinct":
         distinct = True
-        node = node.p
+        node = field(node, "p")
     pv = None
     if node.name == "Project":
-        pv = node.PV
-        pv = (pv,) if isinstance(pv, Variable) else tuple(pv)
-        node = node.p
+        pv = field(node, "PV")
+        pv = (pv,) if term_class(pv) is Variable else tuple(pv)
+        node = field(node, "p")
     elif distinct or start or stop is not None:
         raise NotImplementedError
     if node.name == "OrderBy":
-        for condition in node.expr:
-            if not isinstance(condition.expr, Variable):
+        for condition in field(node, "expr"):
+            key = field(condition, "expr")
+            if term_class(key) is not Variable:
                 raise NotImplementedError
-            order.append((condition.expr, condition.order == "DESC"))
-        node = node.p
+            order.append((key, field(condition, "order") == "DESC"))
+        node = field(node, "p")
     if pv is None and not order:
         raise NotImplementedError
-    algebra._check_block(node)
-    return _Head(node, pv, start, stop, distinct, order)
+    return _Head(algebra.block(node), pv, start, stop, distinct, order)
 
 
 def _eval_head(ctx, store, part):
-    started = tracing._stopwatch()
+    started = trace.stopwatch()
     head = _plan_head(part)
-    tracing._trace_event(
+    _trace_head_planned(part, head)
+    # Without an ORDER BY or a DISTINCT between them, a LIMIT bounds the
+    # block's rows themselves; a block that is one native match takes it.
+    # The relation then goes straight to the emitter (``stream``).
+    stream = not head.order and not head.distinct
+    limit = head.stop if stream else None
+    frame = blocks._Frame(algebra._active_scope(ctx, store), limit=limit, stream=stream)
+    rel = blocks._solve_block(ctx, store, head.block, frame)
+    _trace_block_solved(store, rel, started())
+    if head.order:
+        # DISTINCT narrows the rows after the sort, so only a plain LIMIT
+        # can stop the sort at the top k.
+        rows = _order_rows(ctx, store, rel, head.order, None if head.distinct else head.stop)
+        rel = rel.with_rows(rows)
+    if head.distinct:
+        return _eval_distinct(ctx, store, rel, head)
+    return solutions._yield_solutions(ctx, store, rel, head.pv, head.start, head.stop)
+
+
+def _trace_head_planned(part, head: _Head) -> None:
+    """Trace the head as ``head_planned``: the node it enters at, its
+    projection, sort keys, DISTINCT and window."""
+    if trace.active() is None:
+        return
+    trace.event(
         "head_planned",
         entry_node=part.name,
         project_variable_count=0 if head.pv is None else len(head.pv),
@@ -76,28 +106,21 @@ def _eval_head(ctx, store, part):
         offset=head.start,
         limit=None if head.stop is None else head.stop - head.start,
     )
-    # Without an ORDER BY or a DISTINCT between them, a LIMIT bounds the
-    # block's rows themselves; a block that is one native match takes it.
-    # The relation then goes straight to the emitter (``stream``).
-    stream = not head.order and not head.distinct
-    limit = head.stop if stream else None
-    rel = blocks._solve_block(ctx, store, head.block, limit=limit, stream=stream)
-    tracing._trace_event(
+
+
+def _trace_block_solved(store, rel: Relation, elapsed_ns: int) -> None:
+    """Trace the head's block as ``block_solve_complete``: the relation it
+    was solved into and the query's terms outside the dictionary."""
+    if trace.active() is None:
+        return
+    trace.event(
         "block_solve_complete",
         rows=relation._relation_rows(rel),
         columns=len(rel.schema),
         nullable_columns=len(rel.nullable),
-        foreign_terms=len(rel.foreign),
-        elapsed_ns=started(),
+        foreign_terms=len(store._terms().foreign),
+        elapsed_ns=elapsed_ns,
     )
-    if head.order:
-        # DISTINCT narrows the rows after the sort, so only a plain LIMIT
-        # can stop the sort at the top k.
-        rows = _order_rows(ctx, store, rel, head.order, None if head.distinct else head.stop)
-        rel = rel.with_rows(rows)
-    if head.distinct:
-        return _eval_distinct(ctx, store, rel, head)
-    return solutions._yield_solutions(ctx, store, rel, head.pv, head.start, head.stop)
 
 
 def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
@@ -109,31 +132,14 @@ def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
     keeps only the top ``stop`` rows. A variable the block does not bind
     ties every row, as it does for rdflib.
     """
-    started = tracing._stopwatch()
+    started = trace.stopwatch()
     rows = relation._rows_of(rel)
-    tracing._trace_event(
-        "order_start",
-        input_rows=len(rows),
-        order_key_count=len(order),
-        descending_key_count=sum(descending for _, descending in order),
-        limit=stop,
-    )
     keys = []
-    for key_index, (var, descending) in enumerate(order):
+    for var, descending in order:
         if var not in rel.schema:
             continue
         index = rel.schema.index(var)
-        distinct_codes = {row[index] for row in rows}
-        key_started = tracing._stopwatch()
-        ranks = _rank_codes(store, rel.foreign, distinct_codes)
-        tracing._trace_event(
-            "order_key_ranked",
-            key_index=key_index,
-            descending=descending,
-            input_rows=len(rows),
-            distinct_codes=len(distinct_codes),
-            elapsed_ns=key_started(),
-        )
+        ranks = _rank_codes(store, {row[index] for row in rows})
         keys.append((index, ranks, -1 if descending else 1))
     if not keys:
         return rows
@@ -147,19 +153,18 @@ def _order_rows(ctx, store, rel: Relation, order, stop) -> list:
     else:
         output = sorted(rows, key=sort_key)
         algorithm = "full_stable_sort"
-    tracing._trace_event(
+    trace.event(
         "order_complete",
         algorithm=algorithm,
         input_rows=len(rows),
         output_rows=len(output),
         limit=stop,
-        limit_applied_during_order=algorithm == "bounded_heap_nsmallest",
         elapsed_ns=started(),
     )
     return output
 
 
-def _rank_codes(store, foreign: dict, codes) -> dict:
+def _rank_codes(store, codes) -> dict:
     """Ranks reproducing rdflib's ORDER BY comparison (``_val``): unbound
     first, then blank nodes, IRIs and literals.
 
@@ -173,10 +178,11 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
     comparator. Adjacent keys that compare equal share a rank, so the stable
     sort keeps their input order. With a query constant outside the
     dictionary among the codes, every code ranks as the literals do."""
-    elapsed = tracing._stopwatch()
+    elapsed = trace.stopwatch()
     codes = set(codes)
     ranks = {None: -1}
-    literal_lo, iri_lo, blank_lo = store._term_kind_bounds()
+    ranges = store._opened().codes.kind_ranges
+    iri_lo, blank_lo = ranges.range(IRI)[0], ranges.range(BLANK)[0]
     blanks, iris, others = [], [], []
     by_kind = all(code is None or code >= 0 for code in codes)
     for code in codes:
@@ -195,24 +201,21 @@ def _rank_codes(store, foreign: dict, codes) -> dict:
     if iris:
         # ``<iri>`` decodes to ``URIRef(iri)``, so the string rdflib compares
         # is the spelling without its brackets.
-        spellings = store._dict.decode_many(iris)
-        if None in spellings:
-            code = iris[spellings.index(None)]
-            raise ValueError(f"term code {code} is not in the store dictionary")
+        spellings = store._opened().codes.spellings(iris)
         keyed = [(spelling[1:-1], code) for spelling, code in zip(spellings, iris, strict=True)]
         rank = _rank_keyed(ranks, keyed, rank)
     local = [code for code in others if code >= 0]
-    traced = _TRACE.get() is not None
+    traced = trace.active() is not None
     # For the trace: the literals the query's term cache holds already.
     hits = sum(code in store._terms().decode for code in local) if traced else 0
     if others:
         cached = store._prime_decode_cache(local)
+        foreign = store._terms().foreign
         keyed = [(_val(cached[code] if code >= 0 else foreign[code]), code) for code in others]
         _rank_keyed(ranks, keyed, rank)
     if traced:
-        tracing._trace_event(
+        trace.event(
             "rank_codes_complete",
-            input_codes=len(codes),
             unique_codes=len(codes),
             null_codes=int(None in codes),
             blank_codes=len(blanks),
@@ -250,8 +253,8 @@ def _eval_distinct(ctx, store, rel: Relation, head: _Head):
     pv = head.pv or ()
     keys = tuple(v for v in pv if v in rel.schema)
     idx = [rel.schema.index(v) for v in keys]
-    rows = _term_distinct(store, _code_distinct(rel, idx), rel.foreign)
-    return solutions._yield_rows(ctx, store, keys, rows, rel.foreign, pv, head.start, head.stop)
+    rows = _term_distinct(store, _code_distinct(rel, idx))
+    return solutions._yield_rows(ctx, store, keys, rows, pv, head.start, head.stop)
 
 
 def _code_distinct(rel: Relation, idx: list) -> Iterator[tuple]:
@@ -275,7 +278,7 @@ def _code_distinct(rel: Relation, idx: list) -> Iterator[tuple]:
     return rows()
 
 
-def _term_distinct(store, tuples: Iterator[tuple], foreign: dict) -> Iterator[tuple]:
+def _term_distinct(store, tuples: Iterator[tuple]) -> Iterator[tuple]:
     """Drop the code tuples whose decoded terms equal an earlier tuple's."""
     seen: set = set()
     aliases: dict = {}
@@ -284,10 +287,69 @@ def _term_distinct(store, tuples: Iterator[tuple], foreign: dict) -> Iterator[tu
         chunk = list(islice(tuples, size))
         if not chunk:
             return
-        aliasing._alias_codes(store, {c for row in chunk for c in row}, foreign, aliases)
+        aliasing._alias_codes(store, {c for row in chunk for c in row}, aliases)
         for row in chunk:
             key = tuple(aliases.get(c, c) for c in row) if aliases else row
             if key not in seen:
                 seen.add(key)
                 yield row
         size = min(size * 4, SETTINGS.chunk_max)
+
+
+def _eval_ask(ctx, store, part):
+    """``ASK`` over a block: whether it has a solution."""
+    project = field(part, "p")
+    if getattr(project, "name", None) != "Project":
+        raise NotImplementedError
+    node = algebra.block(field(project, "p"))
+    return {"type_": "ASK", "askAnswer": _block_nonempty(ctx, store, node)}
+
+
+def _block_nonempty(ctx, store, node: Block) -> bool:
+    """Whether a block has a solution: one pattern's count capped at one
+    row (:func:`_single_pattern`), or one row pulled from the solved block."""
+    node, scope = algebra._peel_graph(ctx, node, algebra._active_scope(ctx, store))
+    pat = _single_pattern(ctx, store, node, scope)
+    if pat is not None:
+        if pat.unsatisfiable:
+            return False
+        if not pat.repeats:
+            # Existence needs no rows: a count capped at one, which stops a
+            # file-backed scan at its first match.
+            narrowing = matching._narrowing(pat.nkeep, limit=1)
+            return boundary.native(store).count_quads(*pat.n3, **narrowing) > 0
+    rel = blocks._solve_block(ctx, store, node, blocks._Frame(scope, limit=1))
+    # One row is pulled, and the rows are closed after it: a streamed join
+    # gathers one piece and releases its feed.
+    rows = relation._code_rows(rel)
+    try:
+        return next(rows, None) is not None
+    finally:
+        close = getattr(rows, "close", None)
+        if close is not None:
+            close()
+
+
+def _single_pattern(ctx, store, node: Block, scope) -> Pattern | None:
+    """``node`` as one triple pattern the native layer answers whole: a
+    ``BGP`` of one pattern, or a ``FILTER`` over one whose conjuncts all push
+    into the native match as keeps. The resolved pattern, ready to count, or
+    ``None``."""
+    var_preds = None
+    if isinstance(node, algebra.Filter):
+        inner = node.inner
+        if inner.single is None:
+            return None
+        plan = filters.analyze_filter(
+            node.expr, node.kept, algebra._block_vars(ctx, inner, scope), ctx
+        )
+        if plan.constant or plan.tuples or plan.exists:
+            return None
+        var_preds, node = plan.per_var, inner
+    triple = node.single
+    if triple is None:
+        return None
+    pat = matching.resolve(ctx, store, triple, scope, var_preds)
+    if pat.deferred:
+        return None  # a conjunct the native match cannot decide
+    return pat

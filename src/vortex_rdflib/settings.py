@@ -1,28 +1,39 @@
 """The pushdown's tuning, and every environment switch the package reads.
 
 :data:`SETTINGS` holds the numbers the planner decides by — the pair budget,
-the probe fan-out, the batch and chunk sizes — and the switches that narrow
-what the pushdown hook answers. It is one object, read when each decision is
-made, so every module sees the same values; a test overrides one for its
-duration with ``monkeypatch.setattr(SETTINGS, "pair_budget", 0)``.
+the probe fan-out, the batch and chunk sizes — the switches that narrow what
+the pushdown hook answers, and the ablation and debugging switches. It is one
+object, read when each decision is made, so every module sees the same
+values; a test overrides one for its duration with
+``monkeypatch.setattr(SETTINGS, "pair_budget", 0)``.
 
-The environment is read at four points, each named by a function here:
+A switch is read by one parser per kind of value: :func:`flag` for on and off
+(``1``, ``true``, ``yes``, ``on``; ``0``, ``false``, ``no``, ``off``; any case),
+:func:`positive_int` for a size. Nothing is read on import, so a bad value
+fails where it is read, naming the variable:
 
-- on import: ``VORTEX_RDF_PAIR_BUDGET``, the pair budget's default;
-- each time the pushdown is registered (every store construction):
-  ``VORTEX_RDF_DISABLE_PUSHDOWN`` (:func:`pushdown_disabled`) and the switches
-  :func:`apply_switches` reads, each of which narrows a setting and never
-  widens it back;
-- each time a store is constructed: ``VORTEX_RDF_IN_MEMORY``
-  (:func:`in_memory_by_default`) and ``VORTEX_RDF_DISABLE_CODE_PATH``
-  (:func:`code_path_enabled`);
-- per call: ``VORTEX_RDF_TRACE_QUERY`` and ``VORTEX_RDF_TRACE_QUERY_ID``
-  (:func:`trace_enabled`, :func:`trace_query_id`), for each algebra node the
-  hook answers outside a traced query, and ``VORTEX_RDF_TRACE_TRIPLES``
-  (:func:`trace_triples`), for each ``triples()`` call.
+- each time the pushdown is registered, which constructing a store does
+  once: the switches :func:`apply_switches` reads, each of which moves a
+  setting away from its default and never back, and
+  ``VORTEX_RDF_DISABLE_PUSHDOWN`` (:func:`pushdown_disabled`);
+  ``VORTEX_RDF_IN_MEMORY`` (:func:`in_memory_by_default`) and
+  ``VORTEX_RDF_DISABLE_CODE_PATH`` (:func:`code_path_enabled`) on
+  construction;
+- once per query, as it starts: ``VORTEX_RDF_TRACE_QUERY`` and
+  ``VORTEX_RDF_TRACE_QUERY_ID`` (:func:`trace_enabled`,
+  :func:`trace_query_id`), so a query is traced from its start or not at
+  all.
+
+The ablation switches (``VORTEX_RDF_CODE_PREDICATES``,
+``VORTEX_RDF_COUNT_ORDER``, ``VORTEX_RDF_DECODE_EACH_STEP``,
+``VORTEX_RDF_DECODE_CHUNK``, ``VORTEX_RDF_PROBE_BATCH``) measure what each
+pushdown mechanism contributes: each changes how the pushdown answers, never
+what (``tests/test_ablation_switches.py``); the fields they set say what
+each does, and the README lists them.
 """
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 #: The algebra nodes the pushdown hook answers, by rdflib's name for them:
@@ -49,20 +60,67 @@ PAIR_BUDGET_ENV = "VORTEX_RDF_PAIR_BUDGET"
 PUSHDOWN_OPS_ENV = "VORTEX_RDF_PUSHDOWN_OPS"
 TRACE_ENV = "VORTEX_RDF_TRACE_QUERY"
 
+_ON = frozenset({"1", "true", "yes", "on"})
+_OFF = frozenset({"0", "false", "no", "off"})
 
-def _pair_budget_from_env() -> int:
-    """``VORTEX_RDF_PAIR_BUDGET``, an integer of at least 0, or ``1 << 24``
-    when it is unset."""
-    value = os.environ.get(PAIR_BUDGET_ENV)
-    if value is None:
-        return 1 << 24
-    try:
-        budget = int(value)
-    except ValueError:
-        budget = None
-    if budget is None or budget < 0:
-        raise ValueError(f"{PAIR_BUDGET_ENV} must be an integer >= 0, got {value!r}")
-    return budget
+
+def _environment_reader() -> Callable[[str], str | None]:
+    """``os.environ.get``, through the mapping's own dictionary where it keeps
+    one (CPython's and PyPy's ``os.environ`` do): constructing a store reads
+    every switch, and ``os.environ.get`` of a name that is not set raises
+    and catches a ``KeyError`` (about 550 ns, against a 40 ns probe). The
+    dictionary is the one ``os.environ`` updates when a variable is set or
+    removed through it, so a read sees the environment as it is then."""
+    environ = os.environ
+    data = getattr(environ, "_data", None)
+    encodekey = getattr(environ, "encodekey", None)
+    decodevalue = getattr(environ, "decodevalue", None)
+    if not isinstance(data, dict) or encodekey is None or decodevalue is None:
+        return environ.get
+
+    def read(name: str) -> str | None:
+        raw = data.get(encodekey(name))
+        return None if raw is None else decodevalue(raw)
+
+    return read
+
+
+#: A variable of the environment as it is when read, ``None`` when unset.
+getenv = _environment_reader()
+
+
+def flag(name: str, default: bool) -> bool:
+    """The environment variable ``name`` as on or off: ``1``, ``true``,
+    ``yes`` or ``on`` is on, ``0``, ``false``, ``no`` or ``off`` off, in any
+    case and with surrounding blanks; unset or empty is ``default``; anything
+    else raises ``ValueError``, naming the variable."""
+    value = (getenv(name) or "").strip().lower()
+    if not value:
+        return default
+    if value in _ON:
+        return True
+    if value in _OFF:
+        return False
+    raise ValueError(f"{name} must be 1/true/yes/on or 0/false/no/off, got {value!r}")
+
+
+def _int_at_least(name: str, minimum: int) -> int | None:
+    """The environment variable ``name`` as an integer of at least
+    ``minimum``, written in ASCII digits (surrounding blanks aside), or
+    ``None`` when unset or empty; anything else — a sign, an underscore,
+    another script's digits — raises ``ValueError``, naming the variable."""
+    value = (getenv(name) or "").strip()
+    if not value:
+        return None
+    if not (value.isascii() and value.isdigit()) or int(value) < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+    return int(value)
+
+
+def positive_int(name: str) -> int | None:
+    """The environment variable ``name`` as a positive integer, or ``None``
+    when unset or empty; anything else raises ``ValueError``, naming it."""
+    return _int_at_least(name, 1)
 
 
 def _scan_lookahead() -> int:
@@ -86,14 +144,33 @@ class Settings:
     #: the Python routes, for A/B measurements; turning the fast route off
     #: turns these off too).
     native_filters: bool = True
+    #: Kind tests (``isIRI``, ``isLiteral``, ``isBlank``) and IRI equality
+    #: are answered as code ranges and code sets (``VORTEX_RDF_CODE_PREDICATES=0``
+    #: sends them through decoded values, an ablation).
+    code_predicates: bool = True
+    #: Patterns are ordered by native counts (``VORTEX_RDF_COUNT_ORDER=0``
+    #: orders them by their bound positions alone and probes every connected
+    #: step, as rdflib's nested loop does: an ablation).
+    count_order: bool = True
+    #: After every join step the relation's codes are decoded to spellings and
+    #: encoded again (``VORTEX_RDF_DECODE_EACH_STEP=1``: the term round trip a
+    #: term-space evaluator pays, an ablation).
+    decode_each_step: bool = False
+    #: A store counts every call through its native handle and dictionary
+    #: (``VORTEX_RDF_COUNTERS=1``, read when the store is opened; see
+    #: :mod:`vortex_rdflib.counters`).
+    counters: bool = False
+    #: ``triples()`` prints each pattern it is asked (``VORTEX_RDF_TRACE_TRIPLES=1``,
+    #: debugging).
+    trace_triples: bool = False
 
     #: The most row pairs one join step of a BGP may make. A step whose two
     #: sides' product is within it is built uncounted; past that, its pairs
     #: are counted natively before any is built, and a step that counts more
     #: is not built. A probe step, which has no pairs to count, stops once
     #: its rows pass a quarter of the budget; a keep-scan, once its match
-    #: passes the budget. ``VORTEX_RDF_PAIR_BUDGET``, read on import.
-    pair_budget: int = field(default_factory=_pair_budget_from_env)
+    #: passes the budget. ``VORTEX_RDF_PAIR_BUDGET``: an integer of at least 0.
+    pair_budget: int = 1 << 24
     #: Probing beats hash-joining when the running relation is at least this
     #: many times smaller than the next pattern's match. The value trades the
     #: fixed cost of a native match, which does not depend on how selective
@@ -165,63 +242,70 @@ def parse_ops(spec: str) -> frozenset[str]:
 def pushdown_disabled() -> bool:
     """``VORTEX_RDF_DISABLE_PUSHDOWN=1`` keeps rdflib's evaluator entirely
     (the equivalence tests' oracle)."""
-    return os.environ.get("VORTEX_RDF_DISABLE_PUSHDOWN") == "1"
+    return flag("VORTEX_RDF_DISABLE_PUSHDOWN", False)
 
 
-def apply_switches() -> None:
-    """Narrow :data:`SETTINGS` by the switches set in the environment:
-    ``VORTEX_RDF_PUSHDOWN_OPS`` (:func:`parse_ops`), ``VORTEX_RDF_FILTER_FAST=0``,
-    ``VORTEX_RDF_NATIVE_FILTERS=0``, and the ablation's ``VORTEX_RDF_DECODE_CHUNK`` and
-    ``VORTEX_RDF_PROBE_BATCH`` (:mod:`vortex_rdflib.ablation`). A switch left unset changes nothing,
-    and a list the parser refuses raises before any setting changes."""
-    spec = os.environ.get(PUSHDOWN_OPS_ENV)
+#: The on/off switches :func:`apply_switches` reads: each variable, the
+#: :class:`Settings` field it sets and that field's default, which the switch
+#: moves it away from.
+_FLAGS = (
+    ("VORTEX_RDF_FILTER_FAST", "fast_filters", True),
+    ("VORTEX_RDF_NATIVE_FILTERS", "native_filters", True),
+    ("VORTEX_RDF_CODE_PREDICATES", "code_predicates", True),
+    ("VORTEX_RDF_COUNT_ORDER", "count_order", True),
+    ("VORTEX_RDF_DECODE_EACH_STEP", "decode_each_step", False),
+    ("VORTEX_RDF_COUNTERS", "counters", False),
+    ("VORTEX_RDF_TRACE_TRIPLES", "trace_triples", False),
+)
+
+
+def apply_switches(target: Settings | None = None) -> None:
+    """Set ``target`` (:data:`SETTINGS`) by the switches set in the
+    environment: ``VORTEX_RDF_PUSHDOWN_OPS`` (:func:`parse_ops`), the on/off
+    switches (:data:`_FLAGS`), the pair budget and the decode and probe
+    batch sizes. A switch moves its settings away from their defaults and
+    never back, and one left unset changes nothing. Every switch is read
+    before any setting changes, so a value refused leaves them all as they
+    were."""
+    target = SETTINGS if target is None else target
+    spec = getenv(PUSHDOWN_OPS_ENV)
     ops = None if spec is None else parse_ops(spec)
+    flags = [(field, flag(env, default), default) for env, field, default in _FLAGS]
+    pair_budget = _int_at_least(PAIR_BUDGET_ENV, 0)
+    decode_chunk = positive_int("VORTEX_RDF_DECODE_CHUNK")
+    probe_batch = positive_int("VORTEX_RDF_PROBE_BATCH")
     if ops is not None:
-        SETTINGS.enabled_ops = ops
-    if os.environ.get("VORTEX_RDF_FILTER_FAST") == "0":
-        SETTINGS.fast_filters = False
-    if os.environ.get("VORTEX_RDF_NATIVE_FILTERS") == "0":
-        SETTINGS.native_filters = False
-    from . import ablation  # the ablation's size switches (read on import there)
-
-    if ablation.DECODE_CHUNK is not None:  # VORTEX_RDF_DECODE_CHUNK: one fixed chunk size
-        SETTINGS.chunk_start = SETTINGS.chunk_max = ablation.DECODE_CHUNK
-    if (
-        ablation.PROBE_BATCH is not None
-    ):  # VORTEX_RDF_PROBE_BATCH: this many probes a call, every step batched
-        SETTINGS.probe_batch = ablation.PROBE_BATCH
-        SETTINGS.cheap_batch_min = SETTINGS.scan_batch_min = SETTINGS.memory_scan_batch_min = 1
+        target.enabled_ops = ops
+    for field_name, value, default in flags:
+        if value != default:
+            setattr(target, field_name, value)
+    if pair_budget is not None:
+        target.pair_budget = pair_budget
+    if decode_chunk is not None:  # one fixed chunk size
+        target.chunk_start = target.chunk_max = decode_chunk
+    if probe_batch is not None:  # this many probes a call, every step batched
+        target.probe_batch = probe_batch
+        target.cheap_batch_min = target.scan_batch_min = target.memory_scan_batch_min = 1
 
 
 def in_memory_by_default() -> bool:
     """``VORTEX_RDF_IN_MEMORY=1``: a store constructed without ``in_memory``
     loads the whole file up front (for benchmark sweeps)."""
-    return os.environ.get("VORTEX_RDF_IN_MEMORY") == "1"
+    return flag("VORTEX_RDF_IN_MEMORY", False)
 
 
 def code_path_enabled() -> bool:
     """Whether a store reads term codes (``VORTEX_RDF_DISABLE_CODE_PATH=1``
     keeps it on the N-Triples string columns)."""
-    return os.environ.get("VORTEX_RDF_DISABLE_CODE_PATH") != "1"
+    return not flag("VORTEX_RDF_DISABLE_CODE_PATH", False)
 
 
 def trace_enabled() -> bool:
-    """``VORTEX_RDF_TRACE_QUERY``: ``1`` prints one JSON line per planning
-    step to stderr, ``0`` or unset prints none; anything else is refused."""
-    value = os.environ.get(TRACE_ENV)
-    if value is None or value == "0":
-        return False
-    if value != "1":
-        raise ValueError(f"{TRACE_ENV} must be 0 or 1, got {value!r}")
-    return True
+    """``VORTEX_RDF_TRACE_QUERY=1`` prints one JSON line per planning step to
+    stderr."""
+    return flag(TRACE_ENV, False)
 
 
 def trace_query_id() -> str | None:
     """``VORTEX_RDF_TRACE_QUERY_ID``: the ``query_id`` a trace's events carry."""
-    return os.environ.get("VORTEX_RDF_TRACE_QUERY_ID")
-
-
-def trace_triples() -> bool:
-    """``VORTEX_RDF_TRACE_TRIPLES=1`` prints each ``triples()`` call's pattern
-    to stdout."""
-    return os.environ.get("VORTEX_RDF_TRACE_TRIPLES") == "1"
+    return getenv("VORTEX_RDF_TRACE_QUERY_ID")

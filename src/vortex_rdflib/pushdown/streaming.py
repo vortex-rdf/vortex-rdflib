@@ -9,13 +9,12 @@ from collections.abc import Iterator, Sequence
 
 from vortex_rdf import CodeGroups, U64Column
 
-from .. import union
-from ..cancel import cancel_kw, check_cancelled
+from .. import boundary, trace, union
+from ..cancel import check_cancelled
 from ..settings import SETTINGS
-from . import matching, relation, tracing
+from . import matching, relation
 from .matching import Pattern
 from .relation import Relation
-from .tracing import _TRACE
 
 
 def _gather_pieces(
@@ -41,7 +40,7 @@ def _gather_pieces(
     ``bgp_stream_complete`` is traced then: the pieces gathered, their rows,
     and the time spent here (pulling the feed, counting, gathering), not in
     the consumer."""
-    traced = _TRACE.get() is not None
+    traced = trace.active() is not None
     pieces = output_rows = elapsed_ns = 0
     resumed = time.perf_counter_ns() if traced else 0
     try:
@@ -83,7 +82,7 @@ def _gather_pieces(
         close = getattr(fed, "close", None)
         if close is not None:
             close()
-        tracing._trace_event(
+        trace.event(
             "bgp_stream_complete", pieces=pieces, output_rows=output_rows, elapsed_ns=elapsed_ns
         )
 
@@ -111,11 +110,11 @@ def _streamed_step(
     key_var = next(v for v in varpos if v in schema)
     step_schema = schema + tuple(v for v in varpos if v not in schema)
     held = [rel.native_column(i) for i in range(len(schema))]
-    if not pat.matched and matching._pattern_key(pat) in memo:
+    if pat.cols is None and matching._pattern_key(pat) in memo:
         matching._match_resolved_pattern(store, pat, memo)
     pattern_schema = tuple(varpos)
     pattern = None
-    if pat.matched:
+    if pat.cols is not None:
         body = matching._rel_from_pattern(pat)
         pattern = [body.native_column(i) for i in range(len(pattern_schema))]
     if pattern is not None and len(pattern[0]) < len(held[0]):
@@ -126,12 +125,11 @@ def _streamed_step(
         if pattern is not None:
             fed = relation._slices(pattern, len(pattern[0]))
         else:
-            fed = tracing._native(store).match_code_chunks(
+            fed = boundary.native(store).match_code_chunks(
                 *pat.n3,
                 columns=[("s", "p", "o", "g")[varpos[v][0]] for v in pattern_schema],
                 batch_rows=SETTINGS.piece_rows,
                 **matching._narrowing(pat.nkeep),
-                **cancel_kw(),
             )
             if fed is None:
                 raise NotImplementedError
@@ -161,4 +159,4 @@ def _chunkable(pat: Pattern) -> bool:
     its whole columns — no deferred restriction (:func:`_restrict_pattern`) —
     and no repeated variable asks for a test across a row's columns, which a
     chunk does not make (:func:`_materialize`)."""
-    return not pat.deferred and all(len(positions) == 1 for positions in pat.varpos.values())
+    return not pat.deferred and not pat.repeats

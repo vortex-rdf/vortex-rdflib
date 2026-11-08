@@ -12,7 +12,14 @@ import pytest
 import rdflib.plugins.sparql.evaluate as rdflib_evaluate
 from rdflib import Graph, URIRef
 from rdflib.plugins.sparql import CUSTOM_EVALS
-from tests.support import both_ways, counting_term_dict, is_graph_name_check, row_key, run
+from tests.support import (
+    both_ways,
+    counting_term_dict,
+    file_codes,
+    is_graph_name_check,
+    row_key,
+    run,
+)
 from vortex_rdf import Cancelled, CancelToken, serialize_rdf
 
 import vortex_rdflib.pushdown as pd
@@ -200,7 +207,7 @@ def test_a_bare_graphs_label_is_resolved_once_per_query(tmp_path):
     graph = Graph(store=store)
     register_sparql_pushdown()
     checks = []
-    inner = store._store()
+    inner = store._opened().native
 
     class _Counting:
         def count_quads(self, *args, **kwargs):
@@ -212,7 +219,7 @@ def test_a_bare_graphs_label_is_resolved_once_per_query(tmp_path):
             return getattr(inner, name)
 
     store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    store._native = _Counting()  # ty: ignore[invalid-assignment]
+    store._opened().native = _Counting()  # ty: ignore[invalid-assignment]
     for _ in range(3):
         run(graph, "SELECT ?s WHERE { ?s <http://ex.org/knows> ?o . ?o <http://ex.org/knows> ?x }")
     assert len(checks) == 3
@@ -317,7 +324,7 @@ def test_a_query_failing_mid_iteration_releases_its_scope(tmp_path, tracked):
     query = "SELECT ?s ?p ?o WHERE { ?s ?p ?o }"
     assert len(run(graph, query)) == 150
     before = _footprint(store)
-    store._dict = _FailingDecodes(store._dict)  # ty: ignore[invalid-assignment]
+    file_codes(store).term_dict = _FailingDecodes(file_codes(store).term_dict)
     rows = []
     with pytest.raises(RuntimeError, match="part-way"):
         for row in graph.query(query):

@@ -4,82 +4,94 @@ conjuncts of a ``&&`` chain. An EXISTS body is walked in its translated
 form.
 """
 
+from collections.abc import Iterator
+
 from rdflib.plugins.sparql.parserutils import CompValue
-from rdflib.term import BNode, Variable
+
+from ..nodes import field, var_like
+from ..terms import BLANK, IRI, LITERAL
 
 _IMPURE = frozenset({"Builtin_RAND", "Builtin_UUID", "Builtin_STRUUID", "Builtin_BNODE"})
 
 
-_VAR_LIKE = (Variable, BNode)
+#: The builtins that test a term's kind, and the kind each is true for.
+KIND_BUILTINS = {
+    "Builtin_isIRI": IRI,
+    "Builtin_isURI": IRI,
+    "Builtin_isBLANK": BLANK,
+    "Builtin_isLITERAL": LITERAL,
+}
 
 
-def expr_vars(node, out: list | None = None) -> list:
-    """The variable-like terms an expression references, in first-seen
-    order. An EXISTS body is walked in its translated form (the instance
-    attribute): rdflib pulls the body's FILTERs out of the parse tree it
-    keeps under the key, so only the translation still names their
-    variables, and a VALUES table in it names its own in each row's keys."""
-    if out is None:
-        out = []
-    if isinstance(node, _VAR_LIKE):
-        if node not in out:
-            out.append(node)
-    elif isinstance(node, CompValue):
-        if node.name in ("Builtin_EXISTS", "Builtin_NOTEXISTS"):
-            body = getattr(node, "graph", None)
+_EXISTS = ("Builtin_EXISTS", "Builtin_NOTEXISTS")
+
+
+def _walk(node) -> Iterator[object]:
+    """Every node reachable from ``node``, itself first, depth first in the
+    order the tree holds them: through an expression's arguments (a
+    ``CompValue``'s items but its ``_vars``), lists, tuples and a dict's
+    keys (a VALUES row names its variables there). One generator walks the
+    whole tree, off a stack, so a FILTER compiled per query pays no frame
+    per node.
+
+    An EXISTS body is walked in its translated form, the instance attribute
+    rdflib keeps beside the parse tree under the key: rdflib pulls the
+    body's FILTERs out of that parse tree, so only the translation still
+    holds them."""
+    stack = [node]
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, CompValue):
+            body = getattr(node, "graph", None) if node.name in _EXISTS else None
             if isinstance(body, CompValue):
-                return expr_vars(body, out)
-        for key in node.keys():
-            if key != "_vars":
-                expr_vars(dict.__getitem__(node, key), out)
-    elif isinstance(node, dict):
-        expr_vars(list(node), out)
-    elif isinstance(node, (list, tuple)):
-        for x in node:
-            expr_vars(x, out)
-    return out
+                stack.append(body)
+                continue
+            stack.extend(
+                dict.__getitem__(node, key) for key in reversed(node.keys()) if key != "_vars"
+            )
+        elif isinstance(node, dict):
+            stack.extend(reversed(node))
+        elif isinstance(node, (list, tuple)):
+            stack.extend(reversed(node))
+
+
+def _named(node, names) -> bool:
+    return isinstance(node, CompValue) and node.name in names
+
+
+def expr_vars(node) -> list:
+    """The variable-like terms an expression references, in first-seen
+    order, an EXISTS body's included."""
+    return list(dict.fromkeys(n for n in _walk(node) if var_like(n)))
 
 
 def has_minus(node) -> bool:
     """Whether an algebra tree or an expression holds a MINUS, one in an
-    EXISTS body included (walked in its translated form, as
-    :func:`expr_vars` does)."""
-    if isinstance(node, (list, tuple)):
-        return any(has_minus(item) for item in node)
-    if not isinstance(node, CompValue):
-        return False
-    if node.name == "Minus":
-        return True
-    if node.name in ("Builtin_EXISTS", "Builtin_NOTEXISTS"):
-        return has_minus(getattr(node, "graph", None))
-    return any(has_minus(dict.__getitem__(node, key)) for key in node.keys() if key != "_vars")
+    EXISTS body included."""
+    return any(_named(n, ("Minus",)) for n in _walk(node))
 
 
 def has_exists(node) -> bool:
     """Whether an expression holds an EXISTS or a NOT EXISTS."""
-    if isinstance(node, (list, tuple)):
-        return any(has_exists(item) for item in node)
-    if not isinstance(node, CompValue):
-        return False
-    if node.name in ("Builtin_EXISTS", "Builtin_NOTEXISTS"):
-        return True
-    return any(has_exists(dict.__getitem__(node, key)) for key in node.keys() if key != "_vars")
+    return any(_named(n, _EXISTS) for n in _walk(node))
 
 
-def _is_impure(node) -> bool:
-    if isinstance(node, CompValue):
-        if node.name in _IMPURE:
-            return True
-        return any(_is_impure(dict.__getitem__(node, k)) for k in node.keys() if k != "_vars")
-    if isinstance(node, list):
-        return any(_is_impure(x) for x in node)
-    return False
+def is_impure(node) -> bool:
+    """Whether an expression calls a builtin that draws anew on each call
+    (``RAND``, ``UUID``, ``STRUUID``, ``BNODE``), one in an EXISTS body
+    included."""
+    return any(_named(n, _IMPURE) for n in _walk(node))
 
 
-def _flatten_and(expr, out: list) -> list:
-    if isinstance(expr, CompValue) and expr.name == "ConditionalAndExpression" and expr.other:
-        for x in [expr.expr, *expr.other]:
-            _flatten_and(x, out)
+def flatten_and(expr, out: list) -> list:
+    if (
+        isinstance(expr, CompValue)
+        and expr.name == "ConditionalAndExpression"
+        and (other := field(expr, "other"))
+    ):
+        for x in [field(expr, "expr"), *other]:
+            flatten_and(x, out)
     else:
         out.append(expr)
     return out
@@ -93,8 +105,8 @@ def exists_shape(expr):
     node = expr
     if isinstance(node, CompValue) and node.name == "UnaryNot":
         negate = True
-        node = node.expr
-    if isinstance(node, CompValue) and node.name in ("Builtin_EXISTS", "Builtin_NOTEXISTS"):
+        node = field(node, "expr")
+    if isinstance(node, CompValue) and node.name in _EXISTS:
         body = getattr(node, "graph", None)
         if not isinstance(body, CompValue):
             return None

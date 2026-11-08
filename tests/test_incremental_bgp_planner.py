@@ -32,7 +32,7 @@ def graph_of(tmp_path, size=300, in_memory=True):
 
 def test_connected_patterns_are_probed_without_complete_matches(tmp_path, monkeypatch, capsys):
     graph = graph_of(tmp_path)
-    native = graph.store._store()
+    native = graph.store._opened().native
     calls = []
 
     class Counting:
@@ -44,7 +44,7 @@ def test_connected_patterns_are_probed_without_complete_matches(tmp_path, monkey
             return getattr(native, name)
 
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    graph.store._native = Counting()
+    graph.store._opened().native = Counting()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     rows = list(
@@ -97,7 +97,7 @@ def test_seed_is_the_smallest_count_not_the_most_selective_shape(tmp_path, monke
         "<http://ex/s0> <http://ex/rare> <http://ex/target> .\n"
         + "".join(f"<http://ex/s{i}> <http://ex/big> <http://ex/o{i}> .\n" for i in range(300)),
     )
-    native = graph.store._store()
+    native = graph.store._opened().native
     matched_rows = []
 
     class Counting:
@@ -110,7 +110,7 @@ def test_seed_is_the_smallest_count_not_the_most_selective_shape(tmp_path, monke
             return getattr(native, name)
 
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    graph.store._native = Counting()
+    graph.store._opened().native = Counting()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     rows = list(
@@ -136,7 +136,7 @@ def test_pattern_selecting_nothing_ends_the_block_before_any_match(
     tmp_path, monkeypatch, capsys, in_memory
 ):
     graph = graph_of(tmp_path, in_memory=in_memory)
-    native = graph.store._store()
+    native = graph.store._opened().native
     matches = []
 
     class Counting:
@@ -148,7 +148,7 @@ def test_pattern_selecting_nothing_ends_the_block_before_any_match(
             return getattr(native, name)
 
     graph.store._union_has_repeats()  # the file's one-time bookkeeping is not a query's cost
-    graph.store._native = Counting()
+    graph.store._opened().native = Counting()
     monkeypatch.setenv("VORTEX_RDF_TRACE_QUERY", "1")
     register_sparql_pushdown()
     rows = list(
@@ -261,7 +261,7 @@ def test_native_filter_narrows_every_pattern_it_reaches(tmp_path, monkeypatch, c
 
 def indexed_graph_of(tmp_path, anchors=1, size=300, in_memory=True):
     """``graph_of``'s data behind a secondary-by-copy index, where every
-    pattern with a bound predicate is a point pattern (`VortexRdflibStore._point_lookup`); the
+    pattern with a bound predicate is a point pattern (`OpenFile.point_lookup`); the
     anchor rows are subjects s0 to s{anchors - 1}."""
     source = tmp_path / "indexed.nt"
     source.write_text(
@@ -385,7 +385,7 @@ def test_a_capped_count_is_not_remembered_as_exact(tmp_path):
     """A capped answer is a lower bound: it is never shared with a pattern
     that needs the count itself."""
     graph = indexed_graph_of(tmp_path)
-    pat = pd.matching.Pattern([None, "<http://ex/name>", None, None], {})
+    pat = pd.matching.Pattern((None, "<http://ex/name>", None, None), {})
     counts: dict = {}
     assert pd.matching._count_pattern(graph.store, pat, counts, limit=11) == 11
     assert counts == {}

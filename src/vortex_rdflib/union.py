@@ -9,7 +9,7 @@ the first row of each run of equal ``(s, p, o)`` codes (``U64Column.run_starts``
 makes the match a set, in one pass and no memory beyond its rows.
 """
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator
 
 #: The positions of a quad's triple: the key a union match is made distinct on.
 TRIPLE = (0, 1, 2)
@@ -28,32 +28,49 @@ def distinct_rows(cols: tuple, key=TRIPLE) -> tuple:
     return tuple(None if col is None else col.take(starts) for col in cols)
 
 
-def distinct_chunks(chunks: Iterable[tuple], key=TRIPLE) -> Iterator[tuple]:
+def distinct_chunks(chunks: Iterable[tuple], key=TRIPLE) -> Generator[tuple, None, None]:
     """:func:`distinct_rows` of each chunk of one match, read in order: a run
-    that crosses a chunk boundary is kept in the chunk it starts in."""
+    that crosses a chunk boundary is kept in the chunk it starts in. The
+    chunks are closed however these end — exhausted, failed or closed —
+    which ends a native chunk iterator's scan."""
     last = None
-    for cols in chunks:
-        cols = distinct_rows(cols, key)
-        rows = len(cols[0])
-        if (
-            rows
-            and last is not None
-            and all(_at(cols[i], 0) == v for i, v in zip(key, last, strict=True))
-        ):
-            cols = tuple(col.slice(1, rows) for col in cols)
-            rows -= 1
-        if rows:
-            last = [_at(cols[i], rows - 1) for i in key]
-        yield cols
+    try:
+        for cols in chunks:
+            cols = distinct_rows(cols, key)
+            rows = len(cols[0])
+            if (
+                rows
+                and last is not None
+                and all(_at(cols[i], 0) == v for i, v in zip(key, last, strict=True))
+            ):
+                cols = tuple(col.slice(1, rows) for col in cols)
+                rows -= 1
+            if rows:
+                last = [_at(cols[i], rows - 1) for i in key]
+            yield cols
+    finally:
+        close = getattr(chunks, "close", None)
+        if close is not None:
+            close()
 
 
 def one_per_triple(rows: Iterable[tuple]) -> Iterator[tuple]:
-    """``(triple, contexts)`` rows whose equal triples are adjacent, as one row
-    per triple carrying the contexts of all its rows — what an rdflib store's
-    ``triples()`` yields for the union."""
+    """``(triple, contexts)`` rows whose rows of one triple are adjacent, as
+    one row per triple carrying the contexts of all its rows — what an rdflib
+    store's ``triples()`` yields for the union.
+
+    Rows are of one triple when their terms are the same objects. The store
+    hands out one term object per code — per spelling, on a layout without
+    codes — for the length of a ``triples()`` call
+    (``VortexRdflibStore._quad_rows``), so this is the triple of codes the
+    union is a set of, as ``len()`` and the pushdown count it: two codes
+    rdflib reads as equal terms (``"042"^^xsd:integer`` and
+    ``"42"^^xsd:integer``) stay two triples."""
     triple, first, merged = None, (), None
+    s = p = o = None
     for row_triple, row_contexts in rows:
-        if row_triple == triple:
+        rs, rp, ro = row_triple
+        if ro is o and rp is p and rs is s:
             if merged is None:
                 merged = list(first)
             merged.extend(row_contexts)
@@ -61,6 +78,7 @@ def one_per_triple(rows: Iterable[tuple]) -> Iterator[tuple]:
         if triple is not None:
             yield triple, first if merged is None else tuple(merged)
         triple, first, merged = row_triple, row_contexts, None
+        s, p, o = rs, rp, ro
     if triple is not None:
         yield triple, first if merged is None else tuple(merged)
 

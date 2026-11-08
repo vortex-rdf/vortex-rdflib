@@ -55,7 +55,7 @@ def run(
         "vortex_rdf": getattr(vortex_rdf, "__version__", "?"),
         "native_filters": os.environ.get("VORTEX_RDF_NATIVE_FILTERS", "default"),
         "in_memory": in_memory,
-        "code_path": getattr(store, "_dict", None) is not None,
+        "code_path": store._opened().codes is not None,
         "open_ns": open_ns,
         "query_timeout_s": query_timeout_s,
         "store_budget_s": store_budget_s,

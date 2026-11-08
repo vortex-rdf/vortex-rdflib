@@ -12,14 +12,15 @@ import re
 import signal
 
 import pytest
-from rdflib import Graph, Literal
+from rdflib import Graph, Literal, URIRef
 from rdflib.term import Variable
-from tests.support import both_ways, filter_expr, outcome, rdflib_answer
+from tests.oracle import departs, spec_answer
+from tests.support import both_ways, file_codes, filter_expr, kind_ranges, outcome, run
 from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, filters, register_sparql_pushdown
 from vortex_rdflib.filters import native
-from vortex_rdflib.filters.native import NativeShape
+from vortex_rdflib.filters.native import FilterCodes
 from vortex_rdflib.settings import SETTINGS
 from vortex_rdflib.terms import LITERAL, canonical_spelling, parse_spelling
 
@@ -61,8 +62,8 @@ def corpus(tmp_path_factory):
     out = directory / "texts.vortex"
     serialize_rdf(str(nt), str(out), layout="dictionary")
     store = VortexRdflibStore(str(out), in_memory=True)
-    assert store._dict is not None
-    codes = {store._dict.encode(text) for text in TEXTS}
+    assert store._opened().codes is not None
+    codes = {file_codes(store).term_dict.encode(text) for text in TEXTS}
     assert None not in codes
     return store, codes
 
@@ -163,7 +164,7 @@ def _check_regex(store, codes, spellings, pattern, flags, case, as_str) -> int:
         compiled = re.compile(pattern, _py_flags(flags))
     except re.error:
         return 0  # native_shape never maps a pattern Python cannot compile
-    shape = NativeShape("regex", pattern, flags, case, as_str)
+    shape = FilterCodes("regex", pattern, flags, case, as_str)
     passed, undecided = native.evaluate(store, shape, codes)
     checked = 0
     for code in codes - set(undecided):
@@ -197,7 +198,7 @@ def _time_limit(seconds: float):
 )
 def test_random_allow_list_patterns_agree_with_python_re(corpus, seed, case, as_str):
     store, codes = corpus
-    spellings = {code: store._dict.decode(code) for code in codes}
+    spellings = {code: file_codes(store).term_dict.decode(code) for code in codes}
     rng = random.Random(seed)
     checked = 0
     for _ in range(40):
@@ -222,19 +223,25 @@ STRING_EXPRESSIONS = [
 
 
 @pytest.mark.parametrize("sparql_expr", STRING_EXPRESSIONS)
-def test_string_functions_agree_with_rdflib(corpus, sparql_expr):
+def test_string_functions_follow_the_spec(corpus, sparql_expr):
+    """Each code vortex-rdf decides gets SPARQL 1.1's answer (Oxigraph's,
+    :mod:`tests.oracle`)."""
     store, codes = corpus
     expr = filter_expr(sparql_expr)
     shape = filters.native.native_shape(expr, V, {})
     if shape is None:
-        # A tagged constant against STR(): an error for every value in rdflib.
+        # A tagged constant against STR(): an error for every value.
         assert "str(?v)" in sparql_expr and '"@' in sparql_expr
         return
+    assert isinstance(shape, FilterCodes)
     passed, undecided = native.evaluate(store, shape, codes)
     decided = 0
     for code in codes - set(undecided):
-        stored = store._dict.decode(code)
-        assert (code in passed) == rdflib_answer(expr, stored), (sparql_expr, stored)
+        stored = file_codes(store).term_dict.decode(code)
+        if departs(sparql_expr, stored):
+            continue
+        expected = spec_answer(sparql_expr, {"v": stored})
+        assert (code in passed) == expected, (sparql_expr, stored)
         decided += 1
     assert decided > 0, sparql_expr
 
@@ -249,13 +256,15 @@ def test_bsbm_literals_agree_with_python_re():
     words of string literals from across those codes as
     CONTAINS/STRSTARTS/STRENDS constants."""
     store = VortexRdflibStore(os.environ["VORTEX_RDFLIB_BSBM_STORE"])
-    assert store._dict is not None
-    lo, hi = store._kind_ranges()[LITERAL]
+    assert store._opened().codes is not None
+    lo, hi = kind_ranges(store).range(LITERAL)
     ordered = list(range(lo, hi, max(1, (hi - lo) // 20000)))
     codes = set(ordered)
     spellings = {
         code: spelling
-        for code, spelling in zip(ordered, store._dict.decode_many(ordered), strict=True)
+        for code, spelling in zip(
+            ordered, file_codes(store).term_dict.decode_many(ordered), strict=True
+        )
         if spelling is not None
     }
     assert len(spellings) == len(ordered)
@@ -288,7 +297,7 @@ def test_bsbm_literals_agree_with_python_re():
     }
     for word in list(dict.fromkeys(words))[:50]:
         for function, test in tests.items():
-            shape = NativeShape(function, canonical_spelling(Literal(word)))
+            shape = FilterCodes(function, canonical_spelling(Literal(word)))
             passed, undecided = native.evaluate(store, shape, codes)
             decided = 0
             for code in codes - set(undecided):
@@ -302,8 +311,10 @@ def test_bsbm_literals_agree_with_python_re():
 
 def test_stored_language_tags_are_lower_case(tmp_path):
     """The dictionary stores every language tag lower-cased, which the string
-    shapes rely on: the pushdown and rdflib's evaluator over the store both
-    read `"x"@EN-GB` back as `"x"@en-gb`."""
+    shapes rely on: the pushdown reads `"x"@EN-GB` back as `"x"@en-gb`, and a
+    tag in any case matches it, as RDF 1.1 compares tags case-insensitively
+    (rdflib's evaluator compares them as written, so it drops the row for
+    `"x"@EN-GB`)."""
     nt = tmp_path / "tags.nt"
     nt.write_text('<http://ex.org/s> <http://ex.org/p> "x"@EN-GB .\n', encoding="utf-8")
     out = tmp_path / "tags.vortex"
@@ -321,8 +332,7 @@ def test_stored_language_tags_are_lower_case(tmp_path):
         'langMatches(lang(?o), "EN")',
     ):
         query = f"SELECT ?s WHERE {{ ?s <http://ex.org/p> ?o FILTER({condition}) }}"
-        with_pushdown, without_pushdown = both_ways(graph, query)
-        assert with_pushdown == without_pushdown, condition
+        assert run(graph, query) == [(URIRef("http://ex.org/s"),)], condition
 
 
 #: Patterns Python's `re` refuses with an exception other than `re.error`: a

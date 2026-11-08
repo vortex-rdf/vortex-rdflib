@@ -10,6 +10,7 @@ sorts as its label.
 
 import pytest
 from rdflib import XSD, BNode, Dataset, Graph, Literal, URIRef
+from tests.support import file_codes
 from vortex_rdf import serialize_rdf
 
 import vortex_rdflib.pushdown as pd
@@ -97,7 +98,10 @@ def order_files(tmp_path_factory):
 def dataset(order_files, request):
     index, in_memory = CONFIGURATIONS[request.param]
     store = VortexRdflibStore(str(order_files[index]), in_memory=in_memory)
-    assert store._dict is not None and store._dict.file_backed is not in_memory
+    assert (
+        store._opened().codes is not None
+        and file_codes(store).term_dict.file_backed is not in_memory
+    )
     return Dataset(store=store, default_union=True)
 
 
@@ -108,9 +112,9 @@ def ranked(monkeypatch) -> list:
     calls = []
     rank_codes = pd.head._rank_codes
 
-    def spy(store, foreign, codes):
+    def spy(store, codes):
         calls.append(codes)
-        return rank_codes(store, foreign, codes)
+        return rank_codes(store, codes)
 
     monkeypatch.setattr(pd.head, "_rank_codes", spy)
     return calls
@@ -136,8 +140,10 @@ def test_blank_nodes_order_by_label(tmp_path, ranked):
     they rank as their codes."""
     graph = _graph([("s", BNode(label)) for label in ("b2", "b10", "b1")])
     store = VortexRdflibStore(str(_vortex(tmp_path, graph, "blank")))
-    assert store._dict is not None
-    b1, b10, b2 = (store._dict.encode(f"_:{label}") for label in ("b1", "b10", "b2"))
+    assert store._opened().codes is not None
+    b1, b10, b2 = (
+        file_codes(store).term_dict.encode(f"_:{label}") for label in ("b1", "b10", "b2")
+    )
     assert b1 is not None and b10 is not None and b2 is not None
     assert b1 < b10 < b2
 
@@ -154,7 +160,7 @@ def test_an_iri_code_without_a_spelling_raises_the_store_error(order_files):
     error. The double spells the first code it is handed but not the second,
     and the error names the second."""
     store = VortexRdflibStore(str(order_files["secondary-by-copy"]))
-    dictionary = store._dict
+    dictionary = file_codes(store).term_dict
     assert dictionary is not None
     iris = {dictionary.encode(f"<{EX}{name}>") for name in ("a", "ab")}
     assert None not in iris and len(iris) == 2
@@ -168,8 +174,8 @@ def test_an_iri_code_without_a_spelling_raises_the_store_error(order_files):
         def __getattr__(self, name):
             return getattr(dictionary, name)
 
-    store._dict = _Dict()  # ty: ignore[invalid-assignment]
+    file_codes(store).term_dict = _Dict()
     with pytest.raises(ValueError) as raised:
-        pd.head._rank_codes(store, {}, iris)
+        pd.head._rank_codes(store, iris)
     assert len(handed) == 2 and set(handed) == iris
     assert str(raised.value) == f"term code {handed[1]} is not in the store dictionary"
