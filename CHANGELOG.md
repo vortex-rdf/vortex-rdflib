@@ -208,6 +208,7 @@ typed path per case.
 - Refused is any_refused of one spelling (boundary) ([`8c1672f`](https://github.com/vortex-rdf/vortex-rdflib/commit/8c1672f779cf8d19b06a02de6e3c6eca30a02034) by @claude)
 - Check an ASCII spelling against forms of ASCII alone (terms) ([`2676832`](https://github.com/vortex-rdf/vortex-rdflib/commit/2676832711000581889527831b5710c3660b2ed4) by @claude)
 - Read rdflib's nodes as dicts and tell terms by their class (pushdown) ([`009fcd5`](https://github.com/vortex-rdf/vortex-rdflib/commit/009fcd53723d2c78c408e48597523b35ea901c55) by @claude)
+- The slow paths the review found, the per-row one among them (pushdown) ([`8d4ab15`](https://github.com/vortex-rdf/vortex-rdflib/commit/8d4ab15143c17f84332b48c2d3cd05483c123cb8) by @claude)
 
 ### Fixed
 
