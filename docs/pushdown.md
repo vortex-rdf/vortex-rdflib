@@ -132,13 +132,13 @@ dictionary.
   with the attributes those set; every other spelling reaches the
   constructors split once. At import, a fixed sample is built both ways, and
   if any term differs the constructors build every term
-  ([`_term_builder`](../src/vortex_rdflib/terms.py#L467)).
+  ([`_term_builder`](../src/vortex_rdflib/terms.py#L483)).
 
 Codes follow the byte order of the term spellings, so each kind of term fills
 one contiguous range of codes: first the default graph's empty name, then
 literals (`"…`), then IRIs (`<…>`), then blank nodes (`_:…`). Asking whether a
 code is an IRI is a range check, with no decoding
-([`KindRanges`](../src/vortex_rdflib/terms.py#L245), read once per open file:
+([`KindRanges`](../src/vortex_rdflib/terms.py#L261), read once per open file:
 [`Codes.kind_ranges`](../src/vortex_rdflib/open_file.py#L48)).
 
 Much of the integer work runs inside vortex-rdf ("natively") instead of in
@@ -349,7 +349,7 @@ the pattern simply matches nothing, as with `Store.triples()`. The same holds
 for any term vortex-rdf's parser refuses, in any position and the graph's name
 included (`<http://x/%zz>`, a relative IRI, a lone surrogate, a language tag
 BCP 47 refuses): it is no term of the file. A common spelling is decided
-locally ([`spelling_verdict`](../src/vortex_rdflib/terms.py#L204)), any other
+locally ([`spelling_verdict`](../src/vortex_rdflib/terms.py#L220)), any other
 by vortex-rdf's own parser, once per pattern
 ([`any_refused`](../src/vortex_rdflib/boundary.py#L130)); `Store.triples()`
 asks only once vortex-rdf has refused the pattern, which it does before
@@ -1196,7 +1196,7 @@ vortex-rdf opens a file-backed store memory-mapped.
 | `TermDict.filter_codes` | FILTER predicates over the codes a query produced ([`evaluate`](../src/vortex_rdflib/filters/native.py#L173)). |
 | `TermDict.encode_many` | `VALUES` constants ([`_constant_codes`](../src/vortex_rdflib/pushdown/blocks.py#L165)), the IRIs of an IRI equality ([`keep_of`](../src/vortex_rdflib/filters/native.py#L135)) and the canonical spellings of the typed literals `DISTINCT` and `COUNT` alias ([`_canonical_twins`](../src/vortex_rdflib/pushdown/aliasing.py#L122)). |
 | `TermDict.decode_many` | Decoding results ([`_prime_decode_cache`](../src/vortex_rdflib/store.py#L538)), the spellings that probes fill in ([`_probe_spellings`](../src/vortex_rdflib/pushdown/probes.py#L356)) and the IRIs `ORDER BY` ranks ([`_rank_codes`](../src/vortex_rdflib/pushdown/head.py#L165)). |
-| `TermDict.prefix_range` | The code range of each term kind ([`KindRanges`](../src/vortex_rdflib/terms.py#L245)). |
+| `TermDict.prefix_range` | The code range of each term kind ([`KindRanges`](../src/vortex_rdflib/terms.py#L261)). |
 | `U64Column.distinct`, `value_counts` | `DISTINCT` over one variable and a variable's candidate codes ([`_distinct_codes`](../src/vortex_rdflib/pushdown/relation.py#L214)), `GROUP BY` counts ([`_columnar_groups`](../src/vortex_rdflib/pushdown/aggregate.py#L300)). |
 | `U64Column.join_indices`, `take` | The columnar join ([`_join_columns`](../src/vortex_rdflib/pushdown/relation.py#L264)), which passes the pair budget as `max_pairs=` past the product bound, so the kernel counts the pairs before it builds any; compacting a match to the rows a FILTER keeps ([`_compact_pattern`](../src/vortex_rdflib/pushdown/matching.py#L446)), a group's rows for `COUNT(DISTINCT)`, intersecting keeps ([`intersect_keeps`](../src/vortex_rdflib/filters/native.py#L480)). |
 | `U64Column.join_count` | The pairs of a join of Python rows, counted before it is built ([`_hash_join`](../src/vortex_rdflib/pushdown/relation.py#L234)), and whether a pattern fits when a step is reordered ([`_fits`](../src/vortex_rdflib/pushdown/planner.py#L418)). |

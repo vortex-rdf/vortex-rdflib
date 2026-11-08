@@ -87,6 +87,15 @@ def test_common_spellings_are_decided_locally():
         f'"5"^^<{XSD}integer>',
         "_:b0",
         "",
+        f"<{EX}café>",
+        "<http://dbpedia.org/resource/S\u00e3o_Paulo>",
+        f"<{EX}\u65e5\u672c?q=\u00e9#\u00e9>",
+        f'"x"^^<{EX}\u00e9>',
+        '"x"@zh-hans',
+        '"x"@zh-hans-cn',
+        '"x"@de-ch-1996',
+        '"x"@en-us-x-twain',
+        '"x"@es-419',
     ]:
         assert spelling_verdict(spelling) is False, spelling
     for spelling in ["<rel>", "<http://x/\ud800>", '"\ud800"', '"x"^^<rel>']:
@@ -94,7 +103,8 @@ def test_common_spellings_are_decided_locally():
     for spelling in [
         "<http://x/%zz>",
         "<http://x/a#b#c>",
-        f"<{EX}café>",
+        f"<{EX}\ue000>",
+        "<http://\u00e9x.org/a>",
         '"x"@en-a',
         "<http://[::1]/a>",
         "<http://h:abc/>",
@@ -116,10 +126,28 @@ def _spellings() -> list[str]:
         "//u@h@x",
         "//[::1]",
         "//ex.org:8a",
+        "//\u00e9x.org",
     ]
     paths = ["", "/a", "/%41", "/%zz", "/%4", "/café", "/a\x7f", "/[x]", "/a b", "/\ud800"]
-    queries = ["", "?q=1", "?%zz"]
-    fragments = ["", "#f", "#f#g"]
+    # Non-ASCII: RFC 3987's ucschar (Latin, CJK, an astral emoji), and code
+    # points outside it (a C1 control, private use, a noncharacter, the
+    # specials, a tag character) or barred from IRIs (bidi formatting).
+    paths += [
+        "/S\u00e3o",
+        "/\u65e5\u672c",
+        "/\u00a0",
+        "/\U0001f600",
+        "/\U000e1000",
+        "/\u0085",
+        "/\ue000",
+        "/\ufdd0",
+        "/\ufff0",
+        "/\U000e0001",
+        "/\u200e",
+        "/\u202e",
+    ]
+    queries = ["", "?q=1", "?%zz", "?\u00e9", "?\ue000"]
+    fragments = ["", "#f", "#f#g", "#\u00e9", "#\ue000"]
     spellings = [
         f"<{scheme}:{authority}{path}{query}{fragment}>"
         for scheme, authority, path, query, fragment in product(
@@ -128,6 +156,8 @@ def _spellings() -> list[str]:
     ]
     lexicals = ["", "x", "é", "\n", '"', "\\", "\x00", "\ud800", "abc"]
     tags = ["en", "en-GB", "zh-Hans", "en-a", "en-x", "x-private", "abcdefghi"]
+    tags += ["zh-Hans-CN", "de-CH-1996", "sr-Latn-RS", "en-US-x-twain", "es-419"]
+    tags += ["de-1996-1996", "en-a-bbb", "i-klingon", "zh-yue", "en-GB-oed", "en-x-a-b"]
     datatypes = [f"{XSD}integer", f"{XSD}string", "http://x/%zz", f"{EX}é"]
     for lexical in lexicals:
         literals = [Literal(lexical)]
@@ -174,6 +204,17 @@ def test_an_unusual_valid_term_is_matched_without_a_parse_check(tmp_path):
     graph = _graph(tmp_path, "dictionary", False, extra=f'<{EX}café> <{EX}p> "y" .\n')
     spy = native_spy(graph)
     assert len(list(graph.triples((URIRef(EX + "café"), None, None)))) == 1
+    assert not [args for args in spy.args if args[:1] == (PARSE_CHECK_SUBJECT,)]
+
+
+def test_a_non_ascii_constant_is_resolved_without_a_parse_check(tmp_path):
+    """The pushdown screens a pattern's constants before it matches: an IRI
+    of RFC 3987's characters and a tagged literal of a common BCP 47 tag are
+    decided locally, so the query makes no extra native call."""
+    graph = _graph(tmp_path, "dictionary", False, extra=f'<{EX}café> <{EX}p> "y"@zh-hans .\n')
+    spy = native_spy(graph)
+    rows = graph.query(f'SELECT ?p WHERE {{ <{EX}café> ?p "y"@zh-Hans }}')
+    assert len(list(rows)) == 1
     assert not [args for args in spy.args if args[:1] == (PARSE_CHECK_SUBJECT,)]
 
 

@@ -179,8 +179,19 @@ def unparseable_iri(node) -> bool:
 #: The characters of an ASCII IRI (RFC 3986) besides its delimiters: the
 #: unreserved, the sub-delims and "%" (whose escapes are checked apart).
 _IRI_CHARS = r"A-Za-z0-9\-._~!$&'()*+,;=%"
-_SEGMENT = rf"[{_IRI_CHARS}:@]*"
-#: An absolute ASCII IRI vortex-rdf always parses: a scheme, then an
+#: RFC 3987's ``ucschar``, the characters an IRI's path, query and fragment
+#: take beyond ASCII. The bidirectional formatting characters RFC 3987 bars
+#: (U+200E, U+200F, U+202A-U+202E) are left out.
+_UCS_CHARS = (
+    r"\u00a0-\u200d\u2010-\u2029\u202f-\ud7ff\uf900-\ufdcf\ufdf0-\uffef"
+    r"\U00010000-\U0001fffd\U00020000-\U0002fffd\U00030000-\U0003fffd"
+    r"\U00040000-\U0004fffd\U00050000-\U0005fffd\U00060000-\U0006fffd"
+    r"\U00070000-\U0007fffd\U00080000-\U0008fffd\U00090000-\U0009fffd"
+    r"\U000a0000-\U000afffd\U000b0000-\U000bfffd\U000c0000-\U000cfffd"
+    r"\U000d0000-\U000dfffd\U000e1000-\U000efffd"
+)
+_SEGMENT = rf"[{_IRI_CHARS}{_UCS_CHARS}:@]*"
+#: An absolute IRI vortex-rdf always parses: a scheme, then an ASCII
 #: authority (user info, a host that is no IP literal, a port of digits) and
 #: its path, or a path that does not start with "//"; a query; at most one
 #: "#". Character classes, not alternations per character, keep it a scan.
@@ -188,14 +199,19 @@ _SAFE_IRI_FORM = (
     rf"<[A-Za-z][A-Za-z0-9+.\-]*:"
     rf"(?://(?:[{_IRI_CHARS}:]*@)?[{_IRI_CHARS}]*(?::[0-9]+)?(?:/{_SEGMENT})*"
     rf"|(?!//){_SEGMENT}(?:/{_SEGMENT})*)"
-    rf"(?:\?[{_IRI_CHARS}:@/?]*)?(?:#[{_IRI_CHARS}:@/?]*)?>"
+    rf"(?:\?[{_IRI_CHARS}{_UCS_CHARS}:@/?]*)?(?:#[{_IRI_CHARS}{_UCS_CHARS}:@/?]*)?>"
 )
 _SAFE_IRI = re.compile(_SAFE_IRI_FORM)
-#: A literal as ``canonical_spelling`` spells it, with no suffix, a simple
-#: language tag or such a datatype.
-_SAFE_LITERAL = re.compile(
-    rf'"[^"\\]*(?:\\.[^"\\]*)*"(?:@[a-z]{{2,3}}(?:-[a-z]{{2}}|-[0-9]{{3}})?|\^\^{_SAFE_IRI_FORM})?'
+#: A BCP 47 language tag as ``canonical_spelling`` spells it (lower case): a
+#: language of two or three letters, then an optional script, region and
+#: variant, and private-use subtags.
+_SAFE_TAG = (
+    r"[a-z]{2,3}(?:-[a-z]{4})?(?:-(?:[a-z]{2}|[0-9]{3}))?"
+    r"(?:-(?:[a-z0-9]{5,8}|[0-9][a-z0-9]{3}))?(?:-x(?:-[a-z0-9]{1,8})+)?"
 )
+#: A literal as ``canonical_spelling`` spells it, with no suffix, such a
+#: language tag or such a datatype.
+_SAFE_LITERAL = re.compile(rf'"[^"\\]*(?:\\.[^"\\]*)*"(?:@{_SAFE_TAG}|\^\^{_SAFE_IRI_FORM})?')
 _SAFE_BLANK = re.compile(r"_:[A-Za-z0-9]+")
 #: A "%" that does not start an escape of two hexadecimal digits.
 _BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
