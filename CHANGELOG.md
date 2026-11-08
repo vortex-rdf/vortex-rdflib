@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.4.0...v0.5.0) - 2026-11-03
+## [0.5.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.4.0...v0.5.0) - 2026-11-08
 
 Requires vortex-rdf 0.15 (`vortex-rdf>=0.15.0,<0.16`, up from 0.13.1), and the
 union default graph is a set of triples. A plain `Graph` over the store, and a
@@ -201,6 +201,8 @@ typed path per case.
 - Stream reads without term codes through iter_quads (#27) (store) ([`3feb77b`](https://github.com/vortex-rdf/vortex-rdflib/commit/3feb77b9561a6f5a6d7e48786309b470a36fb9d5) by @claude)
 - Let a streamed quad's tuple go as soon as it is unpacked (store) ([`944787b`](https://github.com/vortex-rdf/vortex-rdflib/commit/944787b14851db2a23b0fe206ff8b80ad3e42ac8) by @claude)
 - Decide non-ASCII IRIs and BCP 47 tags locally (terms) ([`c3e1b6e`](https://github.com/vortex-rdf/vortex-rdflib/commit/c3e1b6e122c5d6aae121f7427fea2a93d46839c3) by @claude)
+- Stream the right side of an OPTIONAL over an UNDEF key (pushdown) ([`7e6b383`](https://github.com/vortex-rdf/vortex-rdflib/commit/7e6b3834f64f5b8492f041ee2bb6e6e57b81aaa9) by @claude)
+- Refused is any_refused of one spelling (boundary) ([`8c1672f`](https://github.com/vortex-rdf/vortex-rdflib/commit/8c1672f779cf8d19b06a02de6e3c6eca30a02034) by @claude)
 
 ### Fixed
 
