@@ -54,7 +54,10 @@ as a BGP's join step does: probed per row only where each probe is a point
 lookup, matched once narrowed to the left side's codes where each would scan
 the store; an `OPTIONAL` whose condition no row can pass leaves its right side
 unread. A query is one trace, whose events are built only when tracing is on,
-and the FILTER applied over rows rdflib produced keeps nothing per row. Inside,
+and the FILTER applied over rows rdflib produced keeps nothing per row.
+Planning reads rdflib's algebra and expression nodes as the dicts they are and
+tells terms by their exact class, sparing rdflib's slow attribute reads and
+`isinstance` checks on every query. Inside,
 the switches are one settings object read when a store is constructed, every
 native call goes through one boundary, an open file's state is one record, and
 the join planner, the FILTER model, `COUNT` and the block solvers take one
@@ -203,6 +206,8 @@ typed path per case.
 - Decide non-ASCII IRIs and BCP 47 tags locally (terms) ([`c3e1b6e`](https://github.com/vortex-rdf/vortex-rdflib/commit/c3e1b6e122c5d6aae121f7427fea2a93d46839c3) by @claude)
 - Stream the right side of an OPTIONAL over an UNDEF key (pushdown) ([`7e6b383`](https://github.com/vortex-rdf/vortex-rdflib/commit/7e6b3834f64f5b8492f041ee2bb6e6e57b81aaa9) by @claude)
 - Refused is any_refused of one spelling (boundary) ([`8c1672f`](https://github.com/vortex-rdf/vortex-rdflib/commit/8c1672f779cf8d19b06a02de6e3c6eca30a02034) by @claude)
+- Check an ASCII spelling against forms of ASCII alone (terms) ([`2676832`](https://github.com/vortex-rdf/vortex-rdflib/commit/2676832711000581889527831b5710c3660b2ed4) by @claude)
+- Read rdflib's nodes as dicts and tell terms by their class (pushdown) ([`009fcd5`](https://github.com/vortex-rdf/vortex-rdflib/commit/009fcd53723d2c78c408e48597523b35ea901c55) by @claude)
 
 ### Fixed
 
