@@ -45,7 +45,7 @@ chunk, and a consumer that stops early (`LIMIT`, `ASK`) stops the read (#27). A
 triple pattern naming a term vortex-rdf's parser refuses (`<http://x/%zz>`, a
 lone surrogate, a second `#`, a language tag BCP 47 refuses) matches nothing
 instead of raising, in `triples()`, `contexts()`, `in` and every SPARQL pattern
-the pushdown resolves, a context binding included (#26). An `OPTIONAL` the
+the pushdown resolves, a context binding and a VALUES table included (#26). An `OPTIONAL` the
 pushdown evaluates answers as SPARQL 1.1 does where rdflib's evaluator does not:
 it keeps a `VALUES` row no right row matches, and its FILTER sees a left-side
 variable an enclosing join binds (#24). An
@@ -198,6 +198,9 @@ typed path per case.
 - A VALUES block's rows are tuples in variable order (values) ([`6c4437e`](https://github.com/vortex-rdf/vortex-rdflib/commit/6c4437eb5bf7fd4bbf70782ccfe78a7f0ffce5cd) by @claude)
 - FILTER and OPTIONAL blocks carry their own expressions (blocks) ([`cfe1e05`](https://github.com/vortex-rdf/vortex-rdflib/commit/cfe1e05d0b8b5a3490c0ddc4d3b7a5f7a64f8f0a) by @claude)
 - COUNT cases that carry their behaviour (aggregate) ([`1c96486`](https://github.com/vortex-rdf/vortex-rdflib/commit/1c96486ecc226996efd2c96c97bcaa1d0d5758d2) by @claude)
+- Stream reads without term codes through iter_quads (#27) (store) ([`3feb77b`](https://github.com/vortex-rdf/vortex-rdflib/commit/3feb77b9561a6f5a6d7e48786309b470a36fb9d5) by @claude)
+- Let a streamed quad's tuple go as soon as it is unpacked (store) ([`944787b`](https://github.com/vortex-rdf/vortex-rdflib/commit/944787b14851db2a23b0fe206ff8b80ad3e42ac8) by @claude)
+- Decide non-ASCII IRIs and BCP 47 tags locally (terms) ([`c3e1b6e`](https://github.com/vortex-rdf/vortex-rdflib/commit/c3e1b6e122c5d6aae121f7427fea2a93d46839c3) by @claude)
 
 ### Fixed
 
@@ -214,6 +217,10 @@ typed path per case.
 - One IRI check, the package's; a refused IRI names no term (filters) ([`ca48ea0`](https://github.com/vortex-rdf/vortex-rdflib/commit/ca48ea0ed4a8d6c4a340ec858b95d287beb47f7c) by @claude)
 - The open file's record refers to no store (store) ([`a58dd11`](https://github.com/vortex-rdf/vortex-rdflib/commit/a58dd11d46f9857b6cc7ab6a02cf90f162c3467b) by @claude)
 - A traced result flushes per chunk (trace) ([`9585528`](https://github.com/vortex-rdf/vortex-rdflib/commit/958552810b8b1dc5cd6d6c83cc05f671475e8963) by @claude)
+- A pattern naming a term vortex-rdf refuses matches nothing (#26) (store) ([`1a1f444`](https://github.com/vortex-rdf/vortex-rdflib/commit/1a1f444de4464af338ab50254165587a233e97ef) by @claude)
+- A constant vortex-rdf refuses matches nothing (#26) (pushdown) ([`05faf90`](https://github.com/vortex-rdf/vortex-rdflib/commit/05faf905b856f9d54ec8d9add4f94a411f33f125) by @claude)
+- Answer OPTIONAL over VALUES, and a condition reading a left variable, per SPARQL 1.1 (#24) (pushdown) ([`b51c429`](https://github.com/vortex-rdf/vortex-rdflib/commit/b51c42973df4a4efc00ebe3660ddba3fadce9e11) by @claude)
+- A VALUES term vortex-rdf refuses keeps its unmatched OPTIONAL row (pushdown) ([`6b8e82a`](https://github.com/vortex-rdf/vortex-rdflib/commit/6b8e82a51dbb75e93d1b828ad032f5675d881186) by @claude)
 
 ## [0.4.0](https://github.com/vortex-rdf/vortex-rdflib/compare/v0.3.0...v0.4.0) - 2026-10-24
 
