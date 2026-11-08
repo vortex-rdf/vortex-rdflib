@@ -81,12 +81,17 @@ jobs:
           uv build
           uvx twine check dist/*
       # The test suite runs against the built wheel in an isolated environment,
-      # not the source tree, so what gets published is what got tested.
+      # not the source tree, so what gets published is what got tested. The
+      # wheel's dependencies resolve as a user's install would; the suite's own
+      # are the lock's dependency groups CI's tests run with (dev: pytest, and
+      # pyoxigraph for tests/oracle.py), as tests/test_release_workflow.py checks.
       - name: Smoke-test the wheel
-        run: >
-          uv run --isolated --no-project
-          --with pytest --with dist/*.whl
-          pytest tests -q
+        run: |
+          uv export --frozen --only-group dev --no-hashes -o "$RUNNER_TEMP/test-requirements.txt"
+          uv run --isolated --no-project \
+            --with-requirements "$RUNNER_TEMP/test-requirements.txt" \
+            --with dist/*.whl \
+            pytest tests -q
       - uses: actions/upload-artifact@v7
         with:
           name: dist
