@@ -442,13 +442,8 @@ class VortexRdflibStore(Store):
         parse = self._from_n3_safe
         memo: dict[str, Node] = {}
         left = chunk_rows
-        previous: tuple = ()
-        for quad in quads:
-            if not left:
-                memo = {raw: memo[raw] for raw in previous[:3]}
-                left = chunk_rows
-            left -= 1
-            s_raw, p_raw, o_raw, g_raw = previous = quad
+        # Unpacked in the loop's target, a quad's tuple is let go at once.
+        for s_raw, p_raw, o_raw, g_raw in quads:
             if g_n3 is not None and fixed is None:
                 fixed = opened.context_tuple(self, g_n3)
             row = []
@@ -461,6 +456,10 @@ class VortexRdflibStore(Store):
                 (row[0], row[1], row[2]),
                 (fixed if fixed is not None else opened.context_tuple(self, g_raw)),
             )
+            left -= 1
+            if not left:
+                memo = {s_raw: memo[s_raw], p_raw: memo[p_raw], o_raw: memo[o_raw]}
+                left = chunk_rows
 
     def _code_matches(
         self, native: boundary.NativeHandle, pattern: tuple
