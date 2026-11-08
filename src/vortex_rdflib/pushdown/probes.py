@@ -357,16 +357,25 @@ def _probe_spellings(store, rows, bound) -> dict:
     """The N-Triples spelling of every code the probes substitute: one
     batch decode for dictionary codes, and for a constant outside the
     dictionary the canonical spelling :func:`_constant_codes` looked up
-    (which then matches nothing), or ``None`` for an IRI the parser rejects,
-    which it did not look up."""
+    (which then matches nothing), or ``None`` for a term no pattern may
+    name (:func:`_foreign_spelling`)."""
     distinct = {row[row_idx] for row in rows for row_idx, _ in bound}
     codes = [code for code in distinct if code >= 0]
     foreign = store._terms().foreign
     n3_cache: dict[int, str | None] = {
-        code: None if unparseable_iri(foreign[code]) else canonical_spelling(foreign[code])
-        for code in distinct
-        if code < 0
+        code: _foreign_spelling(store, foreign[code]) for code in distinct if code < 0
     }
     for code, term in zip(codes, store._opened().codes.spellings(codes), strict=True):
         n3_cache[code] = term
     return n3_cache
+
+
+def _foreign_spelling(store, term) -> str | None:
+    """A constant outside the dictionary as a probe spells it, or ``None``
+    when vortex-rdf's parser would refuse the pattern: an IRI of no IRI's
+    form, or a spelling it refuses (:func:`~vortex_rdflib.boundary.refused`).
+    Such a probe matches nothing, so it is not sent."""
+    if unparseable_iri(term):
+        return None
+    spelling = canonical_spelling(term)
+    return None if boundary.refused(store, spelling) else spelling

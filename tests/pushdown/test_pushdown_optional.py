@@ -18,6 +18,7 @@ from vortex_rdf import serialize_rdf
 
 from vortex_rdflib import VortexRdflibStore, register_sparql_pushdown
 from vortex_rdflib import pushdown as pd
+from vortex_rdflib.settings import SETTINGS
 
 DATA = """
 <http://ex/s0> <http://ex/optional> <http://ex/o0> .
@@ -90,6 +91,24 @@ def _rows(dataset: Dataset, sparql: str) -> list[tuple]:
 def test_an_optional_answers_as_sparql_does(quads_file, rdflib_left_joins, in_memory, sparql):
     dataset = _dataset(quads_file, in_memory)
     assert _rows(dataset, sparql) == oracle.query_rows(DATA, sparql)
+    assert rdflib_left_joins == []
+
+
+@pytest.mark.parametrize("fanout", [0, 10**9], ids=["probe", "scan"])
+@pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
+def test_a_values_term_vortex_rdf_refuses_keeps_its_unmatched_row(
+    quads_file, rdflib_left_joins, monkeypatch, in_memory, fanout
+):
+    """A VALUES term vortex-rdf's parser refuses is no term of the file (#26),
+    as an unknown one is: no right row is compatible with its row, so the
+    OPTIONAL keeps it unextended (§18.5), on the probe plan and the scan."""
+    monkeypatch.setattr(SETTINGS, "probe_fanout", fanout)
+    sparql = """SELECT ?o ?s WHERE { VALUES ?o { <http://x/%zz> <http://ex/o0> }
+        OPTIONAL { ?s <http://ex/optional> ?o } }"""
+    assert _rows(_dataset(quads_file, in_memory), sparql) == [
+        ("<http://ex/o0>", "<http://ex/s0>"),
+        ("<http://x/%zz>", ""),
+    ]
     assert rdflib_left_joins == []
 
 

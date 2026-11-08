@@ -169,19 +169,16 @@ def _constant_codes(store, terms: list) -> list:
     One ``encode_many`` looks every spelling up, tolerant of spelling: the
     native layer canonicalizes a term the way its pattern parser does, so a
     miss means no match of any pattern could reach the term either. An IRI
-    the parser rejects (:func:`~vortex_rdflib.terms.unparseable_iri`) is no
-    term of the file and is not looked up; any other term the native parser
-    rejects leaves the table to rdflib.
+    of no IRI's form (:func:`~vortex_rdflib.terms.unparseable_iri`) is not
+    looked up, and a term the native parser refuses reads as absent
+    (:func:`~vortex_rdflib.boundary.codes_of`): no file holds either, so
+    each gets a private code, as an unknown term does.
     """
     if not terms:
         return []
     rejected = [unparseable_iri(term) for term in terms]
     spellings = [canonical_spelling(t) for t, out in zip(terms, rejected, strict=True) if not out]
-    try:
-        term_dict = boundary.term_dict(store)
-        encoded = iter(term_dict.encode_many(spellings) if spellings else ())
-    except ValueError:
-        raise NotImplementedError from None
+    encoded = iter(boundary.codes_of(store, spellings) if spellings else ())
     found = [None if out else next(encoded) for out in rejected]
     store._prime_decode_cache([code for code in found if code is not None])
     codes = []

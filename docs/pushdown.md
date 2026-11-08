@@ -173,7 +173,7 @@ block := BGP
 typed block before any work starts: the conversion is the check against this
 grammar, and each block knows the variables it mentions, binds and may leave
 unbound. [`_solve_block`](../src/vortex_rdflib/pushdown/blocks.py#L83) then solves it by its kind's solver
-([`_SOLVERS`](../src/vortex_rdflib/pushdown/blocks.py#L753)). The result is a
+([`_SOLVERS`](../src/vortex_rdflib/pushdown/blocks.py#L750)). The result is a
 [`Relation`](../src/vortex_rdflib/pushdown/relation.py#L30): the variables it binds
 (its schema) and a body of codes, which is either
 
@@ -489,7 +489,7 @@ hands it down to the BGP.
 [`_eval_block_node`](../src/vortex_rdflib/pushdown/blocks.py#L23) sets it;
 [`_eval_head`](../src/vortex_rdflib/pushdown/head.py#L70) sets it unless the head
 has an `ORDER BY` or a `DISTINCT`. A `FILTER` passes it on unless it holds an
-`EXISTS` ([`_solve_filter`](../src/vortex_rdflib/pushdown/blocks.py#L202)), and
+`EXISTS` ([`_solve_filter`](../src/vortex_rdflib/pushdown/blocks.py#L199)), and
 `GRAPH` passes it on. A group join, `OPTIONAL`, `MINUS`, an aggregate and an
 `ASK` do not. Tier 3 also needs the block to be matched in the graph the
 context has made active, which is the graph `evalBGP` reads, and no `FILTER`
@@ -590,7 +590,7 @@ evaluated here: its conjunct goes to rdflib, which raises.
 
 ### Splitting into conjuncts
 
-[`_solve_filter`](../src/vortex_rdflib/pushdown/blocks.py#L202) calls
+[`_solve_filter`](../src/vortex_rdflib/pushdown/blocks.py#L199) calls
 [`analyze_filter`](../src/vortex_rdflib/filters/__init__.py#L137), which splits the
 expression at its top-level `&&`. A row passes only when every part (a
 **conjunct**) is true, so each conjunct can be handled on its own. Conjuncts
@@ -773,7 +773,7 @@ outer bindings when it sits directly inside an `EXISTS` body (see
   `BNODE()`), since remembering its result per value would change the answer;
 - a conjunct that, in rdflib, could see a variable an enclosing join binds row
   by row; the hook solves both sides separately, so the conjunct could not see
-  it ([`_reject_env_references`](../src/vortex_rdflib/pushdown/blocks.py#L361));
+  it ([`_reject_env_references`](../src/vortex_rdflib/pushdown/blocks.py#L358));
 - a conjunct on a variable both the block and such a row bind, where rdflib's
   filter forgets the row's binding (a `VALUES` table's, outside the node's
   `_vars`, or any in a group of an `EXISTS` body), so sees it unbound;
@@ -781,7 +781,7 @@ outer bindings when it sits directly inside an `EXISTS` body (see
   not see (an `OPTIONAL`'s filter sees only the query's `initBindings`), where
   rdflib evaluates the filter once per row and calls the hook with the row
   bound: the `EXISTS` would see the binding
-  ([`_reject_forgotten_exists`](../src/vortex_rdflib/pushdown/blocks.py#L389)).
+  ([`_reject_forgotten_exists`](../src/vortex_rdflib/pushdown/blocks.py#L386)).
 
 ## Projection, LIMIT/OFFSET and ASK
 
@@ -895,7 +895,7 @@ for every left row. The hook usually solves each side once instead, and
 combines them on their shared variables:
 
 - **`OPTIONAL`**
-  ([`_solve_left_join`](../src/vortex_rdflib/pushdown/blocks.py#L444)): a hash left
+  ([`_solve_left_join`](../src/vortex_rdflib/pushdown/blocks.py#L441)): a hash left
   join ([`_left_join_rows`](../src/vortex_rdflib/pushdown/relation.py#L131)), which
   answers as SPARQL 1.1's `LeftJoin` does (§18.5). The optional group's
   `FILTER` is checked on each candidate pair, over what both sides bind. A
@@ -903,24 +903,24 @@ combines them on their shared variables:
   unbound. A left row that leaves a shared variable unbound (a `VALUES`
   table's `UNDEF`) is compatible with every right row on it, and takes the
   right row's value.
-- **`MINUS`** ([`_solve_minus`](../src/vortex_rdflib/pushdown/blocks.py#L582)): an
+- **`MINUS`** ([`_solve_minus`](../src/vortex_rdflib/pushdown/blocks.py#L579)): an
   anti-join. When the sides share no variable (under `GRAPH ?g`, the graph
   column alone does not count), it follows rdflib's rule: with no outer
   bindings (the usual top-level case) nothing is removed; with outer bindings,
   everything is removed if the right side has any row (under `GRAPH ?g`, any
   row in the same graph).
-- **Group join** ([`_solve_join`](../src/vortex_rdflib/pushdown/blocks.py#L406)): a
+- **Group join** ([`_solve_join`](../src/vortex_rdflib/pushdown/blocks.py#L403)): a
   hash join (`_join`). When rdflib would deduplicate the right side (a join it
   does not evaluate lazily), so does the hook.
 
 When the right side of an `OPTIONAL`, of a lazy group join or of an `EXISTS` is
-a single pattern, [`_plan_side`](../src/vortex_rdflib/pushdown/blocks.py#L629)
+a single pattern, [`_plan_side`](../src/vortex_rdflib/pushdown/blocks.py#L626)
 counts it first, only as far as the decision needs: up to the left relation's
 rows × `SETTINGS.probe_fanout` + 1
 ([`count_at_step`](../src/vortex_rdflib/pushdown/planner.py#L449)). It plans the
 join as a BGP's join step does
 ([`step_rule`](../src/vortex_rdflib/pushdown/planner.py#L462)), and
-[`_join_side`](../src/vortex_rdflib/pushdown/blocks.py#L688) joins it. If the left relation
+[`_join_side`](../src/vortex_rdflib/pushdown/blocks.py#L685) joins it. If the left relation
 is at least `SETTINGS.probe_fanout` times smaller than that count, the pattern
 is probed once per left row where each probe is a point lookup (with
 `_probe_join`, which also pads unmatched `OPTIONAL` rows), and keep-scanned
@@ -932,7 +932,7 @@ probes with counts capped at one row even where each would scan, unless a free
 variable takes two positions, which a count cannot test.
 
 An `OPTIONAL`'s condition is analysed before either side is solved
-([`_left_join_condition`](../src/vortex_rdflib/pushdown/blocks.py#L554)): a
+([`_left_join_condition`](../src/vortex_rdflib/pushdown/blocks.py#L551)): a
 condition no pair can pass pads every left row and leaves the right side
 unsolved, and one rdflib must evaluate (an `EXISTS` in it) hands the `OPTIONAL`
 back before any native work.
@@ -991,7 +991,7 @@ SELECT ?s WHERE {
 ```
 
 rdflib evaluates the body once per row. Instead,
-[`_apply_exists`](../src/vortex_rdflib/pushdown/blocks.py#L285) runs a semi-join
+[`_apply_exists`](../src/vortex_rdflib/pushdown/blocks.py#L282) runs a semi-join
 (`EXISTS`) or an anti-join (`NOT EXISTS`) on the variables the body shares with
 the block:
 
@@ -1069,13 +1069,16 @@ a relation, which then joins like any other:
 - All constants are looked up in one `TermDict.encode_many` call
   ([`_constant_codes`](../src/vortex_rdflib/pushdown/blocks.py#L165)), spelled the
   way the dictionary stores terms
-  ([`canonical_spelling`](../src/vortex_rdflib/terms.py#L129)). An IRI
-  vortex-rdf's parser rejects is not looked up: no file holds it.
+  ([`canonical_spelling`](../src/vortex_rdflib/terms.py#L129)). An IRI of no
+  IRI's form is not looked up, and a spelling vortex-rdf's parser refuses
+  reads as absent ([`codes_of`](../src/vortex_rdflib/boundary.py#L95)): no file
+  holds either.
 - `UNDEF` becomes an unbound value.
-- A constant the dictionary does not hold, or that is not looked up, gets a
+- A constant the dictionary does not hold, refused or not looked up, gets a
   private negative code
   ([`_foreign_code`](../src/vortex_rdflib/store.py#L571)). It joins nothing,
-  but is still returned as written.
+  but is still returned as written; a probe that would name one the parser
+  refuses is not sent.
 - Rows that contradict an outer binding are dropped, as in rdflib.
 - Rows whose term fails a `FILTER` conjunct pushed down to the table are
   dropped, even where a pattern that binds the variable tests it too. Each
@@ -1085,7 +1088,7 @@ a relation, which then joins like any other:
 
 **Left to rdflib:** a constant whose rdflib term differs from the dictionary's
 term, such as `"042"^^xsd:integer` (rdflib would return the query's own
-spelling); and any other constant vortex-rdf cannot parse.
+spelling).
 
 ## Named graphs
 
@@ -1136,7 +1139,7 @@ a named graph.
 - under any `GRAPH`, an `EXISTS` that rdflib's evaluator decides (one under
   another operator, in an `OPTIONAL`'s condition, or on the generic route):
   rdflib would match its body in the query's graph
-  ([`_reject_graph_exists`](../src/vortex_rdflib/pushdown/blocks.py#L379));
+  ([`_reject_graph_exists`](../src/vortex_rdflib/pushdown/blocks.py#L376));
 - a `GRAPH` variable bound to something that cannot name a graph, such as a
   literal;
 - a `GRAPH ?g` group none of whose patterns is matched in its scope (an empty
