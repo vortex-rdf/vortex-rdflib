@@ -537,11 +537,13 @@ def _solve_left_join(ctx, store, node: algebra.LeftJoin, frame: _Frame) -> Relat
         # give; rdflib answers it.
         raise NotImplementedError
     schema = left.schema + tuple(v for v in right.schema if v not in left.schema)
+    # The right rows are read once, lazily: a streamed or columnar right side
+    # is never held as Python rows.
     rows = relation._left_join_rows(
         left.schema,
         left_rows,
         right.schema,
-        relation._rows_of(right),
+        relation._code_rows(right),
         _condition_preds(store, conjuncts, schema),
         nullable_left=any(v in left.nullable for v in shared),
     )

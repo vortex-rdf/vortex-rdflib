@@ -194,3 +194,25 @@ def test_a_left_row_with_an_unbound_key_joins_every_right_row_agreeing_on_the_re
         nullable_left=True,
     )
     assert rows == [(1, "a", 10), (2, "a", 20), (1, "b", 10), (3, "c", None)]
+
+
+def test_a_left_join_with_an_unbound_key_reads_the_right_rows_once():
+    """The right side streams: its rows are read once, in order, so a
+    one-shot iterator gives the rows a list does, and nothing holds the
+    right side whole."""
+    rows = pd.relation._left_join_rows(
+        ("o", "t"),
+        [(None, "a"), (1, "b"), (None, "c"), (3, "d")],
+        ("s", "o"),
+        iter([(10, 1), (20, 2)]),
+        (),
+        nullable_left=True,
+    )
+    assert rows == [
+        (1, "a", 10),
+        (2, "a", 20),
+        (1, "b", 10),
+        (1, "c", 10),
+        (2, "c", 20),
+        (3, "d", None),
+    ]

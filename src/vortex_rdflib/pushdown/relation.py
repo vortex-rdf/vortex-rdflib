@@ -130,51 +130,78 @@ def _shared_key_ok(left: Relation, right: Relation, shared) -> None:
 
 def _left_join_rows(schema_a, rows_a, schema_b, rows_b, preds, *, nullable_left=False) -> list:
     """Hash left join: each left row extended by every compatible right row
-    that passes ``preds`` (over the combined row), or padded with None.
+    that passes ``preds`` (over the combined row), or padded with None. The
+    right rows, any iterable, are read once.
 
     With ``nullable_left`` a left row may leave a shared variable unbound
     (a VALUES table's UNDEF), which every right row is compatible with on
-    it (SPARQL 1.1 §18.5): such a row joins each right row that agrees on
+    it (SPARQL 1.1 §18.3): such a row joins each right row that agrees on
     its bound shared variables, and takes the right row's values for the
-    unbound ones. The right rows bind every shared variable."""
+    unbound ones. The left rows are indexed then and the right rows
+    streamed past them (:func:`_compatible_left_join`), so the right side is
+    never held. The right rows bind every shared variable."""
     shared = [v for v in schema_b if v in schema_a]
     keep_b = [i for i, v in enumerate(schema_b) if v not in schema_a]
     ia = [schema_a.index(v) for v in shared]
     ib = [schema_b.index(v) for v in shared]
+    pad = (None,) * len(keep_b)
+    if nullable_left:
+        return _compatible_left_join(rows_a, rows_b, ia, ib, keep_b, preds, pad)
     table: dict = {}
     for rb in rows_b:
         table.setdefault(tuple(rb[i] for i in ib), []).append(tuple(rb[i] for i in keep_b))
-    pad = (None,) * len(keep_b)
     out = []
     for ra in rows_a:
         matched = False
-        key = tuple(ra[i] for i in ia)
-        if nullable_left and None in key:
-            for row in _compatible_rows(ra, key, ia, ib, keep_b, rows_b):
-                if all(pred(row) for pred in preds):
-                    out.append(row)
-                    matched = True
-        else:
-            for tail in table.get(key, ()):
-                row = ra + tail
-                if all(pred(row) for pred in preds):
-                    out.append(row)
-                    matched = True
+        for tail in table.get(tuple(ra[i] for i in ia), ()):
+            row = ra + tail
+            if all(pred(row) for pred in preds):
+                out.append(row)
+                matched = True
         if not matched:
             out.append(ra + pad)
     return out
 
 
-def _compatible_rows(ra: tuple, key: tuple, ia, ib, keep_b, rows_b):
-    """The left row ``ra``, whose shared ``key`` leaves some variables
-    unbound, joined with each right row that agrees on the bound ones."""
+def _compatible_left_join(rows_a: list, rows_b, ia, ib, keep_b, preds, pad) -> list:
+    """:func:`_left_join_rows` where a left row may leave a shared variable
+    unbound. The left rows are indexed by their shared values, a row with an
+    unbound one kept apart: it is compatible with every right row that
+    agrees on the rest. Each right row, read once, joins the left rows it is
+    compatible with. Then each left row comes with its matches, in right-row
+    order, or padded."""
+    keyed: dict[tuple, list[int]] = {}
+    unbound: list[tuple[int, tuple]] = []
+    for n, ra in enumerate(rows_a):
+        key = tuple(ra[i] for i in ia)
+        if None in key:
+            unbound.append((n, key))
+        else:
+            keyed.setdefault(key, []).append(n)
+    matches: dict[int, list] = {}
     for rb in rows_b:
-        if all(value is None or rb[j] == value for value, j in zip(key, ib, strict=True)):
-            merged = list(ra)
-            for i, j in zip(ia, ib, strict=True):
-                if merged[i] is None:
-                    merged[i] = rb[j]
-            yield tuple(merged) + tuple(rb[i] for i in keep_b)
+        tail = tuple(rb[j] for j in keep_b)
+        for n in keyed.get(tuple(rb[j] for j in ib), ()) if keyed else ():
+            row = rows_a[n] + tail
+            if all(pred(row) for pred in preds):
+                matches.setdefault(n, []).append(row)
+        for n, key in unbound:
+            if all(value is None or rb[j] == value for value, j in zip(key, ib, strict=True)):
+                merged = list(rows_a[n])
+                for i, j in zip(ia, ib, strict=True):
+                    if merged[i] is None:
+                        merged[i] = rb[j]
+                row = tuple(merged) + tail
+                if all(pred(row) for pred in preds):
+                    matches.setdefault(n, []).append(row)
+    out = []
+    for n, ra in enumerate(rows_a):
+        found = matches.get(n)
+        if found:
+            out.extend(found)
+        else:
+            out.append(ra + pad)
+    return out
 
 
 def _filter_relation(rel: Relation, preds) -> Relation:
