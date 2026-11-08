@@ -187,9 +187,13 @@ def test_a_cancel_stops_a_read_without_codes_at_its_next_chunk(tmp_path, monkeyp
                 next(rows)
 
 
-def test_an_abandoned_read_without_codes_releases_its_native_iterator(tmp_path, monkeypatch):
+@pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
+def test_an_abandoned_read_without_codes_releases_its_native_iterator(
+    tmp_path, monkeypatch, in_memory
+):
     monkeypatch.setattr(SETTINGS, "triples_chunk_rows", 4)
-    graph = Graph(store=VortexRdflibStore(_no_code_file(tmp_path, TWENTY)))
+    store = VortexRdflibStore(_no_code_file(tmp_path, TWENTY), in_memory=in_memory)
+    graph = Graph(store=store)
     spy = native_spy(graph)
     rows = iter(graph.triples((None, None, None)))
     next(rows)
