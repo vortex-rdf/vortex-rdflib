@@ -2,21 +2,25 @@
 slow paths.
 
 A parse, algebra or expression node (``CompValue``) is a dict of its fields.
-Read as an attribute, rdflib answers with an attribute set on the node, else
-the field resolved against the context of an expression being evaluated —
-outside an evaluation, the stored value, after a lookup of that context that
-misses and a ``KeyError`` caught: about a microsecond a read, where
-:func:`field` takes a tenth of it.
+Read as an attribute, rdflib answers with an attribute set on the node — it
+sets a few, an algebra node's ``no_isolated_scope`` and an EXISTS's
+translated graph among them — else the field resolved against the context of
+an expression being evaluated: outside an evaluation, the stored value, after
+a lookup of that context that misses and a ``KeyError`` caught. That is about
+a microsecond a read, where :func:`field` takes a tenth of it.
 
 rdflib's term classes test an instance through ``abc.ABCMeta``: an
-``isinstance`` costs a few hundred nanoseconds for each class a term is not.
-A node of exactly one of the classes a query holds — every term and node
-rdflib's parser builds — is told by its class (:func:`term_class`,
-:func:`var_like`); any other, by ``isinstance``.
+``isinstance`` costs a few hundred nanoseconds for each class a node is not.
+A node whose class is exactly one a query holds — a term, a node or a path
+rdflib's parser builds, ``None``, a plain Python value — is told by its class
+(:func:`term_class`, :func:`var_like`); any other, a term's subclass say, by
+``isinstance``.
 """
 
 from typing import Any
 
+from pyparsing import ParseResults
+from rdflib.paths import AlternativePath, InvPath, MulPath, NegatedPath, SequencePath
 from rdflib.plugins.sparql.parserutils import CompValue, Expr
 from rdflib.term import BNode, Literal, URIRef, Variable
 
@@ -26,19 +30,25 @@ TERM_CLASSES = (URIRef, Literal, BNode, Variable)
 #: ``evalBGP`` treats a query's blank nodes.
 VAR_LIKE = (Variable, BNode)
 
-#: The other classes a query's nodes have, exactly: none is a term class.
-_NOT_TERMS = frozenset([CompValue, Expr, str, int, float, bool, list, tuple, dict])
-#: Whether a node of one of the classes a query holds, exactly, is
-#: variable-like.
-_VAR_LIKE_CLASS: dict[type, bool] = {cls: cls in VAR_LIKE for cls in TERM_CLASSES}
-_VAR_LIKE_CLASS.update(dict.fromkeys(_NOT_TERMS, False))
+#: The term class of a node by its exact class, for the classes a query's
+#: nodes have: a term class for itself, ``None`` for every other.
+_EXACT: dict[type, type | None] = {cls: cls for cls in TERM_CLASSES}
+_EXACT.update(
+    dict.fromkeys(
+        [
+            *(type(None), CompValue, Expr, ParseResults),
+            *(SequencePath, AlternativePath, InvPath, MulPath, NegatedPath),
+            *(str, int, float, bool, list, tuple, dict),
+        ]
+    )
+)
 
 
 def field(node: CompValue, name: str) -> Any:
-    """``node.<name>`` as rdflib answers it: an attribute set on the node
-    (rdflib sets a few on parse nodes, an EXISTS's translated graph among
-    them), else the field, ``None`` where the node has none — or, while
-    rdflib evaluates the node, the field resolved as rdflib resolves it."""
+    """``node.<name>`` for a field of the ``CompValue`` ``node`` — not the
+    name of one of its methods — as rdflib answers it: an attribute set on the
+    node, else the field, ``None`` where the node has none; or, while rdflib
+    evaluates the node, the field resolved as rdflib resolves it."""
     attrs = node.__dict__
     if name in attrs:
         return attrs[name]
@@ -51,12 +61,13 @@ def term_class(node) -> type | None:
     """The term class of :data:`TERM_CLASSES` ``node`` is an instance of, or
     ``None``."""
     cls = type(node)
-    if cls in _VAR_LIKE_CLASS:
-        return None if cls in _NOT_TERMS else cls
+    if cls in _EXACT:
+        return _EXACT[cls]
     return next((term for term in TERM_CLASSES if isinstance(node, term)), None)
 
 
 def var_like(node) -> bool:
     """Whether ``node`` is a variable or a blank node (:data:`VAR_LIKE`)."""
-    known = _VAR_LIKE_CLASS.get(type(node))
-    return isinstance(node, VAR_LIKE) if known is None else known
+    cls = type(node)
+    cls = _EXACT[cls] if cls in _EXACT else term_class(node)
+    return cls is Variable or cls is BNode

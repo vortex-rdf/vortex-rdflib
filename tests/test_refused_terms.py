@@ -195,16 +195,17 @@ def test_the_ascii_forms_decide_an_ascii_spelling_as_the_full_forms_do():
     """The safe forms an ASCII spelling is checked against are the full
     forms without the characters beyond ASCII, which such a spelling cannot
     hold: on every ASCII spelling of the corpus the two agree."""
+    forms = {
+        "iri": (terms._SAFE_ASCII_IRI, terms._SAFE_IRI),
+        "literal": (terms._SAFE_ASCII_LITERAL, terms._SAFE_LITERAL),
+    }
     seen = Counter()
     for spelling in filter(str.isascii, _spellings()):
-        for ascii_form, full_form in [
-            (terms._SAFE_ASCII_IRI, terms._SAFE_IRI),
-            (terms._SAFE_ASCII_LITERAL, terms._SAFE_LITERAL),
-        ]:
+        for name, (ascii_form, full_form) in forms.items():
             matched = full_form.fullmatch(spelling) is not None
             assert (ascii_form.fullmatch(spelling) is not None) == matched, spelling
-            seen[matched] += 1
-    assert min(seen.values()) >= 100, seen
+            seen[name, matched] += 1
+    assert min(seen[key] for key in product(forms, [True, False])) >= 50, seen
 
 
 def test_an_ascii_spelling_is_decided_without_the_full_forms(monkeypatch):

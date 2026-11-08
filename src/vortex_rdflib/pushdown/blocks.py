@@ -12,6 +12,7 @@ from types import MappingProxyType
 from rdflib.plugins.sparql.evaluate import evalPart
 
 from .. import boundary, filters, trace
+from ..nodes import field
 from ..terms import canonical_spelling, unparseable_iri
 from . import algebra, bgp, matching, planner, probes, relation, solutions
 from .algebra import Block
@@ -36,8 +37,9 @@ def _eval_filter(ctx, store, part):
         return _eval_block_node(ctx, store, part)
     except NotImplementedError:
         keep = filters.solution_filter(store, part, ctx)
-    trace.event("filter_over_rdflib_rows", algebra_node=part.p.name)
-    return (solution for solution in evalPart(ctx, part.p) if keep(solution))
+    inner = field(part, "p")
+    trace.event("filter_over_rdflib_rows", algebra_node=inner.name)
+    return (solution for solution in evalPart(ctx, inner) if keep(solution))
 
 
 @dataclass(frozen=True, slots=True)

@@ -50,6 +50,7 @@ from typing import Any
 from rdflib.plugins.sparql.evalutils import _ebv as rdflib_ebv
 from rdflib.plugins.sparql.sparql import FrozenBindings
 
+from .. import nodes
 from ..settings import SETTINGS
 from ..terms import TermView, parse_spelling, view_of
 from . import compiler, exprs, native, values  # noqa: F401 - filters.values is public
@@ -352,7 +353,7 @@ def solution_filter(store, node, ctx) -> Callable[[Any], bool]:
     An expression the pushdown hands back whole (a random or fresh-node
     call) raises ``NotImplementedError``."""
     tests: list[Callable[[Any], bool]] = []
-    for conjunct_expr in exprs.flatten_and(node.expr, []):
+    for conjunct_expr in exprs.flatten_and(nodes.field(node, "expr"), []):
         if exprs.is_impure(conjunct_expr):
             raise NotImplementedError
         if exprs.has_exists(conjunct_expr):
@@ -365,10 +366,11 @@ def solution_filter(store, node, ctx) -> Callable[[Any], bool]:
             tests.append(lambda bound, passes=passes: passes)
             continue
         tests.append(_solution_test(conjunct, referenced))
-    isolated = not getattr(node, "no_isolated_scope", False)
+    isolated = not nodes.field(node, "no_isolated_scope")
+    kept = nodes.field(node, "_vars")
 
     def keep(solution) -> bool:
-        bound = solution.forget(ctx, _except=node._vars) if isolated else solution
+        bound = solution.forget(ctx, _except=kept) if isolated else solution
         return all(test(bound) for test in tests)
 
     return keep

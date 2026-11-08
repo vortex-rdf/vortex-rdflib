@@ -22,7 +22,7 @@ from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.plugins.sparql.sparql import SPARQLError
 from rdflib.term import Literal, URIRef
 
-from ..nodes import field, var_like
+from ..nodes import field, term_class, var_like
 from ..terms import LITERAL, TermView, view_of
 from .exprs import expr_vars
 
@@ -478,11 +478,11 @@ def fold(node, consts: dict):
     that reads any other variable, one rdflib cannot evaluate, or a value no
     term holds. The fast route's compiler reads what its whitelist leaves
     through it, and the native recognizer every constant."""
-    if isinstance(node, (Literal, URIRef)):
+    if term_class(node) in (Literal, URIRef):
         return node
     if var_like(node):
         term = consts.get(node)
-        return term if isinstance(term, (Literal, URIRef)) else None
+        return term if term_class(term) in (Literal, URIRef) else None
     if not isinstance(node, CompValue) or any(v not in consts for v in expr_vars(node)):
         return None
     try:
@@ -491,7 +491,7 @@ def fold(node, consts: dict):
         return None
     if isinstance(result, SPARQLError):
         return ERROR
-    return result if isinstance(result, (Literal, URIRef)) else None
+    return result if term_class(result) in (Literal, URIRef) else None
 
 
 def same_term(a: TermView, b: TermView) -> bool:

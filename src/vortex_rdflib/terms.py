@@ -18,7 +18,11 @@ from collections.abc import Callable
 import rdflib.term
 from rdflib.term import BNode, Literal, Node, URIRef
 
-from .nodes import term_class
+from .nodes import TERM_CLASSES, term_class
+
+#: The term classes, told apart by a node's exact class without a call; a
+#: node of any other class is looked up (:func:`~vortex_rdflib.nodes.term_class`).
+_EXACT_TERMS = frozenset(TERM_CLASSES)
 
 LITERAL = "literal"
 IRI = "iri"
@@ -132,7 +136,9 @@ def canonical_spelling(node) -> str:
     """The spelling the dictionary would hold for an rdflib term — the
     inverse of ``parse_spelling`` for what ``encode`` needs: lowercase
     language tags, no ``^^xsd:string``, the store's escapes."""
-    cls = term_class(node)
+    cls = type(node)
+    if cls not in _EXACT_TERMS:
+        cls = term_class(node)
     if cls is URIRef:
         return f"<{node}>"
     if cls is BNode:
@@ -153,7 +159,9 @@ def view_of(node) -> TermView:
     (``parse_spelling(canonical_spelling(node))``, built directly): a
     literal's lexical form as rdflib left it, well-typed or not, its
     language tag lowercased, ``xsd:string`` dropped."""
-    cls = term_class(node)
+    cls = type(node)
+    if cls not in _EXACT_TERMS:
+        cls = term_class(node)
     if cls is URIRef:
         return TermView(IRI, str(node))
     if cls is BNode:
@@ -177,7 +185,10 @@ def unparseable_iri(node) -> bool:
     """Whether ``node`` is an IRI without the form of every IRI vortex-rdf
     parses — a relative one (no BASE), say. It is no term of a file, and the
     native parser rejects its spelling."""
-    return term_class(node) is URIRef and _IRI_FORM.fullmatch(node) is None
+    cls = type(node)
+    if cls not in _EXACT_TERMS:
+        cls = term_class(node)
+    return cls is URIRef and _IRI_FORM.fullmatch(node) is None
 
 
 #: The characters of an ASCII IRI (RFC 3986) besides its delimiters: the

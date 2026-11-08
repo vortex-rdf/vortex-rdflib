@@ -300,8 +300,8 @@ def _string_function_shape(expr, var, consts) -> FilterCodes | None:
     own tag, compared as written: ``STR()`` text has none (an error for every
     value) and a stored tag is lower-case, so a tag that is not lower-case
     never matches either. Both stay with the Python routes."""
-    text = _text_shape(expr.arg1, var)
-    constant = _constant_term(expr.arg2, consts)
+    text = _text_shape(field(expr, "arg1"), var)
+    constant = _constant_term(field(expr, "arg2"), consts)
     if text is None or constant is None or not values.string_like(view_of(constant)):
         return None
     case, as_str = text
@@ -414,9 +414,10 @@ def native_shape(expr, var, consts: dict) -> IriIn | FilterCodes | None:
         return _regex_shape(expr, var, consts)
     if name == "Builtin_sameTerm":
         return _iri_equality(field(expr, "arg1"), field(expr, "arg2"), var, consts)
-    if name != "RelationalExpression" or field(expr, "other") is None:
+    right = field(expr, "other") if name == "RelationalExpression" else None
+    if right is None:
         return None
-    op, left, right = field(expr, "op"), field(expr, "expr"), field(expr, "other")
+    op, left = field(expr, "op"), field(expr, "expr")
     if op == "IN":
         return _iri_list(left, right, var, consts)
     if isinstance(right, list):
@@ -425,7 +426,7 @@ def native_shape(expr, var, consts: dict) -> IriIn | FilterCodes | None:
         for call, other in ((left, right), (right, left)):
             if _call_on(call, "Builtin_DATATYPE", var):
                 datatype = _constant_term(other, consts)
-                if not isinstance(datatype, URIRef):
+                if term_class(datatype) is not URIRef:
                     return None
                 return FilterCodes("datatype", str(datatype))
             if _call_on(call, "Builtin_LANG", var):
@@ -449,7 +450,7 @@ def native_shape(expr, var, consts: dict) -> IriIn | FilterCodes | None:
     # A well-typed number: vortex-rdf compares it as XPath does, an xsd:float
     # at single precision.
     if (
-        not isinstance(constant, Literal)
+        term_class(constant) is not Literal
         or str(constant.datatype) not in NUMERIC_TYPES
         or values.numeric_value(view_of(constant)) is None
     ):

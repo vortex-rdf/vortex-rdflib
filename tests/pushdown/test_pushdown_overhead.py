@@ -11,6 +11,7 @@ Over the shapes below, the pushdown's own code does neither; rdflib's does
 what it does."""
 
 import abc
+import os
 import sys
 
 import pytest
@@ -19,7 +20,12 @@ from rdflib.plugins.sparql.parserutils import CompValue
 from tests.support import both_ways, run
 from vortex_rdf import serialize_rdf
 
+import vortex_rdflib
 from vortex_rdflib import VortexRdflibStore
+
+#: The package's own source files, and abc's, by path.
+_PACKAGE = os.path.dirname(vortex_rdflib.__file__) + os.sep
+_ABC = (abc.__file__, "<frozen abc>")
 
 EX = "http://ex.org/"
 XSD = "http://www.w3.org/2001/XMLSchema#"
@@ -46,7 +52,20 @@ SHAPES = {
     "graph-var": f"SELECT ?g ?s WHERE {{ GRAPH ?g {{ ?s <{EX}p> ?v }} }}",
     "head": f"SELECT DISTINCT ?t WHERE {{ ?s <{EX}type> ?t }} ORDER BY DESC(?t) LIMIT 2",
     "group": f"SELECT ?t (COUNT(?s) AS ?n) WHERE {{ ?s <{EX}type> ?t }} GROUP BY ?t",
+    "filter-contains": f'SELECT ?s WHERE {{ ?s <{EX}label> ?l FILTER(CONTAINS(?l, "item")) }}',
+    "filter-strends": f'SELECT ?s WHERE {{ ?s <{EX}label> ?l FILTER(STRENDS(LCASE(?l), "1")) }}',
+    "filter-iri-eq": f"SELECT ?s WHERE {{ ?s <{EX}type> ?t FILTER(?t = <{EX}T1>) }}",
+    "filter-iri-ne": f"SELECT ?s WHERE {{ ?s <{EX}type> ?t FILTER(?t != <{EX}T1>) }}",
+    "filter-iri-in": f"SELECT ?s WHERE {{ ?s <{EX}type> ?t FILTER(?t IN (<{EX}T0>, <{EX}T2>)) }}",
+    "filter-same-term": f"SELECT ?s WHERE {{ ?s <{EX}type> ?t FILTER(sameTerm(?t, <{EX}T1>)) }}",
+    "filter-datatype": f"SELECT ?s WHERE {{ ?s <{EX}p> ?v FILTER(datatype(?v) = <{XSD}integer>) }}",
 }
+
+#: A FILTER over a block the pushdown hands back (a UNION): rdflib solves
+#: the block, and the pushdown's FILTER keeps its solutions, one by one.
+OVER_RDFLIB_ROWS = f"""SELECT ?s ?v WHERE {{
+    {{ ?s <{EX}p> ?v }} UNION {{ ?s <{EX}label> ?v }}
+    FILTER(isLiteral(?v) && ?v != "item 3"@en) }}"""
 
 
 @pytest.fixture(scope="module")
@@ -60,12 +79,12 @@ def quads_file(tmp_path_factory):
 
 
 def _ours(frame) -> str | None:
-    """The pushdown's frame making a call from ``frame`` up, past abc's own."""
-    while frame is not None and "abc" in frame.f_code.co_filename.rsplit("/", 1)[-1]:
+    """The package's frame making a call from ``frame`` up, past abc's own."""
+    while frame is not None and frame.f_code.co_filename in _ABC:
         frame = frame.f_back
-    if frame is None or "vortex_rdflib" not in frame.f_code.co_filename:
+    if frame is None or not frame.f_code.co_filename.startswith(_PACKAGE):
         return None
-    return f"{frame.f_code.co_filename.rsplit('vortex_rdflib/', 1)[-1]}:{frame.f_code.co_name}"
+    return f"{frame.f_code.co_filename[len(_PACKAGE) :]}:{frame.f_code.co_name}"
 
 
 @pytest.fixture
@@ -104,4 +123,16 @@ def test_a_query_reads_rdflib_nodes_and_terms_without_slow_calls(
     # The pushdown answers the whole query: rdflib reads no pattern itself.
     monkeypatch.setattr(VortexRdflibStore, "triples", None)
     assert run(dataset, sparql) == pushed
+    assert slow_calls == [], sorted(set(slow_calls))
+
+
+@pytest.mark.parametrize("in_memory", [False, True], ids=["file", "mem"])
+def test_a_filter_over_rdflib_rows_keeps_each_without_slow_calls(quads_file, slow_calls, in_memory):
+    """The pushdown's FILTER over a block rdflib solves reads its node once,
+    not once per solution it keeps."""
+    dataset = Dataset(store=VortexRdflibStore(quads_file, in_memory=in_memory), default_union=True)
+    pushed, plain = both_ways(dataset, OVER_RDFLIB_ROWS)
+    assert pushed == plain and len(pushed) > 10
+    slow_calls.clear()
+    assert run(dataset, OVER_RDFLIB_ROWS) == pushed
     assert slow_calls == [], sorted(set(slow_calls))

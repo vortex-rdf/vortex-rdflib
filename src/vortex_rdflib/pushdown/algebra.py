@@ -9,7 +9,7 @@ from typing import Any, ClassVar
 
 from rdflib.term import BNode, URIRef, Variable
 
-from ..nodes import field, var_like
+from ..nodes import field, term_class, var_like
 from ..terms import canonical_spelling, unparseable_iri
 
 
@@ -47,7 +47,7 @@ def _graph_scope(ctx, node: "Graph") -> _GraphScope:
     value = ctx[term]
     if value is None:
         return _GraphScope(None, term)
-    if not isinstance(value, (URIRef, BNode)) or unparseable_iri(value):
+    if term_class(value) not in (URIRef, BNode) or unparseable_iri(value):
         raise NotImplementedError
     return _GraphScope(canonical_spelling(value), None)
 
